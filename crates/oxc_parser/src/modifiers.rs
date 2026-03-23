@@ -545,7 +545,101 @@ impl<C: Config> ParserImpl<'_, C> {
         kind == Kind::LBrack || kind == Kind::PrivateIdentifier || kind.is_literal_property_name()
     }
 
-    fn check_modifier(&mut self, kinds: ModifierKinds, modifier: &Modifier) {
+    #[inline]
+    fn check_modifier(&mut self, existing_kinds: ModifierKinds, modifier: &Modifier) {
+        // Do a quick check that this modifier is not illegal in this position.
+        // Only if this quick check fails (syntax error, rare), then call `#[cold]` `#[inline(never)]` function
+        // `illegal_modifier_error` to raise an error.
+        if Self::is_illegal_modifier(existing_kinds, modifier.kind) {
+            self.illegal_modifier_error(existing_kinds, modifier);
+        }
+    }
+
+    /// Check whether a [`ModifierKind`] can legally follow other modifiers.
+    ///
+    /// Returns `true` if `kind` cannot legally follow `existing_kinds`, `false` if it can.
+    ///
+    /// This is just 2 instructions:
+    /// 1. Read from a 30-byte lookup table
+    /// 2. AND operation to compare to `existing_kinds`.
+    ///
+    /// <https://godbolt.org/z/Mh76WTTYj>
+    #[inline]
+    fn is_illegal_modifier(existing_kinds: ModifierKinds, kind: ModifierKind) -> bool {
+        /// Static lookup table for which modifiers are illegal preceding another modifier.
+        /// Table is indexed by [`ModifierKind`] discriminant of the later modifier.
+        /// This is all calculated at compile time, and produces a 30-byte lookup table.
+        static ILLEGAL_PRECEDING_MODIFIERS: [ModifierKinds; ModifierKind::VARIANTS.len()] = {
+            let mut illegal = [ModifierKinds::none(); ModifierKind::VARIANTS.len()];
+
+            let mut i = 0;
+            while i < illegal.len() {
+                let kind = ModifierKind::VARIANTS[i];
+
+                let illegal_kinds = get_illegal_preceding_modifiers(kind);
+                assert!(illegal_kinds.contains(kind), "Same modifier twice is always illegal");
+                illegal[kind as usize] = illegal_kinds;
+
+                i += 1;
+            }
+
+            illegal
+        };
+
+        /// Get which modifiers are illegal to precede a modifier.
+        /// This must match the logic in `illegal_modifier_error`.
+        const fn get_illegal_preceding_modifiers(kind: ModifierKind) -> ModifierKinds {
+            match kind {
+                ModifierKind::Public | ModifierKind::Private | ModifierKind::Protected => {
+                    ModifierKinds::new([
+                        ModifierKind::Public,
+                        ModifierKind::Private,
+                        ModifierKind::Protected,
+                        ModifierKind::Override,
+                        ModifierKind::Static,
+                        ModifierKind::Accessor,
+                        ModifierKind::Readonly,
+                        ModifierKind::Async,
+                        ModifierKind::Abstract,
+                    ])
+                }
+                ModifierKind::Static => ModifierKinds::new([
+                    ModifierKind::Static,
+                    ModifierKind::Readonly,
+                    ModifierKind::Async,
+                    ModifierKind::Accessor,
+                    ModifierKind::Override,
+                ]),
+                ModifierKind::Override => ModifierKinds::new([
+                    ModifierKind::Override,
+                    ModifierKind::Readonly,
+                    ModifierKind::Accessor,
+                    ModifierKind::Async,
+                ]),
+                ModifierKind::Abstract => ModifierKinds::new([
+                    ModifierKind::Abstract,
+                    ModifierKind::Override,
+                    ModifierKind::Accessor,
+                ]),
+                ModifierKind::Export => ModifierKinds::new([
+                    ModifierKind::Export,
+                    ModifierKind::Declare,
+                    ModifierKind::Abstract,
+                    ModifierKind::Async,
+                ]),
+                _ => ModifierKinds::new([kind]),
+            }
+        }
+
+        let illegal_preceding_modifier_kinds = ILLEGAL_PRECEDING_MODIFIERS[kind as usize];
+
+        existing_kinds.intersects(illegal_preceding_modifier_kinds)
+    }
+
+    /// Create an error for an illegal modifier (`is_illegal_modifier` returned `true`).
+    #[cold]
+    #[inline(never)]
+    fn illegal_modifier_error(&mut self, kinds: ModifierKinds, modifier: &Modifier) {
         match modifier.kind {
             ModifierKind::Public | ModifierKind::Private | ModifierKind::Protected => {
                 if kinds.intersects(ModifierKinds::new([
@@ -714,6 +808,53 @@ impl<C: Config> ParserImpl<'_, C> {
                 }
             }
             report(self, modifiers, allowed, strict, create_diagnostic);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use oxc_allocator::Allocator;
+    use oxc_span::{SPAN, SourceType};
+
+    use crate::{NoTokensParserConfig, ParseOptions, UniquePromise};
+
+    use super::{Modifier, ModifierKind, ModifierKinds};
+
+    type ParserImpl<'a> = super::ParserImpl<'a, NoTokensParserConfig>;
+
+    // Test that `is_illegal_modifier` and `illegal_modifier_error` behave the same.
+    // * `is_illegal_modifier` returns `true` -> `illegal_modifier_error` should create an error.
+    // * `is_illegal_modifier` returns `false` -> `illegal_modifier_error` should not create an error.
+    #[test]
+    fn illegal_modifiers() {
+        let allocator = Allocator::default();
+        let source_type = SourceType::default();
+        let source_text = "";
+        let options = ParseOptions::default();
+        let mut parser_impl = ParserImpl::new(
+            &allocator,
+            source_text,
+            source_type,
+            options,
+            NoTokensParserConfig,
+            UniquePromise::new_for_tests_and_benchmarks(),
+        );
+
+        for existing_modifier_kind in ModifierKind::VARIANTS {
+            for modifier_kind in ModifierKind::VARIANTS {
+                let existing_kinds = ModifierKinds::new([existing_modifier_kind]);
+
+                let modifier = Modifier::new(SPAN, modifier_kind);
+                parser_impl.illegal_modifier_error(existing_kinds, &modifier);
+
+                if ParserImpl::is_illegal_modifier(existing_kinds, modifier_kind) {
+                    assert!(parser_impl.errors.len() == 1);
+                    parser_impl.errors.pop();
+                } else {
+                    assert!(parser_impl.errors.is_empty());
+                }
+            }
         }
     }
 }
