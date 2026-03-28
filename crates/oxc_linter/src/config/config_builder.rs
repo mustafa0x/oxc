@@ -12,7 +12,7 @@ use oxc_span::{CompactStr, format_compact_str};
 
 use crate::{
     AllowWarnDeny, ExternalPluginStore, LintConfig, LintFilter, LintFilterKind, Oxlintrc,
-    RuleCategory, RuleEnum,
+    OxlintrcExtendsEntry, RuleCategory, RuleEnum,
     config::{
         ESLintRule, OxlintOverrides, OxlintRules,
         external_plugins::ExternalPluginEntry,
@@ -221,6 +221,7 @@ impl ConfigStoreBuilder {
         fn resolve_oxlintrc_config(
             config: Oxlintrc,
             in_object_extends: bool,
+            inherited_config_dir: Option<&Path>,
             resolver: &Resolver,
         ) -> Result<(Oxlintrc, Vec<PathBuf>), ConfigBuilderError> {
             if in_object_extends {
@@ -228,45 +229,61 @@ impl ConfigStoreBuilder {
             }
 
             let path = config.path.clone();
-            let root_path = path.parent();
-            let extends = config.extends.clone();
-            let extends_configs = config.extends_configs.clone();
+            let config_dir = path.parent().or(inherited_config_dir);
+
+            let extends_entries = if config.extends_entries.is_empty() {
+                config
+                    .extends_configs
+                    .iter()
+                    .cloned()
+                    .map(OxlintrcExtendsEntry::Config)
+                    .chain(config.extends.iter().cloned().map(OxlintrcExtendsEntry::Path))
+                    .collect::<Vec<_>>()
+            } else {
+                config.extends_entries.clone()
+            };
             let mut extended_paths = Vec::new();
 
             let mut oxlintrc = config;
 
-            for config in extends_configs.into_iter().rev() {
-                let (extends, extends_paths) = resolve_oxlintrc_config(config, true, resolver)?;
-                oxlintrc = oxlintrc.merge(extends);
-                extended_paths.extend(extends_paths);
-            }
-
-            for path in extends.iter().rev() {
-                if path.starts_with("eslint:") || path.starts_with("plugin:") {
-                    // `eslint:` and `plugin:` named configs are not supported
-                    continue;
-                }
-
-                let Some(path) = resolve_extended_config_path(path, root_path, resolver)? else {
-                    // Unresolved bare specifiers are treated as named configs for backwards
-                    // compatibility, e.g. `prettier` or `next/core-web-vitals`.
-                    continue;
-                };
-
-                let extends_oxlintrc = Oxlintrc::from_file(&path).map_err(|e| {
-                    ConfigBuilderError::InvalidConfigFile {
-                        file: path.display().to_string(),
-                        reason: e.to_string(),
+            for entry in extends_entries.into_iter().rev() {
+                match entry {
+                    OxlintrcExtendsEntry::Config(config) => {
+                        let (extends, extends_paths) =
+                            resolve_oxlintrc_config(config, true, config_dir, resolver)?;
+                        oxlintrc = oxlintrc.merge(extends);
+                        extended_paths.extend(extends_paths);
                     }
-                })?;
+                    OxlintrcExtendsEntry::Path(path) => {
+                        if path.starts_with("eslint:") || path.starts_with("plugin:") {
+                            // `eslint:` and `plugin:` named configs are not supported
+                            continue;
+                        }
 
-                extended_paths.push(path.clone());
+                        let Some(path) = resolve_extended_config_path(&path, config_dir, resolver)?
+                        else {
+                            // Unresolved bare specifiers are treated as named configs for
+                            // backwards compatibility, e.g. `prettier` or
+                            // `next/core-web-vitals`.
+                            continue;
+                        };
 
-                let (extends, extends_paths) =
-                    resolve_oxlintrc_config(extends_oxlintrc, false, resolver)?;
+                        let extends_oxlintrc = Oxlintrc::from_file(&path).map_err(|e| {
+                            ConfigBuilderError::InvalidConfigFile {
+                                file: path.display().to_string(),
+                                reason: e.to_string(),
+                            }
+                        })?;
 
-                oxlintrc = oxlintrc.merge(extends);
-                extended_paths.extend(extends_paths);
+                        extended_paths.push(path.clone());
+
+                        let (extends, extends_paths) =
+                            resolve_oxlintrc_config(extends_oxlintrc, false, None, resolver)?;
+
+                        oxlintrc = oxlintrc.merge(extends);
+                        extended_paths.extend(extends_paths);
+                    }
+                }
             }
 
             Ok((oxlintrc, extended_paths))
@@ -285,7 +302,7 @@ impl ConfigStoreBuilder {
         });
 
         let (oxlintrc, extended_paths) =
-            resolve_oxlintrc_config(oxlintrc, false, &extends_resolver)?;
+            resolve_oxlintrc_config(oxlintrc, false, None, &extends_resolver)?;
 
         // Collect external plugins from both base config and overrides
         let mut external_plugins: FxHashSet<&ExternalPluginEntry> = FxHashSet::default();

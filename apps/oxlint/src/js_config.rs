@@ -2,7 +2,7 @@ use serde::Deserialize;
 use std::path::PathBuf;
 
 use oxc_diagnostics::OxcDiagnostic;
-use oxc_linter::Oxlintrc;
+use oxc_linter::{Oxlintrc, OxlintrcExtendsEntry};
 
 use crate::run::JsLoadJsConfigsCb;
 
@@ -77,7 +77,7 @@ fn parse_js_oxlintrc(mut value: serde_json::Value) -> Result<Oxlintrc, OxcDiagno
     };
 
     let extends_value = map.remove("extends");
-    let (extends, extends_configs) = if let Some(extends_value) = extends_value {
+    let (extends, extends_configs, extends_entries) = if let Some(extends_value) = extends_value {
         let serde_json::Value::Array(items) = extends_value else {
             return Err(OxcDiagnostic::error(
                 "`extends` must be an array of config objects or strings.",
@@ -86,10 +86,19 @@ fn parse_js_oxlintrc(mut value: serde_json::Value) -> Result<Oxlintrc, OxcDiagno
 
         let mut extends = Vec::new();
         let mut extends_configs = Vec::new();
+        let mut extends_entries = Vec::new();
         for (idx, item) in items.into_iter().enumerate() {
             match item {
-                serde_json::Value::String(path) => extends.push(PathBuf::from(path)),
-                value if value.is_object() => extends_configs.push(parse_js_oxlintrc(value)?),
+                serde_json::Value::String(path) => {
+                    let path = PathBuf::from(path);
+                    extends.push(path.clone());
+                    extends_entries.push(OxlintrcExtendsEntry::Path(path));
+                }
+                value if value.is_object() => {
+                    let config = parse_js_oxlintrc(value)?;
+                    extends_configs.push(config.clone());
+                    extends_entries.push(OxlintrcExtendsEntry::Config(config));
+                }
                 _ => {
                     return Err(OxcDiagnostic::error(format!(
                         "`extends[{idx}]` must be a config object or string.",
@@ -98,15 +107,16 @@ fn parse_js_oxlintrc(mut value: serde_json::Value) -> Result<Oxlintrc, OxcDiagno
             }
         }
 
-        (extends, extends_configs)
+        (extends, extends_configs, extends_entries)
     } else {
-        (Vec::new(), Vec::new())
+        (Vec::new(), Vec::new(), Vec::new())
     };
 
     let mut oxlintrc: Oxlintrc =
         serde_json::from_value(value).map_err(|err| OxcDiagnostic::error(err.to_string()))?;
     oxlintrc.extends = extends;
     oxlintrc.extends_configs = extends_configs;
+    oxlintrc.extends_entries = extends_entries;
     Ok(oxlintrc)
 }
 
@@ -340,6 +350,103 @@ mod tests {
                     && rule.name() == react_suspicious_rule.name()
             }),
             "plugin-only suspicious rules should stay disabled for category-level recommended"
+        );
+    }
+
+    #[test]
+    fn test_parse_js_config_response_preserves_mixed_extends_order() {
+        let root_dir = tempfile::tempdir().unwrap();
+        let config_path = root_dir.path().join("oxlint.config.ts");
+        let base_path = root_dir.path().join("base.json");
+        fs::write(&config_path, "export default {};\n").unwrap();
+        fs::write(
+            &base_path,
+            r#"{
+                "rules": {
+                    "no-debugger": "error"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let response = json!({
+            "Success": [{
+                "path": config_path,
+                "config": {
+                    "extends": [
+                        "./base.json",
+                        { "rules": { "no-debugger": "warn" } }
+                    ]
+                }
+            }]
+        });
+
+        let parsed = parse_js_config_response(&response.to_string()).unwrap();
+        let config = parsed.into_iter().next().unwrap().config.unwrap();
+
+        let mut external_plugin_store = ExternalPluginStore::default();
+        let builder =
+            ConfigStoreBuilder::from_oxlintrc(true, config, None, &mut external_plugin_store, None)
+                .unwrap();
+        let config = builder.build(&mut external_plugin_store).unwrap();
+
+        assert_eq!(
+            config
+                .rules()
+                .iter()
+                .find(|(rule, _)| rule.plugin_name() == "eslint" && rule.name() == "no-debugger")
+                .map(|(_, severity)| *severity),
+            Some(AllowWarnDeny::Warn),
+            "later inline object extends should override earlier string extends"
+        );
+    }
+
+    #[test]
+    fn test_parse_js_config_response_resolves_nested_object_extends_from_config_dir() {
+        let root_dir = tempfile::tempdir().unwrap();
+        let config_dir = root_dir.path().join("configs");
+        fs::create_dir_all(&config_dir).unwrap();
+
+        let config_path = config_dir.join("oxlint.config.ts");
+        fs::write(&config_path, "export default {};\n").unwrap();
+
+        fs::write(
+            config_dir.join("base.json"),
+            r#"{
+                "rules": {
+                    "no-alert": "warn"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let response = json!({
+            "Success": [{
+                "path": config_path,
+                "config": {
+                    "extends": [
+                        { "extends": ["./base.json"] }
+                    ]
+                }
+            }]
+        });
+
+        let parsed = parse_js_config_response(&response.to_string()).unwrap();
+        let config = parsed.into_iter().next().unwrap().config.unwrap();
+
+        let mut external_plugin_store = ExternalPluginStore::default();
+        let builder =
+            ConfigStoreBuilder::from_oxlintrc(true, config, None, &mut external_plugin_store, None)
+                .unwrap();
+        let config = builder.build(&mut external_plugin_store).unwrap();
+
+        assert_eq!(
+            config
+                .rules()
+                .iter()
+                .find(|(rule, _)| rule.plugin_name() == "eslint" && rule.name() == "no-alert")
+                .map(|(_, severity)| *severity),
+            Some(AllowWarnDeny::Warn)
         );
     }
 }

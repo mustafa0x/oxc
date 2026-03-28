@@ -21,6 +21,12 @@ use super::{
     settings::OxlintSettings,
 };
 
+#[derive(Debug, Clone)]
+pub enum OxlintrcExtendsEntry {
+    Path(PathBuf),
+    Config(Oxlintrc),
+}
+
 /// Options for the linter.
 #[derive(Debug, Default, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
@@ -282,6 +288,13 @@ pub struct Oxlintrc {
     #[serde(skip)]
     #[schemars(skip)]
     pub extends_configs: Vec<Oxlintrc>,
+    /// Ordered `extends` entries (string paths and inline objects) from `oxlint.config.ts`.
+    ///
+    /// JSON configs only populate `extends`; this field is reserved for JS loader internals so
+    /// mixed extends order can be preserved.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub extends_entries: Vec<OxlintrcExtendsEntry>,
 }
 
 impl Oxlintrc {
@@ -415,6 +428,7 @@ impl Oxlintrc {
             ignore_patterns: self.ignore_patterns.clone(),
             extends: self.extends.clone(),
             extends_configs: self.extends_configs.clone(),
+            extends_entries: self.extends_entries.clone(),
         }
     }
 
@@ -447,6 +461,11 @@ impl Oxlintrc {
 
         for config in &mut self.extends_configs {
             config.set_config_dir(config_dir);
+        }
+        for entry in &mut self.extends_entries {
+            if let OxlintrcExtendsEntry::Config(config) = entry {
+                config.set_config_dir(config_dir);
+            }
         }
     }
 }
