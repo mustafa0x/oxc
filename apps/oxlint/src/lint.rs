@@ -914,6 +914,26 @@ mod test {
     }
 
     #[test]
+    fn test_category_recommended_uses_builtin_subset() {
+        let output = Tester::new()
+            .with_cwd("fixtures/cli/category_recommended".into())
+            .test_output_verbose(&["app.jsx"]);
+
+        assert_eq!(output.matches("eslint(no-debugger)").count(), 1);
+        assert!(!output.contains("eslint-plugin-react(react-in-jsx-scope)"));
+    }
+
+    #[test]
+    fn test_category_recommended_respects_explicit_rule_overrides() {
+        let output = Tester::new()
+            .with_cwd("fixtures/cli/category_recommended".into())
+            .test_output_verbose(&["-c", "explicit-react.json", "app.jsx"]);
+
+        assert_eq!(output.matches("eslint(no-debugger)").count(), 1);
+        assert_eq!(output.matches("eslint-plugin-react(react-in-jsx-scope)").count(), 1);
+    }
+
+    #[test]
     fn test_tsconfig_option() {
         // passed
         Tester::new()
@@ -985,6 +1005,26 @@ mod test {
             "--print-config",
         ];
         Tester::new().test_and_snapshot(args);
+    }
+
+    #[test]
+    fn test_categories_recommended_skips_plugin_only_suspicious_rules() {
+        let output = Tester::new()
+            .with_cwd("fixtures/cli/categories_recommended".into())
+            .test_output_verbose(&["-c", ".oxlintrc.json", "test.jsx"]);
+
+        assert!(output.contains("'done' is not modified in this loop."));
+        assert!(!output.contains("`React` must be in scope when using JSX."));
+    }
+
+    #[test]
+    fn test_correctness_categories_recommended_skips_plugin_only_correctness_rules() {
+        let output = Tester::new()
+            .with_cwd("fixtures/cli/categories_recommended_correctness".into())
+            .test_output_verbose(&["-c", ".oxlintrc.json", "test.jsx"]);
+
+        assert!(output.contains("Unexpected re-assignment of `const` variable value."));
+        assert!(!output.contains("Avoid passing children using a prop."));
     }
 
     #[test]
@@ -1208,6 +1248,26 @@ mod test {
         // Check that using a config that extends a config which extends a config works
         let args = &["--config", "relative_paths/extends_extends_config.json", "console.js"];
         Tester::new().with_cwd("fixtures/cli/extends_config".into()).test_and_snapshot(args);
+    }
+
+    #[test]
+    fn test_extends_package_config_from_node_modules() {
+        let output =
+            Tester::new().with_cwd("fixtures/cli/extends_config".into()).test_output_verbose(&[
+                "--config",
+                "packages/app/oxlintrc.json",
+                "packages/app/console.js",
+                "packages/app/list.jsx",
+            ]);
+
+        assert_eq!(output.matches("eslint(no-console)").count(), 1);
+        assert_eq!(output.matches("eslint(no-debugger)").count(), 1);
+        assert_eq!(output.matches("eslint(no-alert)").count(), 1);
+        assert_eq!(output.matches("jsx-key").count(), 1);
+        assert!(output.contains("packages/app/console.js:1:1"));
+        assert!(output.contains("packages/app/console.js:2:1"));
+        assert!(output.contains("packages/app/console.js:3:1"));
+        assert!(output.contains("packages/app/list.jsx:2:"));
     }
 
     #[test]

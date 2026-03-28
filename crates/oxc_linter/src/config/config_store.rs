@@ -202,13 +202,13 @@ impl Config {
                         // Only apply categories to rules from unconfigured plugins
                         if unconfigured_plugins.contains(rule_plugin) {
                             self.categories
-                                .get(&rule.category())
+                                .severity_for_rule(rule)
                                 .map(|severity| (rule.clone(), severity))
                         } else {
                             None
                         }
                     }) {
-                        rules.entry(rule).or_insert(*severity);
+                        rules.entry(rule).or_insert(severity);
                     }
                     // Mark these plugins as configured
                     configured_plugins |= unconfigured_plugins;
@@ -398,15 +398,15 @@ mod test {
         AllowWarnDeny, ExternalOptionsId, ExternalPluginStore, LintPlugins, RuleCategory, RuleEnum,
         config::{
             LintConfig, OxlintEnv, OxlintGlobals, OxlintSettings,
-            categories::OxlintCategories,
+            categories::{CategoryConfig, OxlintCategories, is_category_default_rule},
             config_store::{Config, ResolvedOxlintOverride, ResolvedOxlintOverrideRules},
             overrides::GlobSet,
             oxlintrc::OxlintOptions,
         },
         rule::Rule,
         rules::{
-            EslintCurly, EslintNoUnusedVars, ReactJsxFilenameExtension, TypescriptNoExplicitAny,
-            TypescriptNoMisusedPromises,
+            EslintCurly, EslintNoUnusedVars, RULES, ReactJsxFilenameExtension,
+            TypescriptNoExplicitAny, TypescriptNoMisusedPromises,
         },
     };
 
@@ -925,6 +925,61 @@ mod test {
             rules_for_tsx.rules.iter().any(|(rule, _)| rule.plugin_name() == "react");
 
         assert!(has_react_rules, "React rules should be enabled by categories for new plugin");
+    }
+
+    #[test]
+    fn test_categories_recommended_only_apply_builtin_subset_for_new_plugins() {
+        let base_config = LintConfig {
+            plugins: LintPlugins::REACT,
+            env: OxlintEnv::default(),
+            settings: OxlintSettings::default(),
+            globals: OxlintGlobals::default(),
+            path: None,
+            options: OxlintOptions::default(),
+        };
+
+        let mut categories = OxlintCategories::default();
+        categories.insert(RuleCategory::Suspicious, CategoryConfig::Recommended);
+
+        let overrides = ResolvedOxlintOverrides::new(vec![ResolvedOxlintOverride {
+            env: None,
+            files: GlobSet::new(vec!["*.tsx"]),
+            plugins: Some(LintPlugins::TYPESCRIPT),
+            globals: None,
+            rules: ResolvedOxlintOverrideRules { builtin_rules: vec![], external_rules: vec![] },
+        }]);
+
+        let store = ConfigStore::new(
+            Config::new(vec![], vec![], categories, base_config, overrides),
+            FxHashMap::default(),
+            ExternalPluginStore::default(),
+        );
+
+        let rules_for_tsx = store.resolve("App.tsx".as_ref());
+        let expected_typescript_rules = RULES
+            .iter()
+            .filter(|rule| {
+                rule.category() == RuleCategory::Suspicious
+                    && rule.plugin_name() == "typescript"
+                    && is_category_default_rule(rule)
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !expected_typescript_rules.is_empty(),
+            "expected at least one recommended suspicious TypeScript rule"
+        );
+
+        for rule in expected_typescript_rules {
+            assert!(rules_for_tsx.rules.iter().any(|(configured_rule, severity)| {
+                configured_rule.plugin_name() == rule.plugin_name()
+                    && configured_rule.name() == rule.name()
+                    && *severity == AllowWarnDeny::Warn
+            }));
+        }
+
+        assert!(!rules_for_tsx.rules.iter().any(|(rule, _)| {
+            rule.category() == RuleCategory::Suspicious && rule.plugin_name() == "react"
+        }));
     }
 
     #[test]

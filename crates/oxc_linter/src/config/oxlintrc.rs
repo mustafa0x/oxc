@@ -460,7 +460,12 @@ mod test {
     use rustc_hash::FxHashSet;
     use serde_json::json;
 
-    use crate::config::{external_plugins::ExternalPluginEntry, plugins::LintPlugins};
+    use crate::{
+        RuleCategory,
+        config::{
+            categories::CategoryConfig, external_plugins::ExternalPluginEntry, plugins::LintPlugins,
+        },
+    };
 
     use super::*;
 
@@ -567,6 +572,68 @@ mod test {
         let config: Result<Oxlintrc, _> =
             serde_json::from_value(json!({ "reportUnusedDisableDirectives": "warn" }));
         assert!(config.is_err());
+    }
+
+    #[test]
+    fn test_oxlintrc_deserializes_recommended_categories() {
+        let config: Oxlintrc = serde_json::from_value(json!({
+            "categories": {
+                "suspicious": "recommended"
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(
+            config.categories.get(&RuleCategory::Suspicious),
+            Some(&CategoryConfig::Recommended)
+        );
+    }
+
+    #[test]
+    fn test_oxlintrc_merge_categories_preserves_recommended() {
+        let mut root: Oxlintrc = serde_json::from_value(json!({
+            "categories": {
+                "suspicious": "recommended"
+            }
+        }))
+        .unwrap();
+        root.path = PathBuf::from("/root/.oxlintrc.json");
+
+        let mut base: Oxlintrc = serde_json::from_value(json!({
+            "categories": {
+                "correctness": "deny",
+                "suspicious": "warn"
+            }
+        }))
+        .unwrap();
+        base.path = PathBuf::from("/root/base.json");
+
+        let merged = root.merge(base);
+        assert_eq!(
+            merged.categories.get(&RuleCategory::Suspicious),
+            Some(&CategoryConfig::Recommended)
+        );
+        assert_eq!(
+            merged.categories.get(&RuleCategory::Correctness),
+            Some(&CategoryConfig::Severity(AllowWarnDeny::Deny))
+        );
+
+        let mut root: Oxlintrc = serde_json::from_value(json!({})).unwrap();
+        root.path = PathBuf::from("/root/.oxlintrc.json");
+
+        let mut base: Oxlintrc = serde_json::from_value(json!({
+            "categories": {
+                "suspicious": "recommended"
+            }
+        }))
+        .unwrap();
+        base.path = PathBuf::from("/root/base.json");
+
+        let merged = root.merge(base);
+        assert_eq!(
+            merged.categories.get(&RuleCategory::Suspicious),
+            Some(&CategoryConfig::Recommended)
+        );
     }
 
     #[test]

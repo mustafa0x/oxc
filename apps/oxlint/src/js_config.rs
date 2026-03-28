@@ -77,31 +77,35 @@ fn parse_js_oxlintrc(mut value: serde_json::Value) -> Result<Oxlintrc, OxcDiagno
     };
 
     let extends_value = map.remove("extends");
-    let extends_configs = if let Some(extends_value) = extends_value {
+    let (extends, extends_configs) = if let Some(extends_value) = extends_value {
         let serde_json::Value::Array(items) = extends_value else {
             return Err(OxcDiagnostic::error(
-                "`extends` must be an array of config objects (strings/paths are not supported).",
+                "`extends` must be an array of config objects or strings.",
             ));
         };
 
-        items
-            .into_iter()
-            .enumerate()
-            .map(|(idx, item)| {
-                if !item.is_object() {
+        let mut extends = Vec::new();
+        let mut extends_configs = Vec::new();
+        for (idx, item) in items.into_iter().enumerate() {
+            match item {
+                serde_json::Value::String(path) => extends.push(PathBuf::from(path)),
+                value if value.is_object() => extends_configs.push(parse_js_oxlintrc(value)?),
+                _ => {
                     return Err(OxcDiagnostic::error(format!(
-                        "`extends[{idx}]` must be a config object (strings/paths are not supported).",
+                        "`extends[{idx}]` must be a config object or string.",
                     )));
                 }
-                parse_js_oxlintrc(item)
-            })
-            .collect::<Result<Vec<_>, _>>()?
+            }
+        }
+
+        (extends, extends_configs)
     } else {
-        Vec::new()
+        (Vec::new(), Vec::new())
     };
 
     let mut oxlintrc: Oxlintrc =
         serde_json::from_value(value).map_err(|err| OxcDiagnostic::error(err.to_string()))?;
+    oxlintrc.extends = extends;
     oxlintrc.extends_configs = extends_configs;
     Ok(oxlintrc)
 }
@@ -171,5 +175,171 @@ fn parse_js_config_response(json: &str) -> Result<Vec<JsConfigResult>, Vec<OxcDi
         LoadJsConfigsResponse::Error { error } => {
             Err(vec![OxcDiagnostic::error(format!("Failed to load config files:\n\n{error}"))])
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{fs, path::PathBuf};
+
+    use oxc_linter::{
+        AllowWarnDeny, ConfigStoreBuilder, ExternalPluginStore, RuleCategory, rules::RULES,
+    };
+    use serde_json::json;
+
+    use super::{parse_js_config_response, parse_js_oxlintrc};
+
+    #[test]
+    fn test_parse_js_oxlintrc_allows_string_and_object_extends() {
+        let config = parse_js_oxlintrc(json!({
+            "extends": [
+                "oxlint-standard",
+                { "rules": { "no-console": "error" } }
+            ],
+            "rules": { "no-debugger": "warn" }
+        }))
+        .unwrap();
+
+        assert_eq!(config.extends, vec![PathBuf::from("oxlint-standard")]);
+        assert_eq!(config.extends_configs.len(), 1);
+        assert!(!config.rules.is_empty());
+        assert!(!config.extends_configs[0].rules.is_empty());
+    }
+
+    #[test]
+    fn test_parse_js_oxlintrc_rejects_non_string_non_object_extends() {
+        let err = parse_js_oxlintrc(json!({ "extends": [42] })).unwrap_err();
+        assert!(err.to_string().contains("`extends[0]` must be a config object or string."));
+    }
+
+    #[test]
+    fn test_parse_js_oxlintrc_allows_recommended_categories() {
+        let config = parse_js_oxlintrc(json!({
+            "categories": {
+                "suspicious": "recommended"
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(
+            serde_json::to_value(&config.categories).unwrap(),
+            json!({ "suspicious": "recommended" })
+        );
+    }
+
+    #[test]
+    fn test_parse_js_config_response_resolves_string_extends_in_builder() {
+        let root_dir = tempfile::tempdir().unwrap();
+        let config_path = root_dir.path().join("oxlint.config.ts");
+        let base_path = root_dir.path().join("base.json");
+        fs::write(&config_path, "export default {};\n").unwrap();
+        fs::write(
+            &base_path,
+            r#"{
+                "rules": {
+                    "eqeqeq": "warn"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let response = json!({
+            "Success": [{
+                "path": config_path,
+                "config": {
+                    "extends": ["./base.json"],
+                    "rules": {
+                        "no-debugger": "error"
+                    }
+                }
+            }]
+        });
+
+        let parsed = parse_js_config_response(&response.to_string()).unwrap();
+        let config = parsed.into_iter().next().unwrap().config.unwrap();
+        assert_eq!(config.extends, vec![PathBuf::from("./base.json")]);
+
+        let mut external_plugin_store = ExternalPluginStore::default();
+        let builder =
+            ConfigStoreBuilder::from_oxlintrc(true, config, None, &mut external_plugin_store, None)
+                .unwrap();
+        let config = builder.build(&mut external_plugin_store).unwrap();
+
+        assert_eq!(
+            config
+                .rules()
+                .iter()
+                .find(|(rule, _)| rule.plugin_name() == "eslint" && rule.name() == "no-debugger")
+                .map(|(_, severity)| *severity),
+            Some(AllowWarnDeny::Deny)
+        );
+        assert_eq!(
+            config
+                .rules()
+                .iter()
+                .find(|(rule, _)| rule.plugin_name() == "eslint" && rule.name() == "eqeqeq")
+                .map(|(_, severity)| *severity),
+            Some(AllowWarnDeny::Warn)
+        );
+    }
+
+    #[test]
+    fn test_parse_js_config_response_preserves_recommended_categories_in_builder() {
+        let root_dir = tempfile::tempdir().unwrap();
+        let config_path = root_dir.path().join("oxlint.config.ts");
+        fs::write(&config_path, "export default {};\n").unwrap();
+
+        let response = json!({
+            "Success": [{
+                "path": config_path,
+                "config": {
+                    "plugins": ["react"],
+                    "categories": {
+                        "suspicious": "recommended"
+                    }
+                }
+            }]
+        });
+
+        let parsed = parse_js_config_response(&response.to_string()).unwrap();
+        let config = parsed.into_iter().next().unwrap().config.unwrap();
+        assert_eq!(
+            serde_json::to_value(&config.categories).unwrap(),
+            json!({ "suspicious": "recommended" })
+        );
+
+        let mut external_plugin_store = ExternalPluginStore::default();
+        let builder =
+            ConfigStoreBuilder::from_oxlintrc(true, config, None, &mut external_plugin_store, None)
+                .unwrap();
+        let config = builder.build(&mut external_plugin_store).unwrap();
+
+        assert!(config.rules().iter().any(|(rule, severity)| {
+            rule.category() == RuleCategory::Suspicious && *severity == AllowWarnDeny::Warn
+        }));
+        assert_eq!(
+            config
+                .rules()
+                .iter()
+                .find(|(rule, _)| {
+                    rule.category() == RuleCategory::Suspicious && rule.plugin_name() == "react"
+                })
+                .map(|(_, severity)| *severity),
+            None
+        );
+
+        let react_suspicious_rule = RULES
+            .iter()
+            .find(|rule| {
+                rule.category() == RuleCategory::Suspicious && rule.plugin_name() == "react"
+            })
+            .unwrap();
+        assert!(
+            !config.rules().iter().any(|(rule, _)| {
+                rule.plugin_name() == react_suspicious_rule.plugin_name()
+                    && rule.name() == react_suspicious_rule.name()
+            }),
+            "plugin-only suspicious rules should stay disabled for category-level recommended"
+        );
     }
 }

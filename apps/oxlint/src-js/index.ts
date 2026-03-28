@@ -8,6 +8,7 @@ export type {
   ExternalPluginEntry,
   OxlintGlobals,
   RuleCategories,
+  RuleCategoryConfig,
   ExternalPluginsConfig,
   OxlintConfig,
   OxlintOverride,

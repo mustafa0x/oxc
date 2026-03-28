@@ -14,6 +14,7 @@ import type {
   OxlintGlobals,
   OxlintOverride,
   RuleCategories,
+  RuleCategoryConfig,
 } from "./config.generated.ts";
 
 type Oxlintrc = Omit<FullOxlintrc, "$schema" | "extends">;
@@ -23,6 +24,7 @@ export type {
   DummyRule,
   DummyRuleMap,
   RuleCategories,
+  RuleCategoryConfig,
   OxlintGlobals,
   OxlintEnv,
   ExternalPluginEntry,
@@ -31,7 +33,7 @@ export type {
 export type ExternalPluginsConfig = Exclude<Oxlintrc["jsPlugins"], undefined | null>;
 
 export interface OxlintConfig extends Oxlintrc {
-  extends?: OxlintConfig[];
+  extends?: Array<OxlintConfig | string>;
 }
 
 export type { OxlintOverride };

@@ -12,6 +12,7 @@ mod oxlintrc;
 pub mod plugins;
 mod rules;
 mod settings;
+pub(crate) use categories::is_category_default_rule;
 pub use config_builder::{ConfigBuilderError, ConfigStoreBuilder};
 pub use config_store::{Config, ConfigStore, ResolvedLinterState};
 pub use env::OxlintEnv;
