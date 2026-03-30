@@ -11,5 +11,6 @@ export type {
   RuleCategoryConfig,
   ExternalPluginsConfig,
   OxlintConfig,
+  OxlintLanguageOptions,
   OxlintOverride,
 } from "./package/config.ts";

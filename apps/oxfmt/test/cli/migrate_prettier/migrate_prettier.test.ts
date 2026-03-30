@@ -180,6 +180,258 @@ node_modules
     }
   });
 
+
+  it("should preserve supported plugin specs while migrating Svelte and Tailwind configs", async () => {
+    const tempDir = await fs.mkdtemp(join(tmpdir(), "oxfmt-migrate-test"));
+
+    try {
+      await fs.writeFile(
+        join(tempDir, ".prettierrc"),
+        JSON.stringify({
+          plugins: [
+            "prettier-plugin-svelte",
+            "prettier-plugin-tailwindcss",
+            "./plugins/prettier-plugin-custom.mjs",
+            "@scope/prettier-plugin-foo/subpath",
+            "prettier-plugin-packagejson",
+            "prettier-plugin-svelte",
+          ],
+          tailwindConfig: "./tailwind.config.js",
+          svelteSortOrder: "scripts-markup-styles",
+        }),
+      );
+
+      const result = await runCli(tempDir, ["--migrate", "prettier"]);
+      expect(result.exitCode).toBe(0);
+
+      const content = await fs.readFile(join(tempDir, ".oxfmtrc.json"), "utf8");
+      const oxfmtrc = JSON.parse(content);
+
+      expect(oxfmtrc.plugins).toEqual([
+        "prettier-plugin-svelte",
+        "./plugins/prettier-plugin-custom.mjs",
+        "@scope/prettier-plugin-foo/subpath",
+      ]);
+      expect(oxfmtrc.svelteSortOrder).toBe("scripts-markup-styles");
+      expect(oxfmtrc.sortTailwindcss).toEqual({ config: "./tailwind.config.js" });
+      expect(oxfmtrc.sortPackageJson).toEqual({});
+      expect(Object.keys(oxfmtrc).at(-1)).toBe("ignorePatterns");
+    } finally {
+      await fs.rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("should migrate JSON-based prettier overrides with Svelte plugins", async () => {
+    const tempDir = await fs.mkdtemp(join(tmpdir(), "oxfmt-migrate-test"));
+
+    try {
+      await fs.writeFile(
+        join(tempDir, ".prettierrc"),
+        JSON.stringify({
+          semi: false,
+          overrides: [
+            {
+              files: "*.svelte",
+              options: {
+                parser: "svelte",
+                plugins: [
+                  "prettier-plugin-svelte",
+                  "prettier-plugin-tailwindcss",
+                  "./plugins/prettier-plugin-custom.mjs",
+                  "prettier-plugin-packagejson",
+                  "prettier-plugin-svelte",
+                ],
+                svelteSortOrder: "scripts-markup-styles",
+                tailwindFunctions: ["cn"],
+              },
+            },
+            {
+              files: ["*.json"],
+              excludeFiles: "package.json",
+              options: {
+                plugins: ["prettier-plugin-packagejson"],
+                printWidth: 90,
+              },
+            },
+          ],
+        }),
+      );
+
+      const result = await runCli(tempDir, ["--migrate", "prettier"]);
+      expect(result.exitCode).toBe(0);
+
+      const content = await fs.readFile(join(tempDir, ".oxfmtrc.json"), "utf8");
+      const oxfmtrc = JSON.parse(content);
+
+      expect(oxfmtrc.overrides).toEqual([
+        {
+          files: ["*.svelte"],
+          options: {
+            parser: "svelte",
+            plugins: ["prettier-plugin-svelte", "./plugins/prettier-plugin-custom.mjs"],
+            svelteSortOrder: "scripts-markup-styles",
+            sortPackageJson: {},
+            sortTailwindcss: {
+              functions: ["cn"],
+            },
+          },
+        },
+        {
+          files: ["*.json"],
+          excludeFiles: ["package.json"],
+          options: {
+            printWidth: 90,
+            sortPackageJson: {},
+          },
+        },
+      ]);
+      expect(Object.keys(oxfmtrc).at(-1)).toBe("ignorePatterns");
+    } finally {
+      await fs.rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("should migrate package.json prettier overrides", async () => {
+    const tempDir = await fs.mkdtemp(join(tmpdir(), "oxfmt-migrate-test"));
+
+    try {
+      await fs.writeFile(
+        join(tempDir, "package.json"),
+        JSON.stringify({
+          name: "oxfmt-migrate-test",
+          prettier: {
+            singleQuote: true,
+            overrides: [
+              {
+                files: ["*.svelte", "*.svx"],
+                options: {
+                  plugins: ["prettier-plugin-svelte"],
+                  svelteSortOrder: "scripts-styles-markup",
+                },
+              },
+            ],
+          },
+        }),
+      );
+
+      const result = await runCli(tempDir, ["--migrate", "prettier"]);
+      expect(result.exitCode).toBe(0);
+
+      const content = await fs.readFile(join(tempDir, ".oxfmtrc.json"), "utf8");
+      const oxfmtrc = JSON.parse(content);
+
+      expect(oxfmtrc.singleQuote).toBe(true);
+      expect(oxfmtrc.overrides).toEqual([
+        {
+          files: ["*.svelte", "*.svx"],
+          options: {
+            plugins: ["prettier-plugin-svelte"],
+            svelteSortOrder: "scripts-styles-markup",
+          },
+        },
+      ]);
+    } finally {
+      await fs.rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("should migrate CommonJS prettier overrides from .prettierrc.cjs", async () => {
+    const tempDir = await fs.mkdtemp(join(tmpdir(), "oxfmt-migrate-test"));
+
+    try {
+      await fs.writeFile(
+        join(tempDir, ".prettierrc.cjs"),
+        `module.exports = {
+  semi: false,
+  overrides: [
+    {
+      files: ["*.svelte"],
+      options: {
+        parser: "svelte",
+        plugins: ["prettier-plugin-svelte", "prettier-plugin-tailwindcss"],
+        svelteSortOrder: "scripts-markup-styles",
+        tailwindFunctions: ["cn"]
+      }
+    }
+  ]
+};
+`,
+      );
+
+      const result = await runCli(tempDir, ["--migrate", "prettier"]);
+      expect(result.exitCode).toBe(0);
+
+      const content = await fs.readFile(join(tempDir, ".oxfmtrc.json"), "utf8");
+      const oxfmtrc = JSON.parse(content);
+
+      expect(oxfmtrc.semi).toBe(false);
+      expect(oxfmtrc.overrides).toEqual([
+        {
+          files: ["*.svelte"],
+          options: {
+            parser: "svelte",
+            plugins: ["prettier-plugin-svelte"],
+            svelteSortOrder: "scripts-markup-styles",
+            sortTailwindcss: {
+              functions: ["cn"],
+            },
+          },
+        },
+      ]);
+    } finally {
+      await fs.rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("should migrate ESM prettier overrides from prettier.config.mjs", async () => {
+    const tempDir = await fs.mkdtemp(join(tmpdir(), "oxfmt-migrate-test"));
+
+    try {
+      await fs.writeFile(
+        join(tempDir, "prettier.config.mjs"),
+        `export default {
+  singleQuote: true,
+  overrides: [
+    {
+      files: "*.svelte",
+      excludeFiles: ["*.generated.svelte"],
+      options: {
+        plugins: [
+          "prettier-plugin-svelte",
+          "prettier-plugin-packagejson",
+          "@scope/prettier-plugin-foo/subpath"
+        ],
+        svelteSortOrder: "scripts-styles-markup"
+      }
+    }
+  ]
+};
+`,
+      );
+
+      const result = await runCli(tempDir, ["--migrate", "prettier"]);
+      expect(result.exitCode).toBe(0);
+
+      const content = await fs.readFile(join(tempDir, ".oxfmtrc.json"), "utf8");
+      const oxfmtrc = JSON.parse(content);
+
+      expect(oxfmtrc.singleQuote).toBe(true);
+      expect(oxfmtrc.overrides).toEqual([
+        {
+          files: ["*.svelte"],
+          excludeFiles: ["*.generated.svelte"],
+          options: {
+            plugins: ["prettier-plugin-svelte", "@scope/prettier-plugin-foo/subpath"],
+            svelteSortOrder: "scripts-styles-markup",
+            sortPackageJson: {},
+          },
+        },
+      ]);
+    } finally {
+      await fs.rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
   it("should warn about regex values in tailwindFunctions and tailwindAttributes", async () => {
     const tempDir = await fs.mkdtemp(join(tmpdir(), "oxfmt-migrate-test"));
 

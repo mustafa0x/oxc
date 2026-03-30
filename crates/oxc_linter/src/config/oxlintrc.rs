@@ -5,7 +5,7 @@ use std::{
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use oxc_diagnostics::OxcDiagnostic;
 
@@ -268,6 +268,22 @@ pub struct Oxlintrc {
     /// Oxlint config options.
     #[serde(skip_serializing_if = "OxlintOptions::is_empty")]
     pub options: OxlintOptions,
+    /// Internal IDs for `languageOptions` objects loaded from `oxlint.config.ts`.
+    ///
+    /// These are kept out of the public schema and are only used to preserve
+    /// non-serializable parser objects and parser options on the JS side.
+    #[serde(
+        rename = "_languageOptionsId",
+        default,
+        deserialize_with = "deserialize_language_options_ids",
+        skip_serializing
+    )]
+    #[schemars(skip)]
+    pub language_options_ids: Vec<u32>,
+    /// Internal parser-presence flag for `languageOptions` loaded from `oxlint.config.ts`.
+    #[serde(rename = "_languageOptionsHasParser", default, skip_serializing)]
+    #[schemars(skip)]
+    pub language_options_has_parser: Option<bool>,
     /// Absolute path to the configuration file.
     #[serde(skip)]
     pub path: PathBuf,
@@ -295,6 +311,13 @@ pub struct Oxlintrc {
     #[serde(skip)]
     #[schemars(skip)]
     pub extends_entries: Vec<OxlintrcExtendsEntry>,
+}
+
+fn deserialize_language_options_ids<'de, D>(deserializer: D) -> Result<Vec<u32>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(Option::<u32>::deserialize(deserializer)?.into_iter().collect())
 }
 
 impl Oxlintrc {
@@ -412,6 +435,10 @@ impl Oxlintrc {
 
         let schema = self.schema.clone().or(other.schema);
         let options = self.options.merge(&other.options);
+        let mut language_options_ids = other.language_options_ids;
+        language_options_ids.extend(self.language_options_ids.iter().copied());
+        let language_options_has_parser =
+            self.language_options_has_parser.or(other.language_options_has_parser);
 
         Oxlintrc {
             schema,
@@ -424,6 +451,8 @@ impl Oxlintrc {
             globals,
             overrides,
             options,
+            language_options_ids,
+            language_options_has_parser,
             path: self.path.clone(),
             ignore_patterns: self.ignore_patterns.clone(),
             extends: self.extends.clone(),
@@ -487,6 +516,26 @@ mod test {
     };
 
     use super::*;
+
+    #[test]
+    fn test_merge_preserves_language_options_ids_order() {
+        let parent: Oxlintrc = serde_json::from_value(json!({ "_languageOptionsId": 1 })).unwrap();
+        let child: Oxlintrc = serde_json::from_value(json!({ "_languageOptionsId": 2 })).unwrap();
+
+        let merged = child.merge(parent);
+        assert_eq!(merged.language_options_ids, vec![1, 2]);
+    }
+
+    #[test]
+    fn test_merge_prefers_child_custom_parser_flag() {
+        let parent: Oxlintrc =
+            serde_json::from_value(json!({ "_languageOptionsHasParser": false })).unwrap();
+        let child: Oxlintrc =
+            serde_json::from_value(json!({ "_languageOptionsHasParser": true })).unwrap();
+
+        let merged = child.merge(parent);
+        assert_eq!(merged.language_options_has_parser, Some(true));
+    }
 
     #[test]
     fn test_oxlintrc_de_empty() {

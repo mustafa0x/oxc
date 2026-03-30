@@ -1,5 +1,6 @@
 import { basename as pathBasename } from "node:path";
 
+import { registerLanguageOptions } from "./js_language_options_registry.ts";
 import { getErrorMessage } from "./utils/utils.ts";
 import { DateNow, JSONStringify } from "./utils/globals.ts";
 import { getUnsupportedTypeScriptModuleLoadHintForError } from "./utils/node_version.ts";
@@ -8,6 +9,9 @@ interface JsConfigResult {
   path: string;
   config: unknown; // Will be validated as Oxlintrc on Rust side, `null` means "skip this config"
 }
+
+const LANGUAGE_OPTIONS_ID_FIELD = "_languageOptionsId";
+const LANGUAGE_OPTIONS_HAS_PARSER_FIELD = "_languageOptionsHasParser";
 
 const isObject = (v: unknown) => typeof v === "object" && v !== null && !Array.isArray(v);
 
@@ -83,6 +87,59 @@ function validateConfigExtends(root: object): void {
   visit(root, "<root>");
 }
 
+function normalizeConfigForRust(root: object): Record<string, unknown> {
+  const normalizedConfigs = new WeakMap<object, Record<string, unknown>>();
+
+  const normalize = (config: object, path: string): Record<string, unknown> => {
+    const cached = normalizedConfigs.get(config);
+    if (cached !== undefined) return cached;
+
+    const normalized: Record<string, unknown> = {};
+    normalizedConfigs.set(config, normalized);
+
+    for (const [key, value] of Object.entries(config as Record<string, unknown>)) {
+      if (key === "languageOptions") {
+        if (!isObject(value)) throw new Error(`${path}.languageOptions must be an object.`);
+        normalized[LANGUAGE_OPTIONS_ID_FIELD] = registerLanguageOptions(value);
+        if (Object.hasOwn(value, "parser")) {
+          normalized[LANGUAGE_OPTIONS_HAS_PARSER_FIELD] =
+            (value as Record<string, unknown>).parser != null;
+        }
+        continue;
+      }
+
+      if (key === "extends" && value !== undefined) {
+        if (!Array.isArray(value)) {
+          throw new Error("`extends` must be an array of config objects or strings.");
+        }
+        normalized.extends = value.map((item, index) => {
+          if (typeof item === "string") return item;
+          if (!isObject(item)) {
+            throw new Error(`\`extends[${index}]\` must be a config object or string.`);
+          }
+          return normalize(item, `${path}.extends[${index}]`);
+        });
+        continue;
+      }
+
+      if (key === "overrides" && value !== undefined) {
+        if (!Array.isArray(value)) throw new Error("`overrides` must be an array.");
+        normalized.overrides = value.map((item, index) => {
+          if (!isObject(item)) throw new Error(`\`overrides[${index}]\` must be an object.`);
+          return normalize(item, `${path}.overrides[${index}]`);
+        });
+        continue;
+      }
+
+      normalized[key] = value;
+    }
+
+    return normalized;
+  };
+
+  return normalize(root, "<root>");
+}
+
 /**
  * Load JavaScript config files in parallel.
  *
@@ -127,14 +184,14 @@ export async function loadJsConfigs(paths: string[]): Promise<string> {
             );
           }
           validateConfigExtends(lintConfig as object);
-          return { path, config: lintConfig };
+          return { path, config: normalizeConfigForRust(lintConfig as object) };
         }
 
         if (!isObject(config)) {
           throw new Error(`Configuration file must have a default export that is an object.`);
         }
         validateConfigExtends(config as object);
-        return { path, config };
+        return { path, config: normalizeConfigForRust(config as object) };
       }),
     );
 

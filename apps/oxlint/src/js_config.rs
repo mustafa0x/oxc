@@ -223,6 +223,39 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_js_oxlintrc_preserves_language_options_ids() {
+        let config = parse_js_oxlintrc(json!({
+            "_languageOptionsId": 7,
+            "overrides": [{
+                "files": ["**/*.svelte"],
+                "_languageOptionsId": 9
+            }]
+        }))
+        .unwrap();
+
+        assert_eq!(config.language_options_ids, vec![7]);
+        assert_eq!(config.overrides.iter().next().unwrap().language_options_id, Some(9));
+    }
+
+    #[test]
+    fn test_parse_js_oxlintrc_preserves_custom_parser_flags() {
+        let config = parse_js_oxlintrc(json!({
+            "_languageOptionsHasParser": true,
+            "overrides": [{
+                "files": ["**/*.svelte"],
+                "_languageOptionsHasParser": false
+            }]
+        }))
+        .unwrap();
+
+        assert_eq!(config.language_options_has_parser, Some(true));
+        assert_eq!(
+            config.overrides.iter().next().unwrap().language_options_has_parser,
+            Some(false)
+        );
+    }
+
+    #[test]
     fn test_parse_js_oxlintrc_allows_recommended_categories() {
         let config = parse_js_oxlintrc(json!({
             "categories": {

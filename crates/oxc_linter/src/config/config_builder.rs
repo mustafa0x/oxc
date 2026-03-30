@@ -368,6 +368,8 @@ impl ConfigStoreBuilder {
             globals: oxlintrc.globals,
             path: Some(oxlintrc.path),
             options: oxlintrc.options,
+            js_language_options_ids: oxlintrc.language_options_ids,
+            js_has_custom_parser: oxlintrc.language_options_has_parser.unwrap_or(false),
         };
 
         let mut builder = Self {
@@ -661,6 +663,8 @@ impl ConfigStoreBuilder {
                     env: override_config.env,
                     globals: override_config.globals,
                     plugins: override_config.plugins,
+                    language_options_id: override_config.language_options_id,
+                    language_options_has_parser: override_config.language_options_has_parser,
                     rules: ResolvedOxlintOverrideRules { builtin_rules, external_rules },
                 })
             })

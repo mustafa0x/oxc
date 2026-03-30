@@ -22,7 +22,7 @@ use oxc_ast::{
 use oxc_ast_macros::ast;
 use oxc_ast_visit::utf8_to_utf16::Utf8ToUtf16;
 use oxc_data_structures::box_macros::boxed_array;
-use oxc_diagnostics::OxcDiagnostic;
+use oxc_diagnostics::{OxcDiagnostic, Severity};
 use oxc_estree_tokens::{ESTreeTokenOptionsJS, update_tokens};
 use oxc_parser::Token;
 use oxc_semantic::AstNode;
@@ -73,9 +73,10 @@ pub use crate::{
     },
     context::{ContextSubHost, LintContext},
     external_linter::{
-        ExternalLinter, ExternalLinterCreateWorkspaceCb, ExternalLinterDestroyWorkspaceCb,
-        ExternalLinterLintFileCb, ExternalLinterLoadPluginCb, ExternalLinterSetupRuleConfigsCb,
-        JsFix, LintFileResult, LoadPluginResult, convert_and_merge_js_fixes,
+        ExternalComment, ExternalCommentKind, ExternalLinter, ExternalLinterCreateWorkspaceCb,
+        ExternalLinterDestroyWorkspaceCb, ExternalLinterLintFileCb, ExternalLinterLoadPluginCb,
+        ExternalLinterSetupRuleConfigsCb, JsFix, LintFilePayload, LintFileResult,
+        LintFileSuccessPayload, LoadPluginResult, convert_and_merge_js_fixes,
     },
     external_plugin_store::{ExternalOptionsId, ExternalPluginStore, ExternalRuleId},
     fixer::{Fix, FixKind, Fixer, Message, PossibleFixes},
@@ -93,6 +94,7 @@ pub use crate::{
 use crate::{
     config::{LintConfig, OxlintEnv, OxlintGlobals, OxlintSettings},
     context::ContextHost,
+    disable_directives::RawDirectiveComment,
     external_linter::GlobalsAndEnvs,
     fixer::CompositeFix,
     loader::LINT_PARTIAL_LOADER_EXTENSIONS,
@@ -173,7 +175,50 @@ impl Linter {
         context_sub_hosts: Vec<ContextSubHost<'a>>,
         allocator: &'a Allocator,
     ) -> Vec<Message> {
-        self.run_with_disable_directives(path, context_sub_hosts, allocator, None).0
+        self.run_with_disable_directives(path, context_sub_hosts, allocator, None, None).0
+    }
+
+    /// Run only external JS-plugin rules against whole-file source text.
+    ///
+    /// This is used for files that select a custom parser through JS `languageOptions`, but do not
+    /// produce any native script sections for the Rust linter to analyze.
+    pub fn run_external_only_on_source_text<'a>(
+        &self,
+        path: &Path,
+        source_text: &'a str,
+        allocator: &'a Allocator,
+    ) -> Vec<Message> {
+        let ResolvedLinterState { config, external_rules, .. } = self.config.resolve(path);
+        if source_text.is_empty()
+            || external_rules.is_empty()
+            || !config.js_has_custom_parser
+            || self.external_linter.is_none()
+        {
+            return Vec::new();
+        }
+
+        let ctx_host = ContextHost::new_external_only(path, self.options, config);
+        let external_disable_directives = self.run_external_rules_on_source_text(
+            &external_rules,
+            path,
+            &ctx_host,
+            source_text,
+            allocator,
+        );
+
+        if let Some(severity) = self.options.report_unused_directive
+            && severity.is_warn_deny()
+            && let Some(directives) = external_disable_directives.as_ref()
+        {
+            Self::report_unused_full_file_disable_directives(
+                &ctx_host,
+                directives,
+                source_text,
+                severity.into(),
+            );
+        }
+
+        ctx_host.take_diagnostics()
     }
 
     /// Same as `run` but also returns the disable directives for the file
@@ -191,10 +236,15 @@ impl Linter {
         context_sub_hosts: Vec<ContextSubHost<'a>>,
         allocator: &'a Allocator,
         js_allocator_pool: Option<&AllocatorPool>,
+        full_source_text: Option<&'a str>,
     ) -> (Vec<Message>, Option<DisableDirectives>) {
         let ResolvedLinterState { rules, config, external_rules } = self.config.resolve(path);
 
         let mut ctx_host = Rc::new(ContextHost::new(path, context_sub_hosts, self.options, config));
+
+        let use_external_source_parser = full_source_text.is_some()
+            && ctx_host.js_has_custom_parser()
+            && !external_rules.is_empty();
 
         #[cfg(debug_assertions)]
         let mut current_diagnostic_index = 0;
@@ -381,13 +431,15 @@ impl Linter {
             // can mutably access `ctx_host` via `Rc::get_mut` without panicking due to multiple references.
             drop(rules);
 
-            self.run_external_rules(
-                &external_rules,
-                path,
-                &mut ctx_host,
-                allocator,
-                js_allocator_pool,
-            );
+            if !use_external_source_parser {
+                self.run_external_rules(
+                    &external_rules,
+                    path,
+                    &mut ctx_host,
+                    allocator,
+                    js_allocator_pool,
+                );
+            }
 
             // Report unused directives is now handled differently with type-aware linting
 
@@ -409,11 +461,42 @@ impl Linter {
             }
         }
 
+        let external_disable_directives = if use_external_source_parser {
+            full_source_text.and_then(|source_text| {
+                let directives = self.run_external_rules_on_source_text(
+                    &external_rules,
+                    path,
+                    &ctx_host,
+                    source_text,
+                    allocator,
+                );
+
+                if let Some(severity) = self.options.report_unused_directive
+                    && severity.is_warn_deny()
+                    && is_partial_loader_file
+                    && let Some(directives_ref) = directives.as_ref()
+                {
+                    Self::report_unused_full_file_disable_directives(
+                        &ctx_host,
+                        directives_ref,
+                        source_text,
+                        severity.into(),
+                    );
+                }
+
+                directives
+            })
+        } else {
+            None
+        };
+
         let diagnostics = ctx_host.take_diagnostics();
         let disable_directives = if is_partial_loader_file {
             None
         } else {
-            Rc::try_unwrap(ctx_host).unwrap().into_disable_directives()
+            let ctx_disable_directives =
+                Rc::try_unwrap(ctx_host).unwrap().into_disable_directives();
+            external_disable_directives.or(ctx_disable_directives)
         };
 
         (diagnostics, disable_directives)
@@ -510,6 +593,101 @@ impl Linter {
         // External rules (JS plugins) are not supported on non-64-bit or big-endian platforms
     }
 
+    #[cfg(all(target_pointer_width = "64", target_endian = "little"))]
+    fn run_external_rules_on_source_text(
+        &self,
+        external_rules: &[(ExternalRuleId, ExternalOptionsId, AllowWarnDeny)],
+        path: &Path,
+        ctx_host: &ContextHost<'_>,
+        source_text: &str,
+        allocator: &Allocator,
+    ) -> Option<DisableDirectives> {
+        if external_rules.is_empty() {
+            return None;
+        }
+
+        let (original_source_text, source_text, has_bom, span_converter) =
+            Self::create_span_converter(source_text);
+
+        let path = path.to_string_lossy();
+        let path = path.as_ref();
+
+        let settings_json = match &ctx_host.settings().json {
+            Some(json) => serde_json::to_string(&json).unwrap_or_else(|e| {
+                let message = format!("Error serializing settings.\nFile path: {path}\n{e}");
+                ctx_host.push_diagnostic_without_offset(Message::new(
+                    OxcDiagnostic::error(message),
+                    PossibleFixes::None,
+                ));
+                "{}".to_string()
+            }),
+            None => "{}".to_string(),
+        };
+
+        let globals_and_envs = GlobalsAndEnvs::new(ctx_host);
+        let globals_json = serde_json::to_string(&globals_and_envs).unwrap_or_else(|e| {
+            let message = format!("Error serializing globals.\nFile path: {path}\n{e}");
+            ctx_host.push_diagnostic_without_offset(Message::new(
+                OxcDiagnostic::error(message),
+                PossibleFixes::None,
+            ));
+            "{}".to_string()
+        });
+
+        let external_linter = self.external_linter.as_ref().unwrap();
+        let result = (external_linter.lint_file)(
+            path.to_owned(),
+            external_rules.iter().map(|(rule_id, _, _)| rule_id.raw()).collect(),
+            external_rules.iter().map(|(_, options_id, _)| options_id.raw()).collect(),
+            settings_json,
+            globals_json,
+            ctx_host.js_language_options_ids().to_vec(),
+            self.workspace_uri.as_ref().map(ToString::to_string),
+            Some(original_source_text.to_string()),
+            allocator,
+        );
+
+        let (result, external_disable_directives) = match result {
+            Ok(payload) => {
+                let external_disable_directives =
+                    Self::build_disable_directives_from_external_comments(
+                        original_source_text,
+                        &payload.comments,
+                        &span_converter,
+                    );
+                (Ok(payload.diagnostics), external_disable_directives)
+            }
+            Err(err) => (Err(err), None),
+        };
+
+        self.handle_external_linter_result(
+            external_rules,
+            path,
+            ctx_host,
+            original_source_text,
+            &span_converter,
+            has_bom,
+            true,
+            external_disable_directives.as_ref(),
+            result,
+        );
+
+        external_disable_directives
+    }
+
+    #[cfg(not(all(target_pointer_width = "64", target_endian = "little")))]
+    fn run_external_rules_on_source_text(
+        &self,
+        _external_rules: &[(ExternalRuleId, ExternalOptionsId, AllowWarnDeny)],
+        _path: &Path,
+        _ctx_host: &ContextHost<'_>,
+        _source_text: &str,
+        _allocator: &Allocator,
+    ) -> Option<DisableDirectives> {
+        // External rules (JS plugins) are not supported on non-64-bit or big-endian platforms
+        None
+    }
+
     /// Clone AST into a fixed-size allocator and run external rules.
     ///
     /// This copies the AST and source text from the standard allocator into a fixed-size
@@ -599,26 +777,11 @@ impl Linter {
         tokens: &mut [Token],
         allocator: &Allocator,
     ) {
-        // If has BOM, remove it
-        const BOM: &str = "\u{feff}";
-        const BOM_LEN: usize = BOM.len();
-
-        let original_source_text = program.source_text;
-        let mut source_text = original_source_text;
-        let has_bom = source_text.starts_with(BOM);
+        let (original_source_text, source_text, has_bom, span_converter) =
+            Self::create_span_converter(program.source_text);
         if has_bom {
-            source_text = &source_text[BOM_LEN..];
             program.source_text = source_text;
         }
-
-        // Create span converter.
-        // If source starts with BOM, create converter which ignores the BOM.
-        let span_converter = if has_bom {
-            #[expect(clippy::cast_possible_truncation)]
-            Utf8ToUtf16::new_with_offset(source_text, BOM_LEN as u32)
-        } else {
-            Utf8ToUtf16::new(source_text)
-        };
 
         // Convert token spans to UTF-16 and update token kinds
         #[expect(clippy::if_not_else, clippy::cast_possible_truncation)]
@@ -698,16 +861,185 @@ impl Linter {
             external_rules.iter().map(|(_, options_id, _)| options_id.raw()).collect(),
             settings_json,
             globals_json,
+            ctx_host.js_language_options_ids().to_vec(),
             self.workspace_uri.as_ref().map(ToString::to_string),
+            None,
             allocator,
         );
+
+        self.handle_external_linter_result(
+            external_rules,
+            path,
+            ctx_host,
+            original_source_text,
+            &span_converter,
+            has_bom,
+            false,
+            None,
+            result.map(|payload| payload.diagnostics),
+        );
+    }
+
+    fn report_unused_full_file_disable_directives(
+        ctx_host: &ContextHost<'_>,
+        directives: &DisableDirectives,
+        source_text: &str,
+        rule_severity: Severity,
+    ) {
+        let message_for_disable = "Unused eslint-disable directive (no problems were reported).";
+        let fix_message = "remove unused disable directive";
+
+        for unused_disable_comment in directives.collect_unused_disable_comments() {
+            let span = unused_disable_comment.span;
+            match &unused_disable_comment.r#type {
+                RuleCommentType::All => {
+                    ctx_host.push_diagnostic_without_offset(Message::new(
+                        OxcDiagnostic::error(message_for_disable)
+                            .with_label(span)
+                            .with_severity(rule_severity),
+                        PossibleFixes::Single(
+                            Fix::delete(span)
+                                .with_kind(FixKind::Suggestion)
+                                .with_message(fix_message),
+                        ),
+                    ));
+                }
+                RuleCommentType::Single(rules_vec) => {
+                    for rule in rules_vec {
+                        let rule_message = format!(
+                            "Unused eslint-disable directive (no problems were reported from {}).",
+                            rule.rule_name
+                        );
+                        let fix = rule.create_fix(source_text, span).with_message(fix_message);
+
+                        ctx_host.push_diagnostic_without_offset(Message::new(
+                            OxcDiagnostic::error(rule_message)
+                                .with_label(rule.name_span)
+                                .with_severity(rule_severity),
+                            PossibleFixes::Single(fix),
+                        ));
+                    }
+                }
+            }
+        }
+
+        for (rule_name, enable_comment_span) in directives.unused_enable_comments() {
+            let message = rule_name.as_ref().map_or_else(
+                || {
+                    "Unused eslint-enable directive (no matching eslint-disable directives were found)."
+                        .to_string()
+                },
+                |name| {
+                    format!(
+                        "Unused eslint-enable directive (no matching eslint-disable directives were found for {name})."
+                    )
+                },
+            );
+            ctx_host.push_diagnostic_without_offset(Message::new(
+                OxcDiagnostic::error(message)
+                    .with_label(*enable_comment_span)
+                    .with_severity(rule_severity),
+                PossibleFixes::None,
+            ));
+        }
+    }
+
+    fn create_span_converter(source_text: &str) -> (&str, &str, bool, Utf8ToUtf16) {
+        const BOM: &str = "\u{feff}";
+        const BOM_LEN: usize = BOM.len();
+
+        let original_source_text = source_text;
+        let mut source_text_without_bom = source_text;
+        let has_bom = source_text_without_bom.starts_with(BOM);
+        let span_converter = if has_bom {
+            source_text_without_bom = &source_text_without_bom[BOM_LEN..];
+            #[expect(clippy::cast_possible_truncation)]
+            Utf8ToUtf16::new_with_offset(source_text_without_bom, BOM_LEN as u32)
+        } else {
+            Utf8ToUtf16::new(source_text_without_bom)
+        };
+
+        (original_source_text, source_text_without_bom, has_bom, span_converter)
+    }
+
+    fn build_disable_directives_from_external_comments<'a>(
+        source_text: &'a str,
+        comments: &'a [ExternalComment],
+        span_converter: &Utf8ToUtf16,
+    ) -> Option<DisableDirectives> {
+        if comments.is_empty() {
+            return None;
+        }
+
+        let raw_comments = comments
+            .iter()
+            .filter_map(|comment| {
+                let mut span = Span::new(comment.start, comment.end);
+                span_converter.convert_span_back(&mut span);
+                let raw_text = source_text.get(span.start as usize..span.end as usize)?;
+                let content_span =
+                    Self::external_comment_content_span(raw_text, span, &comment.kind);
+                let content_text =
+                    source_text.get(content_span.start as usize..content_span.end as usize)?;
+                Some(RawDirectiveComment {
+                    span,
+                    content_span: Some(content_span),
+                    text: content_text,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        if raw_comments.is_empty() {
+            return None;
+        }
+
+        Some(
+            crate::disable_directives::DisableDirectivesBuilder::new()
+                .build_raw_comments(source_text, &raw_comments),
+        )
+    }
+
+    fn external_comment_content_span(
+        raw_text: &str,
+        span: Span,
+        kind: &ExternalCommentKind,
+    ) -> Span {
+        let (start_offset, end_offset) =
+            if raw_text.starts_with("<!--") && raw_text.ends_with("-->") {
+                (4, 3)
+            } else if matches!(kind, ExternalCommentKind::Shebang) && raw_text.starts_with("#!") {
+                (2, 0)
+            } else if matches!(kind, ExternalCommentKind::Line | ExternalCommentKind::Shebang)
+                && raw_text.starts_with("//")
+            {
+                (2, 0)
+            } else if raw_text.starts_with("/*") && raw_text.ends_with("*/") {
+                (2, 2)
+            } else {
+                (0, 0)
+            };
+
+        let start = span.start.saturating_add(start_offset);
+        let end = span.end.saturating_sub(end_offset).max(start);
+        Span::new(start, end)
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    fn handle_external_linter_result(
+        &self,
+        external_rules: &[(ExternalRuleId, ExternalOptionsId, AllowWarnDeny)],
+        path: &str,
+        ctx_host: &ContextHost<'_>,
+        original_source_text: &str,
+        span_converter: &Utf8ToUtf16,
+        has_bom: bool,
+        use_full_file_spans: bool,
+        external_disable_directives: Option<&DisableDirectives>,
+        result: Result<Vec<LintFileResult>, String>,
+    ) {
         match result {
             Ok(diagnostics) => {
                 for diagnostic in diagnostics {
-                    // Convert UTF-16 offsets back to UTF-8.
-                    // TODO: Validate span offsets are within bounds and `start <= end`.
-                    // Also make sure offsets do not fall in middle of a multi-byte UTF-8 character.
-                    // That's possible if UTF-16 offset points to middle of a surrogate pair.
                     let mut span = Span::new(diagnostic.start, diagnostic.end);
                     span_converter.convert_span_back(&mut span);
 
@@ -715,19 +1047,34 @@ impl Linter {
                         external_rules[diagnostic.rule_index as usize];
                     let (plugin_name, rule_name) =
                         self.config.resolve_plugin_rule_names(external_rule_id);
+                    let full_rule_name = format!("{plugin_name}/{rule_name}");
 
-                    if ctx_host
-                        .disable_directives()
-                        .contains(&format!("{plugin_name}/{rule_name}"), span)
-                    {
+                    let is_disabled = if use_full_file_spans {
+                        external_disable_directives
+                            .is_some_and(|directives| directives.contains(&full_rule_name, span))
+                            || ctx_host.contains_disable_directive_for_full_file_span(
+                                &full_rule_name,
+                                span,
+                            )
+                    } else {
+                        ctx_host.disable_directives().contains(&full_rule_name, span)
+                    };
+                    if is_disabled {
                         continue;
                     }
 
-                    // Convert a `Vec<JsFix>` to a `Fix`, including converting spans back to UTF-8
+                    let push_diagnostic = |ctx_host: &ContextHost<'_>, diagnostic: Message| {
+                        if use_full_file_spans {
+                            ctx_host.push_diagnostic_without_offset(diagnostic);
+                        } else {
+                            ctx_host.push_diagnostic(diagnostic);
+                        }
+                    };
+
                     let create_fix = |fixes, fix_kind| match convert_and_merge_js_fixes(
                         fixes,
                         original_source_text,
-                        &span_converter,
+                        span_converter,
                         has_bom,
                     ) {
                         Ok(fix) => Some(fix.with_kind(fix_kind)),
@@ -740,18 +1087,16 @@ impl Linter {
                             let message = format!(
                                 "Plugin `{plugin_name}/{rule_name}` returned invalid {fixes_type}.\nFile path: {path}\n{err}"
                             );
-                            ctx_host.push_diagnostic(Message::new(
-                                OxcDiagnostic::error(message),
-                                PossibleFixes::None,
-                            ));
+                            push_diagnostic(
+                                ctx_host,
+                                Message::new(OxcDiagnostic::error(message), PossibleFixes::None),
+                            );
                             None
                         }
                     };
 
-                    // Convert fix
                     let fix = diagnostic.fixes.and_then(|fixes| create_fix(fixes, FixKind::Fix));
 
-                    // Convert suggestions (only if fix kind allows suggestions), and combine with fix
                     let possible_fixes = if let Some(suggestions) = diagnostic.suggestions
                         && ctx_host.fix.can_apply(FixKind::Suggestion)
                     {
@@ -771,21 +1116,26 @@ impl Linter {
                         PossibleFixes::from(fix)
                     };
 
-                    ctx_host.push_diagnostic(Message::new(
-                        OxcDiagnostic::error(diagnostic.message)
-                            .with_label(span)
-                            .with_error_code(plugin_name.to_string(), rule_name.to_string())
-                            .with_severity(severity.into()),
-                        possible_fixes,
-                    ));
+                    push_diagnostic(
+                        ctx_host,
+                        Message::new(
+                            OxcDiagnostic::error(diagnostic.message)
+                                .with_label(span)
+                                .with_error_code(plugin_name.to_string(), rule_name.to_string())
+                                .with_severity(severity.into()),
+                            possible_fixes,
+                        ),
+                    );
                 }
             }
             Err(err) => {
                 let message = format!("Error running JS plugin.\nFile path: {path}\n{err}");
-                ctx_host.push_diagnostic(Message::new(
-                    OxcDiagnostic::error(message),
-                    PossibleFixes::None,
-                ));
+                let diagnostic = Message::new(OxcDiagnostic::error(message), PossibleFixes::None);
+                if use_full_file_spans {
+                    ctx_host.push_diagnostic_without_offset(diagnostic);
+                } else {
+                    ctx_host.push_diagnostic(diagnostic);
+                }
             }
         }
     }

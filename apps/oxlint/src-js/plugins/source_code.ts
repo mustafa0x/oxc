@@ -16,7 +16,7 @@ import * as commentMethods from "./comments_methods.ts";
 import { ecmaVersion } from "./context.ts";
 import * as locationMethods from "./location.ts";
 import { getNodeLoc, initLines, lines, lineStartIndices, resetLinesAndLocs } from "./location.ts";
-import { resetScopeManager, SCOPE_MANAGER } from "./scope.ts";
+import { resetScopeManager, SCOPE_MANAGER, setParserScopeManagerForFile } from "./scope.ts";
 import * as scopeMethods from "./scope.ts";
 import { resetTokens } from "./tokens.ts";
 import * as tokenMethods from "./tokens_methods.ts";
@@ -40,6 +40,8 @@ export let buffer: BufferWithArrays | null = null;
 
 // Indicates if the original source text has a BOM. Set before linting a file by `setupSourceForFile`.
 let hasBOM = false;
+let isJsx = false;
+let isTs = false;
 
 // Lazily populated when `SOURCE_CODE.text` or `SOURCE_CODE.ast` is accessed,
 // or `initAst()` is called before the AST is walked.
@@ -59,12 +61,14 @@ export function setParserMetadataForFile(metadata?: {
   currentVisitorKeys = metadata?.visitorKeys ?? visitorKeys;
   currentParserServices = metadata?.parserServices ?? EMPTY_PARSER_SERVICES;
   currentScopeManager = metadata?.scopeManager ?? SCOPE_MANAGER;
+  setParserScopeManagerForFile(metadata?.scopeManager ?? null);
 }
 
 export function resetParserMetadataForFile(): void {
   currentVisitorKeys = visitorKeys;
   currentParserServices = EMPTY_PARSER_SERVICES;
   currentScopeManager = SCOPE_MANAGER;
+  setParserScopeManagerForFile(null);
 }
 
 /**
@@ -75,6 +79,22 @@ export function resetParserMetadataForFile(): void {
 export function setupSourceForFile(bufferInput: BufferWithArrays, hasBOMInput: boolean): void {
   buffer = bufferInput;
   hasBOM = hasBOMInput;
+  isJsx = bufferInput[IS_JSX_FLAG_POS] === 1;
+  isTs = bufferInput[IS_TS_FLAG_POS] === 1;
+}
+
+export function setupExternalSourceForFile(
+  sourceTextInput: string,
+  astInput: Program,
+  hasBOMInput: boolean,
+  flags?: { isJsx?: boolean | null; isTs?: boolean | null } | null,
+): void {
+  buffer = null;
+  hasBOM = hasBOMInput;
+  sourceText = sourceTextInput;
+  ast = astInput;
+  isJsx = flags?.isJsx === true;
+  isTs = flags?.isTs === true;
 }
 
 /**
@@ -156,6 +176,9 @@ export function resetSourceAndAst(): void {
   buffer = null;
   sourceText = null;
   ast = null;
+  hasBOM = false;
+  isJsx = false;
+  isTs = false;
   resetBuffer();
   resetLinesAndLocs();
   resetScopeManager();
@@ -170,9 +193,7 @@ export function resetSourceAndAst(): void {
  * @returns `true` if file is JSX, `false` if not
  */
 export function fileIsJsx(): boolean {
-  debugAssertIsNonNull(buffer);
-  // Flag is `bool` in Rust, so 0 = false, 1 = true
-  return buffer[IS_JSX_FLAG_POS] === 1;
+  return buffer === null ? isJsx : buffer[IS_JSX_FLAG_POS] === 1;
 }
 
 /**
@@ -180,9 +201,7 @@ export function fileIsJsx(): boolean {
  * @returns `true` if file is TypeScript, `false` if not
  */
 export function fileIsTs(): boolean {
-  debugAssertIsNonNull(buffer);
-  // Flag is `bool` in Rust, so 0 = false, 1 = true
-  return buffer[IS_TS_FLAG_POS] === 1;
+  return buffer === null ? isTs : buffer[IS_TS_FLAG_POS] === 1;
 }
 
 // `SourceCode` object.

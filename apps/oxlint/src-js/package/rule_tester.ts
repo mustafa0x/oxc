@@ -15,6 +15,7 @@ import { applyFixes } from "../bindings.js";
 import { ecmaFeaturesOverride, setEcmaVersion, ECMA_VERSION, setParserForFile } from "../plugins/context.ts";
 import { registerPlugin, registeredRules } from "../plugins/load.ts";
 import { lintFileImpl, resetStateAfterError } from "../plugins/lint.ts";
+import { createRequiredParserCallOptions } from "../plugins/parser_call_options.ts";
 import { getLineColumnFromOffset, getNodeByRangeIndex } from "../plugins/location.ts";
 import { allOptions, setOptions, DEFAULT_OPTIONS_ID } from "../plugins/options.ts";
 import { diagnostics, replacePlaceholders, PLACEHOLDER_REGEX } from "../plugins/report.ts";
@@ -22,6 +23,7 @@ import { setParserMetadataForFile } from "../plugins/source_code.ts";
 import { parse } from "./parse.ts";
 
 import type { RequireAtLeastOne } from "type-fest";
+import type { ExternalParser } from "../plugins/context.ts";
 import type { FixReport } from "../plugins/fix.ts";
 import type { Plugin, Rule } from "../plugins/load.ts";
 import type { Options } from "../plugins/options.ts";
@@ -172,10 +174,7 @@ interface LanguageOptions {
  */
 export interface LanguageOptionsInternal extends LanguageOptions {
   ecmaVersion?: number | "latest";
-  parser?: {
-    parse?: (code: string, options?: Record<string, unknown>) => unknown;
-    parseForESLint?: (code: string, options?: Record<string, unknown>) => unknown;
-  };
+  parser?: ExternalParser;
   parserOptions?: ParserOptionsInternal;
 }
 
@@ -1262,6 +1261,9 @@ function lint(test: TestCase, plugin: Plugin): Diagnostic[] {
     // Parse file into buffer
     parse(path, test.code, parseOptions);
 
+    // Set parser object and any parser-provided metadata visible to rules.
+    setupParserForTestCase(test, path, parseOptions);
+
     // In conformance tests, set `context.languageOptions.ecmaVersion`.
     // This is not supported outside of conformance tests.
     if (CONFORMANCE) setEcmaVersionAndFeatures(test);
@@ -1272,7 +1274,7 @@ function lint(test: TestCase, plugin: Plugin): Diagnostic[] {
 
     // Lint file.
     // Buffer is stored already, at index 0. No need to pass it.
-    lintFileImpl(path, 0, null, [0], [optionsId], settingsJSON, globalsJSON, null);
+    lintFileImpl(path, 0, null, [0], [optionsId], settingsJSON, globalsJSON, [], null, null);
 
     // Return diagnostics
     const ruleId = `${plugin.meta!.name!}/${Object.keys(plugin.rules)[0]}`;
@@ -1332,9 +1334,6 @@ function getParseOptions(test: TestCase): ParseOptions {
 
   let languageOptions = test.languageOptions as LanguageOptionsInternal | undefined;
   if (languageOptions == null) languageOptions = EMPTY_LANGUAGE_OPTIONS;
-
-  // Throw error if custom parser is provided
-  if (languageOptions.parser != null) throw new Error("Custom parsers are not supported");
 
   // Handle `languageOptions.sourceType`
   const { sourceType } = languageOptions;
@@ -1451,6 +1450,80 @@ function getGlobalsJson(test: TestCase): string {
 
   // Serialize globals + envs to JSON
   return JSON.stringify({ globals, envs });
+}
+
+
+function setupParserForTestCase(test: TestCase, path: string, parseOptions: ParseOptions): void {
+  const languageOptions = test.languageOptions as LanguageOptionsInternal | undefined;
+  const parser = languageOptions?.parser ?? null;
+  const parserOptions = languageOptions?.parserOptions ?? null;
+  const parserCallOptions = getParserCallOptions(languageOptions, parseOptions, path);
+
+  setParserForFile(parser, parserOptions);
+
+  if (parser === null) return;
+
+  const metadata = getParserMetadata(parser, test.code, parserCallOptions);
+  if (metadata !== null) {
+    setParserMetadataForFile(metadata as Parameters<typeof setParserMetadataForFile>[0]);
+  }
+}
+
+function getParserCallOptions(
+  languageOptions: LanguageOptionsInternal | undefined,
+  parseOptions: ParseOptions,
+  path: string,
+): Record<string, unknown> {
+  const parserOptions = { ...(languageOptions?.parserOptions ?? {}) } as Record<string, unknown>;
+
+  if (parseOptions.sourceType != null && parserOptions.sourceType == null) {
+    parserOptions.sourceType = parseOptions.sourceType;
+  }
+
+  return createRequiredParserCallOptions(path, parserOptions);
+}
+
+function getParserMetadata(
+  parser: ExternalParser,
+  code: string,
+  parserOptions: Record<string, unknown> | null,
+): {
+  visitorKeys?: Readonly<Record<string, readonly string[]>> | null;
+  parserServices?: Record<string, unknown> | null;
+  scopeManager?: unknown;
+} | null {
+  if (parser.parseForESLint == null) {
+    return parser.VisitorKeys == null ? null : { visitorKeys: parser.VisitorKeys };
+  }
+
+  const result = parser.parseForESLint(code, parserOptions);
+  const visitorKeys =
+    isObjectRecord(result) && isVisitorKeys(result.visitorKeys)
+      ? result.visitorKeys
+      : (parser.VisitorKeys ?? null);
+  const parserServices =
+    isObjectRecord(result) && isObjectRecord(result.services)
+      ? result.services
+      : isObjectRecord(result) && isObjectRecord(result.parserServices)
+        ? result.parserServices
+        : null;
+  const scopeManager = isObjectRecord(result) ? (result.scopeManager ?? null) : null;
+
+  if (visitorKeys == null && parserServices == null && scopeManager == null) return null;
+  return { visitorKeys, parserServices, scopeManager };
+}
+
+function isObjectRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isVisitorKeys(
+  value: unknown,
+): value is Readonly<Record<string, readonly string[]>> {
+  if (!isObjectRecord(value)) return false;
+  return Object.values(value).every(
+    (keys) => Array.isArray(keys) && keys.every((key) => typeof key === "string"),
+  );
 }
 
 /**

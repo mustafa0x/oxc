@@ -38,6 +38,10 @@ pub struct LintConfig {
     pub(crate) path: Option<PathBuf>,
     /// Options for the linter.
     pub(crate) options: OxlintOptions,
+    /// Internal IDs for JS-side `languageOptions` objects.
+    pub(crate) js_language_options_ids: Vec<u32>,
+    /// `true` if the resolved JS-side `languageOptions` select a custom parser.
+    pub(crate) js_has_custom_parser: bool,
 }
 
 impl From<Oxlintrc> for LintConfig {
@@ -49,6 +53,8 @@ impl From<Oxlintrc> for LintConfig {
             globals: config.globals,
             path: Some(config.path),
             options: config.options,
+            js_language_options_ids: config.language_options_ids,
+            js_has_custom_parser: config.language_options_has_parser.unwrap_or(false),
         }
     }
 }

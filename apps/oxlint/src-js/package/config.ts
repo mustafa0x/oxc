@@ -4,6 +4,7 @@
  * Types are generated from npm/oxlint/configuration_schema.json.
  */
 
+import type { ParserLike } from "./parser.ts";
 import type {
   AllowWarnDeny,
   DummyRule,
@@ -12,12 +13,12 @@ import type {
   Oxlintrc as FullOxlintrc,
   OxlintEnv,
   OxlintGlobals,
-  OxlintOverride,
+  OxlintOverride as GeneratedOxlintOverride,
   RuleCategories,
   RuleCategoryConfig,
 } from "./config.generated.ts";
 
-type Oxlintrc = Omit<FullOxlintrc, "$schema" | "extends">;
+type Oxlintrc = Omit<FullOxlintrc, "$schema" | "extends" | "overrides">;
 
 export type {
   AllowWarnDeny,
@@ -30,13 +31,22 @@ export type {
   ExternalPluginEntry,
 };
 
+export interface OxlintLanguageOptions {
+  parser?: Readonly<ParserLike>;
+  parserOptions?: Record<string, unknown>;
+}
+
+export interface OxlintOverride extends GeneratedOxlintOverride {
+  languageOptions?: OxlintLanguageOptions;
+}
+
 export type ExternalPluginsConfig = Exclude<Oxlintrc["jsPlugins"], undefined | null>;
 
 export interface OxlintConfig extends Oxlintrc {
   extends?: Array<OxlintConfig | string>;
+  languageOptions?: OxlintLanguageOptions;
+  overrides?: OxlintOverride[];
 }
-
-export type { OxlintOverride };
 
 /**
  * Define an Oxlint configuration with type inference.

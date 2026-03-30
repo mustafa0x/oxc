@@ -1,14 +1,25 @@
 import { walkProgramWithCfg, resetCfgWalk } from "./cfg.ts";
-import { setupFileContext, resetFileContext, resetParserForFile } from "./context.ts";
+import { setParserForFile, setupFileContext, resetFileContext, resetParserForFile } from "./context.ts";
+import { resolveLanguageOptionsIds } from "../js_language_options_registry.ts";
 import { registeredRules } from "./load.ts";
 import { allOptions, DEFAULT_OPTIONS_ID } from "./options.ts";
 import { diagnostics } from "./report.ts";
 import { setSettingsForFile, resetSettings } from "./settings.ts";
-import { ast, initAst, resetSourceAndAst, setupSourceForFile } from "./source_code.ts";
+import {
+  ast,
+  initAst,
+  resetSourceAndAst,
+  setParserMetadataForFile,
+  setupExternalSourceForFile,
+  setupSourceForFile,
+} from "./source_code.ts";
 import { HAS_BOM_FLAG_POS } from "../generated/constants.ts";
 import { typeAssertIs, debugAssert, debugAssertIsNonNull } from "../utils/asserts.ts";
 import { getErrorMessage } from "../utils/utils.ts";
+import { createRequiredParserCallOptions } from "./parser_call_options.ts";
 import { setGlobalsForFile, resetGlobals } from "./globals.ts";
+import { comments as currentComments, setupExternalCommentsForFile } from "./comments.ts";
+import { setupExternalTokensForFile } from "./tokens.ts";
 import { resetWeakMaps } from "./weak_map.ts";
 import { switchWorkspace } from "./workspace.ts";
 import {
@@ -23,6 +34,8 @@ import {
 import { walkProgram, ancestors } from "../generated/walk.js";
 
 import type { VisitFn, EnterExit } from "./visitor.ts";
+import type { Program } from "../generated/types.d.ts";
+import type { ScopeManager } from "./scope.ts";
 import type { AfterHook, BufferWithArrays } from "./types.ts";
 
 // Buffers cache.
@@ -39,6 +52,143 @@ const afterHooks: AfterHook[] = [];
 // `value` is updated before each call. Other attributes are omitted to retain existing values.
 const OPTIONS_DESCRIPTOR: PropertyDescriptor = { value: null };
 
+type VisitorKeysRecord = Readonly<Record<string, readonly string[]>>;
+
+type ExternalDirectiveCommentReport = {
+  type: "Line" | "Block" | "Shebang";
+  start: number;
+  end: number;
+};
+
+function getExternalDirectiveCommentsForRoundTrip(): ExternalDirectiveCommentReport[] | null {
+  if (currentComments === null || currentComments.length === 0) return null;
+
+  return currentComments.map(({ type, start, end }) => ({ type, start, end }));
+}
+
+function isObjectRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isVisitorKeys(value: unknown): value is VisitorKeysRecord {
+  if (!isObjectRecord(value)) return false;
+  return Object.values(value).every(
+    (keys) => Array.isArray(keys) && keys.every((key) => typeof key === "string"),
+  );
+}
+
+function normalizeExternalAst(node: unknown, parent: Record<string, unknown> | null): void {
+  if (!isObjectRecord(node)) return;
+
+  if (parent !== null) {
+    (node as Record<string, unknown> & { parent?: Record<string, unknown> | null }).parent = parent;
+  }
+
+  const rangedNode = node as Record<string, unknown> & {
+    range?: [number, number];
+    start?: number;
+    end?: number;
+  };
+  if (Array.isArray(rangedNode.range) && rangedNode.range.length === 2) {
+    if (typeof rangedNode.start !== "number") rangedNode.start = rangedNode.range[0];
+    if (typeof rangedNode.end !== "number") rangedNode.end = rangedNode.range[1];
+  }
+
+  for (const [key, child] of Object.entries(node)) {
+    if (key === "parent" || key === "loc" || key === "range") continue;
+
+    if (Array.isArray(child)) {
+      for (const element of child) normalizeExternalAst(element, node);
+    } else {
+      normalizeExternalAst(child, node);
+    }
+  }
+}
+
+function setupExternalParserSource(
+  filePath: string,
+  parser: {
+    parse?: (code: string, options?: Record<string, unknown>) => unknown;
+    parseForESLint?: (code: string, options?: Record<string, unknown>) => unknown;
+    VisitorKeys?: VisitorKeysRecord;
+  } | null,
+  parserOptions: Record<string, unknown> | null,
+  sourceText: string,
+  hasBOM: boolean,
+): void {
+  if (parser === null) {
+    throw new Error(
+      `Whole-file source linting for ${filePath} requires a configured custom parser`,
+    );
+  }
+
+  const parserCallOptions = createRequiredParserCallOptions(filePath, parserOptions);
+  let parserResult: unknown;
+  let astResult: unknown;
+
+  if (typeof parser.parseForESLint === "function") {
+    parserResult = parser.parseForESLint(sourceText, parserCallOptions);
+    astResult = isObjectRecord(parserResult) ? parserResult.ast : undefined;
+  } else if (typeof parser.parse === "function") {
+    parserResult = null;
+    astResult = parser.parse(sourceText, parserCallOptions);
+  } else {
+    throw new TypeError("Custom parser must implement `parseForESLint()` or `parse()`");
+  }
+
+  if (!isObjectRecord(astResult) || astResult.type !== "Program") {
+    throw new TypeError("Custom parser must return an ESTree Program");
+  }
+
+  const program = astResult as unknown as Program & {
+    body?: unknown[];
+    comments?: unknown[];
+    tokens?: unknown[];
+    sourceType?: Program["sourceType"] | string;
+  };
+  const astCommentsInput = Array.isArray(program.comments) ? program.comments : null;
+  const astTokensInput = Array.isArray(program.tokens) ? program.tokens : null;
+  if (!Array.isArray(program.body)) program.body = [];
+  if (astCommentsInput === null) program.comments = [];
+  if (astTokensInput === null) program.tokens = [];
+  if (program.sourceType !== "module" && program.sourceType !== "script" && program.sourceType !== "commonjs") {
+    program.sourceType = "module";
+  }
+
+  normalizeExternalAst(program, null);
+
+  const visitorKeys =
+    isObjectRecord(parserResult) && isVisitorKeys(parserResult.visitorKeys)
+      ? parserResult.visitorKeys
+      : (parser.VisitorKeys ?? null);
+  const parserServices =
+    isObjectRecord(parserResult) && isObjectRecord(parserResult.services)
+      ? parserResult.services
+      : isObjectRecord(parserResult) && isObjectRecord(parserResult.parserServices)
+        ? parserResult.parserServices
+        : null;
+  const scopeManager = (isObjectRecord(parserResult) ? parserResult.scopeManager ?? null : null) as ScopeManager | null;
+
+  setupExternalSourceForFile(sourceText, program, hasBOM, null);
+  const normalizedComments = setupExternalCommentsForFile(
+    astCommentsInput ??
+      (isObjectRecord(parserResult) && Array.isArray(parserResult.comments)
+        ? parserResult.comments
+        : null),
+    sourceText,
+  );
+  const normalizedTokens = setupExternalTokensForFile(
+    astTokensInput ??
+      (isObjectRecord(parserResult) && Array.isArray(parserResult.tokens)
+        ? parserResult.tokens
+        : null),
+    sourceText,
+  );
+  program.comments = normalizedComments;
+  program.tokens = normalizedTokens;
+  setParserMetadataForFile({ visitorKeys, parserServices, scopeManager });
+}
+
 /**
  * Lint a file.
  *
@@ -51,7 +201,9 @@ const OPTIONS_DESCRIPTOR: PropertyDescriptor = { value: null };
  * @param optionsIds - IDs of options to use for rules on this file, in same order as `ruleIds`
  * @param settingsJSON - Settings for this file, as JSON string
  * @param globalsJSON - Globals for this file, as JSON string
+ * @param languageOptionsIds - Internal JS-side `languageOptions` IDs for this file
  * @param workspaceUri - Workspace URI (`null` in CLI, string in LSP)
+ * @param sourceText - Whole-file source text for custom parser runs
  * @returns Diagnostics or error serialized to JSON string
  */
 export function lintFile(
@@ -62,7 +214,9 @@ export function lintFile(
   optionsIds: number[],
   settingsJSON: string,
   globalsJSON: string,
+  languageOptionsIds: number[],
   workspaceUri: string | null,
+  sourceText: string | null,
 ): string | null {
   try {
     lintFileImpl(
@@ -73,16 +227,25 @@ export function lintFile(
       optionsIds,
       settingsJSON,
       globalsJSON,
+      languageOptionsIds,
       workspaceUri,
+      sourceText,
     );
 
     let ret: string | null = null;
+    const externalDirectiveComments =
+      sourceText === null ? null : getExternalDirectiveCommentsForRoundTrip();
 
-    // Avoid JSON serialization in common case that there are no diagnostics to report
-    if (diagnostics.length !== 0) {
+    // Avoid JSON serialization in the common case where there is nothing to report or round-trip.
+    if (diagnostics.length !== 0 || externalDirectiveComments !== null) {
       // Note: `messageId` field of `DiagnosticReport` is not needed on Rust side, but we assume it's cheaper to leave it
       // in place and let `serde` skip over it on Rust side, than to iterate over all diagnostics and remove it here.
-      ret = JSON.stringify({ Success: diagnostics });
+      ret = JSON.stringify({
+        Success:
+          sourceText === null
+            ? diagnostics
+            : { diagnostics, comments: externalDirectiveComments ?? [] },
+      });
 
       // Empty `diagnostics` array, so it starts empty when linting next file
       diagnostics.length = 0;
@@ -108,7 +271,9 @@ export function lintFile(
  * @param optionsIds - IDs of options to use for rules on this file, in same order as `ruleIds`
  * @param settingsJSON - Settings for this file, as JSON string
  * @param globalsJSON - Globals for this file, as JSON string
+ * @param languageOptionsIds - Internal JS-side `languageOptions` IDs for this file
  * @param workspaceUri - Workspace URI (`null` in CLI, string in LSP)
+ * @param sourceText - Whole-file source text for custom parser runs
  * @throws {Error} If any parameters are invalid
  * @throws {*} If any rule throws
  */
@@ -120,27 +285,31 @@ export function lintFileImpl(
   optionsIds: number[],
   settingsJSON: string,
   globalsJSON: string,
+  languageOptionsIds: number[],
   workspaceUri: string | null,
+  sourceText: string | null,
 ) {
   // If new buffer, add it to `buffers` array. Otherwise, get existing buffer from array.
   // Do this before checks below, to make sure buffer doesn't get garbage collected when not expected
   // if there's an error.
   // TODO: Is this enough to guarantee soundness?
-  if (buffer === null) {
-    // Rust will only send a `bufferId` alone, if it previously sent a buffer with this same ID
-    buffer = buffers[bufferId]!;
-  } else {
-    typeAssertIs<BufferWithArrays>(buffer);
-    const { buffer: arrayBuffer, byteOffset } = buffer;
-    buffer.uint32 = new Uint32Array(arrayBuffer, byteOffset);
-    buffer.float64 = new Float64Array(arrayBuffer, byteOffset);
+  if (sourceText === null) {
+    if (buffer === null) {
+      // Rust will only send a `bufferId` alone, if it previously sent a buffer with this same ID
+      buffer = buffers[bufferId]!;
+    } else {
+      typeAssertIs<BufferWithArrays>(buffer);
+      const { buffer: arrayBuffer, byteOffset } = buffer;
+      buffer.uint32 = new Uint32Array(arrayBuffer, byteOffset);
+      buffer.float64 = new Float64Array(arrayBuffer, byteOffset);
 
-    for (let i = bufferId - buffers.length; i >= 0; i--) {
-      buffers.push(null);
+      for (let i = bufferId - buffers.length; i >= 0; i--) {
+        buffers.push(null);
+      }
+      buffers[bufferId] = buffer;
     }
-    buffers[bufferId] = buffer;
+    typeAssertIs<BufferWithArrays>(buffer);
   }
-  typeAssertIs<BufferWithArrays>(buffer);
 
   // Debug asserts that input is valid
   debugAssert(
@@ -149,6 +318,7 @@ export function lintFileImpl(
   );
   debugAssert(Array.isArray(ruleIds) && ruleIds.length > 0, "`ruleIds` should be non-empty array");
   debugAssert(Array.isArray(optionsIds), "`optionsIds` should be an array");
+  debugAssert(Array.isArray(languageOptionsIds), "`languageOptionsIds` should be an array");
   debugAssert(
     ruleIds.length === optionsIds.length,
     "`ruleIds` and `optionsIds` should be same length",
@@ -175,6 +345,15 @@ export function lintFileImpl(
   // Pass file path to context module, so `Context`s know what file is being linted
   setupFileContext(filePath);
 
+  const resolvedLanguageOptions = resolveLanguageOptionsIds(languageOptionsIds);
+  const parser = resolvedLanguageOptions?.parser ?? null;
+  const parserOptions =
+    (resolvedLanguageOptions?.parserOptions as Record<string, unknown> | null | undefined) ?? null;
+  setParserForFile(
+    parser,
+    parserOptions,
+  );
+
   // Pass buffer to source code module, so it can decode source text and deserialize AST on demand.
   //
   // We don't want to do this eagerly, because all rules might return empty visitors,
@@ -183,8 +362,12 @@ export function lintFileImpl(
   //
   // But... source text and AST can be accessed in body of `create` method, or `before` hook, via `context.sourceCode`.
   // So we pass the buffer to source code module here, so it can decode source text / deserialize AST on demand.
-  const hasBOM = buffer[HAS_BOM_FLAG_POS] === 1;
-  setupSourceForFile(buffer, hasBOM);
+  const hasBOM = sourceText === null ? buffer[HAS_BOM_FLAG_POS] === 1 : sourceText.charCodeAt(0) === 0xfeff;
+  if (sourceText === null) {
+    setupSourceForFile(buffer, hasBOM);
+  } else {
+    setupExternalParserSource(filePath, parser, parserOptions, sourceText, hasBOM);
+  }
 
   // Pass settings and globals JSON to modules that handle them
   setSettingsForFile(settingsJSON);
@@ -244,6 +427,9 @@ export function lintFileImpl(
     debugAssert(ancestors.length === 0, "`ancestors` should be empty before walking AST");
 
     if (visitorState === VISITOR_CFG) {
+      if (sourceText !== null) {
+        throw new Error("CFG listeners are not supported with whole-file custom parsers yet");
+      }
       walkProgramWithCfg(ast, compiledVisitor);
     } else {
       walkProgram(ast, compiledVisitor as (VisitFn | EnterExit | null)[]);

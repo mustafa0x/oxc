@@ -21,3 +21,86 @@ const config: OxlintConfig = defineConfig({
 });
 
 void config;
+
+
+const parser = {
+  parseForESLint(code: string, options?: Record<string, unknown>) {
+    void code;
+    void options;
+    return { ast: null };
+  },
+};
+
+const configWithLanguageOptions = defineConfig({
+  languageOptions: {
+    parser,
+    parserOptions: {
+      parser,
+      svelteConfig: {
+        compilerOptions: {
+          runes: true,
+        },
+      },
+    },
+  },
+  overrides: [
+    {
+      files: ["**/*.svelte"],
+      languageOptions: {
+        parser,
+        parserOptions: {
+          projectService: true,
+          extraFileExtensions: [".svelte"],
+        },
+      },
+    },
+  ],
+});
+
+void configWithLanguageOptions;
+
+
+const nestedTsParser = {
+  parseForESLint(code: string, options?: Record<string, unknown>) {
+    void code;
+    void options;
+    return { ast: null };
+  },
+};
+
+const svelteConfig = {
+  compilerOptions: {
+    runes: true,
+  },
+  preprocess() {
+    return null;
+  },
+};
+
+const typeAwareBase = defineConfig({
+  languageOptions: {
+    parserOptions: {
+      parser: nestedTsParser,
+      svelteConfig,
+      tsFlavor: "base-ts-parser",
+    },
+  },
+});
+
+const typeAwareConfig = defineConfig({
+  extends: [typeAwareBase],
+  overrides: [
+    {
+      files: ["**/*.svelte"],
+      languageOptions: {
+        parser,
+        parserOptions: {
+          projectService: true,
+          extraFileExtensions: [".svelte"],
+        },
+      },
+    },
+  ],
+});
+
+void typeAwareConfig;

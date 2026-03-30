@@ -106,6 +106,20 @@ pub struct OxlintOverride {
     #[schemars(schema_with = "external_plugins_schema")]
     pub external_plugins: Option<FxHashSet<ExternalPluginEntry>>,
 
+    /// Internal ID for `languageOptions` loaded from `oxlint.config.ts`.
+    #[serde(rename = "_languageOptionsId", default, skip_serializing_if = "Option::is_none")]
+    #[schemars(skip)]
+    pub language_options_id: Option<u32>,
+
+    /// Internal parser-presence flag for `languageOptions` loaded from `oxlint.config.ts`.
+    #[serde(
+        rename = "_languageOptionsHasParser",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schemars(skip)]
+    pub language_options_has_parser: Option<bool>,
+
     #[serde(default)]
     pub rules: OxlintRules,
 }

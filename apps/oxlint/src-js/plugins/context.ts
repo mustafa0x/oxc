@@ -32,8 +32,10 @@ import { settings, initSettings } from "./settings.ts";
 import visitorKeys from "../generated/keys.ts";
 import { debugAssertIsNonNull } from "../utils/asserts.ts";
 import { envs, globals, initGlobals } from "./globals.ts";
+import { parseProgram } from "./parser.ts";
 import { version as packageVersion } from "../../package.json" with { type: "json" };
 
+import type { ParserLike } from "../package/parser.ts";
 import type { Globals, Envs } from "./globals.ts";
 import type { RuleDetails } from "./load.ts";
 import type { Options } from "./options.ts";
@@ -87,18 +89,9 @@ const SUPPORTED_ECMA_VERSIONS = Object.freeze([3, 5, 6, 7, 8, 9, 10, 11, 12, 13,
 // Singleton object for parser's `Syntax` property. Generated lazily.
 let Syntax: Record<string, string> | null = null;
 
-export interface ExternalParser {
-  parse?: (code: string, options?: Record<string, unknown>) => unknown;
-  parseForESLint?: (code: string, options?: Record<string, unknown>) => unknown;
-  VisitorKeys?: Readonly<Record<string, readonly string[]>>;
-  Syntax?: Readonly<Record<string, string>>;
-  name?: string;
-  version?: string;
-  latestEcmaVersion?: number;
-  supportedEcmaVersions?: readonly number[];
-}
+export interface ExternalParser extends ParserLike {}
 
-export type Parser = typeof DEFAULT_PARSER | ExternalParser;
+export type Parser = ParserLike;
 
 // Singleton object for parser.
 const DEFAULT_PARSER = Object.freeze({
@@ -118,9 +111,12 @@ const DEFAULT_PARSER = Object.freeze({
    * @param options? - Parser options
    * @returns AST
    */
-  // oxlint-disable-next-line no-unused-vars
   parse(code: string, options?: Record<string, unknown>): Program {
-    throw new Error("`context.languageOptions.parser.parse` not implemented yet."); // TODO
+    return parseProgram(filePath ?? "<input>", code, options ?? null);
+  },
+
+  parseForESLint(code: string, options?: Record<string, unknown>): { ast: Program } {
+    return { ast: parseProgram(filePath ?? "<input>", code, options ?? null) };
   },
 
   /**

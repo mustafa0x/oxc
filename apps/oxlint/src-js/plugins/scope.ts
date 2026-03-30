@@ -98,6 +98,10 @@ type Identifier =
 // Created lazily only when needed.
 let tsScopeManager: TSESLintScopeManager | null = null;
 
+// Parser-provided `ScopeManager` for current file.
+// Set for whole-file custom parser runs when the parser returns `scopeManager`.
+let externalScopeManager: ScopeManager | null = null;
+
 // Options for TS-ESLint's `analyze` method.
 // `sourceType` property is set before calling `analyze`.
 const analyzeOptions: AnalyzeOptions = {
@@ -258,6 +262,15 @@ function createGlobalVariable(name: string, globalScope: TSScope, isWritable: bo
  */
 export function resetScopeManager() {
   tsScopeManager = null;
+  externalScopeManager = null;
+}
+
+export function setParserScopeManagerForFile(scopeManager: ScopeManager | null | undefined): void {
+  externalScopeManager = scopeManager ?? null;
+}
+
+function getActiveScopeManager(): ScopeManager {
+  return externalScopeManager ?? SCOPE_MANAGER;
 }
 
 // Wrapper around `@typescript-eslint/scope-manager` package's `ScopeManager` class.
@@ -336,12 +349,9 @@ export function isGlobalReference(node: ESTree.Node): boolean {
   if (!node) throw new TypeError("Missing required argument: `node`");
   if (node.type !== "Identifier") return false;
 
-  if (tsScopeManager === null) initTsScopeManager();
-  debugAssertIsNonNull(tsScopeManager);
-
-  const { scopes } = tsScopeManager;
-  if (scopes.length === 0) return false;
-  const globalScope = scopes[0];
+  const scopeManager = getActiveScopeManager();
+  const globalScope = scopeManager.globalScope ?? scopeManager.scopes[0] ?? null;
+  if (globalScope === null) return false;
 
   // If the identifier is a reference to a global variable, the global scope should have a variable with the name
   const variable = globalScope.set.get(node.name);
@@ -367,11 +377,8 @@ export function isGlobalReference(node: ESTree.Node): boolean {
  */
 export function getDeclaredVariables(node: ESTree.Node): Variable[] {
   // ref: https://github.com/eslint/eslint/blob/e7cda3bdf1bdd664e6033503a3315ad81736b200/lib/languages/js/source-code/source-code.js#L904
-  if (tsScopeManager === null) initTsScopeManager();
-  debugAssertIsNonNull(tsScopeManager);
-
   // @ts-expect-error - TODO: Our types don't quite align yet
-  return tsScopeManager.getDeclaredVariables(node);
+  return getActiveScopeManager().getDeclaredVariables(node);
 }
 
 /**
@@ -383,15 +390,14 @@ export function getScope(node: ESTree.Node): Scope {
   // ref: https://github.com/eslint/eslint/blob/e7cda3bdf1bdd664e6033503a3315ad81736b200/lib/languages/js/source-code/source-code.js#L862-L892
   if (!node) throw new TypeError("Missing required argument: `node`");
 
-  if (tsScopeManager === null) initTsScopeManager();
-  debugAssertIsNonNull(tsScopeManager);
+  const scopeManager = getActiveScopeManager();
 
   const inner = node.type !== "Program";
 
   // Traverse up the AST to find a `Node` whose scope can be acquired.
   do {
     // @ts-expect-error - TODO: Our types don't quite align yet
-    const scope = tsScopeManager.acquire(node, inner) as Scope;
+    const scope = scopeManager.acquire(node, inner) as Scope;
     if (scope !== null) {
       return scope.type === "function-expression-name" ? scope.childScopes[0] : scope;
     }
@@ -402,7 +408,7 @@ export function getScope(node: ESTree.Node): Scope {
 
   // TODO: Is it possible to get here? Doesn't `Program` always have a scope?
   // @ts-expect-error - TODO: Our types don't quite align yet
-  return tsScopeManager.scopes[0];
+  return scopeManager.scopes[0];
 }
 
 /**
@@ -427,7 +433,7 @@ export function markVariableAsUsed(name: string, refNode?: ESTree.Node): boolean
 
   let currentScope = getScope(refNode);
 
-  // `getScope` calls `initTsScopeManager` which calls `initAst`, so `ast` must have been initialized
+  // `getScope` ensures the file AST has been initialized for both native and external parser paths.
   debugAssertIsNonNull(ast);
 
   // When in the global scope, check if there's a module/function child scope whose `block` is the Program node.
