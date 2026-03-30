@@ -1,5 +1,5 @@
 import { walkProgramWithCfg, resetCfgWalk } from "./cfg.ts";
-import { setupFileContext, resetFileContext } from "./context.ts";
+import { setupFileContext, resetFileContext, resetParserForFile } from "./context.ts";
 import { registeredRules } from "./load.ts";
 import { allOptions, DEFAULT_OPTIONS_ID } from "./options.ts";
 import { diagnostics } from "./report.ts";
@@ -308,6 +308,7 @@ function runAfterHooks(shouldThrowIfError: boolean) {
  */
 export function resetFile() {
   resetFileContext();
+  resetParserForFile();
   resetSourceAndAst();
   resetSettings();
   resetGlobals();

@@ -87,8 +87,21 @@ const SUPPORTED_ECMA_VERSIONS = Object.freeze([3, 5, 6, 7, 8, 9, 10, 11, 12, 13,
 // Singleton object for parser's `Syntax` property. Generated lazily.
 let Syntax: Record<string, string> | null = null;
 
+export interface ExternalParser {
+  parse?: (code: string, options?: Record<string, unknown>) => unknown;
+  parseForESLint?: (code: string, options?: Record<string, unknown>) => unknown;
+  VisitorKeys?: Readonly<Record<string, readonly string[]>>;
+  Syntax?: Readonly<Record<string, string>>;
+  name?: string;
+  version?: string;
+  latestEcmaVersion?: number;
+  supportedEcmaVersions?: readonly number[];
+}
+
+export type Parser = typeof DEFAULT_PARSER | ExternalParser;
+
 // Singleton object for parser.
-const PARSER = Object.freeze({
+const DEFAULT_PARSER = Object.freeze({
   /**
    * Parser name.
    */
@@ -140,6 +153,8 @@ const PARSER = Object.freeze({
    */
   supportedEcmaVersions: SUPPORTED_ECMA_VERSIONS,
 });
+
+let currentParser: Parser = DEFAULT_PARSER;
 
 // In conformance build, setting properties of this object to `true` or `false` overrides the defaults
 export const ecmaFeaturesOverride: {
@@ -196,27 +211,74 @@ const ECMA_FEATURES = Object.freeze({
   },
 });
 
+
+function getSourceType(): ModuleKind {
+  // TODO: Would be better to get `sourceType` without deserializing whole AST,
+  // in case it's used in `create` to return an empty visitor if wrong type.
+  if (ast === null) initAst();
+  debugAssertIsNonNull(ast);
+
+  return ast.sourceType;
+}
+
+type ParserOptionsRecord = Readonly<Record<string, unknown>>;
+
+function createParserOptions(
+  parserOptionsInput?: ParserOptionsRecord | null,
+): ParserOptionsRecord {
+  const descriptors: PropertyDescriptorMap = {
+    sourceType: {
+      enumerable: true,
+      configurable: false,
+      get: getSourceType,
+    },
+    ecmaFeatures: {
+      enumerable: true,
+      configurable: false,
+      value: ECMA_FEATURES,
+    },
+  };
+
+  if (parserOptionsInput != null) {
+    for (const [key, value] of Object.entries(parserOptionsInput)) {
+      if (key === "sourceType" || key === "ecmaFeatures") continue;
+      descriptors[key] = {
+        enumerable: true,
+        configurable: false,
+        writable: false,
+        value,
+      };
+    }
+  }
+
+  return Object.freeze(Object.create(null, descriptors)) as ParserOptionsRecord;
+}
+
+const DEFAULT_PARSER_OPTIONS = createParserOptions();
+let currentParserOptions: ParserOptionsRecord = DEFAULT_PARSER_OPTIONS;
+
+export function setParserForFile(
+  parser: Parser | null | undefined,
+  parserOptions?: ParserOptionsRecord | null,
+): void {
+  currentParser = parser ?? DEFAULT_PARSER;
+  currentParserOptions =
+    parserOptions == null ? DEFAULT_PARSER_OPTIONS : createParserOptions(parserOptions);
+}
+
+export function resetParserForFile(): void {
+  currentParser = DEFAULT_PARSER;
+  currentParserOptions = DEFAULT_PARSER_OPTIONS;
+}
+
 // Singleton object for parser options.
 // TODO: `sourceType` and `ecmaFeatures` are the only property ESLint provides.
 // But does TS-ESLint provide any further properties?
-const PARSER_OPTIONS = Object.freeze({
-  /**
-   * Source type of the file being linted.
-   */
-  get sourceType(): ModuleKind {
-    // TODO: Would be better to get `sourceType` without deserializing whole AST,
-    // in case it's used in `create` to return an empty visitor if wrong type.
-    if (ast === null) initAst();
-    debugAssertIsNonNull(ast);
-
-    return ast.sourceType;
+const PARSER_OPTIONS = {
+  get current(): ParserOptionsRecord {
+    return currentParserOptions;
   },
-
-  /**
-   * ECMA features.
-   */
-  ecmaFeatures: ECMA_FEATURES,
-});
+};
 
 // Singleton object for language options.
 const LANGUAGE_OPTIONS = {
@@ -240,13 +302,17 @@ const LANGUAGE_OPTIONS = {
   /**
    * Parser used to parse the file being linted.
    */
-  parser: PARSER,
+  get parser(): Parser {
+    return currentParser;
+  },
 
   /**
    * Parser options used to parse the file being linted.
    */
   // Note: If we change this implementation, also change `parserOptions` getter on `FILE_CONTEXT` below
-  parserOptions: PARSER_OPTIONS,
+  get parserOptions(): ParserOptionsRecord {
+    return PARSER_OPTIONS.current;
+  },
 
   /**
    * Globals defined for the file being linted.
@@ -447,7 +513,7 @@ const FILE_CONTEXT = Object.freeze({
    */
   get parserOptions(): Record<string, unknown> {
     if (filePath === null) throw new Error("Cannot access `context.parserOptions` in `createOnce`");
-    return PARSER_OPTIONS;
+    return PARSER_OPTIONS.current;
   },
 
   /**

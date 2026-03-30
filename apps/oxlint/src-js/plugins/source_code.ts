@@ -30,6 +30,8 @@ import type { ScopeManager } from "./scope.ts";
 import type { Token } from "./tokens.ts";
 import type { BufferWithArrays, Node } from "./types.ts";
 
+const EMPTY_PARSER_SERVICES = Object.freeze({} as Record<string, unknown>);
+
 // Text decoder, for decoding source text from buffer
 const textDecoder = new TextDecoder("utf-8", { ignoreBOM: true });
 
@@ -45,6 +47,25 @@ export let sourceText: string | null = null;
 let sourceStartPos: number = 0;
 let sourceByteLen: number = 0;
 export let ast: Program | null = null;
+let currentVisitorKeys: Readonly<Record<string, readonly string[]>> = visitorKeys;
+let currentParserServices: Readonly<Record<string, unknown>> = EMPTY_PARSER_SERVICES;
+let currentScopeManager: ScopeManager = SCOPE_MANAGER;
+
+export function setParserMetadataForFile(metadata?: {
+  visitorKeys?: Readonly<Record<string, readonly string[]>> | null;
+  parserServices?: Record<string, unknown> | null;
+  scopeManager?: ScopeManager | null;
+}): void {
+  currentVisitorKeys = metadata?.visitorKeys ?? visitorKeys;
+  currentParserServices = metadata?.parserServices ?? EMPTY_PARSER_SERVICES;
+  currentScopeManager = metadata?.scopeManager ?? SCOPE_MANAGER;
+}
+
+export function resetParserMetadataForFile(): void {
+  currentVisitorKeys = visitorKeys;
+  currentParserServices = EMPTY_PARSER_SERVICES;
+  currentScopeManager = SCOPE_MANAGER;
+}
 
 /**
  * Set up source for the file about to be linted.
@@ -138,6 +159,7 @@ export function resetSourceAndAst(): void {
   resetBuffer();
   resetLinesAndLocs();
   resetScopeManager();
+  resetParserMetadataForFile();
   resetTokens();
   resetComments();
   resetTokensAndComments();
@@ -209,22 +231,22 @@ export const SOURCE_CODE = Object.freeze({
    * `ScopeManager` for the file.
    */
   get scopeManager(): ScopeManager {
-    return SCOPE_MANAGER;
+    return currentScopeManager;
   },
 
   /**
    * Visitor keys to traverse this AST.
    */
   get visitorKeys(): Readonly<Record<string, readonly string[]>> {
-    return visitorKeys;
+    return currentVisitorKeys;
   },
 
   /**
    * Parser services for the file.
-   *
-   * Oxlint does not offer any parser services.
    */
-  parserServices: Object.freeze({} as Record<string, unknown>),
+  get parserServices(): Readonly<Record<string, unknown>> {
+    return currentParserServices;
+  },
 
   /**
    * Source text as array of lines, split according to specification's definition of line breaks.

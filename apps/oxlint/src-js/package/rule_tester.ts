@@ -12,12 +12,13 @@ import { join as pathJoin, isAbsolute as isAbsolutePath, dirname } from "node:pa
 import util from "node:util";
 import stableJsonStringify from "json-stable-stringify-without-jsonify";
 import { applyFixes } from "../bindings.js";
-import { ecmaFeaturesOverride, setEcmaVersion, ECMA_VERSION } from "../plugins/context.ts";
+import { ecmaFeaturesOverride, setEcmaVersion, ECMA_VERSION, setParserForFile } from "../plugins/context.ts";
 import { registerPlugin, registeredRules } from "../plugins/load.ts";
 import { lintFileImpl, resetStateAfterError } from "../plugins/lint.ts";
 import { getLineColumnFromOffset, getNodeByRangeIndex } from "../plugins/location.ts";
 import { allOptions, setOptions, DEFAULT_OPTIONS_ID } from "../plugins/options.ts";
 import { diagnostics, replacePlaceholders, PLACEHOLDER_REGEX } from "../plugins/report.ts";
+import { setParserMetadataForFile } from "../plugins/source_code.ts";
 import { parse } from "./parse.ts";
 
 import type { RequireAtLeastOne } from "type-fest";
