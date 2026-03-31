@@ -14,6 +14,11 @@ import visitorKeys from "../generated/keys.ts";
 import { resetComments } from "./comments.ts";
 import * as commentMethods from "./comments_methods.ts";
 import { ecmaVersion } from "./context.ts";
+import {
+  getInferredExternalChildKeys,
+  mergeExternalChildKeys,
+  sanitizeExternalVisitorKeysRecord,
+} from "./external_ast_utils.ts";
 import * as locationMethods from "./location.ts";
 import { getNodeLoc, initLines, lines, lineStartIndices, resetLinesAndLocs } from "./location.ts";
 import { resetScopeManager, SCOPE_MANAGER, setParserScopeManagerForFile } from "./scope.ts";
@@ -52,13 +57,21 @@ export let ast: Program | null = null;
 let currentVisitorKeys: Readonly<Record<string, readonly string[]>> = visitorKeys;
 let currentParserServices: Readonly<Record<string, unknown>> = EMPTY_PARSER_SERVICES;
 let currentScopeManager: ScopeManager = SCOPE_MANAGER;
+export function getCurrentVisitorKeys(): Readonly<Record<string, readonly string[]>> {
+  return currentVisitorKeys;
+}
+
+export function getVisitorKeysForNode(node: Record<string, unknown> & { type: string }): readonly string[] {
+  const inferredKeys = getInferredExternalChildKeys(node);
+  return mergeExternalChildKeys(inferredKeys, currentVisitorKeys[node.type]);
+}
 
 export function setParserMetadataForFile(metadata?: {
   visitorKeys?: Readonly<Record<string, readonly string[]>> | null;
   parserServices?: Record<string, unknown> | null;
   scopeManager?: ScopeManager | null;
 }): void {
-  currentVisitorKeys = metadata?.visitorKeys ?? visitorKeys;
+  currentVisitorKeys = sanitizeExternalVisitorKeysRecord(metadata?.visitorKeys) ?? visitorKeys;
   currentParserServices = metadata?.parserServices ?? EMPTY_PARSER_SERVICES;
   currentScopeManager = metadata?.scopeManager ?? SCOPE_MANAGER;
   setParserScopeManagerForFile(metadata?.scopeManager ?? null);

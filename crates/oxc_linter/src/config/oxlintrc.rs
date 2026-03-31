@@ -411,9 +411,14 @@ impl Oxlintrc {
             .map(|rule| (**rule).clone())
             .collect::<Vec<_>>();
 
-        let settings = self.settings.clone();
-        let env = self.env.clone();
-        let globals = self.globals.clone();
+        let mut settings = other.settings.clone();
+        self.settings.override_settings(&mut settings);
+
+        let mut env = other.env.clone();
+        self.env.override_envs(&mut env);
+
+        let mut globals = other.globals.clone();
+        self.globals.override_globals(&mut globals);
 
         let mut overrides = other.overrides;
         overrides.extend(self.overrides.clone());
@@ -535,6 +540,81 @@ mod test {
 
         let merged = child.merge(parent);
         assert_eq!(merged.language_options_has_parser, Some(true));
+    }
+
+    #[test]
+    fn test_merge_extends_merges_settings_deeply() {
+        let parent: Oxlintrc = serde_json::from_value(json!({
+            "settings": {
+                "custom": {
+                    "fromParent": true,
+                    "shared": "parent"
+                },
+                "react": {
+                    "version": "18.2.0"
+                }
+            }
+        }))
+        .unwrap();
+        let child: Oxlintrc = serde_json::from_value(json!({
+            "settings": {
+                "custom": {
+                    "fromChild": true,
+                    "shared": "child"
+                }
+            }
+        }))
+        .unwrap();
+
+        let merged = child.merge(parent);
+        let settings_json = merged.settings.json.expect("merged settings should preserve json");
+        assert_eq!(
+            settings_json.get("custom"),
+            Some(&json!({
+                "fromParent": true,
+                "shared": "child",
+                "fromChild": true
+            }))
+        );
+        assert_eq!(settings_json.get("react"), Some(&json!({ "version": "18.2.0" })));
+    }
+
+    #[test]
+    fn test_merge_extends_merges_env_and_globals() {
+        let parent: Oxlintrc = serde_json::from_value(json!({
+            "env": {
+                "browser": true,
+                "node": true
+            },
+            "globals": {
+                "Promise": "readonly",
+                "URL": "writable"
+            }
+        }))
+        .unwrap();
+        let child: Oxlintrc = serde_json::from_value(json!({
+            "env": {
+                "browser": false,
+                "worker": true
+            },
+            "globals": {
+                "Promise": "off",
+                "window": "readonly"
+            }
+        }))
+        .unwrap();
+
+        let merged = child.merge(parent);
+        assert!(!merged.env.contains("browser"));
+        assert!(merged.env.contains("node"));
+        assert!(merged.env.contains("worker"));
+
+        assert_eq!(merged.globals.get("Promise"), Some(&crate::config::globals::GlobalValue::Off));
+        assert_eq!(merged.globals.get("URL"), Some(&crate::config::globals::GlobalValue::Writable));
+        assert_eq!(
+            merged.globals.get("window"),
+            Some(&crate::config::globals::GlobalValue::Readonly)
+        );
     }
 
     #[test]

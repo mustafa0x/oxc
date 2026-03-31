@@ -1,9 +1,11 @@
 # Oracle Tasks
 
 ## Intro Prompt
-You are reviewing Oxc Svelte-support work from a code snapshot.
+You are reviewing Oxc Svelte-support work from a code snapshot (no local command execution available).  
 Your job is to fix issues directly in code and keep progress tracked in `svelte-support-phases.md`.
 
+Constraints:
+- You are cloud-only: do not assume local toolchains, shell commands, or test execution.
 - Focus on code-level fixes and correctness first.
 - Update `svelte-support-phases.md` in every response with:
   - current status
@@ -11,6 +13,7 @@ Your job is to fix issues directly in code and keep progress tracked in `svelte-
   - expected impact
   - remaining risks/gaps
 - Keep changes minimal and targeted.
+- Do not split commits or plan PRs yet.
 
 Goal:
 - Make full Svelte support publish-ready (lint + formatter plugin path), then leave a clear remaining-gap list.

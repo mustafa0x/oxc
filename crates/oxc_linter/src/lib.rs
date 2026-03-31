@@ -189,8 +189,7 @@ impl Linter {
         allocator: &'a Allocator,
     ) -> Vec<Message> {
         let ResolvedLinterState { config, external_rules, .. } = self.config.resolve(path);
-        if source_text.is_empty()
-            || external_rules.is_empty()
+        if external_rules.is_empty()
             || !config.js_has_custom_parser
             || self.external_linter.is_none()
         {
@@ -606,7 +605,7 @@ impl Linter {
             return None;
         }
 
-        let (original_source_text, source_text, has_bom, span_converter) =
+        let (original_source_text, _source_text_without_bom, has_bom, span_converter) =
             Self::create_span_converter(source_text);
 
         let path = path.to_string_lossy();
@@ -1024,6 +1023,38 @@ impl Linter {
         Span::new(start, end)
     }
 
+    fn push_external_linter_diagnostic(
+        ctx_host: &ContextHost<'_>,
+        use_full_file_spans: bool,
+        diagnostic: Message,
+    ) {
+        if use_full_file_spans {
+            ctx_host.push_diagnostic_without_offset(diagnostic);
+        } else {
+            ctx_host.push_diagnostic(diagnostic);
+        }
+    }
+
+    fn validate_external_diagnostic_span(span: Span, source_text: &str) -> Result<(), String> {
+        if span.start > span.end {
+            return Err(format!(
+                "Diagnostic range start {} is after end {}.",
+                span.start, span.end
+            ));
+        }
+
+        if source_text.get(span.start as usize..span.end as usize).is_none() {
+            return Err(format!(
+                "Diagnostic range {}..{} is out of bounds for source text of length {}.",
+                span.start,
+                span.end,
+                source_text.len()
+            ));
+        }
+
+        Ok(())
+    }
+
     #[expect(clippy::too_many_arguments)]
     fn handle_external_linter_result(
         &self,
@@ -1040,14 +1071,46 @@ impl Linter {
         match result {
             Ok(diagnostics) => {
                 for diagnostic in diagnostics {
-                    let mut span = Span::new(diagnostic.start, diagnostic.end);
-                    span_converter.convert_span_back(&mut span);
+                    let Some(&(external_rule_id, _options_id, severity)) =
+                        external_rules.get(diagnostic.rule_index as usize)
+                    else {
+                        let message = format!(
+                            "JS plugin returned invalid rule index {}.
+File path: {path}
+Expected an index less than {}.",
+                            diagnostic.rule_index,
+                            external_rules.len(),
+                        );
+                        Self::push_external_linter_diagnostic(
+                            ctx_host,
+                            use_full_file_spans,
+                            Message::new(OxcDiagnostic::error(message), PossibleFixes::None),
+                        );
+                        continue;
+                    };
 
-                    let (external_rule_id, _options_id, severity) =
-                        external_rules[diagnostic.rule_index as usize];
                     let (plugin_name, rule_name) =
                         self.config.resolve_plugin_rule_names(external_rule_id);
                     let full_rule_name = format!("{plugin_name}/{rule_name}");
+
+                    let mut span = Span::new(diagnostic.start, diagnostic.end);
+                    span_converter.convert_span_back(&mut span);
+
+                    if let Err(err) =
+                        Self::validate_external_diagnostic_span(span, original_source_text)
+                    {
+                        let message = format!(
+                            "Plugin `{plugin_name}/{rule_name}` returned invalid diagnostic range.
+File path: {path}
+{err}"
+                        );
+                        Self::push_external_linter_diagnostic(
+                            ctx_host,
+                            use_full_file_spans,
+                            Message::new(OxcDiagnostic::error(message), PossibleFixes::None),
+                        );
+                        continue;
+                    }
 
                     let is_disabled = if use_full_file_spans {
                         external_disable_directives
@@ -1063,14 +1126,6 @@ impl Linter {
                         continue;
                     }
 
-                    let push_diagnostic = |ctx_host: &ContextHost<'_>, diagnostic: Message| {
-                        if use_full_file_spans {
-                            ctx_host.push_diagnostic_without_offset(diagnostic);
-                        } else {
-                            ctx_host.push_diagnostic(diagnostic);
-                        }
-                    };
-
                     let create_fix = |fixes, fix_kind| match convert_and_merge_js_fixes(
                         fixes,
                         original_source_text,
@@ -1085,10 +1140,13 @@ impl Linter {
                                 "fixes"
                             };
                             let message = format!(
-                                "Plugin `{plugin_name}/{rule_name}` returned invalid {fixes_type}.\nFile path: {path}\n{err}"
+                                "Plugin `{plugin_name}/{rule_name}` returned invalid {fixes_type}.
+File path: {path}
+{err}"
                             );
-                            push_diagnostic(
+                            Self::push_external_linter_diagnostic(
                                 ctx_host,
+                                use_full_file_spans,
                                 Message::new(OxcDiagnostic::error(message), PossibleFixes::None),
                             );
                             None
@@ -1116,8 +1174,9 @@ impl Linter {
                         PossibleFixes::from(fix)
                     };
 
-                    push_diagnostic(
+                    Self::push_external_linter_diagnostic(
                         ctx_host,
+                        use_full_file_spans,
                         Message::new(
                             OxcDiagnostic::error(diagnostic.message)
                                 .with_label(span)
@@ -1129,13 +1188,14 @@ impl Linter {
                 }
             }
             Err(err) => {
-                let message = format!("Error running JS plugin.\nFile path: {path}\n{err}");
-                let diagnostic = Message::new(OxcDiagnostic::error(message), PossibleFixes::None);
-                if use_full_file_spans {
-                    ctx_host.push_diagnostic_without_offset(diagnostic);
-                } else {
-                    ctx_host.push_diagnostic(diagnostic);
-                }
+                let message = format!("Error running JS plugin.
+File path: {path}
+{err}");
+                Self::push_external_linter_diagnostic(
+                    ctx_host,
+                    use_full_file_spans,
+                    Message::new(OxcDiagnostic::error(message), PossibleFixes::None),
+                );
             }
         }
     }
@@ -1177,5 +1237,189 @@ impl RawTransferMetadata {
     ) -> Self {
         #[expect(clippy::inconsistent_struct_constructor)] // `#[ast]` macro reorders fields
         Self { data_offset, is_ts, is_jsx, has_bom, tokens_offset, tokens_len }
+    }
+}
+
+#[cfg(all(test, target_pointer_width = "64", target_endian = "little"))]
+mod tests {
+    use std::{
+        path::{Path, PathBuf},
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
+
+    use rustc_hash::FxHashMap;
+
+    use super::*;
+    use crate::config::{ResolvedOxlintOverrides, categories::OxlintCategories};
+
+    fn noop_load_plugin() -> ExternalLinterLoadPluginCb {
+        Arc::new(Box::new(|_, _, _, _| {
+            panic!("load_plugin should not be called in this test");
+        }))
+    }
+
+    fn noop_setup_rule_configs() -> ExternalLinterSetupRuleConfigsCb {
+        Arc::new(Box::new(|_| Ok(())))
+    }
+
+    fn noop_create_workspace() -> ExternalLinterCreateWorkspaceCb {
+        Arc::new(Box::new(|_| Ok(())))
+    }
+
+    fn noop_destroy_workspace() -> ExternalLinterDestroyWorkspaceCb {
+        Arc::new(Box::new(|_| Ok(())))
+    }
+
+    fn create_external_only_test_linter(
+        lint_file: ExternalLinterLintFileCb,
+    ) -> Linter {
+        let mut external_plugin_store = ExternalPluginStore::new(true);
+        external_plugin_store.register_plugin(
+            PathBuf::from("/tmp/eslint-plugin-svelte/index.js"),
+            "svelte".to_string(),
+            0,
+            vec!["empty-file".to_string()],
+        );
+        let external_rule_id =
+            external_plugin_store.lookup_rule_id("svelte", "empty-file").unwrap();
+
+        let config = Config::new(
+            vec![],
+            vec![(external_rule_id, ExternalOptionsId::NONE, AllowWarnDeny::Warn)],
+            OxlintCategories::default(),
+            LintConfig { js_has_custom_parser: true, ..LintConfig::default() },
+            ResolvedOxlintOverrides::default(),
+        );
+        let config_store = ConfigStore::new(config, FxHashMap::default(), external_plugin_store);
+
+        let external_linter = ExternalLinter::new(
+            noop_load_plugin(),
+            noop_setup_rule_configs(),
+            lint_file,
+            noop_create_workspace(),
+            noop_destroy_workspace(),
+        );
+
+        Linter::new(LintOptions::default(), config_store, Some(external_linter))
+    }
+
+    #[test]
+    fn test_external_only_custom_parser_runs_on_empty_source_text() {
+        let mut external_plugin_store = ExternalPluginStore::new(true);
+        external_plugin_store.register_plugin(
+            PathBuf::from("/tmp/eslint-plugin-svelte/index.js"),
+            "svelte".to_string(),
+            0,
+            vec!["empty-file".to_string()],
+        );
+        let external_rule_id =
+            external_plugin_store.lookup_rule_id("svelte", "empty-file").unwrap();
+
+        let config = Config::new(
+            vec![],
+            vec![(external_rule_id, ExternalOptionsId::NONE, AllowWarnDeny::Warn)],
+            OxlintCategories::default(),
+            LintConfig { js_has_custom_parser: true, ..LintConfig::default() },
+            ResolvedOxlintOverrides::default(),
+        );
+        let config_store = ConfigStore::new(config, FxHashMap::default(), external_plugin_store);
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let lint_call_count = Arc::clone(&call_count);
+        let external_linter = ExternalLinter::new(
+            noop_load_plugin(),
+            noop_setup_rule_configs(),
+            Arc::new(Box::new(move |_, _, _, _, _, _, _, source_text, _| {
+                lint_call_count.fetch_add(1, Ordering::Relaxed);
+                assert_eq!(source_text.as_deref(), Some(""));
+                Ok(LintFilePayload {
+                    diagnostics: vec![LintFileResult {
+                        rule_index: 0,
+                        message: "empty whole-file custom parser ran".to_string(),
+                        start: 0,
+                        end: 0,
+                        fixes: None,
+                        suggestions: None,
+                    }],
+                    comments: vec![],
+                })
+            })),
+            noop_create_workspace(),
+            noop_destroy_workspace(),
+        );
+
+        let linter = Linter::new(LintOptions::default(), config_store, Some(external_linter));
+        let allocator = Allocator::default();
+        let messages =
+            linter.run_external_only_on_source_text(Path::new("App.svelte"), "", &allocator);
+
+        assert_eq!(call_count.load(Ordering::Relaxed), 1);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].span, Span::new(0, 0));
+    }
+
+    #[test]
+    fn test_external_only_custom_parser_invalid_rule_index_reports_error() {
+        let linter = create_external_only_test_linter(Arc::new(Box::new(
+            |_, _, _, _, _, _, _, _, _| {
+                Ok(LintFilePayload {
+                    diagnostics: vec![LintFileResult {
+                        rule_index: 1,
+                        message: "invalid rule index".to_string(),
+                        start: 0,
+                        end: 0,
+                        fixes: None,
+                        suggestions: None,
+                    }],
+                    comments: vec![],
+                })
+            },
+        )));
+
+        let allocator = Allocator::default();
+        let messages = linter.run_external_only_on_source_text(
+            Path::new("App.svelte"),
+            "<h1>Hello</h1>",
+            &allocator,
+        );
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].span, Span::new(0, 0));
+        assert!(messages[0].error.to_string().contains("invalid rule index 1"));
+    }
+
+    #[test]
+    fn test_external_only_custom_parser_invalid_diagnostic_range_reports_error() {
+        let linter = create_external_only_test_linter(Arc::new(Box::new(
+            |_, _, _, _, _, _, _, _, _| {
+                Ok(LintFilePayload {
+                    diagnostics: vec![LintFileResult {
+                        rule_index: 0,
+                        message: "invalid diagnostic range".to_string(),
+                        start: 0,
+                        end: 100,
+                        fixes: None,
+                        suggestions: None,
+                    }],
+                    comments: vec![],
+                })
+            },
+        )));
+
+        let allocator = Allocator::default();
+        let messages = linter.run_external_only_on_source_text(
+            Path::new("App.svelte"),
+            "<h1>Hello</h1>",
+            &allocator,
+        );
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].span, Span::new(0, 0));
+        let error_message = messages[0].error.to_string();
+        assert!(error_message.contains("returned invalid diagnostic range"));
+        assert!(error_message.contains("0..100"));
     }
 }

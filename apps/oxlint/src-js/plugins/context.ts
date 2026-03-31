@@ -293,7 +293,9 @@ const LANGUAGE_OPTIONS = {
   /**
    * ECMAScript version of the file being linted.
    */
-  ecmaVersion: ECMA_VERSION,
+  get ecmaVersion(): number {
+    return ecmaVersion;
+  },
 
   /**
    * Parser used to parse the file being linted.
@@ -333,22 +335,26 @@ const LANGUAGE_OPTIONS = {
   },
 };
 
-// In conformance build, replace `LANGUAGE_OPTIONS.ecmaVersion` with a getter which returns value of local var.
-// This is to allow changing the ECMAScript version in conformance tests.
-// Some of ESLint's rules change behavior based on the version, and ESLint's tests rely on this.
+// Current ECMAScript version visible through `context.languageOptions.ecmaVersion`.
+// Defaults to Oxlint's latest-version behavior, but can be overridden per file so runtime rules and
+// whole-file custom-parser runs stay aligned with resolved language options.
 export let ecmaVersion = ECMA_VERSION;
 
-export function setEcmaVersion(version: number): void {
-  if (!CONFORMANCE) throw new Error("Should be unreachable in release or debug builds");
-  ecmaVersion = version;
+// Same normalization as ESLint's `normalizeEcmaVersionForLanguageOptions`, except we default to Oxlint's
+// latest supported version when no explicit value was configured.
+export function normalizeEcmaVersionForLanguageOptions(version: unknown): number {
+  if (typeof version === "number") {
+    return version > 5 && version < 2015 ? version + 2009 : version;
+  }
+  return ECMA_VERSION;
 }
 
-if (CONFORMANCE) {
-  Object.defineProperty(LANGUAGE_OPTIONS, "ecmaVersion", {
-    get(): number {
-      return ecmaVersion;
-    },
-  });
+export function setEcmaVersion(version: unknown): void {
+  ecmaVersion = normalizeEcmaVersionForLanguageOptions(version);
+}
+
+export function resetEcmaVersion(): void {
+  ecmaVersion = ECMA_VERSION;
 }
 
 Object.freeze(LANGUAGE_OPTIONS);

@@ -1,4 +1,5 @@
 import {
+  ACTIVE_SIZE,
   BUFFER_ALIGN,
   BUFFER_SIZE,
   DATA_POINTER_POS_32,
@@ -78,7 +79,7 @@ function parseIntoBuffer(
 
   const maxSourceByteLen = sourceText.length * 3;
   if (maxSourceByteLen > ONE_GIB) throw new Error("Source text is too long");
-  const sourceStartPos = BUFFER_SIZE - maxSourceByteLen;
+  const sourceStartPos = ACTIVE_SIZE - maxSourceByteLen;
 
   const sourceBuffer = new Uint8Array(
     buffer.buffer,

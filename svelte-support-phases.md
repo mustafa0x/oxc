@@ -510,3 +510,387 @@ Notes:
 
 PR:
 - **Title:** `feat(oxfmt): migrate JS-based Prettier overrides for Svelte and plugin configs`
+
+## Phase 5I — Whole-file custom-parser correctness sweep
+
+Status: in progress; narrow runtime fixes are ready to PR in the current working tree
+
+Changes:
+- fixed `context.languageOptions.parser.parse()` raw-transfer source placement in `apps/oxlint/src-js/plugins/parser.ts`
+  so embedded source text is written inside `ACTIVE_SIZE` instead of the full buffer size
+- added `apps/oxlint/src-js/plugins/external_parser_utils.ts` and taught the whole-file custom-parser lane to:
+  - preserve `Program.sourceType` when the parser returns it
+  - otherwise fall back to the parser call's requested `sourceType`
+  - infer `"unambiguous"` / missing source types from top-level import/export nodes instead of always forcing `"module"`
+  - derive `isJsx` / `isTs` from explicit parser options when present, with AST fallback through external-only nodes when hints are missing
+- tightened external-AST normalization so it no longer walks `comments` / `tokens` payloads while wiring parent links and ranges
+- updated `apps/oxlint/src-js/plugins/report.ts` so node-based reports prefer parser-provided `node.loc` when available, safely fall back to `node.range` when `loc` is malformed, and reject reversed / out-of-bounds ranges before they reach Rust
+- added JS coverage for the new helper logic and the node-loc diagnostic path:
+  - `apps/oxlint/test/external_parser_utils.test.ts`
+  - `apps/oxlint/test/whole_file_custom_parser_diagnostics.test.ts`
+
+Expected impact:
+- removes one likely source of allocator corruption for `languageOptions.parser.parse()` sub-parses
+- makes whole-file Svelte/custom-parser runs report `sourceType`, JSX, and TS flags closer to the parser's real output instead of defaulting to misleading values
+- reduces remaining diagnostic-span drift for external parser nodes that already provide precise `loc`
+- catches invalid external-parser ranges on the JS side before they can fail later in Rust/NAPI conversion
+
+Remaining risks / gaps:
+- I still have not run the full Vitest/Rust/fixture suite in this environment, so this phase is based on code inspection plus file-level syntax validation
+- whole-file traversal compatibility with real upstream `svelte-eslint-parser` visitor keys still needs end-to-end confirmation
+- multiline/stylish rendering differences may still remain on the Rust diagnostic formatting side even after the JS-side span fixups above
+
+## Phase 5J — Whole-file custom-parser `sourceType` alignment
+
+Status: in progress; targeted runtime fix is ready to PR in the current working tree
+
+Changes:
+- updated `apps/oxlint/src-js/plugins/parser_call_options.ts` so required custom-parser call options can inherit a top-level `languageOptions.sourceType` when `parserOptions.sourceType` is absent
+- wired the whole-file runtime in `apps/oxlint/src-js/plugins/lint.ts` to pass resolved `languageOptions.sourceType` through to external/custom parsers instead of only consulting `parserOptions.sourceType`
+- simplified `RuleTester` parser-call option construction in `apps/oxlint/src-js/package/rule_tester.ts` so the runtime and test harness now share the same source-type merge logic
+- added focused coverage for both the helper and the runtime path:
+  - `apps/oxlint/test/parser_call_options.test.ts`
+  - `apps/oxlint/test/whole_file_custom_parser_source_type.test.ts`
+
+Expected impact:
+- fixes a real whole-file parser drift where configs using `languageOptions: { sourceType: "script", parser: ... }` could still invoke the external parser in module mode unless `parserOptions.sourceType` was redundantly set
+- keeps `context.languageOptions.sourceType` aligned with the mode actually requested from the custom parser when the parser omits `Program.sourceType`
+- reduces another behavioral difference between CLI/runtime whole-file linting and `RuleTester`
+
+Remaining risks / gaps:
+- I still have not run the full Vitest/Rust/fixture suite in this environment, so this phase is based on code inspection plus file-level syntax validation
+- there may still be remaining diagnostics rendering drift on the Rust/stylish side after the JS-side span and source-type fixes
+- real upstream `svelte-eslint-parser` end-to-end validation is still the main missing publish-readiness check for the whole-file traversal/runtime path
+
+## Phase 5K — Whole-file external traversal actually uses parser visitor keys
+
+Status: in progress; targeted runtime fix is ready to PR in the current working tree
+
+Changes:
+- wired `apps/oxlint/src-js/plugins/lint.ts` so whole-file custom-parser runs no longer try to walk external ASTs with the generated Oxc ESTree walker
+- whole-file runs now compile visitors through `apps/oxlint/src-js/plugins/external_traversal.ts` and walk the returned AST with parser-aware visitor keys instead
+- taught `external_traversal.ts` to fall back to inferred child keys for custom node types when the parser omits a specific node type from `visitorKeys`
+- added `apps/oxlint/test/whole_file_custom_parser_external_traversal.test.ts` covering three behaviors on a Svelte-style external AST:
+  - direct listeners on `SvelteElement`
+  - selector listeners on `SvelteElement > SvelteText`
+  - `*` listeners on external-only nodes
+
+Expected impact:
+- fixes the main remaining whole-file Svelte compatibility gap where external-only nodes were still invisible to runtime traversal even though parser `visitorKeys` had already been captured
+- brings real runtime behavior closer to the earlier RuleTester/custom-parser foundation and to ESLint’s parser-driven traversal model
+- makes the whole-file lane more resilient when a parser provides visitor keys for the entry node but omits them for some nested custom node types
+
+Remaining risks / gaps:
+- I still have not run the full Vitest/Rust/fixture suite in this environment, so this phase is based on code inspection plus focused regression additions
+- traversal still depends on the parser exposing custom subtree entry points on known ESTree container nodes such as `Program`; the new fallback only helps once traversal reaches a custom node type
+- real upstream `svelte-eslint-parser` end-to-end validation remains the biggest publish-readiness check still missing for the whole-file path
+
+
+## Phase 5L — Whole-file custom-parser `ecmaVersion` alignment
+
+Status: in progress; targeted parser-call fix is ready to PR in the current working tree
+
+Changes:
+- extended `apps/oxlint/src-js/plugins/parser_call_options.ts` so required custom-parser call options now inherit top-level `languageOptions.ecmaVersion` when `parserOptions.ecmaVersion` is absent
+- wired the whole-file runtime in `apps/oxlint/src-js/plugins/lint.ts` to pass resolved `languageOptions.ecmaVersion` through to external/custom parsers alongside the already-aligned `sourceType`
+- mirrored the same behavior in `apps/oxlint/src-js/package/rule_tester.ts`, keeping runtime and `RuleTester` parser-call contracts aligned
+- expanded parser-call coverage in `apps/oxlint/test/parser_call_options.test.ts` for `ecmaVersion` merge and precedence behavior
+- added `apps/oxlint/test/whole_file_custom_parser_ecma_version.test.ts` proving a whole-file custom parser receives top-level `languageOptions.ecmaVersion`
+
+Expected impact:
+- fixes a real compatibility gap where whole-file custom parsers could miss `ecmaVersion` unless users redundantly repeated it inside `parserOptions`
+- reduces another behavioral difference between Oxlint's whole-file Svelte/custom-parser lane and ESLint's parser-call contract
+- keeps `RuleTester` closer to runtime behavior for framework-parser fixtures that gate syntax support on `ecmaVersion`
+
+Remaining risks / gaps:
+- this pass intentionally does not change `context.languageOptions.ecmaVersion` in standard runtime builds; it only aligns the parser-call contract
+- I still have not run the full Vitest/Rust/fixture suite in this environment, so this phase is based on code inspection plus targeted regression additions
+- real upstream `svelte-eslint-parser` end-to-end validation remains the main missing publish-readiness check for the whole-file path
+
+
+## Phase 5M — Whole-file custom-parser BOM handling matches native parser runs
+
+Status: in progress; targeted runtime fix is ready to PR in the current working tree
+
+Changes:
+- updated `apps/oxlint/src-js/plugins/lint.ts` so whole-file custom-parser runs strip a leading Unicode BOM before invoking the external parser and before exposing `sourceCode.text`, while still preserving `sourceCode.hasBOM === true`
+- added coverage in `apps/oxlint/test/whole_file_custom_parser_diagnostics.test.ts` proving the whole-file parser receives BOM-stripped code and rules still observe the preserved BOM flag through `SourceCode`
+
+Expected impact:
+- aligns whole-file custom-parser behavior with the existing native/raw-transfer lane, which already strips the BOM from `sourceCode.text` but keeps `hasBOM` separately
+- fixes a real offset mismatch risk for parser-provided ranges, locations, fixes, and directive-comment spans on BOM-prefixed `.svelte` files, because Rust span conversion already expects JS offsets to be relative to BOM-stripped text
+- reduces another source of snapshot drift and edge-case fix corruption for external-parser diagnostics on files starting with `﻿`
+
+Remaining risks / gaps:
+- I still have not run the full Vitest/Rust/fixture suite in this environment, so this phase is based on code inspection plus file-level syntax validation
+- real upstream `svelte-eslint-parser` end-to-end validation is still the main missing publish-readiness check for the whole-file traversal/runtime path
+- there may still be remaining diagnostics rendering drift on the Rust/stylish side that is unrelated to BOM handling
+
+## Phase 5N — External parser normalization only walks AST children and honors `lang` precedence
+
+Status: in progress; targeted runtime fixes are ready to PR in the current working tree
+
+Changes:
+- tightened whole-file external AST normalization in `apps/oxlint/src-js/plugins/lint.ts` so it now walks only parser-declared or inferred AST child keys instead of recursively descending through every enumerable object property
+- added cycle protection to that normalization pass with a `WeakSet`, preventing accidental recursion into parser metadata objects that point back to the AST
+- kept start/end backfilling from `range`, but now only for actual AST nodes reached through traversal keys
+- fixed `apps/oxlint/src-js/plugins/external_parser_utils.ts` so `parserOptions.lang` wins over conflicting `parserOptions.ecmaFeatures.jsx` hints when deriving whole-file JSX/TS flags
+- added focused regressions for both issues:
+  - `apps/oxlint/test/whole_file_custom_parser_external_traversal.test.ts`
+  - `apps/oxlint/test/external_parser_utils.test.ts`
+
+Expected impact:
+- removes a real stack-overflow/corruption risk for whole-file custom parsers that attach cyclic or non-AST metadata objects to the returned `Program`
+- keeps external-node parent/range normalization aligned with the same child graph the runtime traversal will actually walk
+- fixes incorrect `SourceCode` / `context.languageOptions.parserOptions.ecmaFeatures.jsx` behavior when `lang: "jsx"` or `lang: "tsx"` was paired with contradictory JSX hints
+
+Remaining risks / gaps:
+- I still have not run the full Vitest/Rust/fixture suite in this environment, so this phase is based on code inspection plus syntax validation of the touched files
+- real upstream `svelte-eslint-parser` end-to-end validation is still the main missing publish-readiness check for the whole-file traversal/runtime path
+- any remaining diagnostics snapshot drift is now more likely to be in Rust-side rendering than in JS-side external parser normalization
+
+## Phase 5O — Runtime `languageOptions.ecmaVersion` alignment
+
+Status: in progress; targeted runtime fix is ready to PR in the current working tree
+
+Changes:
+- updated `apps/oxlint/src-js/plugins/context.ts` so `context.languageOptions.ecmaVersion` is now backed by mutable per-file runtime state instead of being pinned to Oxlint's default latest version in normal builds
+- added shared normalization via `normalizeEcmaVersionForLanguageOptions(...)`, matching the existing RuleTester/conformance behavior for numeric legacy values while still defaulting to Oxlint's latest version when no explicit value is configured
+- wired `apps/oxlint/src-js/plugins/lint.ts` to set the active ECMAScript version before rule `create(...)` runs and to reset it after each file; the runtime now also falls back to `parserOptions.ecmaVersion` when no top-level `languageOptions.ecmaVersion` is present so `context.languageOptions` stays aligned with the parser-call contract
+- reused the shared normalization helper in `apps/oxlint/src-js/package/rule_tester.ts` to keep the test harness and runtime on the same code path
+- extended `apps/oxlint/test/whole_file_custom_parser_ecma_version.test.ts` with a regression proving a whole-file custom-parser rule sees the configured `context.languageOptions.ecmaVersion` during rule creation/runtime, not just inside parser call options
+
+Expected impact:
+- fixes a real runtime drift where whole-file custom-parser rules could receive `ecmaVersion` in the parser call but still observe `context.languageOptions.ecmaVersion === 2026` regardless of configuration
+- improves compatibility with framework rules that branch on `context.languageOptions.ecmaVersion` in `create(...)` before returning visitors
+- reduces another remaining difference between runtime linting and RuleTester behavior on the Svelte/custom-parser lane
+
+Remaining risks / gaps:
+- I still have not run the full Vitest/Rust/fixture suite in this environment, so this phase is based on code inspection plus targeted regression additions and parse-level TypeScript validation of the touched files
+- parser call options still preserve user-provided numeric `ecmaVersion` values as-is; this phase aligns the runtime-facing `languageOptions` value, not the external parser option normalization policy
+- real upstream `svelte-eslint-parser` end-to-end validation remains the main missing publish-readiness check for the whole-file traversal/runtime path
+
+
+## Phase 5N — External traversal reaches custom children on known container nodes
+
+Status: in progress; targeted runtime and fixture cleanups are ready to PR in the current working tree
+
+Changes:
+- updated `apps/oxlint/src-js/plugins/source_code.ts` so `getVisitorKeysForNode(...)` now merges parser-configured visitor keys with inferred AST child keys from the actual node shape instead of treating configured keys as complete
+- updated `apps/oxlint/src-js/plugins/external_traversal.ts` to always use the merged visitor-key lookup for external nodes, which lets traversal continue through custom child properties hanging off known ESTree container nodes like `Program`
+- aligned external-AST normalization in `apps/oxlint/src-js/plugins/lint.ts` with the same merged-key behavior, so parent/range normalization and runtime traversal now see the same child graph
+- added a focused regression in `apps/oxlint/test/whole_file_custom_parser_external_traversal.test.ts` proving traversal reaches `Program.templateBody` even when parser `visitorKeys.Program` only lists `body`
+- completed the remaining Svelte fixture package metadata cleanup by adding explicit `main`/`exports` entries in:
+  - `apps/oxlint/test/fixtures/js_config_svelte_parser_baseline_flags_whole_file/node_modules/eslint-plugin-svelte/package.json`
+  - `apps/oxlint/test/fixtures/js_config_svelte_parser_baseline_flags_whole_file/node_modules/svelte-eslint-parser/package.json`
+  - `apps/oxlint/test/fixtures/js_config_svelte_parser_feature_flags_whole_file/node_modules/eslint-plugin-svelte/package.json`
+  - `apps/oxlint/test/fixtures/js_config_svelte_parser_feature_flags_whole_file/node_modules/svelte-eslint-parser/package.json`
+
+Expected impact:
+- closes the remaining traversal gap noted after Phase 5K: external parsers no longer need to redundantly override visitor keys for every known ESTree container just to expose custom Svelte subtrees
+- keeps external-node parent/range normalization aligned with the same merged traversal graph used at runtime and by selector fallback
+- removes the last obvious Node ESM package-shape fixtures that could still emit `[DEP0151]`-style warning noise during Svelte snapshot runs
+
+Remaining risks / gaps:
+- I still have not run the full Vitest/Rust/fixture suite in this environment, so this phase is based on code inspection plus targeted regression additions
+- real upstream `svelte-eslint-parser` end-to-end validation is still the main missing publish-readiness check for the whole-file traversal/runtime path
+- any remaining diagnostics snapshot drift is now more likely to be in Rust-side rendering than in JS-side external traversal or fixture package metadata
+
+## Phase 5P — Override-scoped `settings` survive per-file resolution
+
+Status: in progress; targeted Rust config fix is ready in the current working tree
+
+Changes:
+- extended `crates/oxc_linter/src/config/config_store.rs` so `ResolvedOxlintOverride` now carries override-scoped `settings`
+- fixed `Config::apply_overrides(...)` to merge matching override settings into the per-file resolved `LintConfig` using `OxlintSettings::override_settings(...)`, instead of silently dropping them
+- wired `crates/oxc_linter/src/config/config_builder.rs` to preserve parsed override `settings` when building resolved overrides
+- added a focused regression in `crates/oxc_linter/src/config/config_store.rs` proving:
+  - matching `.svelte` overrides contribute arbitrary nested `settings.svelte` data
+  - later matching overrides win for overlapping keys
+  - non-matching files keep the base settings unchanged
+
+Expected impact:
+- fixes a real config/runtime gap where override `settings` were accepted syntactically but never reached per-file lint execution
+- makes package-shaped Svelte configs with override-scoped plugin settings materially work instead of only parsing successfully
+- restores the intended deep-merge behavior for arbitrary plugin settings, including non-well-known keys such as `settings.svelte`
+
+Remaining risks / gaps:
+- I still have not run the Rust test suite in this environment, so this phase is based on code inspection plus targeted regression additions
+- `extends`/override interactions should now compose through the existing `OxlintSettings::override_settings(...)` logic, but end-to-end confirmation with real Svelte fixture configs is still pending
+- the remaining publish-readiness uncertainty is now more concentrated in end-to-end fixture validation and any leftover diagnostics rendering drift
+
+## Phase 5Q — `extends` merge parity and honest rule-count reporting
+
+Status: in progress; targeted Rust config fixes are ready in the current working tree
+
+Changes:
+- fixed `crates/oxc_linter/src/config/oxlintrc.rs` so `Oxlintrc::merge(...)` now merges inherited `settings`, `env`, and `globals` instead of replacing parent values wholesale
+- preserved child precedence while keeping parent-only entries, using the existing deep-merge / override helpers:
+  - `OxlintSettings::override_settings(...)`
+  - `OxlintEnv::override_envs(...)`
+  - `OxlintGlobals::override_globals(...)`
+- fixed `crates/oxc_linter/src/config/config_store.rs` so `ConfigStore::number_of_rules(...)` now returns `None` whenever overrides exist, not just when nested configs exist
+- added focused regressions proving:
+  - `extends` deep-merges plugin settings instead of dropping inherited keys
+  - `extends` merges `env` and `globals` with child precedence
+  - rule-count reporting becomes unknown when overrides can change the active rule set per file
+
+Expected impact:
+- fixes a real config bug where realistic shared Svelte configs could lose inherited `settings.svelte`, `env`, or `globals` once a child config added its own values
+- restores more ESLint-like `extends` behavior for package-shaped and object-style config composition
+- prevents misleading CLI/report metadata such as a single global rule count when overrides can materially change the enabled rules on matching `.svelte` files
+
+Remaining risks / gaps:
+- I validated the touched Rust files with `rustfmt +stable --check`, but full Rust test execution is still blocked in this container by offline dependency resolution against crates.io
+- real upstream `svelte-eslint-parser` end-to-end validation is still the main missing publish-readiness check for the whole-file traversal/runtime path
+- any remaining uncertainty is now more concentrated in fixture-level runtime behavior and residual diagnostics rendering drift rather than config merge plumbing
+
+## Phase 5Q — External AST traversal now ignores comments, tokens, and comment attachments
+
+Status: in progress; targeted runtime hardening is ready in the current working tree
+
+Changes:
+- added `apps/oxlint/src-js/plugins/external_ast_utils.ts` to centralize external-AST child-key inference and visitor-key sanitization
+- updated `apps/oxlint/src-js/plugins/source_code.ts` to:
+  - infer external child keys through the shared helper
+  - sanitize parser-provided `visitorKeys` before exposing them through `SourceCode` / traversal
+- updated `apps/oxlint/src-js/plugins/lint.ts` so whole-file external AST normalization now uses the shared child-key inference and sanitized visitor keys, preventing parser `comments`, `tokens`, `leadingComments`, `trailingComments`, and `innerComments` entries from being treated as visitable AST children
+- updated `apps/oxlint/src-js/plugins/external_parser_utils.ts` so JSX/TS flag detection now:
+  - walks only inferred AST child keys instead of every enumerable object property
+  - uses a `WeakSet` to avoid recursion on cyclic parser metadata
+- added focused regressions for both issues:
+  - `apps/oxlint/test/whole_file_custom_parser_external_traversal.test.ts`
+  - `apps/oxlint/test/external_parser_utils.test.ts`
+
+Expected impact:
+- prevents whole-file custom-parser traversal from visiting parser comments, tokens, or attached comment arrays as if they were AST nodes
+- removes another stack-overflow risk when external parsers attach cyclic metadata objects to returned programs
+- keeps normalization, runtime traversal, and syntax-flag detection aligned on the same AST-only child graph
+
+Remaining risks / gaps:
+- I still have not run the full Vitest/Rust/fixture suite in this environment, so this phase is based on code inspection plus targeted regression additions and TypeScript parse checks
+- real upstream `svelte-eslint-parser` end-to-end validation remains the main publish-readiness check still missing for the whole-file path
+- any remaining diagnostics snapshot drift is now more likely to be outside external AST child-key handling
+
+
+## Phase 5R — Empty whole-file custom-parser files still run JS plugin rules
+
+Status: in progress; targeted Rust runtime fix is ready in the current working tree
+
+Changes:
+- removed the `source_text.is_empty()` early return in `crates/oxc_linter/src/lib.rs::run_external_only_on_source_text(...)`
+- added a focused Rust regression proving the external-only whole-file path still calls the JS external linter for an empty `App.svelte` source string and surfaces its diagnostic
+
+Expected impact:
+- fixes a real runtime gap where empty `.svelte` or other framework-component files could skip JS plugin linting entirely when they relied on the external-only whole-file custom-parser path
+- keeps empty-file behavior aligned with the normal whole-file parser lane, which already allows empty source text through to the parser/runtime
+- avoids silently missing file-level Svelte rules that report on `Program`, parser services, or framework metadata even when the component body is empty
+
+Remaining risks / gaps:
+- I still have not run the full Rust or fixture suite in this environment, so this phase is based on code inspection plus a targeted unit regression
+- real upstream `svelte-eslint-parser` end-to-end validation is still the main publish-readiness check missing for the whole-file traversal/runtime path
+- any remaining snapshot/rendering drift is likely unrelated to this empty-file runtime guard now that the external-only path no longer skips empty sources
+
+
+## Phase 5S — Whole-file external ASTs set `Program.parent = null`
+
+Status: in progress; targeted runtime fix is ready in the current working tree
+
+Changes:
+- updated `apps/oxlint/src-js/plugins/lint.ts` so whole-file external AST normalization now always writes the `parent` property, including `parent: null` on the root `Program`
+- added a focused regression in `apps/oxlint/test/whole_file_custom_parser_external_traversal.test.ts` proving `context.sourceCode.getAncestors(...)` works on a Svelte-style external node and yields `Program,SvelteElement` instead of crashing
+
+Expected impact:
+- fixes a real whole-file custom-parser runtime bug where external AST nodes could have a complete parent chain except for the root `Program`, causing `SourceCode.getAncestors(...)` to walk past the root and throw
+- brings external AST normalization back in line with Oxlint's native ESTree shape, where `Program.parent` is explicitly `null`
+- improves compatibility for Svelte/framework rules that use ancestor lookups on external-only template nodes
+
+Remaining risks / gaps:
+- I still have not run the full Vitest/Rust/fixture suite in this environment, so this phase is based on code inspection plus a focused regression and TypeScript syntax checks
+- real upstream `svelte-eslint-parser` end-to-end validation remains the main publish-readiness check still missing for the whole-file traversal/runtime path
+- any remaining diagnostics rendering drift is likely separate from this external parent-chain fix
+
+## Phase 5T — Harden malformed JS-plugin diagnostics in whole-file runs
+
+Status: in progress; targeted runtime hardening is ready in the current working tree
+
+Changes:
+- hardened `crates/oxc_linter/src/lib.rs` so external JS-plugin diagnostics no longer blindly trust `rule_index` or diagnostic spans returned from JS
+- whole-file / external-only runs now:
+  - report an internal plugin error when `rule_index` is out of bounds instead of panicking on `external_rules[rule_index]`
+  - validate converted diagnostic spans against the original source text before building labeled diagnostics
+- added focused Rust regressions proving malformed external diagnostics now surface ordinary error messages instead of crashing:
+  - invalid `rule_index`
+  - out-of-bounds diagnostic range
+- tightened `apps/oxlint/src-js/plugins/report.ts` so explicit `context.report({ loc })` calls now reject reversed ranges where `loc.end` is before `loc.start`
+- added a JS regression in `apps/oxlint/test/whole_file_custom_parser_diagnostics.test.ts` covering reversed explicit `loc` ranges
+
+Expected impact:
+- removes another real crash path in the whole-file custom-parser / JS-plugin bridge
+- keeps malformed third-party plugin diagnostics from taking down the linter process even if JS-side validation is bypassed or regresses
+- closes a remaining reporting correctness gap where explicit `loc` diagnostics could still produce reversed spans
+
+Remaining risks / gaps:
+- I still have not run the full Vitest/Rust/fixture suite in this environment, so this phase is based on code inspection plus targeted regression additions and syntax/format checks of the touched files
+- real upstream `svelte-eslint-parser` end-to-end validation remains the main publish-readiness check still missing for the whole-file traversal/runtime path
+- any remaining diagnostics rendering drift is now more likely to be in final Rust-side formatter rendering than in JS-to-Rust diagnostic validation
+
+## Phase 5U — Preserve top-level parser metadata when `ast.comments` / `ast.tokens` are empty
+
+Status: in progress; targeted whole-file parser compatibility fixes are ready in the current working tree
+
+Changes:
+- updated `apps/oxlint/src-js/plugins/lint.ts` so whole-file `parseForESLint()` runs no longer discard parser-provided top-level `comments` / `tokens` metadata merely because the returned `ast` contains empty `comments: []` or `tokens: []` placeholders
+- added a focused JS regression in `apps/oxlint/test/whole_file_custom_parser_metadata_fallback.test.ts` proving Oxlint now falls back to top-level parser metadata when `ast.comments` / `ast.tokens` are empty while the parser result still provides real entries
+- cleaned the minor unused-variable warning in `crates/oxc_linter/src/lib.rs` by renaming the ignored BOM-stripped source-text binding in the external-only whole-file path
+- added explicit `exports` entries to the remaining package-shaped Svelte fixture packages that still only relied on `main`, reducing `[DEP0151]` ESM warning noise in Node-based fixture runs
+
+Expected impact:
+- fixes a real whole-file custom-parser compatibility bug where `SourceCode` comment/token APIs and whole-file directive round-tripping could silently lose parser metadata if a framework parser returned top-level `comments` / `tokens` alongside empty AST placeholders
+- improves compatibility with parsers that follow `parseForESLint()`'s top-level metadata shape instead of mutating the returned `Program` in place
+- reduces fixture stderr noise so any remaining snapshot drift is more likely to reflect real diagnostic/rendering differences instead of Node package-resolution warnings
+
+Remaining risks / gaps:
+- I still have not run the full Vitest/Rust/fixture suite in this environment, so this phase is based on code inspection plus a targeted regression and syntax checks of the touched TypeScript files
+- real upstream `svelte-eslint-parser` end-to-end validation remains the main publish-readiness check still missing for the whole-file traversal/runtime path
+- diagnostics rendering/stylish snapshot drift may still need a separate Rust-side pass even after this metadata fallback fix
+
+
+## Phase 5V — Preserve parser visitor-key traversal order on whole-file external ASTs
+
+Status: ready to PR in the current working tree
+
+Changes:
+- added `mergeExternalChildKeys(...)` so parser-provided `visitorKeys` stay authoritative for child traversal order
+- still append inferred-only external child keys when parsers omit a custom subtree entry, preserving the earlier fallback behavior
+- switched both whole-file external AST normalization and runtime traversal key lookup to the shared merge helper
+- added a regression proving parser `visitorKeys.Program = ["templateBody", "body"]` visits Svelte template nodes before script nodes even when the object property order is `body` then `templateBody`
+
+Notes:
+- before this pass, traversal merged parser keys with inferred keys but preserved object insertion order whenever both sets overlapped, which could silently reorder whole-file Svelte traversal relative to ESLint/parser expectations
+- this is a correctness fix, not just a perf cleanup; listener order can affect rule state and diagnostics when template and script subtrees interact
+
+PR:
+- **Title:** `fix(js-plugins): preserve parser visitor-key order for whole-file external AST traversal`
+
+## Phase 5V — Respect explicit empty external `visitorKeys`
+
+Status: in progress; targeted whole-file external-parser fix is ready in the current working tree
+
+Changes:
+- updated `apps/oxlint/src-js/plugins/external_ast_utils.ts` so explicit empty parser `visitorKeys` entries now stay authoritative instead of being expanded with inferred child keys
+- updated `apps/oxlint/src-js/plugins/external_parser_utils.ts` so JSX/TS flag detection walks the same sanitized external child graph as normalization/traversal, including respect for explicit empty visitor keys
+- updated `apps/oxlint/src-js/plugins/lint.ts` to derive whole-file external source flags after sanitizing parser `visitorKeys`, keeping parser metadata, traversal, and syntax-flag detection aligned on one graph
+- added focused regressions in:
+  - `apps/oxlint/test/whole_file_custom_parser_external_traversal.test.ts`
+  - `apps/oxlint/test/external_parser_utils.test.ts`
+
+Expected impact:
+- fixes a real traversal correctness gap where a custom parser could explicitly mark a node type as a leaf with `visitorKeys: []`, but Oxlint would still recurse into inferred node-like children under that node
+- prevents whole-file external runs from visiting hidden parser metadata subtrees or firing listeners on nodes the parser intentionally kept out of traversal
+- keeps JSX/TS feature-flag inference aligned with the same external AST graph used for parent normalization and listener traversal
+
+Remaining risks / gaps:
+- I validated the touched TypeScript files with `typescript.transpileModule(...)` parse checks, but I still have not run the full Vitest/Rust/fixture suite in this environment
+- real upstream `svelte-eslint-parser` end-to-end validation remains the main publish-readiness check still missing for the whole-file traversal/runtime path
+- any remaining diagnostics rendering/stylish snapshot drift is likely separate from this visitor-key authority fix

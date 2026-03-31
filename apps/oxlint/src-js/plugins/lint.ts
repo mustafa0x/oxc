@@ -1,5 +1,12 @@
 import { walkProgramWithCfg, resetCfgWalk } from "./cfg.ts";
-import { setParserForFile, setupFileContext, resetFileContext, resetParserForFile } from "./context.ts";
+import {
+  setEcmaVersion,
+  setParserForFile,
+  setupFileContext,
+  resetEcmaVersion,
+  resetFileContext,
+  resetParserForFile,
+} from "./context.ts";
 import { resolveLanguageOptionsIds } from "../js_language_options_registry.ts";
 import { registeredRules } from "./load.ts";
 import { allOptions, DEFAULT_OPTIONS_ID } from "./options.ts";
@@ -18,6 +25,13 @@ import { typeAssertIs, debugAssert, debugAssertIsNonNull } from "../utils/assert
 import { getErrorMessage } from "../utils/utils.ts";
 import { createRequiredParserCallOptions } from "./parser_call_options.ts";
 import { setGlobalsForFile, resetGlobals } from "./globals.ts";
+import { detectExternalSourceFlags, normalizeExternalProgramSourceType } from "./external_parser_utils.ts";
+import {
+  getInferredExternalChildKeys,
+  isExternalNodeLike,
+  mergeExternalChildKeys,
+  sanitizeExternalVisitorKeysRecord,
+} from "./external_ast_utils.ts";
 import { comments as currentComments, setupExternalCommentsForFile } from "./comments.ts";
 import { setupExternalTokensForFile } from "./tokens.ts";
 import { resetWeakMaps } from "./weak_map.ts";
@@ -30,10 +44,12 @@ import {
   VISITOR_EMPTY,
   VISITOR_CFG,
 } from "./visitor.ts";
+import { compileExternalVisitors, walkExternalProgram } from "./external_traversal.ts";
 
 import { walkProgram, ancestors } from "../generated/walk.js";
 
 import type { VisitFn, EnterExit } from "./visitor.ts";
+import type { VisitorObject } from "../generated/visitor.d.ts";
 import type { Program } from "../generated/types.d.ts";
 import type { ScopeManager } from "./scope.ts";
 import type { AfterHook, BufferWithArrays } from "./types.ts";
@@ -77,12 +93,37 @@ function isVisitorKeys(value: unknown): value is VisitorKeysRecord {
   );
 }
 
-function normalizeExternalAst(node: unknown, parent: Record<string, unknown> | null): void {
-  if (!isObjectRecord(node)) return;
+function pickExternalMetadataArray(
+  astMetadata: unknown,
+  parserResultMetadata: unknown,
+): unknown[] | null {
+  const astMetadataArray = Array.isArray(astMetadata) ? astMetadata : null;
+  const parserResultMetadataArray = Array.isArray(parserResultMetadata)
+    ? parserResultMetadata
+    : null;
 
-  if (parent !== null) {
-    (node as Record<string, unknown> & { parent?: Record<string, unknown> | null }).parent = parent;
+  if (astMetadataArray !== null && astMetadataArray.length > 0) {
+    return astMetadataArray;
   }
+  if (parserResultMetadataArray !== null && parserResultMetadataArray.length > 0) {
+    return parserResultMetadataArray;
+  }
+  return astMetadataArray ?? parserResultMetadataArray;
+}
+
+function normalizeExternalAst(
+  node: unknown,
+  parent: (Record<string, unknown> & { type: string }) | null,
+  visitorKeys: VisitorKeysRecord | null,
+  seen: WeakSet<object>,
+): void {
+  if (!isExternalNodeLike(node)) return;
+  if (seen.has(node)) return;
+  seen.add(node);
+
+  (
+    node as Record<string, unknown> & { parent?: Record<string, unknown> | null }
+  ).parent = parent;
 
   const rangedNode = node as Record<string, unknown> & {
     range?: [number, number];
@@ -94,13 +135,17 @@ function normalizeExternalAst(node: unknown, parent: Record<string, unknown> | n
     if (typeof rangedNode.end !== "number") rangedNode.end = rangedNode.range[1];
   }
 
-  for (const [key, child] of Object.entries(node)) {
-    if (key === "parent" || key === "loc" || key === "range") continue;
+  const inferredKeys = getInferredExternalChildKeys(node);
+  const keys = mergeExternalChildKeys(inferredKeys, visitorKeys?.[node.type]);
 
+  for (let i = 0, len = keys.length; i < len; i++) {
+    const child = node[keys[i]!];
     if (Array.isArray(child)) {
-      for (const element of child) normalizeExternalAst(element, node);
+      for (let j = 0, childLen = child.length; j < childLen; j++) {
+        normalizeExternalAst(child[j], node, visitorKeys, seen);
+      }
     } else {
-      normalizeExternalAst(child, node);
+      normalizeExternalAst(child, node, visitorKeys, seen);
     }
   }
 }
@@ -113,6 +158,8 @@ function setupExternalParserSource(
     VisitorKeys?: VisitorKeysRecord;
   } | null,
   parserOptions: Record<string, unknown> | null,
+  sourceType: unknown,
+  ecmaVersion: unknown,
   sourceText: string,
   hasBOM: boolean,
 ): void {
@@ -122,7 +169,12 @@ function setupExternalParserSource(
     );
   }
 
-  const parserCallOptions = createRequiredParserCallOptions(filePath, parserOptions);
+  const parserCallOptions = createRequiredParserCallOptions(
+    filePath,
+    parserOptions,
+    sourceType,
+    ecmaVersion,
+  );
   let parserResult: unknown;
   let astResult: unknown;
 
@@ -146,21 +198,35 @@ function setupExternalParserSource(
     tokens?: unknown[];
     sourceType?: Program["sourceType"] | string;
   };
-  const astCommentsInput = Array.isArray(program.comments) ? program.comments : null;
-  const astTokensInput = Array.isArray(program.tokens) ? program.tokens : null;
+  const parserResultCommentsInput =
+    isObjectRecord(parserResult) && Array.isArray(parserResult.comments)
+      ? parserResult.comments
+      : null;
+  const parserResultTokensInput =
+    isObjectRecord(parserResult) && Array.isArray(parserResult.tokens)
+      ? parserResult.tokens
+      : null;
+  const commentsInput = pickExternalMetadataArray(program.comments, parserResultCommentsInput);
+  const tokensInput = pickExternalMetadataArray(program.tokens, parserResultTokensInput);
   if (!Array.isArray(program.body)) program.body = [];
-  if (astCommentsInput === null) program.comments = [];
-  if (astTokensInput === null) program.tokens = [];
-  if (program.sourceType !== "module" && program.sourceType !== "script" && program.sourceType !== "commonjs") {
-    program.sourceType = "module";
-  }
+  if (commentsInput === null) program.comments = [];
+  if (tokensInput === null) program.tokens = [];
+  program.sourceType = normalizeExternalProgramSourceType(
+    program.sourceType,
+    parserCallOptions.sourceType,
+    program.body,
+  );
 
-  normalizeExternalAst(program, null);
-
-  const visitorKeys =
+  const visitorKeys = sanitizeExternalVisitorKeysRecord(
     isObjectRecord(parserResult) && isVisitorKeys(parserResult.visitorKeys)
       ? parserResult.visitorKeys
-      : (parser.VisitorKeys ?? null);
+      : isVisitorKeys(parser.VisitorKeys)
+        ? parser.VisitorKeys
+        : null,
+  );
+  const sourceFlags = detectExternalSourceFlags(parserOptions, program, visitorKeys);
+  normalizeExternalAst(program, null, visitorKeys, new WeakSet());
+
   const parserServices =
     isObjectRecord(parserResult) && isObjectRecord(parserResult.services)
       ? parserResult.services
@@ -169,21 +235,9 @@ function setupExternalParserSource(
         : null;
   const scopeManager = (isObjectRecord(parserResult) ? parserResult.scopeManager ?? null : null) as ScopeManager | null;
 
-  setupExternalSourceForFile(sourceText, program, hasBOM, null);
-  const normalizedComments = setupExternalCommentsForFile(
-    astCommentsInput ??
-      (isObjectRecord(parserResult) && Array.isArray(parserResult.comments)
-        ? parserResult.comments
-        : null),
-    sourceText,
-  );
-  const normalizedTokens = setupExternalTokensForFile(
-    astTokensInput ??
-      (isObjectRecord(parserResult) && Array.isArray(parserResult.tokens)
-        ? parserResult.tokens
-        : null),
-    sourceText,
-  );
+  setupExternalSourceForFile(sourceText, program, hasBOM, sourceFlags);
+  const normalizedComments = setupExternalCommentsForFile(commentsInput, sourceText);
+  const normalizedTokens = setupExternalTokensForFile(tokensInput, sourceText);
   program.comments = normalizedComments;
   program.tokens = normalizedTokens;
   setParserMetadataForFile({ visitorKeys, parserServices, scopeManager });
@@ -349,6 +403,8 @@ export function lintFileImpl(
   const parser = resolvedLanguageOptions?.parser ?? null;
   const parserOptions =
     (resolvedLanguageOptions?.parserOptions as Record<string, unknown> | null | undefined) ?? null;
+  const resolvedEcmaVersion = resolvedLanguageOptions?.ecmaVersion ?? parserOptions?.ecmaVersion;
+  setEcmaVersion(resolvedEcmaVersion);
   setParserForFile(
     parser,
     parserOptions,
@@ -362,16 +418,30 @@ export function lintFileImpl(
   //
   // But... source text and AST can be accessed in body of `create` method, or `before` hook, via `context.sourceCode`.
   // So we pass the buffer to source code module here, so it can decode source text / deserialize AST on demand.
-  const hasBOM = sourceText === null ? buffer[HAS_BOM_FLAG_POS] === 1 : sourceText.charCodeAt(0) === 0xfeff;
+  const hasBOM =
+    sourceText === null ? buffer[HAS_BOM_FLAG_POS] === 1 : sourceText.charCodeAt(0) === 0xfeff;
+  const normalizedExternalSourceText =
+    sourceText !== null && hasBOM ? sourceText.slice(1) : sourceText;
   if (sourceText === null) {
     setupSourceForFile(buffer, hasBOM);
   } else {
-    setupExternalParserSource(filePath, parser, parserOptions, sourceText, hasBOM);
+    setupExternalParserSource(
+      filePath,
+      parser,
+      parserOptions,
+      resolvedLanguageOptions?.sourceType,
+      resolvedEcmaVersion,
+      normalizedExternalSourceText,
+      hasBOM,
+    );
   }
 
   // Pass settings and globals JSON to modules that handle them
   setSettingsForFile(settingsJSON);
   setGlobalsForFile(globalsJSON);
+
+  const isWholeFileCustomParserRun = sourceText !== null;
+  const externalVisitors: VisitorObject[] | null = isWholeFileCustomParserRun ? [] : null;
 
   // Get visitors for this file from all rules
   for (let i = 0, len = ruleIds.length; i < len; i++) {
@@ -411,34 +481,52 @@ export function lintFileImpl(
       if (afterHook !== null) afterHooks.push(afterHook);
     }
 
-    addVisitorToCompiled(visitor);
+    if (externalVisitors !== null) {
+      externalVisitors.push(visitor);
+    } else {
+      addVisitorToCompiled(visitor);
+    }
   }
 
-  const visitorState = finalizeCompiledVisitor();
+  if (externalVisitors !== null) {
+    const compiledExternalVisitor = compileExternalVisitors(externalVisitors);
 
-  // Visit AST.
-  // Skip this if no visitors visit any nodes.
-  // Some rules seen in the wild return an empty visitor object from `create` if some initial check fails
-  // e.g. file extension is not one the rule acts on.
-  if (visitorState !== VISITOR_EMPTY) {
-    if (ast === null) initAst();
-    debugAssertIsNonNull(ast);
+    // Visit AST.
+    // Skip this if no visitors visit any nodes.
+    // Some rules seen in the wild return an empty visitor object from `create` if some initial check fails
+    // e.g. file extension is not one the rule acts on.
+    if (compiledExternalVisitor !== null) {
+      if (ast === null) initAst();
+      debugAssertIsNonNull(ast);
 
-    debugAssert(ancestors.length === 0, "`ancestors` should be empty before walking AST");
-
-    if (visitorState === VISITOR_CFG) {
-      if (sourceText !== null) {
-        throw new Error("CFG listeners are not supported with whole-file custom parsers yet");
-      }
-      walkProgramWithCfg(ast, compiledVisitor);
-    } else {
-      walkProgram(ast, compiledVisitor as (VisitFn | EnterExit | null)[]);
+      debugAssert(ancestors.length === 0, "`ancestors` should be empty before walking AST");
+      walkExternalProgram(ast, compiledExternalVisitor);
+      debugAssert(ancestors.length === 0, "`ancestors` should be empty after walking AST");
     }
+  } else {
+    const visitorState = finalizeCompiledVisitor();
 
-    debugAssert(ancestors.length === 0, "`ancestors` should be empty after walking AST");
+    // Visit AST.
+    // Skip this if no visitors visit any nodes.
+    // Some rules seen in the wild return an empty visitor object from `create` if some initial check fails
+    // e.g. file extension is not one the rule acts on.
+    if (visitorState !== VISITOR_EMPTY) {
+      if (ast === null) initAst();
+      debugAssertIsNonNull(ast);
 
-    // Reset compiled visitor, ready for next file
-    resetCompiledVisitor();
+      debugAssert(ancestors.length === 0, "`ancestors` should be empty before walking AST");
+
+      if (visitorState === VISITOR_CFG) {
+        walkProgramWithCfg(ast, compiledVisitor);
+      } else {
+        walkProgram(ast, compiledVisitor as (VisitFn | EnterExit | null)[]);
+      }
+
+      debugAssert(ancestors.length === 0, "`ancestors` should be empty after walking AST");
+
+      // Reset compiled visitor, ready for next file
+      resetCompiledVisitor();
+    }
   }
 
   // Run any `after` hooks
@@ -494,6 +582,7 @@ function runAfterHooks(shouldThrowIfError: boolean) {
  */
 export function resetFile() {
   resetFileContext();
+  resetEcmaVersion();
   resetParserForFile();
   resetSourceAndAst();
   resetSettings();

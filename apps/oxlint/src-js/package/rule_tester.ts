@@ -12,7 +12,12 @@ import { join as pathJoin, isAbsolute as isAbsolutePath, dirname } from "node:pa
 import util from "node:util";
 import stableJsonStringify from "json-stable-stringify-without-jsonify";
 import { applyFixes } from "../bindings.js";
-import { ecmaFeaturesOverride, setEcmaVersion, ECMA_VERSION, setParserForFile } from "../plugins/context.ts";
+import {
+  ecmaFeaturesOverride,
+  setEcmaVersion,
+  normalizeEcmaVersionForLanguageOptions,
+  setParserForFile,
+} from "../plugins/context.ts";
 import { registerPlugin, registeredRules } from "../plugins/load.ts";
 import { lintFileImpl, resetStateAfterError } from "../plugins/lint.ts";
 import { createRequiredParserCallOptions } from "../plugins/parser_call_options.ts";
@@ -1474,13 +1479,12 @@ function getParserCallOptions(
   parseOptions: ParseOptions,
   path: string,
 ): Record<string, unknown> {
-  const parserOptions = { ...(languageOptions?.parserOptions ?? {}) } as Record<string, unknown>;
-
-  if (parseOptions.sourceType != null && parserOptions.sourceType == null) {
-    parserOptions.sourceType = parseOptions.sourceType;
-  }
-
-  return createRequiredParserCallOptions(path, parserOptions);
+  return createRequiredParserCallOptions(
+    path,
+    languageOptions?.parserOptions as Record<string, unknown> | null | undefined,
+    parseOptions.sourceType,
+    languageOptions?.ecmaVersion,
+  );
 }
 
 function getParserMetadata(
@@ -1595,13 +1599,7 @@ function setEcmaVersionAndFeatures(test: TestCase) {
   // In ESLint, the branch for `undefined` is actually dead code, because `undefined` is replaced by default value
   // in an early step of config parsing.
   const languageOptions = test.languageOptions as LanguageOptionsInternal | undefined;
-  let ecmaVersion = languageOptions?.ecmaVersion;
-
-  if (typeof ecmaVersion === "number") {
-    if (ecmaVersion > 5 && ecmaVersion < 2015) ecmaVersion += 2009;
-  } else {
-    ecmaVersion = ECMA_VERSION;
-  }
+  const ecmaVersion = normalizeEcmaVersionForLanguageOptions(languageOptions?.ecmaVersion);
   setEcmaVersion(ecmaVersion);
 
   // Set `globalReturn` and `impliedStrict` in scope analyzer options

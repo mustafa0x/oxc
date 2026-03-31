@@ -662,6 +662,7 @@ impl ConfigStoreBuilder {
                     files: override_config.files,
                     env: override_config.env,
                     globals: override_config.globals,
+                    settings: override_config.settings,
                     plugins: override_config.plugins,
                     language_options_id: override_config.language_options_id,
                     language_options_has_parser: override_config.language_options_has_parser,
