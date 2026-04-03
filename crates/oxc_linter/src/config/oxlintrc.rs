@@ -21,6 +21,12 @@ use super::{
     settings::OxlintSettings,
 };
 
+#[derive(Debug, Clone)]
+pub enum OxlintrcExtendsEntry {
+    Path(PathBuf),
+    Config(Oxlintrc),
+}
+
 /// Options for the linter.
 #[derive(Debug, Default, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
@@ -282,6 +288,13 @@ pub struct Oxlintrc {
     #[serde(skip)]
     #[schemars(skip)]
     pub extends_configs: Vec<Oxlintrc>,
+    /// Ordered `extends` entries (string paths and inline objects) from `oxlint.config.ts`.
+    ///
+    /// JSON configs only populate `extends`; this field is reserved for JS loader internals so
+    /// mixed extends order can be preserved.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub extends_entries: Vec<OxlintrcExtendsEntry>,
 }
 
 impl Oxlintrc {
@@ -415,6 +428,7 @@ impl Oxlintrc {
             ignore_patterns: self.ignore_patterns.clone(),
             extends: self.extends.clone(),
             extends_configs: self.extends_configs.clone(),
+            extends_entries: self.extends_entries.clone(),
         }
     }
 
@@ -448,6 +462,11 @@ impl Oxlintrc {
         for config in &mut self.extends_configs {
             config.set_config_dir(config_dir);
         }
+        for entry in &mut self.extends_entries {
+            if let OxlintrcExtendsEntry::Config(config) = entry {
+                config.set_config_dir(config_dir);
+            }
+        }
     }
 }
 
@@ -460,7 +479,12 @@ mod test {
     use rustc_hash::FxHashSet;
     use serde_json::json;
 
-    use crate::config::{external_plugins::ExternalPluginEntry, plugins::LintPlugins};
+    use crate::{
+        RuleCategory,
+        config::{
+            categories::CategoryConfig, external_plugins::ExternalPluginEntry, plugins::LintPlugins,
+        },
+    };
 
     use super::*;
 
@@ -567,6 +591,68 @@ mod test {
         let config: Result<Oxlintrc, _> =
             serde_json::from_value(json!({ "reportUnusedDisableDirectives": "warn" }));
         assert!(config.is_err());
+    }
+
+    #[test]
+    fn test_oxlintrc_deserializes_recommended_categories() {
+        let config: Oxlintrc = serde_json::from_value(json!({
+            "categories": {
+                "suspicious": "recommended"
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(
+            config.categories.get(&RuleCategory::Suspicious),
+            Some(&CategoryConfig::Recommended)
+        );
+    }
+
+    #[test]
+    fn test_oxlintrc_merge_categories_preserves_recommended() {
+        let mut root: Oxlintrc = serde_json::from_value(json!({
+            "categories": {
+                "suspicious": "recommended"
+            }
+        }))
+        .unwrap();
+        root.path = PathBuf::from("/root/.oxlintrc.json");
+
+        let mut base: Oxlintrc = serde_json::from_value(json!({
+            "categories": {
+                "correctness": "deny",
+                "suspicious": "warn"
+            }
+        }))
+        .unwrap();
+        base.path = PathBuf::from("/root/base.json");
+
+        let merged = root.merge(base);
+        assert_eq!(
+            merged.categories.get(&RuleCategory::Suspicious),
+            Some(&CategoryConfig::Recommended)
+        );
+        assert_eq!(
+            merged.categories.get(&RuleCategory::Correctness),
+            Some(&CategoryConfig::Severity(AllowWarnDeny::Deny))
+        );
+
+        let mut root: Oxlintrc = serde_json::from_value(json!({})).unwrap();
+        root.path = PathBuf::from("/root/.oxlintrc.json");
+
+        let mut base: Oxlintrc = serde_json::from_value(json!({
+            "categories": {
+                "suspicious": "recommended"
+            }
+        }))
+        .unwrap();
+        base.path = PathBuf::from("/root/base.json");
+
+        let merged = root.merge(base);
+        assert_eq!(
+            merged.categories.get(&RuleCategory::Suspicious),
+            Some(&CategoryConfig::Recommended)
+        );
     }
 
     #[test]

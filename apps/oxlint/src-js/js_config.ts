@@ -53,16 +53,14 @@ function validateConfigExtends(root: object): void {
     const maybeExtends = (config as Record<string, unknown>).extends;
     if (maybeExtends !== undefined) {
       if (!Array.isArray(maybeExtends)) {
-        throw new Error(
-          "`extends` must be an array of config objects (strings/paths are not supported).",
-        );
+        throw new Error("`extends` must be an array of config objects or strings.");
       }
       for (let i = 0; i < maybeExtends.length; i++) {
         const item = maybeExtends[i];
+        if (typeof item === "string") continue;
+
         if (!isObject(item)) {
-          throw new Error(
-            `\`extends[${i}]\` must be a config object (strings/paths are not supported).`,
-          );
+          throw new Error(`\`extends[${i}]\` must be a config object or string.`);
         }
 
         const itemPath = `${path}.extends[${i}]`;
