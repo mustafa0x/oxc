@@ -11,7 +11,7 @@ mod rsvelte_backend {
     use oxc_span::Span;
     use svelte_compiler_rust::{
         CompileOptions, GenerateMode, ParseOptions,
-        ast::{Fragment, Script, ScriptContext, TemplateNode, arena::SerializeArenaGuard},
+        ast::{Fragment, Root, Script, ScriptContext, TemplateNode, arena::SerializeArenaGuard},
         compiler::phases::phase2_analyze::{AnalysisError, analyze_component},
         compiler::phases::phase3_transform::{TransformError, transform_component},
         error::ParseError,
@@ -129,6 +129,49 @@ mod rsvelte_backend {
         // SAFETY: `root.arena` lives until the guard is dropped at the end of this function.
         let _arena_guard = unsafe { SerializeArenaGuard::new(&raw const root.arena) };
 
+        let mut result = build_parse_result(source, &root);
+
+        let compile_options = CompileOptions {
+            generate: GenerateMode::None,
+            enable_sourcemap: false,
+            ..CompileOptions::default()
+        };
+        let analysis = analyze_component(&mut root, source, &compile_options)
+            .map_err(|error| convert_analysis_error(source, &error))?;
+        let transform = transform_component(&analysis, &root, source, &compile_options)
+            .map_err(|error| convert_transform_error(source, &error))?;
+
+        result.warnings = transform
+            .warnings
+            .into_iter()
+            .map(|warning| {
+                let start = warning.start.unwrap_or(0);
+                let end = warning.end.unwrap_or(start).max(start);
+                SvelteParseWarning {
+                    code: warning.code,
+                    message: warning.message,
+                    range: SvelteSourceRange::new(source, start, end),
+                }
+            })
+            .collect();
+
+        Ok(result)
+    }
+
+    /// Parse Svelte syntax without running rsvelte's analysis and transform phases.
+    ///
+    /// This path extracts scripts and comments for linting while leaving Svelte compiler
+    /// diagnostics to configured lint rules.
+    pub fn parse_svelte_syntax(source: &str) -> Result<SvelteParseResult, SvelteParseError> {
+        let root = parse(source, ParseOptions::default())
+            .map_err(|error| convert_parse_error(source, &error))?;
+        // SAFETY: `root.arena` lives until the guard is dropped at the end of this function.
+        let _arena_guard = unsafe { SerializeArenaGuard::new(&raw const root.arena) };
+
+        Ok(build_parse_result(source, &root))
+    }
+
+    fn build_parse_result(source: &str, root: &Root) -> SvelteParseResult {
         let mut scripts = Vec::with_capacity(2);
         if let Some(script) = root.module.as_deref() {
             scripts.push(convert_script(source, SvelteScriptKind::Module, script));
@@ -157,34 +200,12 @@ mod rsvelte_backend {
         collect_html_comments(source, &root.fragment, &mut comments);
         comments.sort_by_key(|comment| comment.range.span.start);
 
-        let compile_options = CompileOptions {
-            generate: GenerateMode::None,
-            enable_sourcemap: false,
-            ..CompileOptions::default()
-        };
-        let analysis = analyze_component(&mut root, source, &compile_options)
-            .map_err(|error| convert_analysis_error(source, &error))?;
-        let transform = transform_component(&analysis, &root, source, &compile_options)
-            .map_err(|error| convert_transform_error(source, &error))?;
-
-        Ok(SvelteParseResult {
+        SvelteParseResult {
             scripts,
             comments,
-            warnings: transform
-                .warnings
-                .into_iter()
-                .map(|warning| {
-                    let start = warning.start.unwrap_or(0);
-                    let end = warning.end.unwrap_or(start).max(start);
-                    SvelteParseWarning {
-                        code: warning.code,
-                        message: warning.message,
-                        range: SvelteSourceRange::new(source, start, end),
-                    }
-                })
-                .collect(),
+            warnings: Vec::new(),
             top_level_node_count: root.fragment.nodes.len(),
-        })
+        }
     }
 
     /// Parse Svelte source with rsvelte and return a minimal Oxc-facing summary.
@@ -439,7 +460,7 @@ mod rsvelte_backend {
     mod tests {
         use super::{
             SvelteCommentKind, SvelteScriptKind, format_svelte, format_svelte_with_options,
-            parse_svelte, parse_svelte_summary,
+            parse_svelte, parse_svelte_summary, parse_svelte_syntax,
         };
 
         #[test]
@@ -584,6 +605,22 @@ let count:number=1;
         }
 
         #[test]
+        fn syntax_parse_does_not_emit_analysis_diagnostics() {
+            let source = r#"<svelte:component foo="bar"/>"#;
+            let parsed = parse_svelte_syntax(source).expect("Svelte syntax should parse");
+
+            assert!(parsed.warnings.is_empty());
+        }
+
+        #[test]
+        fn formats_snippet_parameter_with_default() {
+            let source = "{#snippet child(label = '')}{label}{/snippet}";
+            let formatted = format_svelte(source).expect("Svelte snippet should format");
+
+            parse_svelte_syntax(&formatted).expect("formatted Svelte snippet should reparse");
+        }
+
+        #[test]
         fn parse_error_includes_code_and_range() {
             let source = r#"<script context="not-module"></script>"#;
             let error = parse_svelte(source).expect_err("Svelte source should fail to parse");
@@ -600,5 +637,5 @@ pub use rsvelte_backend::{
     SvelteComment, SvelteCommentKind, SvelteParseError, SvelteParseResult, SvelteParseSummary,
     SvelteParseWarning, SvelteScript, SvelteScriptKind, SvelteSourcePosition, SvelteSourceRange,
     format_svelte, format_svelte_with_options, format_svelte_with_options_and_indent, parse_svelte,
-    parse_svelte_summary,
+    parse_svelte_summary, parse_svelte_syntax,
 };

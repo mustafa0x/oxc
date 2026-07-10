@@ -392,11 +392,9 @@ fn push_pattern_at_span(
 }
 
 /// Format a destructuring pattern. Patterns like `{a, b = 1}`,
-/// `[a, ...rest]`, or `{ a: { b } }` aren't valid as bare expressions
-/// (object literals can't carry default values), so we wrap them in a
-/// `let PATTERN = $$;` declaration and parse the whole thing as a
-/// Program. The formatted declaration is then sliced back down to just
-/// the pattern body.
+/// `[a, ...rest]`, or `{ a: { b } }` aren't valid as bare expressions,
+/// so we wrap them as a function parameter and parse the whole program.
+/// Function parameters also support defaults used by Svelte snippets.
 ///
 /// We force `line_width` to its maximum so nested patterns stay on one
 /// line — multi-line patterns inside `{#each as ...}` would land
@@ -405,11 +403,11 @@ pub(crate) fn format_pattern_source(
     pattern_source: &str,
     options: &FormatOptions,
 ) -> Result<String, FormatError> {
-    const SENTINEL: &str = "__rsvelte_fmt_rhs__";
+    const FUNCTION_NAME: &str = "__rsvelte_fmt_pattern__";
     let allocator = Allocator::default();
     let source_type = SourceType::ts().with_module(true);
 
-    let wrapped = format!("let {pattern_source} = {SENTINEL};");
+    let wrapped = format!("function {FUNCTION_NAME}({pattern_source}) {{}}");
 
     // Build a single-line copy of JsFormatOptions for this pattern only.
     // Setting `expand = Never` plus a very wide `line_width` keeps even
@@ -428,17 +426,13 @@ pub(crate) fn format_pattern_source(
             .map_err(|err| FormatError::ScriptParse(format!("{err:?}")))?
             .into_code();
 
-    // Output shape: `let <pattern> = __rsvelte_fmt_rhs__;\n`. Strip the
-    // leading `let ` and the trailing ` = __rsvelte_fmt_rhs__;` so we
-    // are left with the formatted pattern.
+    // Output shape: `function __rsvelte_fmt_pattern__(<pattern>) {}`.
     let s = formatted.trim_end();
-    let stripped_prefix = s.strip_prefix("let ").unwrap_or(s);
-    let suffix = format!(" = {SENTINEL};");
-    let suffix_without_semi = format!(" = {SENTINEL}");
-    let pattern = stripped_prefix
-        .strip_suffix(&suffix)
-        .or_else(|| stripped_prefix.strip_suffix(&suffix_without_semi))
-        .unwrap_or(stripped_prefix);
+    let prefix = format!("function {FUNCTION_NAME}(");
+    let pattern = s
+        .strip_prefix(&prefix)
+        .and_then(|body| body.strip_suffix(") {}"))
+        .unwrap_or(pattern_source);
     let candidate = pattern.trim().to_string();
 
     // Some patterns (deeply nested destructuring) get hard-wrapped by

@@ -27,7 +27,7 @@ use oxc_semantic::{Semantic, SemanticBuilder};
 use oxc_span::{SourceType, VALID_EXTENSIONS};
 use oxc_str::CompactStr;
 #[cfg(feature = "svelte-rsvelte-backend")]
-use oxc_svelte_backend::{SvelteCommentKind, parse_svelte};
+use oxc_svelte_backend::{SvelteCommentKind, parse_svelte_syntax};
 
 use crate::{
     AllowWarnDeny, Fixer, Linter, Message, MessageRule, PossibleFixes, RuleTimingStore,
@@ -1380,11 +1380,8 @@ impl Runtime {
         #[cfg(feature = "svelte-rsvelte-backend")]
         let mut svelte_section_sources = None;
         #[cfg(feature = "svelte-rsvelte-backend")]
-        let mut svelte_diagnostics = None;
-
-        #[cfg(feature = "svelte-rsvelte-backend")]
         if ext == "svelte" {
-            let parsed = parse_svelte(source_text);
+            let parsed = parse_svelte_syntax(source_text);
             let respect_eslint_disable_directives = self.linter.respect_eslint_disable_directives();
             full_file_disable_directives = match parsed.as_ref() {
                 Ok(parsed) => Self::build_svelte_html_disable_directives(
@@ -1404,20 +1401,6 @@ impl Runtime {
 
             match parsed {
                 Ok(parsed) => {
-                    let diagnostics = parsed
-                        .warnings
-                        .iter()
-                        .map(|warning| {
-                            OxcDiagnostic::warn(warning.message.clone())
-                                .with_error_code("svelte", warning.code.clone())
-                                .with_label(
-                                    warning.range.span.primary_label("Svelte compiler warning"),
-                                )
-                        })
-                        .collect::<Vec<_>>();
-                    if !diagnostics.is_empty() {
-                        svelte_diagnostics = Some(diagnostics);
-                    }
                     svelte_section_sources =
                         Some(SveltePartialLoader::parse_scripts_from_result(source_text, &parsed));
                 }
@@ -1463,17 +1446,6 @@ impl Runtime {
         let mut section_module_records = SmallVec::<
             [Result<ResolvedModuleRecord, Vec<OxcDiagnostic>>; 1],
         >::with_capacity(section_sources.len());
-        #[cfg(feature = "svelte-rsvelte-backend")]
-        if let Some(diagnostics) = svelte_diagnostics {
-            if let Some(sections) = &mut out_sections {
-                sections.push(SectionContent {
-                    source: JavaScriptSource::partial(source_text, source_type, 0),
-                    semantic: None,
-                    parser_tokens: ArenaBox::new_empty_boxed_slice(),
-                });
-            }
-            section_module_records.push(Err(diagnostics));
-        }
         for section_source in section_sources {
             match self.process_source_section(
                 path,

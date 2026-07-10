@@ -1241,12 +1241,11 @@ mod test {
 
     #[cfg(feature = "svelte-rsvelte-backend")]
     #[test]
-    fn lint_svelte_compiler_warning_with_rsvelte_backend() {
+    fn lint_svelte_compiler_warning_is_not_emitted_unconditionally() {
         let output =
             Tester::new().test_output_verbose(&["fixtures/cli/svelte/a11y-warning.svelte"]);
 
-        assert!(output.contains("svelte(a11y_invalid_attribute)"));
-        assert!(output.contains("'javascript:void(0)' is not a valid href attribute"));
+        assert!(!output.contains("svelte(a11y_invalid_attribute)"));
     }
 
     #[cfg(feature = "svelte-rsvelte-backend")]
@@ -1260,12 +1259,11 @@ mod test {
 
     #[cfg(feature = "svelte-rsvelte-backend")]
     #[test]
-    fn lint_svelte_analysis_error_with_rsvelte_backend() {
+    fn lint_svelte_analysis_error_is_not_emitted_unconditionally() {
         let output =
             Tester::new().test_output_verbose(&["fixtures/cli/svelte/analysis-error.svelte"]);
 
-        assert!(output.contains("svelte(svelte_component_missing_this)"));
-        assert!(output.contains("must have a 'this' attribute"));
+        assert!(!output.contains("svelte(svelte_component_missing_this)"));
     }
 
     #[cfg(feature = "svelte-rsvelte-backend")]

@@ -3,7 +3,7 @@ use memchr::memmem::{Finder, FinderRev};
 
 use oxc_span::SourceType;
 #[cfg(feature = "svelte-rsvelte-backend")]
-use oxc_svelte_backend::{SvelteParseResult, parse_svelte};
+use oxc_svelte_backend::{SvelteParseResult, parse_svelte_syntax};
 
 use crate::loader::JavaScriptSource;
 
@@ -28,7 +28,7 @@ impl<'a> SveltePartialLoader<'a> {
 
     #[cfg(feature = "svelte-rsvelte-backend")]
     fn parse_scripts(&self) -> Vec<JavaScriptSource<'a>> {
-        let Ok(parsed) = parse_svelte(self.source_text) else {
+        let Ok(parsed) = parse_svelte_syntax(self.source_text) else {
             return vec![];
         };
 
