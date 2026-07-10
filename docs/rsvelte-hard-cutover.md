@@ -3,8 +3,9 @@
 Date: 2026-07-10
 
 Status: latest rsvelte source integrated and Kunuz acceptance complete on the
-`svelte` branch. Full Rust and Node/NAPI build and test verification passes. The
-branch remains local and must not be pushed until explicitly requested.
+`svelte` branch. Full Rust and Node/NAPI build and test verification passes.
+Fork packages `@mustafaj/oxlint@1.73.0-svelte.4` and
+`@mustafaj/oxfmt@0.58.0-svelte.4` are published under the `svelte` dist-tag.
 
 Repos:
 
@@ -675,19 +676,18 @@ same checkout, configuration, arguments, and file sets:
 - Oxlint `1.73.0` linted the same 133 files in 665 ms on average, versus 1.60 s
   for Oxlint `1.59.0` (2.4x faster); both produced zero diagnostics.
 
-The current packages used the coverage build profile for these measurements,
-while the installed previous packages were release builds. Native release
-artifacts should therefore be measured again after publication, but the result
-already rules out a performance regression from the rsvelte adapter.
+The published `-svelte.4` release artifacts repeated the comparison at 3.9x
+faster for Oxfmt and 2.3x faster for Oxlint. Run-to-run variation affects the
+exact ratio, but both coverage and release measurements rule out a performance
+regression from the rsvelte adapter.
 
 ## Release follow-up
 
-1. Keep the completed commit stack local until a push is explicitly requested.
-2. On the first requested publish run, confirm the native Windows runner loads
+1. On a Windows consumer, confirm the native Windows runner loads
    the binding in Node; local verification can build and inspect the PE artifact
    but cannot execute it.
-3. Use the normal fork publish workflow and inspect the resulting package set
-   before assigning the requested npm dist-tag.
+2. Migrate consumers through the `svelte` dist-tag before promoting a release
+   to `latest`.
 
 ## Hard cutover exit criteria
 
