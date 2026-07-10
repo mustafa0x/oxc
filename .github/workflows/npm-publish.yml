@@ -116,8 +116,6 @@ jobs:
         if: ${{ contains(format(',{0},', inputs.packages), format(',{0},', matrix.package)) }}
 
       - if: ${{ contains(format(',{0},', inputs.packages), format(',{0},', matrix.package)) }}
-        run: npm install -g npm@latest
-      - if: ${{ contains(format(',{0},', inputs.packages), format(',{0},', matrix.package)) }}
         run: pnpm install --frozen-lockfile
       - if: ${{ contains(format(',{0},', inputs.packages), format(',{0},', matrix.package)) }}
         run: pnpm -C ${{ matrix.app_dir }} run build-js
