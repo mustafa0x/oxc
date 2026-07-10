@@ -1,0 +1,23 @@
+[package]
+name = "rsvelte_esrap"
+version = "0.7.11"
+edition = "2024"
+rust-version = "1.90"
+description = "A Rust port of esrap — prints an oxc AST to JavaScript with esrap's exact layout"
+license = "MIT"
+repository = "https://github.com/baseballyama/rsvelte"
+homepage = "https://github.com/baseballyama/rsvelte"
+keywords = ["svelte", "compiler", "esrap", "printer"]
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+oxc_allocator = { path = "../../../../crates/oxc_allocator" }
+oxc_ast = { path = "../../../../crates/oxc_ast" }
+oxc_span = { path = "../../../../crates/oxc_span" }
+oxc_syntax = { path = "../../../../crates/oxc_syntax" }
+
+[dev-dependencies]
+oxc_parser = { path = "../../../../crates/oxc_parser" }
+oxc_ast_visit = { path = "../../../../crates/oxc_ast_visit" }

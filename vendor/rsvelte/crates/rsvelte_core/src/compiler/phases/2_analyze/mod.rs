@@ -76,21 +76,27 @@ pub fn analyze_component(
         return Err(parse_err.into());
     }
 
-    if let Some(ref mut instance) = ast.instance {
-        crate::compiler::phases::phase1_parse::read::script::ensure_script_parsed(
-            &ast.arena,
-            instance,
-            source,
-            &line_offsets,
-        );
+    if let Some(ref mut instance) = ast.instance
+        && let Some(parse_err) =
+            crate::compiler::phases::phase1_parse::read::script::ensure_script_parsed(
+                &ast.arena,
+                instance,
+                source,
+                &line_offsets,
+            )
+    {
+        return Err(parse_err.into());
     }
-    if let Some(ref mut module) = ast.module {
-        crate::compiler::phases::phase1_parse::read::script::ensure_script_parsed(
-            &ast.arena,
-            module,
-            source,
-            &line_offsets,
-        );
+    if let Some(ref mut module) = ast.module
+        && let Some(parse_err) =
+            crate::compiler::phases::phase1_parse::read::script::ensure_script_parsed(
+                &ast.arena,
+                module,
+                source,
+                &line_offsets,
+            )
+    {
+        return Err(parse_err.into());
     }
 
     let mut analysis = ComponentAnalysis::new(source, options);
@@ -139,17 +145,61 @@ pub fn analyze_component(
     if let Some(ref svelte_options) = ast.options
         && let Some(ref ce_opts) = svelte_options.custom_element
     {
+        // Extract the `extend` option's source text. When the component uses
+        // TypeScript, strip type annotations (mirrors compiler/index.js lines
+        // 49-53: `remove_typescript_nodes(customElementOptions.extend)`).
+        let extend = ce_opts.extend.as_ref().and_then(|expr| {
+            let json = expr.as_json();
+            let start = json.get("start")?.as_u64()? as usize;
+            let end = json.get("end")?.as_u64()? as usize;
+            let text = source.get(start..end)?.to_string();
+            let is_ts = |script: &Option<Box<crate::ast::Script>>| {
+                script.as_ref().is_some_and(|s| {
+                    s.attributes.iter().any(|attr| {
+                        attr.name.as_str() == "lang"
+                            && matches!(
+                                &attr.value,
+                                crate::ast::AttributeValue::Sequence(parts)
+                                    if matches!(
+                                        parts.first(),
+                                        Some(crate::ast::AttributeValuePart::Text(t))
+                                            if t.data.as_str() == "ts" || t.data.as_str() == "typescript"
+                                    )
+                            )
+                    })
+                })
+            };
+            if is_ts(&ast.instance) || is_ts(&ast.module) {
+                Some(types::strip_typescript(&text))
+            } else {
+                Some(text)
+            }
+        });
+        // ShadowRootInit object form (`shadow: { mode: 'open', ... }`):
+        // upstream passes the AST through to `create_custom_element`
+        // (transform-client.js line 641: `shadow_root_init = ce.shadow`).
+        let shadow_object_source = ce_opts.shadow_object.as_ref().and_then(|obj| {
+            let start = obj.get("start")?.as_u64()? as usize;
+            let end = obj.get("end")?.as_u64()? as usize;
+            Some(source.get(start..end)?.to_string())
+        });
         analysis.custom_element = Some(types::CustomElementConfig {
             tag: ce_opts.tag.as_ref().map(|t| t.to_string()),
             shadow: ce_opts.shadow.map(|s| match s {
                 crate::ast::template::ShadowMode::Open => "open".to_string(),
                 crate::ast::template::ShadowMode::None => "none".to_string(),
             }),
+            shadow_object_source,
             props: ce_opts.props.clone(),
+            extend,
         });
         // Custom elements always inject styles (into shadow DOM)
         // Reference: analyze/index.js line 527: inject_styles: options.css === 'injected' || is_custom_element
         analysis.inject_styles = true;
+        // Custom elements always get accessors so that props are reflected as
+        // element properties. Reference: analyze/index.js lines 536-540:
+        // accessors: is_custom_element || (runes ? false : !!options.accessors) || ...
+        analysis.accessors = true;
     }
 
     // Check for options_missing_custom_element warning
@@ -218,16 +268,17 @@ pub fn analyze_component(
     let fragment_results = fragment_check_features(&ast.fragment, &ast.arena, &store_sub_names);
 
     // Check the instance script for both await expressions and rune references
-    // in a single traversal. For script checks, we use an empty set for store_subs
-    // (scripts can have both runes and stores, but store_subs are created from
-    // template/instance references after scope building, so they are not relevant
-    // for script-level rune detection).
+    // in a single traversal. The store-sub exclusion set applies to scripts
+    // too: upstream deletes synthetic store-subscription names (e.g. `$state`
+    // when `state` is imported from a non-svelte module) from
+    // `module.scope.references` *before* runes detection reads it
+    // (2-analyze/index.js, `module.scope.references.delete(name)`), so a
+    // store-subscribed rune name in the script must not flip runes mode on.
     let (instance_has_await, instance_has_rune_reference) = ast
         .instance
         .as_ref()
         .map(|inst| {
-            let empty_subs: rustc_hash::FxHashSet<&str> = rustc_hash::FxHashSet::default();
-            let r = expression_check_features(&inst.content, &ast.arena, &empty_subs);
+            let r = expression_check_features(&inst.content, &ast.arena, &store_sub_names);
             (r.has_await, r.has_rune_reference)
         })
         .unwrap_or((false, false));
@@ -238,8 +289,7 @@ pub fn analyze_component(
         ast.module
             .as_ref()
             .map(|module| {
-                let empty_subs: rustc_hash::FxHashSet<&str> = rustc_hash::FxHashSet::default();
-                expression_check_features(&module.content, &ast.arena, &empty_subs)
+                expression_check_features(&module.content, &ast.arena, &store_sub_names)
                     .has_rune_reference
             })
             .unwrap_or(false)
@@ -386,6 +436,7 @@ pub fn analyze_component(
     // `binding.legacy_dependencies = Array.from(reactive_statement.dependencies)` is set.
     if !analysis.runes {
         populate_legacy_dependencies(ast, &mut analysis);
+        collect_reactive_statement_dependencies(ast, &mut analysis);
     }
 
     // Pre-compute legacy-pattern detection so template visitors (notably
@@ -396,9 +447,47 @@ pub fn analyze_component(
     // it's safe to call here.
     analysis.instance_has_legacy_patterns = instance_has_legacy_patterns(ast);
 
+    // Legacy mode: declare a synthetic `$$props` binding in the instance scope so
+    // template/script references to it (`$$props.class`) are recorded in
+    // expression metadata. Mirrors upstream `2-analyze/index.js`:
+    // `instance.scope.declare(b.id('$$props'), 'rest_prop', 'synthetic')`, done in
+    // the non-runes branch before the AST walks. Without it, a legacy reactive
+    // expression reading `$$props.class` omits the
+    // `$.deep_read_state($$sanitized_props)` dependency in `build_expression`.
+    //
+    // (`$$restProps` is intentionally NOT declared here: it is already handled by
+    // the existing rest-props path, and binding it would re-route a plain
+    // `$$restProps.x` read through the `$$sanitized_props` rewrite.)
+    if !analysis.runes {
+        use crate::compiler::phases::phase2_analyze::scope::{
+            Binding, BindingKind, DeclarationKind,
+        };
+        let instance_scope = analysis.root.instance_scope_index;
+        if analysis
+            .root
+            .get_binding("$$props", instance_scope)
+            .is_none()
+        {
+            let idx = analysis.root.bindings.len();
+            analysis.root.bindings.push(Binding::with_declaration_kind(
+                "$$props".to_string(),
+                BindingKind::RestProp,
+                DeclarationKind::Synthetic,
+                instance_scope,
+            ));
+            if let Some(scope) = analysis.root.all_scopes.get_mut(instance_scope) {
+                scope.declarations.insert("$$props".to_string(), idx);
+            }
+        }
+    }
+
     // Analyze the template using visitors.
     // Take a pointer to the arena to avoid borrow conflict with &mut ast.
     let arena_ptr = &ast.arena as *const crate::ast::arena::ParseArena;
+    // SAFETY: `arena_ptr` is derived from `&ast.arena`, which is alive for the
+    // rest of this function. The raw-pointer indirection only sidesteps the
+    // borrow checker so `&ast` can be passed mutably alongside; the arena field
+    // is never mutated through `&mut ast`, so there is no aliasing conflict.
     let arena_ref = unsafe { &*arena_ptr };
     visitors::analyze_template(ast, &mut analysis, arena_ref)?;
 
@@ -437,33 +526,6 @@ pub fn analyze_component(
                         }
                     }
                     continue;
-                }
-                // Raw fallback (statements with leadingComments)
-                if let JsNode::Raw(value) = stmt
-                    && value.get("type").and_then(|t| t.as_str()) == Some("ExportNamedDeclaration")
-                    && value.get("declaration").is_none_or(|d| d.is_null())
-                    && value.get("source").is_none_or(|s| s.is_null())
-                    && let Some(specifiers) = value.get("specifiers").and_then(|s| s.as_array())
-                {
-                    for specifier in specifiers {
-                        let Some(local) = specifier.get("local") else {
-                            continue;
-                        };
-                        if local.get("type").and_then(|t| t.as_str()) != Some("Identifier") {
-                            continue;
-                        }
-                        let Some(name) = local.get("name").and_then(|n| n.as_str()) else {
-                            continue;
-                        };
-                        if name.is_empty() {
-                            continue;
-                        }
-                        if !is_in_module_scope_or_hoisted(name, &analysis)
-                            && analysis.template.snippets.contains(name)
-                        {
-                            return Err(errors::snippet_invalid_export());
-                        }
-                    }
                 }
             }
         }
@@ -666,7 +728,7 @@ pub fn analyze_component(
         // properly considering combinators (>, space, +, ~).
         if !analysis.css.hash.is_empty() {
             let css_selectors = css_scoping::extract_css_selectors(stylesheet);
-            css_scoping::mark_elements_scoped(&mut ast.fragment, &css_selectors);
+            css_scoping::mark_elements_scoped(&mut ast.fragment, &css_selectors, Some(&analysis));
 
             // When a `@keyframes` rule contains a percentage step (`0%`, `50%`, ...),
             // the official Svelte css-prune walker visits the `Percentage` selector
@@ -732,8 +794,26 @@ pub fn analyze_component(
         if let Some(script) = ast.module.as_ref() {
             collect_identifier_names_from_expression(&script.content, &mut global_names);
         }
+        // Template expressions also produce references (`scope.reference()` is
+        // called on every identifier inside `{...}` mustaches, attribute values,
+        // directives and block heads). An unbound one (e.g. `{progress.current}`
+        // with no `let progress`) is a global and must enter `root.conflicts`.
+        collect_template_reference_names(&ast.fragment.nodes, &mut global_names);
         // Filter to only those NOT already declared (true globals/unbound).
         global_names.retain(|n| !used_names.contains(n.as_str()));
+
+        // Unbound (global) references at the top level are added to
+        // `scope.root.conflicts` by the official compiler's `scope.reference()`
+        // (scope.js: "no binding was found ... which means this is a global").
+        // Mirror that so generated template variables (e.g. a `<canvas>` local
+        // named `canvas`) avoid colliding with a referenced-but-undeclared global
+        // of the same name and get suffixed (`canvas_1`).
+        {
+            let mut conflicts = analysis.root.conflicts.borrow_mut();
+            for name in &global_names {
+                conflicts.insert(name.clone());
+            }
+        }
 
         let mut name = analysis.name.clone();
         let base = name.clone();
@@ -950,16 +1030,6 @@ fn instance_has_legacy_patterns(ast: &Root) -> bool {
                     }
                 }
             }
-            // Raw fallback: nodes that carry leadingComments arrive as Raw(Value)
-            JsNode::Raw(value) => match value.get("type").and_then(|v| v.as_str()) {
-                Some("LabeledStatement") => return true,
-                Some("ExportNamedDeclaration")
-                    if export_named_raw_has_legacy_let(value, *body, arena) =>
-                {
-                    return true;
-                }
-                _ => {}
-            },
             _ => {}
         }
     }
@@ -972,10 +1042,6 @@ fn matches_let_variable_declaration(node: &crate::ast::typed_expr::JsNode) -> bo
     use crate::ast::typed_expr::JsNode;
     match node {
         JsNode::VariableDeclaration { kind, .. } => kind == "let",
-        JsNode::Raw(value) => {
-            value.get("type").and_then(|t| t.as_str()) == Some("VariableDeclaration")
-                && value.get("kind").and_then(|k| k.as_str()) == Some("let")
-        }
         _ => false,
     }
 }
@@ -996,14 +1062,8 @@ fn instance_body_has_labeled_statement(ast: &Root) -> bool {
     };
     let arena = &ast.arena;
     for stmt in arena.get_js_children(*body) {
-        match stmt {
-            JsNode::LabeledStatement { .. } => return true,
-            JsNode::Raw(v)
-                if v.get("type").and_then(|t| t.as_str()) == Some("LabeledStatement") =>
-            {
-                return true;
-            }
-            _ => {}
+        if let JsNode::LabeledStatement { .. } = stmt {
+            return true;
         }
     }
     false
@@ -1032,44 +1092,8 @@ fn export_specifier_local_name<'a>(
             JsNode::Identifier { name, .. } => Some(name.as_str()),
             _ => None,
         },
-        JsNode::Raw(value) => value
-            .get("local")
-            .filter(|l| l.get("type").and_then(|t| t.as_str()) == Some("Identifier"))
-            .and_then(|l| l.get("name"))
-            .and_then(|n| n.as_str()),
         _ => None,
     }
-}
-
-/// Raw-variant handler for `ExportNamedDeclaration`. Returns true if it is
-/// either `export let ...` or `export { x }` where `x` is declared with `let`
-/// in `body`.
-fn export_named_raw_has_legacy_let(
-    value: &serde_json::Value,
-    body: crate::ast::arena::IdRange,
-    arena: &crate::ast::arena::ParseArena,
-) -> bool {
-    if let Some(decl) = value.get("declaration").filter(|d| !d.is_null())
-        && decl.get("type").and_then(|v| v.as_str()) == Some("VariableDeclaration")
-        && decl.get("kind").and_then(|v| v.as_str()) == Some("let")
-    {
-        return true;
-    }
-    let Some(specifiers) = value.get("specifiers").and_then(|s| s.as_array()) else {
-        return false;
-    };
-    for spec in specifiers {
-        if let Some(name) = spec
-            .get("local")
-            .filter(|l| l.get("type").and_then(|v| v.as_str()) == Some("Identifier"))
-            .and_then(|l| l.get("name"))
-            .and_then(|v| v.as_str())
-            && body_has_let_declaration_typed(body, name, arena)
-        {
-            return true;
-        }
-    }
-    false
 }
 
 /// Check if `body` contains a `let` declaration for the given name.
@@ -1090,32 +1114,6 @@ fn body_has_let_declaration_typed(
                         && id_name == name
                     {
                         return true;
-                    }
-                    // Raw fallback for declarators with leadingComments
-                    if let JsNode::Raw(v) = decl
-                        && v.get("id")
-                            .and_then(|id| id.get("name"))
-                            .and_then(|n| n.as_str())
-                            == Some(name)
-                    {
-                        return true;
-                    }
-                }
-            }
-            JsNode::Raw(v) => {
-                if v.get("type").and_then(|t| t.as_str()) == Some("VariableDeclaration")
-                    && v.get("kind").and_then(|k| k.as_str()) == Some("let")
-                    && let Some(decls) = v.get("declarations").and_then(|d| d.as_array())
-                {
-                    for decl in decls {
-                        if decl
-                            .get("id")
-                            .and_then(|id| id.get("name"))
-                            .and_then(|n| n.as_str())
-                            == Some(name)
-                        {
-                            return true;
-                        }
                     }
                 }
             }
@@ -1384,14 +1382,6 @@ fn process_legacy_exports(ast: &Root, analysis: &mut ComponentAnalysis) {
 
     let arena = &ast.arena;
     for stmt in arena.get_js_children(*body) {
-        // Raw fallback: nodes with leadingComments
-        if let JsNode::Raw(value) = stmt {
-            if value.get("type").and_then(|v| v.as_str()) == Some("ExportNamedDeclaration") {
-                analysis.needs_props = true;
-                process_legacy_export_raw(value, analysis);
-            }
-            continue;
-        }
         // Typed dispatch on ExportNamedDeclaration
         let JsNode::ExportNamedDeclaration {
             declaration,
@@ -1448,8 +1438,6 @@ fn process_legacy_exports(ast: &Root, analysis: &mut ComponentAnalysis) {
                             arena,
                             &mut identifiers,
                         );
-                    } else if let JsNode::Raw(v) = declarator {
-                        identifiers = extract_identifiers_from_pattern(v.get("id"));
                     }
                     if is_const {
                         for name in identifiers {
@@ -1464,11 +1452,6 @@ fn process_legacy_exports(ast: &Root, analysis: &mut ComponentAnalysis) {
                         }
                     }
                 }
-            }
-            JsNode::Raw(decl_value) => {
-                // Declaration is a Raw node (carries leadingComments). Fall back to
-                // the JSON helper for legacy handling.
-                process_legacy_export_declaration_raw(decl_value, analysis);
             }
             _ => {}
         }
@@ -1493,17 +1476,6 @@ fn export_specifier_local_exported<'a>(
                 JsNode::Identifier { name, .. } => Some(name.as_str()),
                 _ => None,
             };
-            (local_name, exported_name)
-        }
-        JsNode::Raw(value) => {
-            let local_name = value
-                .get("local")
-                .and_then(|v| v.get("name"))
-                .and_then(|v| v.as_str());
-            let exported_name = value
-                .get("exported")
-                .and_then(|v| v.get("name"))
-                .and_then(|v| v.as_str());
             (local_name, exported_name)
         }
         _ => (None, None),
@@ -1543,78 +1515,6 @@ fn apply_specifier_export(local: &str, exported: &str, analysis: &mut ComponentA
     }
 }
 
-/// Raw fallback for the whole `ExportNamedDeclaration` body of
-/// `process_legacy_exports`. Mirrors the JSON-walk logic when the
-/// outer statement arrives as `JsNode::Raw`.
-fn process_legacy_export_raw(value: &serde_json::Value, analysis: &mut ComponentAnalysis) {
-    let declaration = value.get("declaration");
-    if declaration.is_some_and(|d| d.is_null()) || declaration.is_none() {
-        if let Some(specifiers) = value.get("specifiers").and_then(|v| v.as_array()) {
-            for specifier in specifiers {
-                let local_name = specifier
-                    .get("local")
-                    .and_then(|v| v.get("name"))
-                    .and_then(|v| v.as_str());
-                let exported_name = specifier
-                    .get("exported")
-                    .and_then(|v| v.get("name"))
-                    .and_then(|v| v.as_str());
-                if let (Some(local), Some(exported)) = (local_name, exported_name) {
-                    apply_specifier_export(local, exported, analysis);
-                }
-            }
-        }
-        return;
-    }
-    let Some(declaration) = declaration else {
-        return;
-    };
-    process_legacy_export_declaration_raw(declaration, analysis);
-}
-
-/// Raw fallback for an `ExportNamedDeclaration.declaration` node.
-fn process_legacy_export_declaration_raw(
-    declaration: &serde_json::Value,
-    analysis: &mut ComponentAnalysis,
-) {
-    let decl_type = declaration.get("type").and_then(|v| v.as_str());
-    match decl_type {
-        Some("FunctionDeclaration") | Some("ClassDeclaration") => {
-            if let Some(name) = declaration
-                .get("id")
-                .and_then(|v| v.get("name"))
-                .and_then(|v| v.as_str())
-            {
-                analysis.exports.push(types::Export {
-                    name: name.to_string(),
-                    alias: None,
-                });
-            }
-        }
-        Some("VariableDeclaration") => {
-            let kind = declaration.get("kind").and_then(|v| v.as_str());
-            if let Some(declarations) = declaration.get("declarations").and_then(|v| v.as_array()) {
-                for declarator in declarations {
-                    let identifiers = extract_identifiers_from_pattern(declarator.get("id"));
-                    if kind == Some("const") {
-                        for name in identifiers {
-                            analysis.exports.push(types::Export { name, alias: None });
-                        }
-                    } else {
-                        for name in identifiers {
-                            if let Some(binding_idx) = analysis.root.find_binding_any_scope(&name) {
-                                analysis.root.bindings[binding_idx].kind =
-                                    BindingKind::BindableProp;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        _ => {}
-    }
-}
-
 /// Extract identifier names from a typed pattern (handles destructuring).
 fn extract_identifiers_from_pattern_typed(
     pattern: &crate::ast::typed_expr::JsNode,
@@ -1641,7 +1541,6 @@ fn extract_identifiers_from_pattern_typed(
                             out,
                         );
                     }
-                    JsNode::Raw(v) => out.extend(extract_identifiers_from_pattern(v.get("value"))),
                     _ => {}
                 }
             }
@@ -1657,56 +1556,8 @@ fn extract_identifiers_from_pattern_typed(
         JsNode::AssignmentPattern { left, .. } => {
             extract_identifiers_from_pattern_typed(arena.get_js_node(*left), arena, out);
         }
-        JsNode::Raw(v) => out.extend(extract_identifiers_from_pattern(Some(v))),
         _ => {}
     }
-}
-
-/// Extract identifier names from a pattern (handles destructuring).
-fn extract_identifiers_from_pattern(pattern: Option<&serde_json::Value>) -> Vec<String> {
-    let Some(pattern) = pattern else {
-        return Vec::new();
-    };
-
-    let mut identifiers = Vec::new();
-
-    match pattern.get("type").and_then(|v| v.as_str()) {
-        Some("Identifier") => {
-            if let Some(name) = pattern.get("name").and_then(|v| v.as_str()) {
-                identifiers.push(name.to_string());
-            }
-        }
-        Some("ObjectPattern") => {
-            if let Some(properties) = pattern.get("properties").and_then(|v| v.as_array()) {
-                for prop in properties {
-                    // Handle RestElement in object pattern
-                    if prop.get("type").and_then(|v| v.as_str()) == Some("RestElement") {
-                        identifiers.extend(extract_identifiers_from_pattern(prop.get("argument")));
-                    } else {
-                        identifiers.extend(extract_identifiers_from_pattern(prop.get("value")));
-                    }
-                }
-            }
-        }
-        Some("ArrayPattern") => {
-            if let Some(elements) = pattern.get("elements").and_then(|v| v.as_array()) {
-                for elem in elements {
-                    if !elem.is_null() {
-                        identifiers.extend(extract_identifiers_from_pattern(Some(elem)));
-                    }
-                }
-            }
-        }
-        Some("RestElement") => {
-            identifiers.extend(extract_identifiers_from_pattern(pattern.get("argument")));
-        }
-        Some("AssignmentPattern") => {
-            identifiers.extend(extract_identifiers_from_pattern(pattern.get("left")));
-        }
-        _ => {}
-    }
-
-    identifiers
 }
 
 /// Promote store underlying variables to 'state' if reassigned in legacy mode.
@@ -1895,12 +1746,17 @@ fn collect_each_block_promotions(
                     let mut names = Vec::new();
                     extract_each_pattern_identifiers_node(&context_node, &mut names);
                     names.iter().any(|name| {
-                        // Check ALL bindings with this name, not just the first one.
-                        // The each block's item binding (EachItem kind) may be shadowed by
-                        // callback parameters with the same name in earlier scopes.
-                        // We need to find the EachItem binding specifically.
+                        // Mirror upstream EachBlock.js `scope.get(id.name)?.mutated`,
+                        // which resolves WITHIN the each scope — i.e. the each block's
+                        // own item binding (BindingKind::EachItem) — never a same-named
+                        // outer binding that happens to be reassigned (e.g. a `let`/prop
+                        // bound via `bind:`). Without the kind filter, a `const items`
+                        // collection whose item name collides with a `bind:`-reassigned
+                        // outer `let` was wrongly promoted to mutable_source.
                         analysis.root.bindings.iter().any(|binding| {
-                            binding.name == *name && (binding.reassigned || binding.mutated)
+                            binding.name == *name
+                                && binding.kind == BindingKind::EachItem
+                                && (binding.reassigned || binding.mutated)
                         })
                     })
                 } else {
@@ -2144,6 +2000,261 @@ fn extract_object_root(node: &serde_json::Value) -> Option<String> {
             .and_then(|n| n.as_str())
             .map(|s| s.to_string()),
         _ => None,
+    }
+}
+
+/// Collect ordered `$:` dependency identifier names per top-level reactive
+/// statement, mirroring `2-analyze/visitors/LabeledStatement.js`. Stored in
+/// `analysis.reactive_statement_dependencies` indexed by source ordinal (the
+/// Phase-3 client reads the same ordinal). Order = first-appearance during AST
+/// traversal; a name is a dependency unless its only references are the outermost
+/// member-chain LHS of an `=` assignment; member-property keys, object keys,
+/// function params and block-locals are never references.
+fn collect_reactive_statement_dependencies(ast: &Root, analysis: &mut ComponentAnalysis) {
+    let instance = match ast.instance {
+        Some(ref inst) => inst,
+        None => return,
+    };
+    if !instance_body_has_labeled_statement(ast) {
+        return;
+    }
+    let program = instance.content.as_json();
+    let body = match program.get("body").and_then(|b| b.as_array()) {
+        Some(b) => b,
+        None => return,
+    };
+
+    for stmt in body {
+        if stmt.get("type").and_then(|t| t.as_str()) != Some("LabeledStatement") {
+            continue;
+        }
+        if stmt
+            .get("label")
+            .and_then(|l| l.get("name"))
+            .and_then(|n| n.as_str())
+            != Some("$")
+        {
+            continue;
+        }
+        let Some(stmt_body) = stmt.get("body") else {
+            analysis.reactive_statement_dependencies.push(Vec::new());
+            continue;
+        };
+
+        let mut order: Vec<String> = Vec::new();
+        let mut included: rustc_hash::FxHashSet<String> = rustc_hash::FxHashSet::default();
+        let mut path: Vec<&serde_json::Value> = Vec::new();
+        collect_reactive_refs(stmt_body, &mut path, &Vec::new(), &mut order, &mut included);
+
+        let deps: Vec<String> = order.into_iter().filter(|n| included.contains(n)).collect();
+        analysis.reactive_statement_dependencies.push(deps);
+    }
+}
+
+/// One genuine reference visit: record first-appearance order + whether the name
+/// is a dependency (i.e. has at least one reference that is NOT the outermost
+/// member-chain on the LHS of an `=` assignment).
+fn note_reactive_ref(
+    id: &serde_json::Value,
+    path: &[&serde_json::Value],
+    order: &mut Vec<String>,
+    included: &mut rustc_hash::FxHashSet<String>,
+) {
+    let Some(name) = id.get("name").and_then(|n| n.as_str()) else {
+        return;
+    };
+    let name = name.to_string();
+    if !order.iter().any(|n| n == &name) {
+        order.push(name.clone());
+    }
+    if included.contains(&name) {
+        return;
+    }
+
+    let span = |n: &serde_json::Value| -> (u64, u64) {
+        (
+            n.get("start").and_then(|v| v.as_u64()).unwrap_or(u64::MAX),
+            n.get("end").and_then(|v| v.as_u64()).unwrap_or(u64::MAX),
+        )
+    };
+    // Walk up through MemberExpression parents to the outermost chain node.
+    let mut left_span = span(id);
+    let mut k = path.len(); // path[k-1] == immediate parent
+    while k >= 1 && path[k - 1].get("type").and_then(|t| t.as_str()) == Some("MemberExpression") {
+        left_span = span(path[k - 1]);
+        k -= 1;
+    }
+    let excluded = if k >= 1 {
+        let parent = path[k - 1];
+        parent.get("type").and_then(|t| t.as_str()) == Some("AssignmentExpression")
+            && parent.get("operator").and_then(|o| o.as_str()) == Some("=")
+            && parent.get("left").map(span) == Some(left_span)
+    } else {
+        false
+    };
+    if !excluded {
+        included.insert(name);
+    }
+}
+
+/// Traversal mirroring `scope.references` population for one `$:` body. Skips
+/// non-computed member-property keys, non-computed/non-shorthand object keys,
+/// function params, and block-local declarations.
+fn collect_reactive_refs<'a>(
+    node: &'a serde_json::Value,
+    path: &mut Vec<&'a serde_json::Value>,
+    locals: &Vec<String>,
+    order: &mut Vec<String>,
+    included: &mut rustc_hash::FxHashSet<String>,
+) {
+    let Some(node_type) = node.get("type").and_then(|t| t.as_str()) else {
+        return;
+    };
+
+    match node_type {
+        "Identifier" => {
+            if let Some(name) = node.get("name").and_then(|n| n.as_str())
+                && !locals.iter().any(|l| l == name)
+            {
+                note_reactive_ref(node, path, order, included);
+            }
+        }
+        "MemberExpression" => {
+            path.push(node);
+            if let Some(obj) = node.get("object") {
+                collect_reactive_refs(obj, path, locals, order, included);
+            }
+            if node
+                .get("computed")
+                .and_then(|c| c.as_bool())
+                .unwrap_or(false)
+                && let Some(prop) = node.get("property")
+            {
+                collect_reactive_refs(prop, path, locals, order, included);
+            }
+            path.pop();
+        }
+        "Property" => {
+            path.push(node);
+            if node
+                .get("computed")
+                .and_then(|c| c.as_bool())
+                .unwrap_or(false)
+                && let Some(key) = node.get("key")
+            {
+                collect_reactive_refs(key, path, locals, order, included);
+            }
+            if let Some(value) = node.get("value") {
+                collect_reactive_refs(value, path, locals, order, included);
+            }
+            path.pop();
+        }
+        "ArrowFunctionExpression" | "FunctionExpression" | "FunctionDeclaration" => {
+            let mut new_locals = locals.clone();
+            if let Some(params) = node.get("params").and_then(|p| p.as_array()) {
+                for p in params {
+                    extract_param_names(p, &mut new_locals);
+                }
+            }
+            path.push(node);
+            if let Some(b) = node.get("body") {
+                collect_reactive_refs(b, path, &new_locals, order, included);
+            }
+            path.pop();
+        }
+        "BlockStatement" => {
+            let mut new_locals = locals.clone();
+            if let Some(stmts) = node.get("body").and_then(|b| b.as_array()) {
+                for s in stmts {
+                    collect_block_local_decls(s, &mut new_locals);
+                }
+                path.push(node);
+                for s in stmts {
+                    collect_reactive_refs(s, path, &new_locals, order, included);
+                }
+                path.pop();
+            }
+        }
+        "VariableDeclaration" => {
+            path.push(node);
+            if let Some(decls) = node.get("declarations").and_then(|d| d.as_array()) {
+                for d in decls {
+                    path.push(d);
+                    if let Some(init) = d.get("init") {
+                        collect_reactive_refs(init, path, locals, order, included);
+                    }
+                    path.pop();
+                }
+            }
+            path.pop();
+        }
+        "ForOfStatement" | "ForInStatement" => {
+            let mut new_locals = locals.clone();
+            if let Some(left) = node.get("left") {
+                collect_block_local_decls(left, &mut new_locals);
+            }
+            path.push(node);
+            if let Some(right) = node.get("right") {
+                collect_reactive_refs(right, path, locals, order, included);
+            }
+            if let Some(b) = node.get("body") {
+                collect_reactive_refs(b, path, &new_locals, order, included);
+            }
+            path.pop();
+        }
+        "SwitchCase" => {
+            // acorn populates `consequent` BEFORE `test`, so upstream's traversal
+            // (and thus scope.references first-appearance order) visits the case
+            // body before the case test. Our JSON serializes `test` first, so
+            // mirror acorn here to keep dependency-thunk ordering byte-identical.
+            path.push(node);
+            if let Some(cons) = node.get("consequent").and_then(|c| c.as_array()) {
+                for s in cons {
+                    collect_reactive_refs(s, path, locals, order, included);
+                }
+            }
+            if let Some(test) = node.get("test").filter(|t| t.is_object()) {
+                collect_reactive_refs(test, path, locals, order, included);
+            }
+            path.pop();
+        }
+        _ => {
+            // Generic field walk in AST/source (insertion) order — serde_json is
+            // built with `preserve_order`, so object fields iterate in insertion
+            // order, matching upstream traversal order.
+            path.push(node);
+            if let Some(obj) = node.as_object() {
+                for (key, val) in obj {
+                    if matches!(key.as_str(), "type" | "start" | "end" | "loc" | "range") {
+                        continue;
+                    }
+                    if val.is_object() {
+                        collect_reactive_refs(val, path, locals, order, included);
+                    } else if let Some(arr) = val.as_array() {
+                        for item in arr {
+                            if item.is_object() {
+                                collect_reactive_refs(item, path, locals, order, included);
+                            }
+                        }
+                    }
+                }
+            }
+            path.pop();
+        }
+    }
+}
+
+/// Add `let/const/var` (and `for`-binding) identifiers from a statement to
+/// `locals` so they shadow outer reactive bindings within their block.
+fn collect_block_local_decls(node: &serde_json::Value, locals: &mut Vec<String>) {
+    if node.get("type").and_then(|t| t.as_str()) == Some("VariableDeclaration")
+        && let Some(decls) = node.get("declarations").and_then(|d| d.as_array())
+    {
+        for d in decls {
+            if let Some(id) = d.get("id") {
+                extract_param_names(id, locals);
+            }
+        }
     }
 }
 
@@ -2399,10 +2510,6 @@ fn extract_each_pattern_identifiers_node(node: &JsNode, names: &mut Vec<String>)
             let json = node.to_value();
             extract_each_pattern_identifiers(&json, names);
         }
-        // Raw fallback
-        JsNode::Raw(v) => {
-            extract_each_pattern_identifiers(v, names);
-        }
         _ => {}
     }
 }
@@ -2489,15 +2596,6 @@ impl From<crate::error::ParseError> for AnalysisError {
         match err {
             crate::error::ParseError::SvelteError { code, message, .. } => {
                 AnalysisError::ValidationWithCode { code, message }
-            }
-            crate::error::ParseError::TypeScriptInvalidFeature { feature, .. } => {
-                AnalysisError::ValidationWithCode {
-                    code: "typescript_invalid_feature".to_string(),
-                    message: format!(
-                        "TypeScript language features like {} are not natively supported",
-                        feature
-                    ),
-                }
             }
             other => AnalysisError::Validation(format!("{}", other)),
         }
@@ -2967,11 +3065,6 @@ impl JsonCheckResults {
     fn all_found(&self) -> bool {
         self.has_await && self.has_rune_reference
     }
-
-    fn merge(&mut self, other: &JsonCheckResults) {
-        self.has_await = self.has_await || other.has_await;
-        self.has_rune_reference = self.has_rune_reference || other.has_rune_reference;
-    }
 }
 
 /// Check if an expression contains an AwaitExpression and/or rune references
@@ -2990,13 +3083,62 @@ fn expression_check_features(
     match expr {
         Expression::Typed(te) => {
             let mut results = JsonCheckResults::default();
-            js_node_check_features(&te.node, arena, store_subs, &mut results, false);
+            let mut shadowed = Vec::new();
+            js_node_check_features(
+                &te.node,
+                arena,
+                store_subs,
+                &mut results,
+                false,
+                &mut shadowed,
+            );
             results
         }
-        Expression::Value(v) => json_check_features(v, store_subs),
         // `resolve_lazy_expressions` runs before analyze, so Lazy should never
         // reach here. Return empty results defensively rather than panicking.
         Expression::Lazy { .. } => JsonCheckResults::default(),
+    }
+}
+
+/// Collect `$`-prefixed identifier names from a function-parameter *pattern*
+/// (typed `JsNode` form) into `out`. Default values (`AssignmentPattern.right`)
+/// are expressions, not declarations, so they are not collected.
+///
+/// Used for shadow-aware rune detection: upstream determines runes mode from
+/// `module.scope.references` — a reference that resolves to a function
+/// parameter (e.g. `function bar($derived) { $derived(...) }`) never reaches
+/// the module scope and therefore never flips runes mode on.
+fn collect_dollar_param_names(node: &JsNode, arena: &ParseArena, out: &mut Vec<String>) {
+    match node {
+        JsNode::Identifier { name, .. } if name.starts_with('$') => {
+            out.push(name.to_string());
+        }
+        JsNode::ObjectPattern { properties, .. } => {
+            for prop in arena.get_js_children(*properties) {
+                match prop {
+                    JsNode::Property { value, .. } => {
+                        collect_dollar_param_names(arena.get_js_node(*value), arena, out);
+                    }
+                    JsNode::RestElement { argument, .. }
+                    | JsNode::SpreadElement { argument, .. } => {
+                        collect_dollar_param_names(arena.get_js_node(*argument), arena, out);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        JsNode::ArrayPattern { elements, .. } => {
+            for elem in elements.iter().flatten() {
+                collect_dollar_param_names(elem, arena, out);
+            }
+        }
+        JsNode::RestElement { argument, .. } | JsNode::SpreadElement { argument, .. } => {
+            collect_dollar_param_names(arena.get_js_node(*argument), arena, out);
+        }
+        JsNode::AssignmentPattern { left, .. } => {
+            collect_dollar_param_names(arena.get_js_node(*left), arena, out);
+        }
+        _ => {}
     }
 }
 
@@ -3025,6 +3167,7 @@ fn js_node_check_features(
     store_subs: &rustc_hash::FxHashSet<&str>,
     results: &mut JsonCheckResults,
     inside_function: bool,
+    shadowed: &mut Vec<String>,
 ) {
     if results.all_found() {
         return;
@@ -3037,6 +3180,7 @@ fn js_node_check_features(
     if let JsNode::Identifier { name, .. } = node
         && is_rune_name(name.as_str())
         && !store_subs.contains(name.as_str())
+        && !shadowed.iter().any(|s| s == name.as_str())
     {
         results.has_rune_reference = true;
     }
@@ -3053,6 +3197,21 @@ fn js_node_check_features(
                 | JsNode::FunctionDeclaration { .. }
         );
 
+    // Shadow-aware rune detection: `$`-prefixed function parameters (e.g.
+    // `function bar($derived, $effect) {}`) shadow the rune names inside the
+    // function, mirroring upstream where such references resolve to the
+    // parameter binding and never reach `module.scope.references` (the set
+    // runes-mode detection is computed from).
+    let shadow_base = shadowed.len();
+    if let JsNode::FunctionDeclaration { params, .. }
+    | JsNode::FunctionExpression { params, .. }
+    | JsNode::ArrowFunctionExpression { params, .. } = node
+    {
+        for param in arena.get_js_children(*params) {
+            collect_dollar_param_names(param, arena, shadowed);
+        }
+    }
+
     macro_rules! walk_id {
         ($id:expr) => {{
             js_node_check_features(
@@ -3061,8 +3220,10 @@ fn js_node_check_features(
                 store_subs,
                 results,
                 child_inside_function,
+                shadowed,
             );
             if results.all_found() {
+                shadowed.truncate(shadow_base);
                 return;
             }
         }};
@@ -3077,8 +3238,16 @@ fn js_node_check_features(
     macro_rules! walk_range {
         ($range:expr) => {{
             for child in arena.get_js_children($range) {
-                js_node_check_features(child, arena, store_subs, results, child_inside_function);
+                js_node_check_features(
+                    child,
+                    arena,
+                    store_subs,
+                    results,
+                    child_inside_function,
+                    shadowed,
+                );
                 if results.all_found() {
+                    shadowed.truncate(shadow_base);
                     return;
                 }
             }
@@ -3097,6 +3266,7 @@ fn js_node_check_features(
         | JsNode::DebuggerStatement { .. }
         | JsNode::Decorator { .. }
         | JsNode::TSEnumDeclaration { .. }
+        | JsNode::TSParameterProperty { .. }
         | JsNode::Comment { .. }
         | JsNode::Null => {}
 
@@ -3154,7 +3324,14 @@ fn js_node_check_features(
 
         JsNode::ArrayExpression { elements, .. } | JsNode::ArrayPattern { elements, .. } => {
             for elem in elements.iter().flatten() {
-                js_node_check_features(elem, arena, store_subs, results, child_inside_function);
+                js_node_check_features(
+                    elem,
+                    arena,
+                    store_subs,
+                    results,
+                    child_inside_function,
+                    shadowed,
+                );
                 if results.all_found() {
                     return;
                 }
@@ -3396,15 +3573,9 @@ fn js_node_check_features(
             type_annotation, ..
         } => walk_id!(*type_annotation),
         JsNode::TSModuleDeclaration { body, .. } => walk_opt_id!(body),
-
-        // Raw(Value) — fall back to the JSON walker. Used only for statements
-        // that carry leadingComments (rare). The recursion stops at this
-        // boundary; descendants of Raw are not pattern-matched on JsNode.
-        JsNode::Raw(value) => {
-            let sub = json_check_features_inner(value, store_subs, child_inside_function);
-            results.merge(&sub);
-        }
     }
+
+    shadowed.truncate(shadow_base);
 }
 
 /// Check if a name is a rune identifier.
@@ -3416,129 +3587,6 @@ fn is_rune_name(name: &str) -> bool {
         name,
         "$state" | "$derived" | "$props" | "$bindable" | "$effect" | "$inspect" | "$host"
     )
-}
-
-/// Recursively check a JSON AST node for both AwaitExpression and rune identifier references
-/// in a single pass.
-///
-/// For await detection:
-/// - Stops at function boundaries (FunctionExpression, ArrowFunctionExpression, FunctionDeclaration)
-///   but continues checking for rune references past those boundaries.
-///
-/// For rune detection:
-/// - Does NOT stop at function boundaries because rune references inside functions still
-///   indicate runes mode.
-/// - Skips label properties of LabeledStatement, non-computed property keys in
-///   MemberExpressions, and non-computed keys in Property nodes.
-///
-/// The `inside_function` parameter tracks whether we are inside a function boundary,
-/// which suppresses await detection while still allowing rune detection.
-fn json_check_features(
-    node: &serde_json::Value,
-    store_subs: &rustc_hash::FxHashSet<&str>,
-) -> JsonCheckResults {
-    json_check_features_inner(node, store_subs, false)
-}
-
-fn json_check_features_inner(
-    node: &serde_json::Value,
-    store_subs: &rustc_hash::FxHashSet<&str>,
-    inside_function: bool,
-) -> JsonCheckResults {
-    let mut results = JsonCheckResults::default();
-    let node_type = node.get("type").and_then(|t| t.as_str());
-
-    // Check for AwaitExpression (only if not inside a function boundary)
-    if !inside_function && node_type == Some("AwaitExpression") {
-        results.has_await = true;
-        // Don't return early - still need to check children for rune references
-    }
-
-    // Check if this is an Identifier with a rune name
-    if node_type == Some("Identifier")
-        && let Some(name) = node.get("name").and_then(|n| n.as_str())
-        && is_rune_name(name)
-        && !store_subs.contains(name)
-    {
-        results.has_rune_reference = true;
-    }
-
-    // Early exit if both features found
-    if results.all_found() {
-        return results;
-    }
-
-    // Determine if we're entering a function boundary
-    let is_function_boundary = matches!(
-        node_type,
-        Some("FunctionExpression" | "ArrowFunctionExpression" | "FunctionDeclaration")
-    );
-    let child_inside_function = inside_function || is_function_boundary;
-
-    match node {
-        serde_json::Value::Object(map) => {
-            for (key, val) in map {
-                if key == "type" || key == "start" || key == "end" || key == "loc" {
-                    continue;
-                }
-                // Skip the "label" property of LabeledStatement nodes for rune check.
-                // Labels like `$effect:` contain Identifiers with rune names but
-                // they are NOT rune references - they are just label declarations.
-                // Without this check, `$effect: if (obj) x++` would falsely trigger
-                // runes mode detection, causing `export let` to be rejected.
-                //
-                // For the await check, labels can't contain AwaitExpression, so skipping is safe.
-                if key == "label" && node_type == Some("LabeledStatement") {
-                    continue;
-                }
-                // Skip property keys in non-computed MemberExpressions and Properties for rune check.
-                // `foo.$state` should not be treated as a rune reference.
-                //
-                // For the await check, property keys can't contain AwaitExpression, so skipping is safe.
-                if key == "property"
-                    && node_type == Some("MemberExpression")
-                    && !node
-                        .get("computed")
-                        .and_then(|c| c.as_bool())
-                        .unwrap_or(false)
-                {
-                    continue;
-                }
-                // Skip the "key" field of non-computed Property nodes for rune check.
-                // { $state: value } should not be treated as a rune reference.
-                //
-                // For the await check, non-computed keys can't contain AwaitExpression, so skipping is safe.
-                if key == "key"
-                    && node_type == Some("Property")
-                    && !node
-                        .get("computed")
-                        .and_then(|c| c.as_bool())
-                        .unwrap_or(false)
-                {
-                    continue;
-                }
-                let child_results =
-                    json_check_features_inner(val, store_subs, child_inside_function);
-                results.merge(&child_results);
-                if results.all_found() {
-                    return results;
-                }
-            }
-        }
-        serde_json::Value::Array(arr) => {
-            for val in arr {
-                let child_results =
-                    json_check_features_inner(val, store_subs, child_inside_function);
-                results.merge(&child_results);
-                if results.all_found() {
-                    return results;
-                }
-            }
-        }
-        _ => {}
-    }
-
-    results
 }
 
 /// Check if an attribute contains both await expressions and rune references in a single walk.
@@ -3640,7 +3688,58 @@ fn attribute_check_features(
                 has_rune_reference: false,
             }
         }
-        _ => FragmentCheckResults::default(),
+        // A rune used only inside a directive/attach expression (e.g.
+        // `{@attach (n) => { $effect(...) }}`) still flips the component to
+        // runes mode upstream, because every template identifier reference is
+        // propagated into `module.scope.references` (scope.js reference()) and
+        // `is_rune` is checked over the full set (2-analyze/index.js:454-456).
+        Attribute::AttachTag(attach) => {
+            let r = expression_check_features(&attach.expression, arena, store_subs);
+            FragmentCheckResults {
+                has_await: r.has_await,
+                has_rune_reference: r.has_rune_reference,
+            }
+        }
+        Attribute::UseDirective(dir) => match &dir.expression {
+            Some(expr) => {
+                let r = expression_check_features(expr, arena, store_subs);
+                FragmentCheckResults {
+                    has_await: r.has_await,
+                    has_rune_reference: r.has_rune_reference,
+                }
+            }
+            None => FragmentCheckResults::default(),
+        },
+        Attribute::TransitionDirective(dir) => match &dir.expression {
+            Some(expr) => {
+                let r = expression_check_features(expr, arena, store_subs);
+                FragmentCheckResults {
+                    has_await: r.has_await,
+                    has_rune_reference: r.has_rune_reference,
+                }
+            }
+            None => FragmentCheckResults::default(),
+        },
+        Attribute::AnimateDirective(dir) => match &dir.expression {
+            Some(expr) => {
+                let r = expression_check_features(expr, arena, store_subs);
+                FragmentCheckResults {
+                    has_await: r.has_await,
+                    has_rune_reference: r.has_rune_reference,
+                }
+            }
+            None => FragmentCheckResults::default(),
+        },
+        Attribute::LetDirective(dir) => match &dir.expression {
+            Some(expr) => {
+                let r = expression_check_features(expr, arena, store_subs);
+                FragmentCheckResults {
+                    has_await: r.has_await,
+                    has_rune_reference: r.has_rune_reference,
+                }
+            }
+            None => FragmentCheckResults::default(),
+        },
     }
 }
 
@@ -3750,6 +3849,13 @@ fn assign_each_block_indices_in_node(
         }
         TemplateNode::SlotElement(slot) => {
             assign_each_block_indices_in_fragment(&mut slot.fragment, index_counter);
+        }
+        TemplateNode::SvelteFragment(frag) => {
+            // `<svelte:fragment>` wraps a fragment; without recursing here the
+            // post-order `$$index` numbering never reaches each blocks nested
+            // inside a component slot, so the transform falls back to its own
+            // pre-order naming (reversed from upstream).
+            assign_each_block_indices_in_fragment(&mut frag.fragment, index_counter);
         }
         TemplateNode::SvelteBoundary(boundary) => {
             assign_each_block_indices_in_fragment(&mut boundary.fragment, index_counter);
@@ -3888,6 +3994,10 @@ fn mark_group_bindings_in_node(
                         let starts: Vec<String> = matched_each_ptrs
                             .iter()
                             .map(|p| {
+                                // SAFETY: `p` is a `*mut EachBlock` collected from
+                                // `ancestor_stack`, each originating from a live mutable
+                                // reference to an ancestor each block that outlives this
+                                // single-threaded traversal; we only read `start` here.
                                 let e = unsafe { &**p };
                                 e.start.to_string()
                             })
@@ -3913,6 +4023,11 @@ fn mark_group_bindings_in_node(
 
                         // Assign the SAME group name to ALL matched ancestor EachBlocks
                         for each_ptr in &matched_each_ptrs {
+                            // SAFETY: `each_ptr` is a `*mut EachBlock` from
+                            // `ancestor_stack`, derived from a live mutable reference to
+                            // an ancestor each block. Traversal is single-threaded and
+                            // each pointer is unique within the stack, so no other live
+                            // alias exists while we write its metadata here.
                             let each = unsafe { &mut **each_ptr };
                             each.metadata.contains_group_binding = true;
                             // Only set if not already set (in case multiple bind:group expressions
@@ -4089,10 +4204,6 @@ fn extract_all_identifiers_from_node(node: &JsNode, ids: &mut Vec<String>) {
             let json = node.to_value();
             extract_all_identifiers_from_expr(&json, ids);
         }
-        // Raw fallback
-        JsNode::Raw(v) => {
-            extract_all_identifiers_from_expr(v, ids);
-        }
         _ => {}
     }
 }
@@ -4179,10 +4290,6 @@ fn build_keypath_parts_node(node: &JsNode, parts: &mut Vec<String>) {
             let json = node.to_value();
             build_keypath_parts(&json, parts);
         }
-        // Raw fallback
-        JsNode::Raw(v) => {
-            build_keypath_parts(v, parts);
-        }
         _ => {
             // For other expression types (CallExpression, etc.), fall back to a
             // representation that includes all identifiers
@@ -4268,6 +4375,199 @@ fn collect_template_component_names<'a>(
     }
 }
 
+/// Collect every reference-position identifier name appearing in template
+/// expressions (mustache tags, attribute values, directives and block heads).
+///
+/// Mirrors the official compiler, where `scope.reference()` runs on every
+/// identifier use in the template. Names that don't resolve to a binding become
+/// globals and are added to `scope.root.conflicts`; the caller filters out the
+/// declared ones, so over-collecting binding/declaration identifiers here is
+/// harmless. `collect_identifier_names_from_expression` already drops non-ref
+/// slots (member properties, object keys, declaration ids).
+fn collect_template_reference_names(
+    nodes: &[crate::ast::template::TemplateNode],
+    out: &mut rustc_hash::FxHashSet<String>,
+) {
+    use crate::ast::template::{Attribute, AttributeValue, AttributeValuePart, TemplateNode};
+
+    fn collect_attr_value(value: &AttributeValue, out: &mut rustc_hash::FxHashSet<String>) {
+        match value {
+            AttributeValue::True(_) => {}
+            AttributeValue::Expression(tag) => {
+                collect_identifier_names_from_expression(&tag.expression, out);
+            }
+            AttributeValue::Sequence(parts) => {
+                for part in parts {
+                    if let AttributeValuePart::ExpressionTag(tag) = part {
+                        collect_identifier_names_from_expression(&tag.expression, out);
+                    }
+                }
+            }
+        }
+    }
+
+    fn collect_attrs(attributes: &[Attribute], out: &mut rustc_hash::FxHashSet<String>) {
+        for attr in attributes {
+            match attr {
+                Attribute::Attribute(a) => collect_attr_value(&a.value, out),
+                Attribute::SpreadAttribute(s) => {
+                    collect_identifier_names_from_expression(&s.expression, out)
+                }
+                Attribute::AttachTag(t) => {
+                    collect_identifier_names_from_expression(&t.expression, out)
+                }
+                Attribute::BindDirective(d) => {
+                    collect_identifier_names_from_expression(&d.expression, out)
+                }
+                Attribute::ClassDirective(d) => {
+                    collect_identifier_names_from_expression(&d.expression, out)
+                }
+                Attribute::StyleDirective(d) => collect_attr_value(&d.value, out),
+                Attribute::OnDirective(d) => {
+                    if let Some(e) = &d.expression {
+                        collect_identifier_names_from_expression(e, out)
+                    }
+                }
+                Attribute::TransitionDirective(d) => {
+                    if let Some(e) = &d.expression {
+                        collect_identifier_names_from_expression(e, out)
+                    }
+                }
+                Attribute::AnimateDirective(d) => {
+                    if let Some(e) = &d.expression {
+                        collect_identifier_names_from_expression(e, out)
+                    }
+                }
+                Attribute::UseDirective(d) => {
+                    if let Some(e) = &d.expression {
+                        collect_identifier_names_from_expression(e, out)
+                    }
+                }
+                Attribute::LetDirective(d) => {
+                    if let Some(e) = &d.expression {
+                        collect_identifier_names_from_expression(e, out)
+                    }
+                }
+            }
+        }
+    }
+
+    for node in nodes {
+        match node {
+            TemplateNode::ExpressionTag(t) => {
+                collect_identifier_names_from_expression(&t.expression, out)
+            }
+            TemplateNode::HtmlTag(t) => {
+                collect_identifier_names_from_expression(&t.expression, out)
+            }
+            TemplateNode::ConstTag(t) => {
+                collect_identifier_names_from_expression(&t.declaration, out)
+            }
+            TemplateNode::DeclarationTag(t) => {
+                collect_identifier_names_from_expression(&t.declaration, out)
+            }
+            TemplateNode::DebugTag(t) => {
+                for e in &t.identifiers {
+                    collect_identifier_names_from_expression(e, out)
+                }
+            }
+            TemplateNode::RenderTag(t) => {
+                collect_identifier_names_from_expression(&t.expression, out)
+            }
+            TemplateNode::AttachTag(t) => {
+                collect_identifier_names_from_expression(&t.expression, out)
+            }
+            TemplateNode::IfBlock(b) => {
+                collect_identifier_names_from_expression(&b.test, out);
+                collect_template_reference_names(&b.consequent.nodes, out);
+                if let Some(alt) = &b.alternate {
+                    collect_template_reference_names(&alt.nodes, out);
+                }
+            }
+            TemplateNode::EachBlock(b) => {
+                collect_identifier_names_from_expression(&b.expression, out);
+                if let Some(ctx) = &b.context {
+                    collect_identifier_names_from_expression(ctx, out);
+                }
+                if let Some(key) = &b.key {
+                    collect_identifier_names_from_expression(key, out);
+                }
+                collect_template_reference_names(&b.body.nodes, out);
+                if let Some(fallback) = &b.fallback {
+                    collect_template_reference_names(&fallback.nodes, out);
+                }
+            }
+            TemplateNode::AwaitBlock(b) => {
+                collect_identifier_names_from_expression(&b.expression, out);
+                if let Some(v) = &b.value {
+                    collect_identifier_names_from_expression(v, out);
+                }
+                if let Some(e) = &b.error {
+                    collect_identifier_names_from_expression(e, out);
+                }
+                if let Some(pending) = &b.pending {
+                    collect_template_reference_names(&pending.nodes, out);
+                }
+                if let Some(then) = &b.then {
+                    collect_template_reference_names(&then.nodes, out);
+                }
+                if let Some(catch) = &b.catch {
+                    collect_template_reference_names(&catch.nodes, out);
+                }
+            }
+            TemplateNode::KeyBlock(b) => {
+                collect_identifier_names_from_expression(&b.expression, out);
+                collect_template_reference_names(&b.fragment.nodes, out);
+            }
+            TemplateNode::SnippetBlock(b) => {
+                collect_identifier_names_from_expression(&b.expression, out);
+                for p in &b.parameters {
+                    collect_identifier_names_from_expression(p, out);
+                }
+                collect_template_reference_names(&b.body.nodes, out);
+            }
+            TemplateNode::RegularElement(e) => {
+                collect_attrs(&e.attributes, out);
+                collect_template_reference_names(&e.fragment.nodes, out);
+            }
+            TemplateNode::Component(c) => {
+                collect_attrs(&c.attributes, out);
+                collect_template_reference_names(&c.fragment.nodes, out);
+            }
+            TemplateNode::SvelteComponent(c) => {
+                collect_attrs(&c.attributes, out);
+                collect_identifier_names_from_expression(&c.expression, out);
+                collect_template_reference_names(&c.fragment.nodes, out);
+            }
+            TemplateNode::SvelteElement(e) => {
+                collect_attrs(&e.attributes, out);
+                collect_identifier_names_from_expression(&e.tag, out);
+                collect_template_reference_names(&e.fragment.nodes, out);
+            }
+            TemplateNode::TitleElement(t) => {
+                collect_attrs(&t.attributes, out);
+                collect_template_reference_names(&t.fragment.nodes, out);
+            }
+            TemplateNode::SlotElement(s) => {
+                collect_attrs(&s.attributes, out);
+                collect_template_reference_names(&s.fragment.nodes, out);
+            }
+            TemplateNode::SvelteBody(e)
+            | TemplateNode::SvelteDocument(e)
+            | TemplateNode::SvelteFragment(e)
+            | TemplateNode::SvelteBoundary(e)
+            | TemplateNode::SvelteHead(e)
+            | TemplateNode::SvelteOptions(e)
+            | TemplateNode::SvelteSelf(e)
+            | TemplateNode::SvelteWindow(e) => {
+                collect_attrs(&e.attributes, out);
+                collect_template_reference_names(&e.fragment.nodes, out);
+            }
+            TemplateNode::Text(_) | TemplateNode::Comment(_) => {}
+        }
+    }
+}
+
 /// Register a standalone bind:group directive (one not inside any matching each block)
 /// in `analysis.binding_groups`. This mirrors the standalone-registration branch of
 /// `mark_group_bindings_in_fragment` for RegularElement, but for Component-style hosts.
@@ -4309,6 +4609,17 @@ fn collect_identifier_names_in_json(
     match value {
         Value::Object(obj) => {
             let node_type = obj.get("type").and_then(|t| t.as_str()).unwrap_or("");
+
+            // TypeScript type-space nodes (`TSTypeAnnotation`, `TSTypeReference`,
+            // …) never contain value references — their identifiers live in type
+            // space and are erased from the output. Skipping them keeps type-only
+            // names (e.g. `let x: File` / `type Foo`) out of the component-name
+            // deconfliction set, which otherwise renames the component to `_1`.
+            // (The typed tree can still carry annotations at this point; the JSON
+            // strip path drops them, so this guard makes both paths agree.)
+            if node_type.starts_with("TS") {
+                return;
+            }
 
             // If this is an Identifier node, collect its name.
             if node_type == "Identifier"

@@ -69,7 +69,9 @@ pub fn visit(block: &mut IfBlock, context: &mut VisitorContext) -> Result<(), An
     // Clear is_direct_child_of_component since children of control flow blocks
     // are not direct children of a component
     let was_direct_child = context.is_direct_child_of_component;
+    let was_direct_snippet = context.is_direct_child_of_snippet;
     context.is_direct_child_of_component = false;
+    context.is_direct_child_of_snippet = false;
 
     // Push fragment owner type for const_tag placement validation
     context
@@ -89,6 +91,7 @@ pub fn visit(block: &mut IfBlock, context: &mut VisitorContext) -> Result<(), An
 
     // Restore is_direct_child_of_component
     context.is_direct_child_of_component = was_direct_child;
+    context.is_direct_child_of_snippet = was_direct_snippet;
 
     // Decrement block depth
     context.block_depth -= 1;
@@ -106,6 +109,10 @@ fn analyze_test_expression(
 ) -> Result<(), AnalysisError> {
     // Get the current expression metadata if set
     if let Some(metadata_ptr) = context.expression {
+        // SAFETY: `metadata_ptr` is the `*mut ExpressionMetadata` installed on the
+        // visit context by the enclosing if-block scope; it points at metadata on
+        // an AST node that outlives this single-threaded traversal, and that node
+        // is not otherwise borrowed here, so there is no aliasing.
         let metadata = unsafe { &mut *metadata_ptr };
 
         // Walk the JS AST to detect expression features

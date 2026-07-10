@@ -10,12 +10,33 @@ publish = false
 [lib]
 crate-type = ["rlib"]
 
+[features]
+default = ["native"]
+# Forward the backend choice down to `rsvelte_core`: `native` keeps rayon /
+# miette / jemalloc; `wasm` swaps them for the wasm-bindgen toolchain so the
+# formatter (and the parser it reuses) link cleanly on wasm32 — see
+# `crates/rsvelte_fmt_wasm`.
+native = ["rsvelte_core/native"]
+wasm = ["rsvelte_core/wasm-deps"]
+
 [dependencies]
-svelte-compiler-rust = { path = "../rsvelte_core", default-features = false, features = ["native"] }
+rsvelte_core = { path = "../rsvelte_core", default-features = false }
 oxc_allocator = { path = "../../../../crates/oxc_allocator" }
 oxc_ast = { path = "../../../../crates/oxc_ast" }
 oxc_parser = { path = "../../../../crates/oxc_parser" }
 oxc_span = { path = "../../../../crates/oxc_span" }
 oxc_formatter = { path = "../../../../crates/oxc_formatter" }
 oxc_formatter_core = { path = "../../../../crates/oxc_formatter_core" }
+oxc_formatter_json = { path = "../../../../crates/oxc_formatter_json" }
+oxc_formatter_css = { path = "../../../../crates/oxc_formatter_css" }
 thiserror = "2.0"
+unicode-width = "0.2"
+
+[dev-dependencies]
+criterion = { version = "5.0.0", features = [
+  "html_reports",
+], package = "codspeed-criterion-compat" }
+
+[[bench]]
+name = "formatter"
+harness = false

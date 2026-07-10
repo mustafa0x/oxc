@@ -9,9 +9,11 @@
 //!
 //! The transformer produces the final JavaScript and CSS output.
 
+pub mod builders;
 pub mod client;
 pub mod css;
 pub mod js_ast;
+pub mod jsnode_to_oxc;
 pub mod profile;
 pub mod server;
 pub mod shared;
@@ -215,7 +217,7 @@ pub fn transform_component(
 
     let css = if analysis.css.has_css && !analysis.inject_styles {
         let _css_start = profile::timer_start();
-        let mut css_output = css::render_stylesheet(analysis, source, options)?;
+        let mut css_output = css::render_stylesheet(analysis, ast.css.as_deref(), source, options)?;
         profile::record_css_render(profile::timer_elapsed(_css_start));
         // Apply preprocessor source map composition to CSS map if needed
         if let Some(ref pp_map_json) = options.sourcemap
@@ -258,7 +260,8 @@ pub fn transform_component(
             });
 
         if !should_ignore_unused {
-            let css_warnings = css::collect_css_unused_warnings(analysis, source);
+            let css_warnings =
+                css::collect_css_unused_warnings(analysis, ast.css.as_deref(), source);
             for w in css_warnings {
                 warnings.push(TransformWarning {
                     code: "css_unused_selector".to_string(),

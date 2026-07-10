@@ -11,15 +11,33 @@
 // the new API surface is out of scope for the dep bump.
 #![allow(deprecated)]
 
-// Jemalloc is installed here (rather than at the lib root) so that the
-// rlib doesn't carry a `#[global_allocator]` symbol — which collides with
+// The global allocator is installed here (rather than at the lib root) so that
+// the rlib doesn't carry a `#[global_allocator]` symbol — which collides with
 // the cdylib's copy on Linux + fat LTO when a downstream bin links against
 // both crate-type outputs (cargo issue rust-lang/cargo#6313). This module
 // is only compiled when the `napi` feature is on, so the rlib stays clean
-// for normal builds, and the cdylib gets jemalloc when it ships as the
+// for normal builds, and the cdylib gets a fast allocator when it ships as the
 // NAPI prebuilt.
+//
+// We prefer mimalloc: an interleaved A/B over the full compile corpus measured
+// it ~11% faster than jemalloc, and the allocation-bound profile (serde_json
+// Value churn) is exactly the workload mimalloc wins on — the same reason the
+// mold linker links mimalloc. mimalloc has the same initial-exec TLS issue as
+// jemalloc when the cdylib is dlopen'd by Node on Linux ("cannot allocate memory
+// in static TLS block"); the mimalloc crate's `local_dynamic_tls` feature
+// (enabled in Cargo.toml) builds it with the local-dynamic TLS model to fix that.
+// jemalloc remains the fallback when only the `jemalloc` feature is enabled.
+#[cfg(all(
+    feature = "mimalloc-alloc",
+    not(target_arch = "wasm32"),
+    not(target_os = "windows")
+))]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[cfg(all(
     feature = "jemalloc",
+    not(feature = "mimalloc-alloc"),
     not(target_arch = "wasm32"),
     not(target_os = "windows")
 ))]
@@ -120,6 +138,9 @@ pub fn napi_parse(source: String, options: Option<NapiParseOptions>) -> napi::Re
             .as_ref()
             .and_then(|o| o.skip_expression_loc)
             .unwrap_or(false),
+        // The public AST API mirrors svelte/compiler `parse()`, which keeps
+        // `leadingComments`/`trailingComments` on nodes.
+        capture_comments: true,
         ..ParseOptions::default()
     };
     match rust_parse(&source, parse_options) {
@@ -127,7 +148,17 @@ pub fn napi_parse(source: String, options: Option<NapiParseOptions>) -> napi::Re
             // Serialize within the AST's arena so `JsNodeId`s in the
             // Serialize impls resolve (mirrors `wasm::parse_svelte`).
             crate::ast::arena::with_serialize_arena(&ast.arena, || {
-                serde_json::to_string(&ast)
+                // Spans are UTF-16 code-unit offsets to match svelte/compiler
+                // (#793). ASCII source needs no remap — keep the fast path.
+                if source.is_ascii() {
+                    return serde_json::to_string(&ast)
+                        .map_err(|e| napi::Error::from_reason(format!("serialize ast: {e}")));
+                }
+                let mut value = serde_json::to_value(&ast)
+                    .map_err(|e| napi::Error::from_reason(format!("serialize ast: {e}")))?;
+                let conv = crate::compiler::legacy::Utf8ToUtf16::new(&source);
+                crate::compiler::legacy::convert_positions_to_utf16(&mut value, &conv);
+                serde_json::to_string(&value)
                     .map_err(|e| napi::Error::from_reason(format!("serialize ast: {e}")))
             })
         }
@@ -346,7 +377,10 @@ impl NapiCompileOptions {
             if let Some(s) = v.as_str() {
                 opts.sourcemap = Some(s.to_string());
             } else if v.is_object() || v.is_array() {
-                opts.sourcemap = Some(serde_json::to_string(&v).unwrap_or_default());
+                // Only carry the map through when it serializes; on failure
+                // `.ok()` yields `None`, leaving the field unset rather than
+                // storing an empty-string sourcemap.
+                opts.sourcemap = serde_json::to_string(&v).ok();
             }
         }
         if let Some(v) = self.output_filename {
@@ -700,14 +734,18 @@ mod preprocess_bridge {
             napi_val: napi::sys::napi_value,
         ) -> napi::Result<Self> {
             let mut is_promise = false;
+            // SAFETY: `env`/`napi_val` are the valid handles passed by Node-API to
+            // `from_napi_value`; `napi_is_promise` only reads them and writes the bool.
             let status = unsafe { napi::sys::napi_is_promise(env, napi_val, &mut is_promise) };
             if status != napi::sys::Status::napi_ok {
                 return Err(napi::Error::from_status(napi::Status::from(status)));
             }
             if is_promise {
+                // SAFETY: same valid `env`/`napi_val`; we just confirmed it is a Promise.
                 let p = unsafe { Promise::<T>::from_napi_value(env, napi_val)? };
                 Ok(MaybePromise::Promise(p))
             } else {
+                // SAFETY: same valid `env`/`napi_val`; delegating to `T`'s own decoder.
                 let v = unsafe { T::from_napi_value(env, napi_val)? };
                 Ok(MaybePromise::Value(v))
             }
@@ -1310,10 +1348,14 @@ pub fn napi_compile_module_envelope_zero_copy(
     ensure_envelope_size(size)?;
     let bump = Box::new(bumpalo::Bump::with_capacity(size));
     let bump_ptr: *mut bumpalo::Bump = Box::into_raw(bump);
+    // SAFETY: `bump_ptr` is freshly leaked from `Box::into_raw` and not aliased;
+    // ownership is re-acquired via `Box::from_raw` in the finalizer below.
     let bump_ref: &bumpalo::Bump = unsafe { &*bump_ptr };
     let slice = crate::napi_raw::encode_into_bump(bump_ref, &cr);
     let ptr = slice.as_mut_ptr();
     let len = slice.len();
+    // SAFETY: `ptr`/`len` describe a valid slice inside `*bump_ptr`; V8 invokes the
+    // finalizer exactly once on GC, which drops the Box and frees the arena bytes.
     let js_buf_value = unsafe {
         env.create_buffer_with_borrowed_data(
             ptr,

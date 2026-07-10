@@ -2,14 +2,92 @@
 
 use memchr::memmem;
 use rustc_hash::FxHashSet;
+use std::fmt::Write as _;
 
 use crate::compiler::phases::phase2_analyze::ComponentAnalysis;
 use crate::compiler::phases::phase2_analyze::scope::BindingKind;
 
 use super::{
     extract_destructured_prop_names, find_matching_paren, get_or_compile_regex,
-    is_inside_string_literal, is_shadowed_by_function_param, is_shorthand_object_property,
+    is_explicit_property_key, is_inside_string_literal, is_shadowed_by_function_param,
+    is_shorthand_object_property,
 };
+
+/// True when the identifier at `var_start` (len `var_len`) is a *binding* in an
+/// arrow-function parameter list — `name => …`, `(name) => …`, `(a, name, b) =>
+/// …`. Such positions declare a new local that shadows a like-named prop and
+/// must not be wrapped as a prop read. Mirrors the `in_param_position` guard the
+/// AST version (`prop_source_reads_ast`) applies.
+fn is_arrow_param_binding(chars: &[char], var_start: usize, var_len: usize) -> bool {
+    let after = var_start + var_len;
+
+    // `name => …`  (single param, no parens)
+    {
+        let mut k = after;
+        while k < chars.len() && chars[k].is_whitespace() {
+            k += 1;
+        }
+        if k + 1 < chars.len() && chars[k] == '=' && chars[k + 1] == '>' {
+            return true;
+        }
+    }
+
+    // `( … name … ) => …` : find enclosing `(` at depth 0 (stop at array/object/`;`)
+    let mut depth = 0i32;
+    let mut j = var_start;
+    let mut open = None;
+    while j > 0 {
+        j -= 1;
+        match chars[j] {
+            ')' | ']' | '}' => depth += 1,
+            '(' if depth == 0 => {
+                open = Some(j);
+                break;
+            }
+            '(' => depth -= 1,
+            '[' | '{' if depth == 0 => return false,
+            '[' | '{' => depth -= 1,
+            ';' if depth == 0 => return false,
+            _ => {}
+        }
+    }
+    let Some(open) = open else { return false };
+
+    // Must be at a parameter *name* position (preceded by `(` or `,`), not a
+    // default-value expression like `(a = prop) =>` where `prop` is a read.
+    let mut p = var_start;
+    while p > 0 && chars[p - 1].is_whitespace() {
+        p -= 1;
+    }
+    if !(p == 0 || chars[p - 1] == '(' || chars[p - 1] == ',') {
+        return false;
+    }
+
+    // matching `)` then `=>`
+    let mut depth2 = 0i32;
+    let mut m = open + 1;
+    let mut close = None;
+    while m < chars.len() {
+        match chars[m] {
+            '(' | '[' | '{' => depth2 += 1,
+            ')' if depth2 == 0 => {
+                close = Some(m);
+                break;
+            }
+            ')' => depth2 -= 1,
+            ']' | '}' if depth2 == 0 => return false,
+            ']' | '}' => depth2 -= 1,
+            _ => {}
+        }
+        m += 1;
+    }
+    let Some(close) = close else { return false };
+    let mut k = close + 1;
+    while k < chars.len() && chars[k].is_whitespace() {
+        k += 1;
+    }
+    k + 1 < chars.len() && chars[k] == '=' && chars[k + 1] == '>'
+}
 
 /// Transform prop reads in an expression to prop() calls.
 ///
@@ -206,6 +284,18 @@ pub(super) fn transform_prop_reads_in_expr(expr: &str, prop_vars: &[String]) -> 
                 // Check if this identifier is shadowed by a function parameter
                 let is_shadowed = is_shadowed_by_function_param(&chars, i, prop_name);
 
+                // Check if this identifier is an explicit object-literal property
+                // KEY (`{ foo: bar }`). A key is not a value read and must not be
+                // wrapped — `{ foo(): bar }` is invalid JS. (Shorthand `{ foo }`
+                // is handled below by expanding to `{ foo: foo() }`.)
+                let is_property_key = is_explicit_property_key(&chars, i, prop_name.len());
+
+                // Check if this identifier is the BINDING in an arrow-function
+                // parameter list (`name =>`, `(a, name) =>`). That declares a new
+                // local shadowing the prop and must not be wrapped as a read —
+                // `(name()) =>` is invalid syntax.
+                let is_arrow_param = is_arrow_param_binding(&chars, i, prop_name.len());
+
                 if before_ok
                     && after_ok
                     && !is_update_target
@@ -213,6 +303,8 @@ pub(super) fn transform_prop_reads_in_expr(expr: &str, prop_vars: &[String]) -> 
                     && !is_inside_update_call
                     && !is_shadowed
                     && !is_sole_derived_arg
+                    && !is_property_key
+                    && !is_arrow_param
                 {
                     // Check if this is a shorthand property in an object literal.
                     // e.g., `{ value }` should become `{ value: value() }` not `{ value() }`
@@ -266,16 +358,25 @@ pub(super) fn transform_let_with_reexported_props(
 
     let trimmed = line.trim();
 
-    // Only handle `let` declarations (not `const`, `var`, etc.)
-    if !trimmed.starts_with("let ") {
+    // Handle `let` / `var` declarations (a re-exported `var d` keeps its `var`
+    // keyword — upstream only rewrites the initializer to `$.prop(...)`).
+    let kw = if trimmed.starts_with("let ") {
+        "let"
+    } else if trimmed.starts_with("var ") {
+        "var"
+    } else {
         return None;
-    }
+    };
 
     // Preserve the leading whitespace from the original line
     let leading_ws: &str = &line[..line.len() - line.trim_start().len()];
 
-    let rest = trimmed[4..].trim();
-    let rest = rest.trim_end_matches(';').trim();
+    let rest_raw = trimmed[4..].trim();
+    // Strip trailing JS comments (// and /* */) before splitting declarators so that
+    //   `let name; // comment`
+    // does not produce `name; // comment` as the declarator name.
+    let rest_stripped = strip_js_comments(rest_raw);
+    let rest = rest_stripped.trim().trim_end_matches(';').trim();
 
     // Split by commas (respecting nesting)
     let declarators = split_declarators(rest);
@@ -326,15 +427,32 @@ pub(super) fn transform_let_with_reexported_props(
                 let rhs_part = decl[pattern_end..].trim();
                 if let Some(rhs) = rhs_part.strip_prefix('=') {
                     let rhs = rhs.trim().trim_end_matches(';').trim();
-                    // Create a tmp variable and flatten the destructuring
-                    results.push(format!("{}let tmp = {};", leading_ws, rhs));
-                    if let Some(flattened) =
-                        flatten_destructured_let_with_reexported_props(pattern, "tmp", analysis)
+                    // Upstream merges `tmp = rhs` and all the flattened declarators into a
+                    // SINGLE `let` VariableDeclaration with comma-separated declarators.
+                    // The continuation declarators are indented by `leading_ws + "  "`.
+                    let continuation_ws = format!("{}  ", leading_ws);
+                    if let Some(flat_decls) =
+                        flatten_destructured_let_as_declarators(pattern, "tmp", analysis)
                     {
-                        results.push(flattened);
+                        // Build: `  let tmp = rhs,\n    a = ...,\n    b = ...,\n    c = ...;`
+                        let mut merged = format!("{}let tmp = {}", leading_ws, rhs);
+                        for d in &flat_decls {
+                            merged.push_str(",\n");
+                            merged.push_str(&continuation_ws);
+                            merged.push_str(d);
+                        }
+                        merged.push(';');
+                        results.push(merged);
                     } else {
-                        // Fallback: keep original
-                        results.push(format!("{}let {} = {};", leading_ws, pattern, rhs));
+                        // Fallback for non-ObjectPattern (e.g. ArrayPattern)
+                        results.push(format!("{}let tmp = {};", leading_ws, rhs));
+                        if let Some(flattened) =
+                            flatten_destructured_let_with_reexported_props(pattern, "tmp", analysis)
+                        {
+                            results.push(flattened);
+                        } else {
+                            results.push(format!("{}let {} = {};", leading_ws, pattern, rhs));
+                        }
                     }
                     continue;
                 }
@@ -382,12 +500,16 @@ pub(super) fn transform_let_with_reexported_props(
                 // because after transforms it would become a function call (e.g., v2 -> v2()).
                 // The official compiler checks is_simple_expression on the VISITED (transformed)
                 // expression, where prop identifiers become CallExpressions.
-                let mut is_simple = is_simple_expression_str(val);
+                let mut is_simple = is_simple_expression_str(val, analysis);
                 // Track if the identifier refers to a prop (it will be a no-arg call after transform,
                 // and the official compiler unwraps no-arg calls to just the callee)
                 let mut is_prop_ref = false;
-                if is_simple
-                    && is_identifier_str(val)
+                // A bare reactive-binding identifier is a no-arg getter call after
+                // transform (`val()`); the official compiler unwraps it to the bare
+                // callee. This must fire regardless of `is_simple` — which is now
+                // false for such an identifier (it is non-simple, like upstream's
+                // visited CallExpression) — otherwise it would be thunked instead.
+                if is_identifier_str(val)
                     && analysis
                         .root
                         .find_binding_any_scope(val)
@@ -406,40 +528,59 @@ pub(super) fn transform_let_with_reexported_props(
                     is_simple = false;
                     is_prop_ref = true;
                 }
+                // A bare legacy `$:` reactive variable (`BindingKind::LegacyReactive`)
+                // becomes `$.get(name)` after transform — a MEMBER call, not a
+                // no-arg identifier getter — so it is non-simple and must be
+                // THUNKED (`() => $.get(name)`), not unwrapped to a bare callee
+                // like a prop ref. Mirrors upstream applying the transform before
+                // `is_simple_expression` (the visited CallExpression is non-simple,
+                // and its callee `$.get` is a MemberExpression so it falls through
+                // to `b.thunk(initial)`).
+                if is_simple
+                    && is_identifier_str(val)
+                    && analysis
+                        .root
+                        .find_binding_any_scope(val)
+                        .and_then(|idx| analysis.root.bindings.get(idx))
+                        .is_some_and(|b| matches!(b.kind, BindingKind::LegacyReactive))
+                {
+                    is_simple = false;
+                    // is_prop_ref stays false → thunk path
+                }
                 let flags = calculate_prop_flags(name, analysis, !is_simple);
                 if is_simple {
                     results.push(format!(
-                        "{}let {} = $.prop($$props, '{}', {}, {});",
-                        leading_ws, name, prop_name, flags, val
+                        "{}{} {} = $.prop($$props, '{}', {}, {});",
+                        leading_ws, kw, name, prop_name, flags, val
                     ));
                 } else if is_prop_ref {
                     // Prop/state identifier: after transform it becomes val() (no-arg call).
                     // The official compiler unwraps no-arg calls to just the callee,
                     // so we pass the identifier directly.
                     results.push(format!(
-                        "{}let {} = $.prop($$props, '{}', {}, {});",
-                        leading_ws, name, prop_name, flags, val
+                        "{}{} {} = $.prop($$props, '{}', {}, {});",
+                        leading_ws, kw, name, prop_name, flags, val
                     ));
                 } else {
                     let lazy_arg = make_lazy_prop_arg(val);
                     results.push(format!(
-                        "{}let {} = $.prop($$props, '{}', {}, {});",
-                        leading_ws, name, prop_name, flags, lazy_arg
+                        "{}{} {} = $.prop($$props, '{}', {}, {});",
+                        leading_ws, kw, name, prop_name, flags, lazy_arg
                     ));
                 }
             } else {
                 let flags = calculate_prop_flags(name, analysis, false);
                 results.push(format!(
-                    "{}let {} = $.prop($$props, '{}', {});",
-                    leading_ws, name, prop_name, flags
+                    "{}{} {} = $.prop($$props, '{}', {});",
+                    leading_ws, kw, name, prop_name, flags
                 ));
             }
         } else {
             // Non-exported variable, keep as-is
             if let Some(val) = value {
-                results.push(format!("{}let {} = {};", leading_ws, name, val));
+                results.push(format!("{}{} {} = {};", leading_ws, kw, name, val));
             } else {
-                results.push(format!("{}let {};", leading_ws, name));
+                results.push(format!("{}{} {};", leading_ws, kw, name));
             }
         }
     }
@@ -544,12 +685,24 @@ pub(super) fn apply_prop_reads_in_prop_default_values(line: &str, prop_vars: &[S
             let default_val = &after_prop[start_byte..end_byte];
             let _after_default = &after_prop[end_byte..];
 
-            let transformed_default = super::prop_source_reads_ast::wrap_prop_source_reads_ast(
-                default_val,
-                prop_vars,
-                &[],
-            )
-            .unwrap_or_else(|| default_val.to_string());
+            // A default value that is EXACTLY a bare prop identifier is the lazy
+            // getter reference upstream passes directly (`get_prop_source`
+            // unwraps a zero-arg call back to its callee, so `prop` stays `prop`,
+            // NOT `prop()`). Leave it bare — only wrap prop reads NESTED inside a
+            // larger default (e.g. `() => { logs.push(…) }`).
+            let default_trimmed = default_val.trim();
+            let transformed_default = if is_identifier_str(default_trimmed)
+                && prop_vars.iter().any(|p| p == default_trimmed)
+            {
+                default_val.to_string()
+            } else {
+                super::prop_source_reads_ast::wrap_prop_source_reads_ast(
+                    default_val,
+                    prop_vars,
+                    &[],
+                )
+                .unwrap_or_else(|| default_val.to_string())
+            };
             result.push_str("$.prop(");
             result.push_str(before_default);
             result.push_str(&transformed_default);
@@ -743,25 +896,104 @@ pub(super) fn apply_store_reads_in_prop_default_values(
 }
 
 pub(super) fn transform_export_let(line: &str, analysis: &ComponentAnalysis) -> String {
-    let trimmed = line.trim();
+    // Strip leading block comments so that a declaration like:
+    //   `/* ... */ export let name = value;`
+    // (where `/* ... */` may span multiple lines) is still recognised and
+    // transformed.  We feed the comment-stripped text to the kw detector but
+    // keep the original `line` / `leading_ws` for everything else so that the
+    // caller's indentation is preserved.
+    let trimmed_full = line.trim();
 
-    // Pattern: export let name = value; or export let name;
-    if !trimmed.starts_with("export let ") {
-        return line.to_string();
+    // Walk past any leading `/* ... */` blocks to find the actual `export let/var`.
+    let mut trimmed = trimmed_full;
+    let mut leading_comment = "";
+    while trimmed.starts_with("/*") {
+        if let Some(end) = trimmed.find("*/") {
+            let comment_end = end + 2;
+            leading_comment = &trimmed_full[..trimmed_full.len() - trimmed.len() + comment_end];
+            trimmed = trimmed[comment_end..].trim_start();
+        } else {
+            break;
+        }
     }
 
-    // Preserve the leading whitespace from the original line so that the
-    // generated $.prop() call keeps the same indentation as surrounding code.
-    let leading_ws: &str = &line[..line.len() - line.trim_start().len()];
+    // Pattern: `export let name = value;` / `export var name = value;` / `export let name;`
+    // Upstream keeps the source declaration keyword (`export var` → `var`),
+    // rewriting only the initializer to `$.prop(...)`.
+    let kw = if trimmed.starts_with("export let ") {
+        "let"
+    } else if trimmed.starts_with("export var ") {
+        "var"
+    } else {
+        return line.to_string();
+    };
 
-    let rest = trimmed[11..].trim(); // After "export let "
-    let rest = rest.trim_end_matches(';').trim();
+    // If there was a leading block comment, find the position of `export` in the
+    // original `line` and split:
+    //   - `comment_prefix`: all original text before `export` (trimmed of trailing
+    //     space between `**/` and `export`), followed by a newline
+    //   - `leading_ws`: the file-level indentation (leading whitespace of the line
+    //     that contains `export`), so the transformed declaration gets proper indent
+    let (comment_prefix, leading_ws_string): (String, String) = if !leading_comment.is_empty() {
+        if let Some(export_pos) = line.rfind("export ") {
+            // Everything before `export` (trimmed of the separating space).
+            let before_export = &line[..export_pos];
+            let prefix_text = before_export.trim_end();
+            let prefix = format!("{}\n", prefix_text);
+
+            // Find the start of the source line that contains `export`.
+            let line_start = before_export.rfind('\n').map(|p| p + 1).unwrap_or(0);
+            // The indentation = leading whitespace of that line.
+            let line_content = &line[line_start..export_pos];
+            let ws_len = line_content.len()
+                - line_content
+                    .trim_start_matches(|c: char| c.is_ascii_whitespace())
+                    .len();
+            let indent = line[line_start..line_start + ws_len].to_string();
+            (prefix, indent)
+        } else {
+            (
+                String::new(),
+                line[..line.len() - line.trim_start().len()].to_string(),
+            )
+        }
+    } else {
+        (
+            String::new(),
+            line[..line.len() - line.trim_start().len()].to_string(),
+        )
+    };
+    let leading_ws = leading_ws_string.as_str();
+
+    // Extract the declaration body after `export let ` / `export var `.
+    // `trimmed` already points past any leading block comment.
+    let rest_raw = trimmed[11..].trim(); // After "export let " / "export var "
+
+    // Strip trailing `// line comment` and `/* block comment */` from the declaration
+    // text BEFORE splitting declarators.  Without this, a declaration like:
+    //   `export let name; // comment`
+    // would produce `name; // comment` as the declarator, corrupting the prop name.
+    let rest_stripped = strip_js_comments(rest_raw);
+    let rest = rest_stripped.trim().trim_end_matches(';').trim();
 
     // Handle multiple declarators: export let a, b, c;
     // Split by comma, but be careful of commas inside default values
     let declarators = split_declarators(rest);
 
     let mut results = Vec::new();
+
+    // The `$.prop($$props, '<key>', …)` KEY is the prop's PUBLIC name, which is
+    // the `prop_alias` for a renamed export (`export let fore; export { fore as
+    // for }` → key `'for'`, local binding `fore`). Falls back to the local name.
+    let prop_key_for = |local: &str| -> String {
+        analysis
+            .root
+            .find_binding_any_scope(local)
+            .and_then(|idx| analysis.root.bindings.get(idx))
+            .and_then(|b| b.prop_alias.as_deref())
+            .unwrap_or(local)
+            .to_string()
+    };
 
     for decl in declarators {
         let decl = decl.trim();
@@ -800,18 +1032,26 @@ pub(super) fn transform_export_let(line: &str, analysis: &ComponentAnalysis) -> 
                 // Store accessor: pass the getter function directly with PROPS_IS_LAZY_INITIAL
                 let flags = calculate_prop_flags(name, analysis, true);
                 results.push(format!(
-                    "{}let {} = $.prop($$props, '{}', {}, {});",
-                    leading_ws, name, name, flags, value
+                    "{}{} {} = $.prop($$props, '{}', {}, {});",
+                    leading_ws,
+                    kw,
+                    name,
+                    prop_key_for(name),
+                    flags,
+                    value
                 ));
             } else {
                 // Check if the value is a "simple expression" that can be passed directly
                 // Non-simple expressions need to be wrapped in a thunk and use PROPS_IS_LAZY_INITIAL
-                let mut is_simple = is_simple_expression_str(value);
+                let mut is_simple = is_simple_expression_str(value, analysis);
                 // An identifier is NOT simple if it refers to another prop/state variable
                 // because after transforms it would become a function call (e.g., v2 -> v2()).
                 let mut is_prop_ref = false;
-                if is_simple
-                    && is_identifier_str(value)
+                // A bare reactive-binding identifier is a no-arg getter call after
+                // transform (`value()`); the official compiler unwraps it to the bare
+                // callee. Fire regardless of `is_simple` (now false for such an
+                // identifier) so it is emitted bare rather than thunked.
+                if is_identifier_str(value)
                     && analysis
                         .root
                         .find_binding_any_scope(value)
@@ -830,20 +1070,46 @@ pub(super) fn transform_export_let(line: &str, analysis: &ComponentAnalysis) -> 
                     is_simple = false;
                     is_prop_ref = true;
                 }
+                // A bare legacy `$:` reactive variable becomes `$.get(name)` after
+                // transform — a MEMBER call, not a no-arg identifier getter — so it
+                // is non-simple and must be THUNKED (`() => $.get(name)`), not
+                // unwrapped to a bare callee. Mirrors upstream applying the
+                // transform before `is_simple_expression`.
+                if is_simple
+                    && is_identifier_str(value)
+                    && analysis
+                        .root
+                        .find_binding_any_scope(value)
+                        .and_then(|idx| analysis.root.bindings.get(idx))
+                        .is_some_and(|b| matches!(b.kind, BindingKind::LegacyReactive))
+                {
+                    is_simple = false;
+                    // is_prop_ref stays false → thunk path
+                }
 
                 // Calculate flags: PROPS_IS_BINDABLE + PROPS_IS_UPDATED + PROPS_IS_LAZY_INITIAL
                 let flags = calculate_prop_flags(name, analysis, !is_simple);
 
                 if is_simple {
                     results.push(format!(
-                        "{}let {} = $.prop($$props, '{}', {}, {});",
-                        leading_ws, name, name, flags, value
+                        "{}{} {} = $.prop($$props, '{}', {}, {});",
+                        leading_ws,
+                        kw,
+                        name,
+                        prop_key_for(name),
+                        flags,
+                        value
                     ));
                 } else if is_prop_ref {
                     // Prop/state identifier: pass directly (official compiler unwraps no-arg calls)
                     results.push(format!(
-                        "{}let {} = $.prop($$props, '{}', {}, {});",
-                        leading_ws, name, name, flags, value
+                        "{}{} {} = $.prop($$props, '{}', {}, {});",
+                        leading_ws,
+                        kw,
+                        name,
+                        prop_key_for(name),
+                        flags,
+                        value
                     ));
                 } else {
                     // Wrap non-simple values in a thunk: () => value
@@ -852,8 +1118,13 @@ pub(super) fn transform_export_let(line: &str, analysis: &ComponentAnalysis) -> 
                     // instead of arrow returning object literal
                     let lazy_arg = make_lazy_prop_arg(value);
                     results.push(format!(
-                        "{}let {} = $.prop($$props, '{}', {}, {});",
-                        leading_ws, name, name, flags, lazy_arg
+                        "{}{} {} = $.prop($$props, '{}', {}, {});",
+                        leading_ws,
+                        kw,
+                        name,
+                        prop_key_for(name),
+                        flags,
+                        lazy_arg
                     ));
                 }
             }
@@ -863,13 +1134,21 @@ pub(super) fn transform_export_let(line: &str, analysis: &ComponentAnalysis) -> 
             let flags = calculate_prop_flags(name, analysis, false);
 
             results.push(format!(
-                "{}let {} = $.prop($$props, '{}', {});",
-                leading_ws, name, name, flags
+                "{}{} {} = $.prop($$props, '{}', {});",
+                leading_ws,
+                kw,
+                name,
+                prop_key_for(name),
+                flags
             ));
         }
     }
 
-    results.join("\n")
+    if comment_prefix.is_empty() {
+        results.join("\n")
+    } else {
+        format!("{}{}", comment_prefix, results.join("\n"))
+    }
 }
 
 /// Transform destructured `export let { ... } = expr` patterns into flattened
@@ -919,7 +1198,25 @@ pub(super) fn transform_destructured_export_let(
         analysis,
     )?;
 
-    Some(format!("let {};", declarations.join(",\n\t")))
+    // Upstream emits all generated `$$array`/`$$array_N` `$.to_array(...)`
+    // deriveds together right after `tmp`, before the individual prop getters
+    // (which reference them). Reorder to match — `tmp` first, then the array
+    // deriveds in creation order, then the prop declarators in walk order.
+    let ordered = if let Some((tmp_decl, rest_decls)) = declarations.split_first() {
+        let (array_decls, prop_decls): (Vec<String>, Vec<String>) = rest_decls
+            .iter()
+            .cloned()
+            .partition(|d| d.trim_start().starts_with("$$array"));
+        let mut ordered = Vec::with_capacity(declarations.len());
+        ordered.push(tmp_decl.clone());
+        ordered.extend(array_decls);
+        ordered.extend(prop_decls);
+        ordered
+    } else {
+        declarations
+    };
+
+    Some(format!("let {};", ordered.join(",\n\t")))
 }
 
 /// Find the end position of a destructuring pattern in `{ ... } = RHS` or `[ ... ] = RHS`.
@@ -1072,10 +1369,18 @@ pub(super) fn extract_destructured_export_paths(
         };
         *array_counter += 1;
 
-        declarations.push(format!(
-            "{} = $.derived(() => $.to_array({}, {}))",
-            array_var, base_path, total_count
-        ));
+        // A rest element makes the destructure unbounded, so `$.to_array` is
+        // called without the element-count argument (upstream omits it when the
+        // pattern has a `...rest`).
+        let has_rest = elements.iter().any(|e| e.trim().starts_with("..."));
+        declarations.push(if has_rest {
+            format!("{} = $.derived(() => $.to_array({}))", array_var, base_path)
+        } else {
+            format!(
+                "{} = $.derived(() => $.to_array({}, {}))",
+                array_var, base_path, total_count
+            )
+        });
 
         for (idx, elem) in elements.iter().enumerate() {
             let elem = elem.trim();
@@ -1244,6 +1549,112 @@ pub(super) fn flatten_destructured_let_with_reexported_props(
     Some(declarations.join("\n"))
 }
 
+/// Like `flatten_destructured_let_with_reexported_props` but returns each
+/// declarator as a bare `name = rhs` string (no leading `let`, no trailing `;`).
+/// This allows the caller to merge them into a single `let tmp = rhs, a = ...,
+/// b = ..., c = ...;` statement, matching the upstream AST output where a
+/// single `VariableDeclaration` node holds all declarators.
+///
+/// Returns `None` if the pattern is unsupported (non-ObjectPattern).
+pub(super) fn flatten_destructured_let_as_declarators(
+    pattern: &str,
+    base_path: &str,
+    analysis: &ComponentAnalysis,
+) -> Option<Vec<String>> {
+    use crate::compiler::phases::phase2_analyze::scope::BindingKind;
+
+    let pattern = pattern.trim();
+    let mut declarators: Vec<String> = Vec::new();
+
+    if pattern.starts_with('{') && pattern.ends_with('}') {
+        let inner = &pattern[1..pattern.len() - 1];
+        let properties = split_destructuring_properties(inner);
+
+        for prop in properties {
+            let prop = prop.trim();
+            if prop.is_empty() {
+                continue;
+            }
+
+            if let Some((key, value_pattern)) = split_property_key_value(prop) {
+                let new_path = format!("{}.{}", base_path, key);
+
+                if value_pattern.starts_with('{') || value_pattern.starts_with('[') {
+                    // Nested destructuring — recurse and collect nested declarators
+                    if let Some(nested) =
+                        flatten_destructured_let_as_declarators(value_pattern, &new_path, analysis)
+                    {
+                        declarators.extend(nested);
+                    }
+                } else {
+                    let (binding_name, default_value) = split_binding_name_default(value_pattern);
+                    let is_prop = analysis
+                        .root
+                        .find_binding_any_scope(binding_name)
+                        .and_then(|idx| analysis.root.bindings.get(idx))
+                        .is_some_and(|b| b.kind == BindingKind::BindableProp);
+
+                    if is_prop {
+                        let flags = calculate_prop_flags(binding_name, analysis, true);
+                        if let Some(default_val) = default_value {
+                            declarators.push(format!(
+                                "{} = $.prop($$props, '{}', {}, () => $.fallback({}, {}))",
+                                binding_name, binding_name, flags, new_path, default_val
+                            ));
+                        } else {
+                            declarators.push(format!(
+                                "{} = $.prop($$props, '{}', {}, () => {})",
+                                binding_name, binding_name, flags, new_path
+                            ));
+                        }
+                    } else if let Some(default_val) = default_value {
+                        declarators.push(format!(
+                            "{} = {} !== undefined ? {} : {}",
+                            binding_name, new_path, new_path, default_val
+                        ));
+                    } else {
+                        declarators.push(format!("{} = {}", binding_name, new_path));
+                    }
+                }
+            } else {
+                let (binding_name, default_value) = split_binding_name_default(prop);
+                let new_path = format!("{}.{}", base_path, binding_name);
+                let is_prop = analysis
+                    .root
+                    .find_binding_any_scope(binding_name)
+                    .and_then(|idx| analysis.root.bindings.get(idx))
+                    .is_some_and(|b| b.kind == BindingKind::BindableProp);
+
+                if is_prop {
+                    let flags = calculate_prop_flags(binding_name, analysis, true);
+                    if let Some(default_val) = default_value {
+                        declarators.push(format!(
+                            "{} = $.prop($$props, '{}', {}, () => $.fallback({}, {}))",
+                            binding_name, binding_name, flags, new_path, default_val
+                        ));
+                    } else {
+                        declarators.push(format!(
+                            "{} = $.prop($$props, '{}', {}, () => {})",
+                            binding_name, binding_name, flags, new_path
+                        ));
+                    }
+                } else if let Some(default_val) = default_value {
+                    declarators.push(format!(
+                        "{} = {} !== undefined ? {} : {}",
+                        binding_name, new_path, new_path, default_val
+                    ));
+                } else {
+                    declarators.push(format!("{} = {}", binding_name, new_path));
+                }
+            }
+        }
+    } else {
+        return None;
+    }
+
+    Some(declarators)
+}
+
 /// Split a property pattern into key and value parts around `:`.
 /// Returns None if there's no `:` (simple property like `a` or `a = default`).
 /// Handles nested patterns so `b: { c }` splits into `("b", "{ c }")`.
@@ -1345,10 +1756,22 @@ pub(super) fn calculate_prop_flags(
     // Look up the binding in the instance scope (not module scope).
     // Props always live in the instance scope; looking in any scope risks picking up
     // shadowing variables in module/function scopes with the same name.
+    //
+    // Prefer an actual `prop` / `bindable_prop` binding of this name first: a
+    // same-named `function f(prop) {…}` parameter can be registered at the
+    // instance scope index by Phase-2, so `get_binding` would return the
+    // parameter (kind `normal`) and drop the `PROPS_IS_BINDABLE` bit.
     let binding = analysis
         .root
-        .get_binding(name, analysis.root.instance_scope_index)
-        .and_then(|idx| analysis.root.bindings.get(idx));
+        .bindings
+        .iter()
+        .find(|b| b.name == name && matches!(b.kind, BindingKind::Prop | BindingKind::BindableProp))
+        .or_else(|| {
+            analysis
+                .root
+                .get_binding(name, analysis.root.instance_scope_index)
+                .and_then(|idx| analysis.root.bindings.get(idx))
+        });
 
     // PROPS_IS_BINDABLE: only if binding.kind == BindableProp
     if let Some(b) = binding
@@ -1372,10 +1795,30 @@ pub(super) fn calculate_prop_flags(
     if analysis.accessors {
         flags |= PROPS_IS_UPDATED;
     } else if let Some(b) = binding {
+        use crate::compiler::phases::phase2_analyze::scope::DeclarationKind;
+        // When a prop is shadowed by a same-named function parameter, the
+        // BindableProp kind can land on the parameter binding (which is never
+        // reassigned), while the real `export let`/destructured prop binding —
+        // declared in the instance/module scope — carries the reassignment.
+        // Borrow the real declaration's updated-ness so a reassigned prop still
+        // gets PROPS_IS_UPDATED. (Sort/flag-only — does not change which binding
+        // is marked BindableProp, so var-hoisting is untouched.)
+        let real_reassigned = analysis.root.bindings.iter().any(|x| {
+            x.name == name
+                && x.declaration_kind != DeclarationKind::Param
+                && (x.scope_index == 0 || x.scope_index == analysis.root.instance_scope_index)
+                && x.reassigned
+        });
+        let real_mutated = analysis.root.bindings.iter().any(|x| {
+            x.name == name
+                && x.declaration_kind != DeclarationKind::Param
+                && (x.scope_index == 0 || x.scope_index == analysis.root.instance_scope_index)
+                && x.mutated
+        });
         let is_updated = if analysis.immutable {
-            b.reassigned || (analysis.runes && b.mutated)
+            (b.reassigned || real_reassigned) || (analysis.runes && (b.mutated || real_mutated))
         } else {
-            b.is_updated()
+            b.is_updated() || real_reassigned || real_mutated
         };
         if is_updated {
             flags |= PROPS_IS_UPDATED;
@@ -1402,6 +1845,42 @@ pub(super) fn is_identifier_str(s: &str) -> bool {
     }
 }
 
+/// Whether `s` contains a `=>` token at bracket depth 0 (i.e. the expression is
+/// itself an arrow function), as opposed to a `=>` nested inside a call argument
+/// (`x.map(a => b)`). The call/member-expression "not simple" checks below use
+/// this to avoid bailing on a call CHAIN that merely contains a nested arrow:
+/// `type.split("").map((c) => c).join("")` is a CallExpression (NOT simple),
+/// even though it contains `=>`.
+fn has_top_level_arrow(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    let mut depth: i32 = 0;
+    let mut i = 0;
+    let mut string: Option<u8> = None;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = string {
+            if b == b'\\' {
+                i += 2;
+                continue;
+            }
+            if b == q {
+                string = None;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'\'' | b'"' | b'`' => string = Some(b),
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            b'=' if depth == 0 && i + 1 < bytes.len() && bytes[i + 1] == b'>' => return true,
+            _ => {}
+        }
+        i += 1;
+    }
+    false
+}
+
 /// Check if a value string represents a "simple expression" that can be passed directly.
 ///
 /// Simple expressions don't need to be wrapped in a thunk (factory function).
@@ -1420,7 +1899,7 @@ pub(super) fn is_identifier_str(s: &str) -> bool {
 /// - Object literals: { a: 1 }
 /// - Call expressions: foo()
 /// - Template literals: `hello`, `${x}` (TemplateLiteral != Literal in AST)
-pub(super) fn is_simple_expression_str(value: &str) -> bool {
+pub(super) fn is_simple_expression_str(value: &str, analysis: &ComponentAnalysis) -> bool {
     let trimmed = value.trim();
 
     // Empty is not simple
@@ -1476,10 +1955,7 @@ pub(super) fn is_simple_expression_str(value: &str) -> bool {
 
     // Call expressions are NOT simple (unless it's a no-arg function reference)
     // e.g., foo() is not simple, but foo is simple
-    if trimmed.ends_with(')')
-        && !trimmed.starts_with("function")
-        && memchr::memmem::find(trimmed.as_bytes(), b"=>").is_none()
-    {
+    if trimmed.ends_with(')') && !trimmed.starts_with("function") && !has_top_level_arrow(trimmed) {
         // Check if it looks like a call expression
         // Find matching parens
         let mut depth = 0;
@@ -1494,7 +1970,7 @@ pub(super) fn is_simple_expression_str(value: &str) -> bool {
                         // If there's a valid identifier before the paren, it's a call
                         if !before.is_empty()
                             && !before.ends_with("function")
-                            && memchr::memmem::find(before.as_bytes(), b"=>").is_none()
+                            && !has_top_level_arrow(before)
                         {
                             return false;
                         }
@@ -1526,13 +2002,24 @@ pub(super) fn is_simple_expression_str(value: &str) -> bool {
 
     // Member expressions (containing dots) are NOT simple
     if !trimmed.starts_with("function")
-        && memchr::memmem::find(trimmed.as_bytes(), b"=>").is_none()
+        && !has_top_level_arrow(trimmed)
         && !trimmed.starts_with('"')
         && !trimmed.starts_with('\'')
         && !trimmed.starts_with('`')
         && trimmed.contains('.')
         && trimmed.parse::<f64>().is_err()
     {
+        return false;
+    }
+
+    // Conditional / binary / logical expressions are simple ONLY when every
+    // operand is itself simple — mirroring upstream `is_simple_expression`
+    // (utils/ast.js), which recurses into test/consequent/alternate (and
+    // left/right). The string heuristic above never recursed, so e.g.
+    // `solid() ? "a" : "b"` (whose test is a CallExpression) was wrongly treated
+    // as simple, dropping PROPS_IS_LAZY_INITIAL and the default thunk. Defer to an
+    // exact AST check; only flips a heuristic `true` to `false`, never the reverse.
+    if ast_expr_is_simple(trimmed, analysis) == Some(false) {
         return false;
     }
 
@@ -1547,6 +2034,93 @@ pub(super) fn is_simple_expression_str(value: &str) -> bool {
     // - Binary/logical expressions: a + b, a && b
     // - Conditional expressions: a ? b : c
     true
+}
+
+/// Exact `is_simple_expression` check via the OXC parser, mirroring upstream's
+/// `is_simple_expression` in `packages/svelte/src/compiler/utils/ast.js`.
+///
+/// Returns `Some(true)`/`Some(false)` when `value` parses as a single expression,
+/// and `None` when it cannot be parsed (callers then keep the string-heuristic
+/// result). The text passed here is post-transform (prop reads are already
+/// `name()` calls), so a `CallExpression` operand is correctly non-simple.
+fn ast_expr_is_simple(value: &str, analysis: &ComponentAnalysis) -> Option<bool> {
+    use oxc_allocator::Allocator;
+    use oxc_ast::ast::Statement;
+    use oxc_parser::Parser;
+    use oxc_span::SourceType;
+
+    let alloc = Allocator::default();
+    // Wrap in parens so an object literal (`{...}`) parses as an expression, not a block.
+    let src = format!("({})", value.trim());
+    let parsed = Parser::new(&alloc, &src, SourceType::mjs()).parse();
+    if parsed.panicked || !parsed.diagnostics.is_empty() {
+        return None;
+    }
+    let Some(Statement::ExpressionStatement(stmt)) = parsed.program.body.first() else {
+        return None;
+    };
+    Some(expr_is_simple(&stmt.expression, analysis))
+}
+
+/// `true` if `name` is a reactive binding that prop-read transforms rewrite into
+/// a getter call (`name` -> `name()`). Such an identifier is therefore NOT a
+/// simple expression: upstream's `is_simple_expression` runs after that rewrite
+/// and sees a `CallExpression`. Mirrors the `is_prop_ref` binding-kind set.
+fn is_call_becoming_binding(name: &str, analysis: &ComponentAnalysis) -> bool {
+    // Only legacy mode rewrites a prop/state read into a getter call (`name()` /
+    // `$.get(name)`); in runes mode these identifiers stay plain reads, so they
+    // remain simple. Gating here keeps runes default-value handling identical to
+    // before this predicate existed (mirrors the legacy-only `is_prop_ref` sites).
+    if analysis.runes {
+        return false;
+    }
+    analysis
+        .root
+        .find_binding_any_scope(name)
+        .and_then(|idx| analysis.root.bindings.get(idx))
+        .is_some_and(|b| {
+            matches!(
+                b.kind,
+                BindingKind::BindableProp
+                    | BindingKind::Prop
+                    | BindingKind::State
+                    | BindingKind::RawState
+                    | BindingKind::Derived
+            )
+        })
+}
+
+/// Recursive AST predicate matching upstream `is_simple_expression`
+/// (`utils/ast.js`), evaluated as if prop/state reads were already rewritten to
+/// getter calls (so a reactive-binding identifier is non-simple).
+fn expr_is_simple(expr: &oxc_ast::ast::Expression, analysis: &ComponentAnalysis) -> bool {
+    use oxc_ast::ast::Expression;
+    match expr {
+        Expression::ParenthesizedExpression(p) => expr_is_simple(&p.expression, analysis),
+        Expression::NumericLiteral(_)
+        | Expression::StringLiteral(_)
+        | Expression::BooleanLiteral(_)
+        | Expression::NullLiteral(_)
+        | Expression::BigIntLiteral(_)
+        | Expression::RegExpLiteral(_)
+        | Expression::ArrowFunctionExpression(_)
+        | Expression::FunctionExpression(_) => true,
+        // A bare identifier is simple only if it stays a plain identifier; a
+        // prop/state/derived binding is rewritten to `name()` (a call) later.
+        Expression::Identifier(id) => !is_call_becoming_binding(id.name.as_str(), analysis),
+        Expression::ConditionalExpression(c) => {
+            expr_is_simple(&c.test, analysis)
+                && expr_is_simple(&c.consequent, analysis)
+                && expr_is_simple(&c.alternate, analysis)
+        }
+        Expression::BinaryExpression(b) => {
+            expr_is_simple(&b.left, analysis) && expr_is_simple(&b.right, analysis)
+        }
+        Expression::LogicalExpression(l) => {
+            expr_is_simple(&l.left, analysis) && expr_is_simple(&l.right, analysis)
+        }
+        _ => false,
+    }
 }
 
 /// Create the argument for a lazy prop initializer.
@@ -1599,8 +2173,31 @@ pub(super) fn split_declarators(s: &str) -> Vec<&str> {
     // declarator anyway.
     let mut string_char: Option<char> = None;
     let mut escaped = false;
+    // Track comment state so commas inside `// …` / `/* … */` comments — which
+    // can legitimately appear between prop names in a `$props()` destructuring,
+    // e.g. `// we add name, color, and stroke …` — are not treated as
+    // declarator separators. The comment text itself stays inside the declarator
+    // and is stripped per-declarator by the caller.
+    let mut in_line_comment = false;
+    // Byte index just past the `/*` opener, or `usize::MAX` when not in a block
+    // comment. The close `*/` must occur at or after this index so a `/*/` does
+    // not self-close on the opener's own `*`.
+    let mut block_comment_body_start = usize::MAX;
+    let bytes = s.as_bytes();
 
     for (i, c) in s.char_indices() {
+        if in_line_comment {
+            if c == '\n' {
+                in_line_comment = false;
+            }
+            continue;
+        }
+        if block_comment_body_start != usize::MAX {
+            if c == '/' && i >= block_comment_body_start && i > 0 && bytes[i - 1] == b'*' {
+                block_comment_body_start = usize::MAX;
+            }
+            continue;
+        }
         if let Some(quote) = string_char {
             if escaped {
                 escaped = false;
@@ -1609,6 +2206,15 @@ pub(super) fn split_declarators(s: &str) -> Vec<&str> {
             } else if c == quote {
                 string_char = None;
             }
+            continue;
+        }
+        // Comment start (only outside strings). Peek the next byte.
+        if c == '/' && bytes.get(i + 1) == Some(&b'/') {
+            in_line_comment = true;
+            continue;
+        }
+        if c == '/' && bytes.get(i + 1) == Some(&b'*') {
+            block_comment_body_start = i + 3;
             continue;
         }
         match c {
@@ -1658,6 +2264,80 @@ pub(super) fn find_line_comment_position(code: &str) -> Option<usize> {
         pos += c.len_utf8();
     }
     None
+}
+
+/// Strip all JS comments (`// ...` and `/* ... */`) from `code`, respecting
+/// string literals so that `//` or `/*` inside a string is not treated as a
+/// comment delimiter.  Returns the comment-free string.
+///
+/// Used by prop-declaration lowering to sanitise declaration text before
+/// parsing the prop name and value.
+pub(super) fn strip_js_comments(code: &str) -> String {
+    // Build the result as raw bytes so multi-byte UTF-8 sequences (e.g. a
+    // non-ASCII character inside a string default value) are copied verbatim
+    // rather than split per byte. All structural delimiters we test for
+    // (`/`, `*`, quotes, `\\`, `\n`) are ASCII, so byte comparison is safe:
+    // UTF-8 continuation bytes are >= 0x80 and never collide with them.
+    let mut result: Vec<u8> = Vec::with_capacity(code.len());
+    let bytes = code.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    let mut in_string: Option<u8> = None; // Some(b'\'') / Some(b'"') / Some(b'`')
+
+    while i < len {
+        let b = bytes[i];
+
+        if let Some(quote) = in_string {
+            // Inside a string literal — copy verbatim until the closing quote.
+            result.push(b);
+            if b == b'\\' && i + 1 < len {
+                // Escaped character: copy both bytes and advance past them.
+                i += 1;
+                result.push(bytes[i]);
+            } else if b == quote {
+                in_string = None;
+            }
+            i += 1;
+            continue;
+        }
+
+        // Outside a string — check for comment or string start.
+        if b == b'/' && i + 1 < len {
+            let next = bytes[i + 1];
+            if next == b'/' {
+                // Line comment: skip to end of line.
+                i += 2;
+                while i < len && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                // Do NOT consume the newline itself so line structure is preserved.
+                continue;
+            }
+            if next == b'*' {
+                // Block comment: skip to closing `*/`.
+                i += 2;
+                while i + 1 < len {
+                    if bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                        i += 2;
+                        break;
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+        }
+
+        if b == b'\'' || b == b'"' || b == b'`' {
+            in_string = Some(b);
+        }
+
+        result.push(b);
+        i += 1;
+    }
+
+    // `result` only ever contains complete byte sequences copied from valid
+    // UTF-8 input, so it is itself valid UTF-8.
+    String::from_utf8(result).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
 }
 
 /// Transform $props() usage.
@@ -1881,7 +2561,13 @@ pub(super) fn transform_props_destructuring(
                     )
                     .unwrap_or(dv);
                 }
-                if !prop_source_vars.is_empty() {
+                // In runes mode the instance-script AST pass
+                // (`ast_state_transform`) already wraps prop-source reads
+                // (`b` → `b()`) across the whole statement, including these
+                // `$.prop(..., () => <default>)` thunks. Wrapping here too
+                // double-wraps (`b()()`), so only do the text wrap in legacy
+                // mode, where the AST pass doesn't run on this output.
+                if !analysis.runes && !prop_source_vars.is_empty() {
                     dv = super::prop_source_reads_ast::wrap_prop_source_reads_ast(
                         &dv,
                         prop_source_vars,
@@ -1892,12 +2578,6 @@ pub(super) fn transform_props_destructuring(
                 dv
             };
             let default_value = default_value.as_str();
-
-            // Check if the TRANSFORMED default value is a simple expression
-            let is_simple = is_simple_expression_str(default_value);
-
-            // Calculate flags using the official logic
-            let flags = calculate_prop_flags(local_name, analysis, !is_simple);
 
             // Check if the value needs $.proxy() wrapping.
             // Only $bindable() defaults get proxy-wrapped when should_proxy returns true.
@@ -1913,6 +2593,17 @@ pub(super) fn transform_props_destructuring(
             } else {
                 default_value.to_string()
             };
+
+            // Check if the VISITED default value is a simple expression. Upstream's
+            // `get_prop_source` receives the already-proxied `initial`, so the
+            // is_simple / lazy-thunk decision is made on `$.proxy(defValue)` — a
+            // CallExpression, hence non-simple → thunked + PROPS_IS_LAZY_INITIAL.
+            // Checking the bare `defValue` (an Identifier) instead would wrongly
+            // treat it as simple and emit a non-lazy, un-thunked default.
+            let is_simple = is_simple_expression_str(&proxy_wrapped, analysis);
+
+            // Calculate flags using the official logic
+            let flags = calculate_prop_flags(local_name, analysis, !is_simple);
 
             if is_simple {
                 declarators.push(format!(
@@ -2260,7 +2951,7 @@ pub(super) fn wrap_prop_mutation_validation(
                 prop_alias, path_array, full_expr,
             );
             if line_num > 0 {
-                replacement.push_str(&format!(", {}, {}", line_num, col_num));
+                let _ = write!(replacement, ", {}, {}", line_num, col_num);
             }
             replacement.push(')');
             result = format!(
@@ -2476,7 +3167,7 @@ pub(super) fn wrap_prop_mutation_validation(
                 prop_alias, path_array, full_original_expr,
             );
             if line_num > 0 {
-                replacement.push_str(&format!(", {}, {}", line_num, col_num));
+                let _ = write!(replacement, ", {}, {}", line_num, col_num);
             }
             replacement.push(')');
             result = format!(
@@ -2776,7 +3467,31 @@ pub(super) fn split_top_level_args(s: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod split_declarators_tests {
-    use super::split_declarators;
+    use super::{
+        apply_prop_reads_in_prop_default_values, split_declarators, transform_prop_reads_in_expr,
+    };
+
+    #[test]
+    fn bare_prop_default_stays_a_getter_reference() {
+        let props = vec!["log_all".to_string(), "logs".to_string()];
+        // A default value that IS a bare prop identifier is the lazy getter ref
+        // upstream passes directly — keep it bare.
+        assert_eq!(
+            apply_prop_reads_in_prop_default_values(
+                "let log_rs = $.prop($$props, 'log_rs', 24, log_all);",
+                &props
+            ),
+            "let log_rs = $.prop($$props, 'log_rs', 24, log_all);"
+        );
+        // A prop read NESTED inside a larger default still wraps.
+        assert_eq!(
+            apply_prop_reads_in_prop_default_values(
+                "let f = $.prop($$props, 'f', 24, () => logs.push(1));",
+                &props
+            ),
+            "let f = $.prop($$props, 'f', 24, () => logs().push(1));"
+        );
+    }
 
     #[test]
     fn splits_top_level_commas() {
@@ -2806,10 +3521,66 @@ mod split_declarators_tests {
     }
 
     #[test]
+    fn ignores_commas_inside_comments() {
+        // A `//` comment between prop names can contain commas; they must not
+        // split the declarator list (the comment travels with the next name and
+        // is stripped per-declarator by the caller).
+        assert_eq!(
+            split_declarators("a,\n// we add b, c, and d for compat\nb, c"),
+            vec!["a", "\n// we add b, c, and d for compat\nb", " c"]
+        );
+        // Trailing line comment after a comma (commas inside it preserved).
+        assert_eq!(
+            split_declarators("open = void 0, // If undefined, renders inline; else modal\nclose"),
+            vec![
+                "open = void 0",
+                " // If undefined, renders inline; else modal\nclose"
+            ]
+        );
+        // Block comment with commas.
+        assert_eq!(
+            split_declarators("a /* x, y, z */, b"),
+            vec!["a /* x, y, z */", " b"]
+        );
+        // `/*/` must not self-close on the opener's own star.
+        assert_eq!(
+            split_declarators("a = b /*/, c */ , d"),
+            vec!["a = b /*/, c */ ", " d"]
+        );
+        // `//` inside a string is still a string, not a comment.
+        assert_eq!(
+            split_declarators(r#"a = "http://x,y", b"#),
+            vec![r#"a = "http://x,y""#, " b"]
+        );
+    }
+
+    #[test]
     fn honours_escaped_quote_in_string() {
         assert_eq!(
             split_declarators(r#"a = "x\",y", b"#),
             vec![r#"a = "x\",y""#, " b"]
+        );
+    }
+
+    #[test]
+    fn does_not_wrap_explicit_property_key() {
+        // An explicit object-literal property KEY must not be wrapped as a
+        // value read — `{ active(): active() }` is invalid JS. Only the value
+        // (and shorthand) get the prop-getter call.
+        let props = vec!["active".to_string(), "className".to_string()];
+        assert_eq!(
+            transform_prop_reads_in_expr("classnames(className, { active: active, x: 1 })", &props),
+            "classnames(className(), { active: active(), x: 1 })"
+        );
+        // Shorthand still expands.
+        assert_eq!(
+            transform_prop_reads_in_expr("({ active })", &["active".to_string()]),
+            "({ active: active() })"
+        );
+        // A ternary value before `:` is still wrapped (it is a read, not a key).
+        assert_eq!(
+            transform_prop_reads_in_expr("cond ? active : 0", &["active".to_string()]),
+            "cond ? active() : 0"
         );
     }
 }

@@ -1,6 +1,6 @@
 [package]
-name = "svelte-compiler-rust"
-version = "0.6.0"
+name = "rsvelte_core"
+version = "0.7.16"
 edition = "2024"
 rust-version = "1.90"
 description = "A high-performance Rust implementation of the Svelte compiler"
@@ -14,7 +14,11 @@ crate-type = ["cdylib", "rlib"]
 
 [features]
 default = ["native"]
-native = ["rayon", "miette/fancy", "jemalloc"]
+# `mimalloc-alloc` is included so the NAPI cdylib + profiling bins default to
+# mimalloc, which A/B-measured ~11% faster than jemalloc on the compile workload
+# (mold itself links mimalloc for the same allocation-bound reason). jemalloc is
+# kept available for comparison.
+native = ["rayon", "miette/fancy", "jemalloc", "mimalloc-alloc"]
 trace-fastpath = []
 # `napi` opts the cdylib into the NAPI build. When the cdylib gets
 # dlopen'd by Node (post-program-start), jemalloc's default
@@ -23,9 +27,26 @@ trace-fastpath = []
 # Pull in the `disable_initial_exec_tls` feature transitively so the
 # NAPI build is always dlopen-safe. The `?` makes it a no-op when
 # jemalloc is disabled (e.g. `--no-default-features --features napi`).
-napi = ["dep:napi", "dep:napi-derive", "dep:napi-build", "tikv-jemallocator?/disable_initial_exec_tls"]
+napi = [
+  "dep:napi",
+  "dep:napi-derive",
+  "dep:napi-build",
+  "tikv-jemallocator?/disable_initial_exec_tls",
+]
 jemalloc = ["dep:tikv-jemallocator"]
-wasm = ["wasm-bindgen", "console_error_panic_hook", "getrandom/wasm_js"]
+# Profiling-only: use mimalloc instead of jemalloc in the profiling bins (A/B).
+mimalloc-alloc = ["dep:mimalloc"]
+pprof = ["dep:pprof"]
+# `wasm` exports this crate's own `#[wasm_bindgen]` surface (the `wasm`
+# module — `parse_svelte`, `compile_client`, `svelte2tsx`, …) and is what
+# `pkg/` is built with.
+wasm = ["wasm-deps"]
+# `wasm-deps` pulls only the wasm-bindgen toolchain + the wasm `getrandom`
+# backend, *without* enabling the `wasm` bindings module. Downstream wasm
+# crates (e.g. `rsvelte_fmt_wasm`) depend on `rsvelte_core` with this
+# feature so they reuse the parser on a wasm target without re-exporting
+# `rsvelte_core`'s `#[wasm_bindgen]` symbols (which collide at link time).
+wasm-deps = ["wasm-bindgen", "console_error_panic_hook", "getrandom/wasm_js"]
 
 [dependencies]
 # Serialization
@@ -50,16 +71,34 @@ oxc_ast = { path = "../../../../crates/oxc_ast", features = ["serialize"] }
 oxc_span = { path = "../../../../crates/oxc_span" }
 oxc_diagnostics = { path = "../../../../crates/oxc_diagnostics" }
 oxc_codegen = { path = "../../../../crates/oxc_codegen" }
+rsvelte_esrap = { path = "../rsvelte_esrap" }
 oxc_syntax = { path = "../../../../crates/oxc_syntax" }
 oxc_semantic = { path = "../../../../crates/oxc_semantic" }
+
+# Module resolution for the svelte-check overlay: resolves `.svelte` imports
+# (including tsconfig `paths`/`baseUrl` aliases like `$lib/...`) so aliased
+# imports can be rewritten to point straight at their generated shadow `.tsx`.
+oxc_resolver = "11"
+
+# SPIKE: oxc_formatter is publish=false in oxc; pull via git from main HEAD
 oxc_formatter = { path = "../../../../crates/oxc_formatter" }
 
 # Error handling
 thiserror = "2.0"
 miette = "7.4"
 
-# Regex
-regex = "1.11"
+# Regex. Trim to the minimal feature set our patterns need — `unicode-perl`
+# (`\w \s \d \b`) + `unicode-case` (`(?i)`). We use no `\p{...}`/script/category
+# classes or `\X` graphemes, so dropping `unicode-age`/`-bool`/`-gencat`/
+# `-script`/`-segment` (the large Unicode tables) shrinks every artifact with no
+# behavior change. (string_wizard already requests exactly this minimal set, so
+# feature unification keeps the trim effective.)
+regex = { version = "1.11", default-features = false, features = [
+  "std",
+  "perf",
+  "unicode-perl",
+  "unicode-case",
+] }
 
 # Immutable data structures for efficient cloning
 im = "15.1"
@@ -88,7 +127,13 @@ clap = { version = "4.5", features = ["derive"] }
 chrono = "0.4"
 
 # N-API support (optional)
-napi = { version = "3", default-features = false, features = ["napi9", "serde-json", "async", "tokio_rt", "compat-mode"], optional = true }
+napi = { version = "3", default-features = false, features = [
+  "napi9",
+  "serde-json",
+  "async",
+  "tokio_rt",
+  "compat-mode",
+], optional = true }
 napi-derive = { version = "3", optional = true }
 
 # WASM support (optional)
@@ -102,6 +147,13 @@ oxc_ast_visit = { path = "../../../../crates/oxc_ast_visit" }
 # Better multi-threaded memory allocator (optional, Unix/Mac only)
 [target.'cfg(all(not(windows), not(target_arch = "wasm32")))'.dependencies]
 tikv-jemallocator = { version = "0.7", optional = true }
+# mimalloc: production allocator (mold itself links mimalloc). `local_dynamic_tls`
+# builds mimalloc with the local-dynamic TLS model instead of the default
+# initial-exec one — required so the NAPI cdylib can be `dlopen`'d by Node on
+# Linux without "cannot allocate memory in static TLS block" (the same class of
+# issue jemalloc's `disable_initial_exec_tls` solved).
+mimalloc = { version = "0.1", optional = true, features = ["local_dynamic_tls"] }
+pprof = { version = "0.15", default-features = false, optional = true }
 
 [build-dependencies]
 napi-build = { version = "2", optional = true }
@@ -110,7 +162,9 @@ napi-build = { version = "2", optional = true }
 # Testing
 insta = { version = "1.42", features = ["json", "glob"] }
 pretty_assertions = "1.4"
-criterion = { version = "0.8", features = ["html_reports"] }
+criterion = { version = "5.0.0", features = [
+  "html_reports",
+], package = "codspeed-criterion-compat" }
 test-generator = "0.3"
 glob = "0.3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
@@ -165,5 +219,8 @@ harness = false
 name = "compiler"
 harness = false
 
+# wasm-opt (Binaryen) is the single largest WASM size win (≈15–40%). `-Oz`
+# optimizes the produced `.wasm` for size; this only affects the wasm-pack
+# release build shipped as @rsvelte/compiler, not native artifacts.
 [package.metadata.wasm-pack.profile.release]
-wasm-opt = false
+wasm-opt = ['-Oz']

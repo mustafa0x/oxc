@@ -21,14 +21,19 @@ use super::super::parser::Parser;
 
 /// Ensure a Script's content has been fully parsed from raw_content.
 /// This performs the deferred OXC parse. Call this before accessing script.content in analysis.
+///
+/// Returns the first JS parse error, if any — mirroring upstream
+/// `read_script` → `acorn.parse`, which throws `js_parse_error` for scripts
+/// acorn rejects. The (recovered, partial) program is still stored on the
+/// script so lenient callers can ignore the error.
 pub fn ensure_script_parsed(
     arena: &ParseArena,
     script: &mut Script,
     _source: &str,
     line_offsets: &[usize],
-) {
+) -> Option<crate::error::ParseError> {
     if script.raw_content.is_empty() {
-        return; // Already parsed or no raw content
+        return None; // Already parsed or no raw content
     }
 
     let raw = std::mem::take(&mut script.raw_content);
@@ -38,7 +43,7 @@ pub fn ensure_script_parsed(
     // For now, pass empty - TODO: preserve leading comments from parse phase
     let leading_comments: Vec<String> = Vec::new();
 
-    let program = super::expression::parse_program(
+    let (program, parse_error) = super::expression::parse_program_with_error(
         arena,
         &raw,
         offset,
@@ -50,6 +55,7 @@ pub fn ensure_script_parsed(
     );
 
     script.content = program;
+    parse_error
 }
 
 impl Parser<'_> {
@@ -88,25 +94,33 @@ impl Parser<'_> {
     }
 
     /// Parse a `<script>` tag and store it in instance_script or module_script.
+    ///
+    /// `self_closing` is only ever `true` in lenient (lint) mode, where a
+    /// self-closed `<script />` is tolerated to mirror svelte-eslint-parser. In
+    /// that case there is no content and no closing tag to consume — the `/>`
+    /// has already been eaten by the caller.
     pub fn parse_script_tag(
         &mut self,
         start: usize,
         attributes: Vec<crate::ast::Attribute>,
+        self_closing: bool,
     ) -> ParseResult<Option<TemplateNode>> {
         let content_start = self.index;
 
         // Use SIMD-accelerated search for </script instead of byte-by-byte scanning
-        loop {
-            if let Some(offset) = memchr::memmem::find(&self.bytes[self.index..], b"</script") {
-                self.index += offset;
-                if self.is_valid_closing_tag("</script") {
+        if !self_closing {
+            loop {
+                if let Some(offset) = memchr::memmem::find(&self.bytes[self.index..], b"</script") {
+                    self.index += offset;
+                    if self.is_valid_closing_tag("</script") {
+                        break;
+                    }
+                    // Not a valid closing tag (e.g., </scripting), skip past it
+                    self.index += 8;
+                } else {
+                    self.index = self.bytes.len();
                     break;
                 }
-                // Not a valid closing tag (e.g., </scripting), skip past it
-                self.index += 8;
-            } else {
-                self.index = self.bytes.len();
-                break;
             }
         }
 
@@ -114,7 +128,9 @@ impl Parser<'_> {
         let script_content = &self.source[content_start..content_end];
 
         // Consume </script followed by optional whitespace and >
-        if self.match_str("</script") {
+        if self_closing {
+            // Nothing to consume — the self-closing `/>` was already eaten.
+        } else if self.match_str("</script") {
             self.advance_by(8); // consume '</script'
             // Skip whitespace before >
             while !self.is_eof() && self.current_char() != '>' {
@@ -178,6 +194,16 @@ impl Parser<'_> {
                     {
                         if t.data.as_str() == "module" {
                             context = ScriptContext::Module;
+                            // The compiler drops the `context` attribute from the
+                            // script's attribute list (it only needs the
+                            // `ScriptContext`), and the snapshot tests expect that.
+                            // svelte-eslint-parser keeps it, so attribute-layout
+                            // lint rules count it — preserve it only in lenient
+                            // (lint) mode to match the oracle without changing
+                            // compiler output.
+                            if self.options.lenient_script {
+                                script_attributes.push(attr_node.clone());
+                            }
                         } else {
                             // Invalid context value - only "module" is allowed
                             return Err(crate::error::ParseError::svelte(
@@ -208,7 +234,7 @@ impl Parser<'_> {
             }
         }
 
-        let use_typescript = self.ts || is_typescript;
+        let use_typescript = self.ts || self.script_ts || is_typescript;
         let leading_comments = std::mem::take(&mut self.pending_leading_comments);
 
         let script = if self.options.defer_script_parse {
@@ -221,6 +247,7 @@ impl Parser<'_> {
                 source_type: CompactString::from("module"),
                 leading_comments: None,
                 trailing_comments: None,
+                ignore_comment_map: Vec::new(),
             });
             Script {
                 node_type: ScriptType::Script,
@@ -235,7 +262,7 @@ impl Parser<'_> {
             }
         } else {
             // Eager parsing (default for tests and direct AST comparison)
-            let program = super::super::expression::parse_program(
+            let (program, parse_error) = super::super::expression::parse_program_with_error(
                 &self.arena,
                 script_content,
                 content_start,
@@ -245,16 +272,52 @@ impl Parser<'_> {
                 start,
                 end,
             );
-            Script {
-                node_type: ScriptType::Script,
-                start: start as u32,
-                end: end as u32,
-                context,
-                content: program,
-                attributes: script_attributes,
-                raw_content: String::new(),
-                content_offset: content_start as u32,
-                is_typescript: use_typescript,
+            // Upstream acorn throws on the first script parse error, even in
+            // loose mode (read/script.js → acorn.js `handle_parse_error`). BUT
+            // official svelte2tsx parses scripts with acorn's error recovery and
+            // just SPLICES the raw script — it never aborts on a script JS error
+            // (e.g. `foo {}`, or `await {…}` in a non-async script, both of which
+            // acorn accepts where OXC correctly rejects). In svelte2tsx mode
+            // (`script_ts`) mirror that: on a script parse error fall back to an
+            // empty-body placeholder + raw content, so svelte2tsx applies NO body
+            // transforms and the script source survives verbatim in the output.
+            if let Some(err) = parse_error {
+                if !self.script_ts && !self.options.lenient_script {
+                    return Err(err);
+                }
+                let placeholder = Expression::from_node(crate::ast::typed_expr::JsNode::Program {
+                    start: content_start as u32,
+                    end: (content_start + script_content.len()) as u32,
+                    loc: None,
+                    body: crate::ast::arena::IdRange::empty(),
+                    source_type: CompactString::from("module"),
+                    leading_comments: None,
+                    trailing_comments: None,
+                    ignore_comment_map: Vec::new(),
+                });
+                Script {
+                    node_type: ScriptType::Script,
+                    start: start as u32,
+                    end: end as u32,
+                    context,
+                    content: placeholder,
+                    attributes: script_attributes,
+                    raw_content: script_content.to_string(),
+                    content_offset: content_start as u32,
+                    is_typescript: use_typescript,
+                }
+            } else {
+                Script {
+                    node_type: ScriptType::Script,
+                    start: start as u32,
+                    end: end as u32,
+                    context,
+                    content: program,
+                    attributes: script_attributes,
+                    raw_content: String::new(),
+                    content_offset: content_start as u32,
+                    is_typescript: use_typescript,
+                }
             }
         };
 

@@ -1,13 +1,15 @@
-//! tsgo subprocess driver. Spawns Microsoft's `tsgo` (or falls back to
-//! `tsc`) against the overlay tsconfig produced by
-//! `super::overlay::materialize_overlay`, captures the textual diagnostic
-//! stream, and parses it into the `RawTsDiagnostic` shape consumed by
-//! `super::mapper`.
+//! TypeScript compiler subprocess driver. Spawns `tsc` (the default) or
+//! Microsoft's native `tsgo` (with `--tsgo` / `prefer_tsgo`) against the
+//! overlay tsconfig produced by `super::overlay::materialize_overlay`,
+//! captures the textual diagnostic stream, and parses it into the
+//! `RawTsDiagnostic` shape consumed by `super::mapper`. The two compilers
+//! are wire-compatible (`--pretty false` output + flags), so the same
+//! driver handles both; `find_compiler` just decides which binary to run.
 //!
 //! The JS reference (`incremental.ts::runTypeScriptDiagnostics`) spawns
 //! `node <tsgo_js> -p <tsconfig> --pretty true --noErrorTruncation`. Our
-//! version mirrors that, plus a graceful fallback chain when tsgo isn't
-//! installed.
+//! version mirrors that, plus a graceful fallback chain when the preferred
+//! compiler isn't installed.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -55,13 +57,23 @@ pub struct TsgoBinary {
     pub args_prefix: Vec<String>,
 }
 
-/// Locate a TypeScript compiler binary. Resolution order matches the JS
-/// reference's preference plus a couple of common rsvelte dev paths:
-/// 1. `$TSGO_BIN`
-/// 2. `<workspace>/node_modules/.bin/tsgo`
-/// 3. `<workspace>/node_modules/.bin/tsc`
-/// 4. Globally on `$PATH`: `tsgo`, then `tsc`.
-pub fn find_compiler(workspace: &Path) -> Result<TsgoBinary, TsgoError> {
+/// Locate a TypeScript compiler binary.
+///
+/// `$TSGO_BIN` is always honoured first as an explicit override. After
+/// that the search order depends on `prefer_tsgo`:
+///   * `prefer_tsgo == false` (the default, `rsvelte-check` without
+///     `--tsgo`) — prefer the stock `tsc`, falling back to `tsgo`:
+///       1. `node_modules/.bin/tsc` in `workspace` or any ancestor, then `…/tsgo`
+///       2. Globally on `$PATH`: `tsc`, then `tsgo`.
+///   * `prefer_tsgo == true` (`rsvelte-check --tsgo`) — prefer
+///     Microsoft's native `tsgo`, falling back to `tsc`:
+///       1. `node_modules/.bin/tsgo` in `workspace` or any ancestor, then `…/tsc`
+///       2. Globally on `$PATH`: `tsgo`, then `tsc`.
+///
+/// Each name is searched across the full ancestor chain before the next,
+/// so a workspace-hoisted `tsgo` (pnpm puts it at the monorepo root, not in
+/// a deeply-nested package) still wins over a locally-resolvable `tsc`.
+pub fn find_compiler(workspace: &Path, prefer_tsgo: bool) -> Result<TsgoBinary, TsgoError> {
     if let Ok(explicit) = std::env::var("TSGO_BIN")
         && !explicit.is_empty()
     {
@@ -70,29 +82,41 @@ pub fn find_compiler(workspace: &Path) -> Result<TsgoBinary, TsgoError> {
             args_prefix: Vec::new(),
         });
     }
-    let candidates = [
-        workspace.join("node_modules/.bin/tsgo"),
-        workspace.join("node_modules/.bin/tsc"),
-    ];
-    for path in &candidates {
-        if path.exists() {
+    // Binary names in preference order.
+    let names: [&str; 2] = if prefer_tsgo {
+        ["tsgo", "tsc"]
+    } else {
+        ["tsc", "tsgo"]
+    };
+    // 1. `node_modules/.bin` in `workspace` AND every ancestor directory,
+    //    in preference order. pnpm (and npm/yarn workspaces) hoist workspace
+    //    binaries to the repo-root `node_modules/.bin`, so a package nested
+    //    several levels deep (e.g. `apps/foo/frontend/app`) usually has NO
+    //    local `.bin/tsgo` — only the monorepo root does. Walking each name
+    //    across all ancestors before moving to the fallback means a hoisted
+    //    `tsgo` is still preferred over a locally-resolvable `tsc`; without
+    //    this, `--tsgo` silently ran `tsc` (≈3-4x slower) in monorepos.
+    for name in names {
+        let mut dir: Option<&Path> = Some(workspace);
+        while let Some(d) = dir {
+            let path = d.join("node_modules/.bin").join(name);
+            if path.exists() {
+                return Ok(TsgoBinary {
+                    program: path.display().to_string(),
+                    args_prefix: Vec::new(),
+                });
+            }
+            dir = d.parent();
+        }
+    }
+    // 2. Global `$PATH`, in preference order.
+    for name in names {
+        if which(name) {
             return Ok(TsgoBinary {
-                program: path.display().to_string(),
+                program: name.to_string(),
                 args_prefix: Vec::new(),
             });
         }
-    }
-    if which("tsgo") {
-        return Ok(TsgoBinary {
-            program: "tsgo".into(),
-            args_prefix: Vec::new(),
-        });
-    }
-    if which("tsc") {
-        return Ok(TsgoBinary {
-            program: "tsc".into(),
-            args_prefix: Vec::new(),
-        });
     }
     Err(TsgoError::NotFound)
 }
@@ -180,6 +204,85 @@ mod tests {
         assert_eq!(diags[0].severity, "error");
         assert_eq!(diags[1].severity, "warning");
         assert!(diags[1].message.contains("declared but never used"));
+    }
+
+    #[test]
+    fn find_compiler_respects_backend_preference() {
+        // `TSGO_BIN` is checked before everything else, so this layout-based
+        // test is only meaningful when the override isn't set in the env.
+        if std::env::var_os("TSGO_BIN").is_some() {
+            eprintln!("skip: TSGO_BIN is set in the environment");
+            return;
+        }
+        let dir =
+            std::env::temp_dir().join(format!("rsvelte_find_compiler_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let bin = dir.join("node_modules/.bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        // Both binaries present locally — preference decides the winner.
+        std::fs::write(bin.join("tsc"), "").unwrap();
+        std::fs::write(bin.join("tsgo"), "").unwrap();
+
+        let tsc = find_compiler(&dir, false).expect("tsc found");
+        assert!(
+            tsc.program.ends_with("tsc"),
+            "prefer_tsgo=false should pick tsc, got {}",
+            tsc.program
+        );
+        let tsgo = find_compiler(&dir, true).expect("tsgo found");
+        assert!(
+            tsgo.program.ends_with("tsgo"),
+            "prefer_tsgo=true should pick tsgo, got {}",
+            tsgo.program
+        );
+
+        // Only the non-preferred binary present → fall back to it.
+        std::fs::remove_file(bin.join("tsgo")).unwrap();
+        let fallback = find_compiler(&dir, true).expect("falls back to tsc");
+        assert!(
+            fallback.program.ends_with("tsc"),
+            "prefer_tsgo=true with only tsc present should fall back to tsc, got {}",
+            fallback.program
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn find_compiler_walks_up_to_hoisted_monorepo_bin() {
+        if std::env::var_os("TSGO_BIN").is_some() {
+            eprintln!("skip: TSGO_BIN is set in the environment");
+            return;
+        }
+        // Monorepo layout: `tsgo` hoisted to the repo root, only `tsc`
+        // resolvable from the nested package — `--tsgo` must still pick the
+        // hoisted `tsgo` (regression for the silent tsc fallback).
+        let root =
+            std::env::temp_dir().join(format!("rsvelte_find_compiler_mono_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let root_bin = root.join("node_modules/.bin");
+        let pkg = root.join("apps/foo/frontend/app");
+        let pkg_bin = pkg.join("node_modules/.bin");
+        std::fs::create_dir_all(&root_bin).unwrap();
+        std::fs::create_dir_all(&pkg_bin).unwrap();
+        std::fs::write(root_bin.join("tsgo"), "").unwrap();
+        std::fs::write(pkg_bin.join("tsc"), "").unwrap();
+
+        let found = find_compiler(&pkg, true).expect("tsgo found via ancestor");
+        assert!(
+            found.program.ends_with("tsgo"),
+            "hoisted tsgo must win over a nested tsc, got {}",
+            found.program
+        );
+        assert!(
+            found
+                .program
+                .contains(&root.join("node_modules").display().to_string()),
+            "tsgo must resolve from the root, got {}",
+            found.program
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

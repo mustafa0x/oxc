@@ -1,25 +1,25 @@
 //! Identify exactly where parse time is spent.
 //! Measures: template-only vs script parsing vs OXC conversion vs expression parsing
 
-// Use jemalloc as the global allocator for better multi-threaded
+// Use mimalloc as the global allocator (A/B-measured faster than jemalloc;
 // performance. Defined per-bin rather than once in the lib because the lib
 // is built as both rlib and cdylib, and a lib-level `#[global_allocator]`
 // is duplicated across both outputs at link time — cargo issue
 // rust-lang/cargo#6313.
 #[cfg(all(
-    feature = "jemalloc",
+    feature = "mimalloc-alloc",
     not(feature = "napi"),
     not(target_arch = "wasm32"),
     not(target_os = "windows")
 ))]
 #[global_allocator]
-static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use std::fs;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use svelte_compiler_rust::compiler::phases::phase1_parse::{ParseOptions, parse};
+use rsvelte_core::compiler::phases::phase1_parse::{ParseOptions, parse};
 
 fn main() {
     let files = collect_files();
@@ -124,7 +124,7 @@ fn main() {
 }
 
 fn bench_reuse(files: &[(String, String)], options: ParseOptions, label: &str) -> f64 {
-    use svelte_compiler_rust::compiler::phases::phase1_parse::{Parser, parse_reuse};
+    use rsvelte_core::compiler::phases::phase1_parse::{Parser, parse_reuse};
 
     let mut parser = Parser::new("", options);
 

@@ -92,47 +92,49 @@ fn visit_common(
             });
         }
 
-        // Check for invalid parentheses in the binding expression
-        // But ignore parentheses that are inside comments (leading comments before the expression)
+        // Check for invalid parentheses in the binding expression, ignoring any
+        // '(' that sits inside a comment between the opening `{` and the
+        // expression. Comment regions are detected directly from the source
+        // (scanning `/* … */` and `// …`) rather than from the expression's
+        // `leadingComments` JSON — comment capture is off on the compile path,
+        // so the typed expression carries no comment metadata here; a source
+        // scan is the robust source of truth.
         if let Some(start) = directive.expression.start() {
-            // Get leading comments from the expression if available
-            let expr_json = directive.expression.as_json();
-            let leading_comments = expr_json.get("leadingComments").and_then(|c| c.as_array());
-
-            // Calculate comment range if we have leading comments
-            let comment_range: Option<(usize, usize)> = leading_comments.and_then(|comments| {
-                let first_comment = comments.first()?;
-                let last_comment = comments.last()?;
-                let comment_start = first_comment.get("start")?.as_u64()? as usize;
-                let comment_end = last_comment.get("end")?.as_u64()? as usize;
-                Some((comment_start, comment_end))
-            });
-
             let start_usize = start as usize;
+            let source_bytes = context.analysis.source.as_bytes();
             let mut i = start_usize;
-            while i > 0
-                && context.analysis.source.as_bytes().get(i.saturating_sub(1)) != Some(&b'{')
-            {
+            while i > 0 && source_bytes.get(i.saturating_sub(1)) != Some(&b'{') {
                 i -= 1;
             }
 
-            // Check for '(' between '{' and the expression, but skip if inside a comment
-            let source_bytes = context.analysis.source.as_bytes();
+            // Scan from just after `{` to the expression start, tracking comment
+            // state so parens inside comments are ignored.
             let mut pos = i;
             let mut found_invalid_paren = false;
-
             while pos < start_usize {
-                if source_bytes.get(pos) == Some(&b'(') {
-                    // Check if this position is inside a comment
-                    let inside_comment = comment_range
-                        .is_some_and(|(c_start, c_end)| pos >= c_start && pos <= c_end);
-
-                    if !inside_comment {
+                match source_bytes.get(pos) {
+                    Some(&b'/') if source_bytes.get(pos + 1) == Some(&b'*') => {
+                        pos += 2;
+                        while pos < start_usize
+                            && !(source_bytes.get(pos) == Some(&b'*')
+                                && source_bytes.get(pos + 1) == Some(&b'/'))
+                        {
+                            pos += 1;
+                        }
+                        pos += 2;
+                    }
+                    Some(&b'/') if source_bytes.get(pos + 1) == Some(&b'/') => {
+                        pos += 2;
+                        while pos < start_usize && source_bytes.get(pos) != Some(&b'\n') {
+                            pos += 1;
+                        }
+                    }
+                    Some(&b'(') => {
                         found_invalid_paren = true;
                         break;
                     }
+                    _ => pos += 1,
                 }
-                pos += 1;
             }
 
             if found_invalid_paren {
@@ -242,45 +244,7 @@ fn visit_common(
     // TODO: Set node.metadata.binding = binding
 
     // For Identifier (not MemberExpression), validate the binding kind
-    if directive.expression.is_identifier_node() {
-        // bind:this also works for regular variables, so skip validation for it
-        if directive.name != "this" {
-            // In the official Svelte, if there's no binding, or the binding is not a valid type,
-            // it should error with bind_invalid_value
-            // Reference: svelte/packages/svelte/src/compiler/phases/2-analyze/visitors/BindDirective.js L193-207
-            let is_valid = if let Some(binding) = binding {
-                // In runes mode, check binding kind strictly
-                // In legacy mode, `let` declarations are allowed for bindings
-                // (their `updated` flag will be set during template analysis)
-                let valid_kind = matches!(
-                    binding.kind,
-                    crate::compiler::phases::phase2_analyze::BindingKind::State
-                        | crate::compiler::phases::phase2_analyze::BindingKind::RawState
-                        | crate::compiler::phases::phase2_analyze::BindingKind::Prop
-                        | crate::compiler::phases::phase2_analyze::BindingKind::BindableProp
-                        | crate::compiler::phases::phase2_analyze::BindingKind::EachItem
-                        | crate::compiler::phases::phase2_analyze::BindingKind::StoreSub
-                        // Legacy mode: allow let declarations (Normal kind)
-                        | crate::compiler::phases::phase2_analyze::BindingKind::Normal
-                        | crate::compiler::phases::phase2_analyze::BindingKind::Let
-                );
-                // Also valid if the binding has been updated (reassigned/mutated)
-                valid_kind || binding.reassigned || binding.mutated
-            } else {
-                // No binding found - this is an error (undefined variable)
-                false
-            };
-
-            if !is_valid {
-                return Err(AnalysisError::ValidationWithCode {
-                    code: "bind_invalid_value".to_string(),
-                    message:
-                        "Can only bind to state or props\nhttps://svelte.dev/e/bind_invalid_value"
-                            .to_string(),
-                });
-            }
-        }
-    }
+    validate_bind_value_identifier(directive, binding)?;
 
     // Handle bind:group special logic
     if directive.name == "group"
@@ -341,6 +305,103 @@ fn visit_common(
     // if node.metadata.expression.has_await { return Err(errors::illegal_await_expression()); }
 
     Ok(())
+}
+
+/// Validate that an Identifier `bind:x={y}` expression targets state or props.
+///
+/// Corresponds to BindDirective.js L193-207:
+/// ```js
+/// if (assignee.type === 'Identifier') {
+///   if (
+///     node.name !== 'this' &&
+///     (!binding ||
+///       (binding.kind !== 'state' && ... && !binding.updated))
+///   ) {
+///     e.bind_invalid_value(node.expression);
+///   }
+/// }
+/// ```
+///
+/// Upstream's scope.js marks every bound identifier as `reassigned` (the bind
+/// itself is an update), so with a resolved binding this effectively only
+/// fires for kinds that escape that marking; with no binding (undeclared /
+/// global identifier) it always fires. This check applies to bindings on
+/// elements AND components alike (upstream's BindDirective visitor runs for
+/// both).
+pub(super) fn validate_bind_value_identifier(
+    directive: &BindDirective,
+    binding: Option<&crate::compiler::phases::phase2_analyze::Binding>,
+) -> Result<(), AnalysisError> {
+    if !directive.expression.is_identifier_node() {
+        return Ok(());
+    }
+
+    // bind:this also works for regular variables, so skip validation for it
+    if directive.name == "this" {
+        return Ok(());
+    }
+
+    // In the official Svelte, if there's no binding, or the binding is not a valid type,
+    // it should error with bind_invalid_value
+    // Reference: svelte/packages/svelte/src/compiler/phases/2-analyze/visitors/BindDirective.js L193-207
+    let is_valid = if let Some(binding) = binding {
+        // In runes mode, check binding kind strictly
+        // In legacy mode, `let` declarations are allowed for bindings
+        // (their `updated` flag will be set during template analysis)
+        let valid_kind = matches!(
+            binding.kind,
+            crate::compiler::phases::phase2_analyze::BindingKind::State
+                | crate::compiler::phases::phase2_analyze::BindingKind::RawState
+                | crate::compiler::phases::phase2_analyze::BindingKind::Prop
+                | crate::compiler::phases::phase2_analyze::BindingKind::BindableProp
+                | crate::compiler::phases::phase2_analyze::BindingKind::EachItem
+                | crate::compiler::phases::phase2_analyze::BindingKind::StoreSub
+                // Legacy mode: allow let declarations (Normal kind)
+                | crate::compiler::phases::phase2_analyze::BindingKind::Normal
+                | crate::compiler::phases::phase2_analyze::BindingKind::Let
+        );
+        // Also valid if the binding has been updated (reassigned/mutated)
+        valid_kind || binding.reassigned || binding.mutated
+    } else {
+        // No binding found - this is an error (undefined variable)
+        false
+    };
+
+    if !is_valid {
+        return Err(AnalysisError::ValidationWithCode {
+            code: "bind_invalid_value".to_string(),
+            message: "Can only bind to state or props\nhttps://svelte.dev/e/bind_invalid_value"
+                .to_string(),
+        });
+    }
+
+    Ok(())
+}
+
+/// Resolve the binding for an Identifier bind expression and run
+/// `validate_bind_value_identifier`. Used by the component visitor
+/// (`shared/component.rs`), which does not go through `visit_common`.
+pub(super) fn validate_bind_value_for_component(
+    directive: &BindDirective,
+    context: &VisitorContext,
+) -> Result<(), AnalysisError> {
+    if !directive.expression.is_identifier_node() {
+        return Ok(());
+    }
+
+    let expr_node = directive.expression.as_node();
+    let name = expr_node.name().unwrap_or_default();
+    if name.is_empty() {
+        return Ok(());
+    }
+
+    let binding = context
+        .analysis
+        .root
+        .get_binding(name, context.scope)
+        .map(|idx| &context.analysis.root.bindings[idx]);
+
+    validate_bind_value_identifier(directive, binding)
 }
 
 /// Validate a binding for a specific element type.
@@ -759,7 +820,6 @@ fn get_object_node<'a>(
         JsNode::MemberExpression { object, .. } => {
             get_object_node(arena.get_js_node(*object), arena)
         }
-        JsNode::Raw(_) => None,
         _ => None,
     }
 }

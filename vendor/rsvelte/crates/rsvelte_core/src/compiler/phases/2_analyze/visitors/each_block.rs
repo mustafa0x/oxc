@@ -104,6 +104,7 @@ pub fn visit(block: &mut EachBlock, context: &mut VisitorContext) -> Result<(), 
         .filter(|n| match n {
             TemplateNode::Comment(_) => false,
             TemplateNode::ConstTag(_) => false,
+            TemplateNode::DeclarationTag(_) => false,
             TemplateNode::Text(text) => !text.data.trim().is_empty(),
             _ => true,
         })
@@ -118,7 +119,9 @@ pub fn visit(block: &mut EachBlock, context: &mut VisitorContext) -> Result<(), 
     // Clear is_direct_child_of_component since children of control flow blocks
     // are not direct children of a component
     let was_direct_child = context.is_direct_child_of_component;
+    let was_direct_snippet = context.is_direct_child_of_snippet;
     context.is_direct_child_of_component = false;
+    context.is_direct_child_of_snippet = false;
 
     // Push fragment owner type for const_tag placement validation
     context
@@ -164,6 +167,7 @@ pub fn visit(block: &mut EachBlock, context: &mut VisitorContext) -> Result<(), 
 
     // Restore is_direct_child_of_component
     context.is_direct_child_of_component = was_direct_child;
+    context.is_direct_child_of_snippet = was_direct_snippet;
 
     // Visit the key expression if present
     // IMPORTANT: Use a separate metadata for the key expression, NOT block.metadata.expression.
@@ -253,7 +257,6 @@ fn walk_pattern_defaults_typed(
                     JsNode::RestElement { argument, .. } => {
                         walk_pattern_defaults_typed(arena.get_js_node(*argument), arena, context)?;
                     }
-                    JsNode::Raw(v) => walk_pattern_defaults(v, context)?,
                     _ => {}
                 }
             }
@@ -266,7 +269,6 @@ fn walk_pattern_defaults_typed(
         JsNode::RestElement { argument, .. } => {
             walk_pattern_defaults_typed(arena.get_js_node(*argument), arena, context)?;
         }
-        JsNode::Raw(v) => walk_pattern_defaults(v, context)?,
         _ => {}
     }
     Ok(())

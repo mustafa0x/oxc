@@ -9,9 +9,9 @@ The workflow depends on `mise.toml` being present in the repository:
 
 ```toml
 [tools]
-rust = "1.94.1"
+rust = "1.97.0"
 node = "24.14.0"
-pnpm = "10.30.2"
+pnpm = "11.9.0"
 ```
 
 If publishing suddenly fails with missing `pnpm`, an older Node, or

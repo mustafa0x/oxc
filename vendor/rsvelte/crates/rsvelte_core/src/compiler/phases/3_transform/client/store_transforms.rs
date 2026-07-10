@@ -3,7 +3,7 @@
 use memchr::memmem;
 use rustc_hash::FxHashSet;
 
-use super::find_matching_paren;
+use super::{find_matching_paren, is_shorthand_object_property};
 
 /// Transform store assignments in client-side code.
 ///
@@ -98,6 +98,11 @@ pub(super) fn is_function_parameter_in_statement(statement: &str, store_sub: &st
                     let trimmed = param.trim();
                     // Handle destructuring and default values
                     let param_name = trimmed.split('=').next().unwrap_or(trimmed).trim();
+                    // Strip destructuring delimiters so a name inside an array /
+                    // object pattern param (`([$x, $y]) =>`) is recognized.
+                    let param_name = param_name.trim_matches(|c: char| {
+                        c == '[' || c == ']' || c == '{' || c == '}' || c.is_whitespace()
+                    });
                     if param_name == store_sub {
                         return true;
                     }
@@ -163,6 +168,15 @@ pub(super) fn is_function_parameter_in_statement(statement: &str, store_sub: &st
                                     let trimmed = param.trim();
                                     let param_name =
                                         trimmed.split('=').next().unwrap_or(trimmed).trim();
+                                    // Strip destructuring delimiters so a name inside an
+                                    // array/object pattern param (`([$x, $y]) =>`) matches.
+                                    let param_name = param_name.trim_matches(|c: char| {
+                                        c == '['
+                                            || c == ']'
+                                            || c == '{'
+                                            || c == '}'
+                                            || c.is_whitespace()
+                                    });
                                     if param_name == store_sub {
                                         return true;
                                     }
@@ -231,15 +245,7 @@ pub(super) fn transform_store_sub_calls(line: &str, store_sub_vars: &[String]) -
                 continue;
             }
 
-            // Check if it's followed by `)` immediately (i.e., `$name()` - already a getter call)
             let paren_pos = abs_pos + store_sub.len(); // position of `(`
-            let after_paren = paren_pos + 1;
-            if after_paren < result.len() && result.as_bytes()[after_paren] == b')' {
-                // This is `$name()` - already a getter call, skip
-                new_result.push_str(&result[search_start..paren_pos]);
-                search_start = paren_pos;
-                continue;
-            }
 
             // Check if this is inside a function parameter declaration
             // e.g., `function bar($state, $effect)` - skip these.
@@ -286,7 +292,8 @@ pub(super) fn transform_store_sub_calls(line: &str, store_sub_vars: &[String]) -
                     }
                     // Now check if preceded by `function` keyword
                     if k >= 8 {
-                        let prefix = &before_text[k - 8..k];
+                        let prefix =
+                            crate::compiler::utils::char_boundary_lookback(before_text, k, 8);
                         prefix == "function"
                             && (k == 8
                                 || !{
@@ -365,15 +372,21 @@ pub(super) fn transform_store_reads_client(line: &str, store_sub_vars: &[String]
 
         while i < chars.len() {
             // Check if we're at the start of the identifier
-            let remaining = &result[result
+            let byte_i = result
                 .char_indices()
                 .nth(i)
                 .map(|(idx, _)| idx)
-                .unwrap_or(i)..];
+                .unwrap_or(i);
+            let remaining = &result[byte_i..];
             if remaining.starts_with(store_sub) {
                 // Check character before (must be non-identifier char or start of string)
-                // Also exclude `.` - a dot before means this is a property access like `obj.$value`
-                let before_ok = if i == 0 {
+                // Also exclude `.` - a dot before means this is a property access like `obj.$value`.
+                // EXCEPTION: a `...` spread (`[...$store]`, `f(...$store)`) ends in a `.`
+                // but is NOT a property access — the spread argument IS a read and must be
+                // wrapped. Detect the spread by the three preceding dots.
+                let is_spread_prefix =
+                    i >= 3 && chars[i - 1] == '.' && chars[i - 2] == '.' && chars[i - 3] == '.';
+                let before_ok = if i == 0 || is_spread_prefix {
                     true
                 } else {
                     let prev_char = chars[i - 1];
@@ -421,9 +434,23 @@ pub(super) fn transform_store_reads_client(line: &str, store_sub_vars: &[String]
                         && chars[k] == ':'
                         && (k + 1 >= chars.len() || chars[k + 1] != ':');
 
-                    // Only treat as property key if followed by `:` AND we're inside an object literal
-                    // (i.e., there is an unmatched `{` before this position in `new_result`)
-                    has_colon && {
+                    // A real property key is ALWAYS immediately preceded (skipping
+                    // whitespace/newlines) by `{` (first entry) or `,` (later entry).
+                    // A ternary consequent `cond ? $store : x` is instead preceded by
+                    // `?`. This distinguishes the two even inside a function body,
+                    // whose block `{` would otherwise make the brace-depth check below
+                    // a false positive for any ternary `$store :` in the body.
+                    let prev_is_obj_sep = {
+                        let mut j = i;
+                        while j > 0 && chars[j - 1].is_whitespace() {
+                            j -= 1;
+                        }
+                        j > 0 && (chars[j - 1] == '{' || chars[j - 1] == ',')
+                    };
+
+                    // Only treat as property key if followed by `:`, preceded by an
+                    // object-entry separator, AND we're inside an unmatched `{`.
+                    has_colon && prev_is_obj_sep && {
                         let mut brace_depth: i32 = 0;
                         for ch in new_result.chars() {
                             match ch {
@@ -436,13 +463,14 @@ pub(super) fn transform_store_reads_client(line: &str, store_sub_vars: &[String]
                     }
                 };
 
-                // Check if this is inside a string literal (e.g., '$foo' in $.store_unsub(..., '$foo', ...))
-                let is_inside_string = if i > 0 {
-                    let prev_char = chars[i - 1];
-                    prev_char == '\'' || prev_char == '"'
-                } else {
-                    false
-                };
+                // Check if this is inside a string literal. A store-sub name can
+                // appear mid-string (a log/message argument like
+                // `"… if ($canvas_dim) :"`), not only right after the opening
+                // quote, so scan from the start tracking string + template `${}`
+                // state rather than only inspecting the preceding char. A `$x`
+                // inside a `${ }` interpolation is code and is still transformed.
+                let is_inside_string =
+                    super::state_transforms::is_inside_string_literal(&result, byte_i);
 
                 if before_ok && after_ok {
                     if is_inside_string {
@@ -465,6 +493,16 @@ pub(super) fn transform_store_reads_client(line: &str, store_sub_vars: &[String]
                         // This handles cases like `$x()` or `$.update_store(x, $x())`
                         // where the `()` was already generated by store assignment transforms
                         new_result.push_str(store_sub);
+                        i += store_sub.len();
+                        continue;
+                    } else if is_shorthand_object_property(&chars, i, store_sub.len()) {
+                        // Shorthand object property: `{ $width }` -> `{ $width: $width() }`.
+                        // Emitting `{ $width() }` is invalid (method shorthand), so expand
+                        // like the prop-read path, keeping the leading `$` in the key.
+                        new_result.push_str(store_sub);
+                        new_result.push_str(": ");
+                        new_result.push_str(store_sub);
+                        new_result.push_str("()");
                         i += store_sub.len();
                         continue;
                     } else {

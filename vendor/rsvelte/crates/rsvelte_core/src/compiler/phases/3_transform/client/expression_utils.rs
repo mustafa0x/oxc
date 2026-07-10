@@ -1,6 +1,7 @@
 //! Expression parsing, shadowing detection, and identifier analysis utilities.
 
 use memchr::memmem;
+use std::fmt::Write as _;
 
 /// Collapse a multi-line expression to a single line, matching esrap's behavior.
 /// Strip TypeScript generic type parameters from rune calls.
@@ -91,10 +92,17 @@ pub(super) fn collapse_to_single_line(content: &str) -> String {
     // Extract inner content (between braces/brackets)
     let inner = &trimmed[1..trimmed.len() - 1];
 
-    // Collapse whitespace: replace newlines and leading whitespace with single space
+    // Collapse whitespace: replace newlines and leading whitespace with single space.
+    // Line comments must be dropped — joining lines would otherwise swallow the
+    // rest of the collapsed expression behind the `//`. This matches esrap,
+    // which prints the flattened object from the AST without interior comments.
     let mut collapsed_inner = String::new();
     for line in inner.split('\n') {
-        let trimmed_line = line.trim();
+        let mut trimmed_line = line.trim();
+        if let Some(comment_pos) = super::props_transforms::find_line_comment_position(trimmed_line)
+        {
+            trimmed_line = trimmed_line[..comment_pos].trim_end();
+        }
         if !trimmed_line.is_empty() {
             if !collapsed_inner.is_empty() {
                 collapsed_inner.push(' ');
@@ -231,6 +239,65 @@ pub(super) fn needs_compound_assignment_parens(expr: &str, _op: &str) -> bool {
 }
 
 /// Find the end of a statement value for client-side transformations.
+/// True if `s` ends with the identifier `kw` on a word boundary (the char before
+/// `kw` is not an identifier char), so `else`/`if` match but `notif` / `myelse`
+/// do not.
+fn ends_with_keyword(s: &str, kw: &str) -> bool {
+    let Some(before) = s.strip_suffix(kw) else {
+        return false;
+    };
+    match before.chars().next_back() {
+        Some(c) => !(c.is_alphanumeric() || c == '_' || c == '$'),
+        None => true,
+    }
+}
+
+/// Given text ending in `)`, return the byte index of the matching `(` (scanning
+/// backward, string-unaware — adequate for the control-header check where the
+/// header parens contain no unbalanced-paren string literals in practice).
+fn matching_open_paren(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    if bytes.last() != Some(&b')') {
+        return None;
+    }
+    let mut depth = 0i32;
+    let mut i = bytes.len();
+    while i > 0 {
+        i -= 1;
+        match bytes[i] {
+            b')' => depth += 1,
+            b'(' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// True if `prefix` ends with a brace-less control-flow header whose body is the
+/// following statement — `if (cond)`, `for (...)`, `while (...)`, `switch (...)`,
+/// `catch (...)`, or the bare keywords `else` / `do`. Used so a depth-0 newline
+/// after such a header does not prematurely end the statement.
+pub(super) fn ends_with_braceless_control_header(prefix: &str) -> bool {
+    let t = prefix.trim_end();
+    if ends_with_keyword(t, "else") || ends_with_keyword(t, "do") {
+        return true;
+    }
+    if t.ends_with(')')
+        && let Some(open) = matching_open_paren(t)
+    {
+        let before = t[..open].trim_end();
+        return ["if", "for", "while", "switch", "catch"]
+            .iter()
+            .any(|kw| ends_with_keyword(before, kw));
+    }
+    false
+}
+
 pub(super) fn find_statement_end_client(s: &str) -> usize {
     let mut depth = 0;
     let mut in_string = false;
@@ -297,8 +364,24 @@ pub(super) fn find_statement_end_client(s: &str) -> usize {
                             | '>'
                             | '='
                             | ','
+                            // `(`, `[`, and a backtick after a newline continue the
+                            // expression per JS ASI rules (`foo\n(bar)` is `foo(bar)`,
+                            // `a\n[i]` is `a[i]`). Without these, a multi-line
+                            // initializer whose continuation line starts with `(`
+                            // (e.g. `let x =\n  (cond ? a : b) || c`) is truncated to
+                            // an empty expression.
+                            | '('
+                            | '['
+                            | '`'
                     ) {
                         // continuation; keep scanning
+                    } else if ends_with_braceless_control_header(&s[..byte_pos]) {
+                        // A brace-less control-flow header (`if (cond)`, `else`,
+                        // `for (...)`, `while (...)`, `do`) takes the following
+                        // statement as its body — JS does not insert a semicolon
+                        // after it. Keep scanning so `$: if (cond)\n  stmt` stays a
+                        // single statement rather than splitting `stmt` off into a
+                        // separate top-level (unguarded) statement.
                     } else {
                         return byte_pos;
                     }
@@ -1100,12 +1183,46 @@ pub(super) fn is_shorthand_object_property(
     }
 
     // Now we need to verify this is inside an object literal
-    // by checking what's before the variable
-    // We need to find a matching `{` that's not a block statement
-    // This is tricky, but we can use a simple heuristic:
-    // - Preceded by `{` or `,` (possibly with whitespace)
-    // - And we should verify the context looks like an object literal
+    // by checking what's before the variable.
+    is_object_literal_property_position(chars, var_start)
+}
 
+/// Check if a variable at the given position is the KEY of an explicit
+/// (non-shorthand) object-literal property, e.g. the `foo` in
+/// `{ foo: bar }`. Used to avoid rewriting a property key as if it were a
+/// value read — `{ foo(): bar }` is invalid JavaScript.
+///
+/// Mirrors [`is_shorthand_object_property`] but the forward check looks for a
+/// `:` (property-value separator) rather than `,`/`}`. The backward
+/// object-literal-context check is shared via
+/// [`is_object_literal_property_position`], which also excludes ternary
+/// `cond ? a : b` (there `a` is not preceded by `{`/`,`).
+pub(super) fn is_explicit_property_key(chars: &[char], var_start: usize, var_len: usize) -> bool {
+    let var_end = var_start + var_len;
+
+    // Skip whitespace after the variable.
+    let mut k = var_end;
+    while k < chars.len() && chars[k].is_whitespace() {
+        k += 1;
+    }
+
+    if k >= chars.len() {
+        return false;
+    }
+
+    // Must be followed by a single `:` (property-value separator). Exclude
+    // `::` (not valid object syntax, but guard anyway) — a real key is `name:`.
+    if chars[k] != ':' || (k + 1 < chars.len() && chars[k + 1] == ':') {
+        return false;
+    }
+
+    is_object_literal_property_position(chars, var_start)
+}
+
+/// Shared backward heuristic: returns true when the identifier at `var_start`
+/// sits in object-literal property position — preceded (ignoring whitespace)
+/// by `{` or `,` inside an object literal (not a block statement or array).
+fn is_object_literal_property_position(chars: &[char], var_start: usize) -> bool {
     let mut j = var_start;
     // Skip whitespace before the variable
     while j > 0 && chars[j - 1].is_whitespace() {
@@ -1804,6 +1921,33 @@ pub(super) fn find_matching_brace(s: &str) -> Option<usize> {
     None
 }
 
+/// Strip leading block comments and line comments (and the whitespace between
+/// them) from the start of an expression string. Returns the remainder starting
+/// at the first non-comment, non-whitespace character.
+pub(super) fn strip_leading_comments(s: &str) -> &str {
+    let mut rest = s.trim_start();
+    loop {
+        if let Some(after) = rest.strip_prefix("/*") {
+            if let Some(end) = after.find("*/") {
+                rest = after[end + 2..].trim_start();
+                continue;
+            }
+            // Unterminated block comment — nothing usable follows.
+            return "";
+        }
+        if let Some(after) = rest.strip_prefix("//") {
+            match after.find('\n') {
+                Some(nl) => {
+                    rest = after[nl + 1..].trim_start();
+                    continue;
+                }
+                None => return "",
+            }
+        }
+        return rest;
+    }
+}
+
 /// Determine if an expression needs proxying (could return an object/array).
 ///
 /// Returns `true` for:
@@ -1819,7 +1963,14 @@ pub(super) fn find_matching_brace(s: &str) -> Option<usize> {
 /// - Identifier references
 /// - Arrow functions and function expressions (even if they contain objects inside)
 pub(super) fn expression_needs_proxy(expr: &str) -> bool {
-    let trimmed = expr.trim();
+    // Strip leading comments before sniffing the expression shape. esbuild
+    // (which strips TS from `.svelte.ts` modules before compilation) prepends
+    // `/* @__PURE__ */` to `new`/call initializers, e.g.
+    // `$state(new Map())` → `$state(/* @__PURE__ */ new Map())`. The official
+    // compiler sees the comment as leading trivia on the AST node, so
+    // `should_proxy` still fires; this text sniff must skip it too, otherwise
+    // `trimmed.starts_with("new ")` (and the call/identifier checks) miss.
+    let trimmed = strip_leading_comments(expr.trim()).trim();
 
     // `await expr` needs proxy because the resolved value could be an object/array.
     // In the official Svelte compiler, AwaitExpression is not in the list of types
@@ -2661,7 +2812,7 @@ pub(super) fn wrap_await_with_save_in_async_derived(expr: &str) -> String {
 
                 if has_more_after {
                     // Wrap with $.save: `await expr` -> `(await $.save(expr))()`
-                    result.push_str(&format!("(await $.save({}))()", await_arg_trimmed));
+                    let _ = write!(result, "(await $.save({}))()", await_arg_trimmed);
                     i = j;
                 } else {
                     // Last expression - keep as is
@@ -2678,4 +2829,31 @@ pub(super) fn wrap_await_with_save_in_async_derived(expr: &str) -> String {
     }
 
     result
+}
+
+#[cfg(test)]
+mod proxy_detection_tests {
+    use super::{expression_needs_proxy, strip_leading_comments};
+
+    #[test]
+    fn strips_leading_block_and_line_comments() {
+        assert_eq!(
+            strip_leading_comments("/* @__PURE__ */ new Map()"),
+            "new Map()"
+        );
+        assert_eq!(strip_leading_comments("// x\nfoo"), "foo");
+        assert_eq!(strip_leading_comments("  /*a*/ /*b*/ x"), "x");
+        assert_eq!(strip_leading_comments("plain"), "plain");
+    }
+
+    #[test]
+    fn needs_proxy_through_leading_pure_comment() {
+        // esbuild prepends `/* @__PURE__ */` to `new`/call initializers when
+        // stripping TS from `.svelte.ts` modules; proxy detection must see past it.
+        assert!(expression_needs_proxy("/* @__PURE__ */ new Map()"));
+        assert!(expression_needs_proxy("new Map()"));
+        assert!(expression_needs_proxy("/* @__PURE__ */ createThing()"));
+        // Functions still don't need a proxy even behind a comment.
+        assert!(!expression_needs_proxy("/* c */ () => 1"));
+    }
 }

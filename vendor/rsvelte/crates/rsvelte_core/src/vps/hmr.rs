@@ -3,7 +3,7 @@
 //! edit (full module reload).
 //!
 //! Mirrors the JS reference's
-//! `submodules/vite-plugin-svelte/packages/vite-plugin-svelte/src/plugins/hot-update.js`
+//! `apps/npm/vite-plugin-svelte/src/plugins/hot-update.js`
 //! but at a coarser level: we compare the verbatim text of the
 //! `<script>` and `<script context="module">` blocks. A subsequent
 //! milestone may swap this for an AST-based diff that ignores
@@ -79,9 +79,9 @@ fn extract_script(source: &str, module: bool) -> Option<String> {
         let abs_open = i + open;
         let after_open = abs_open + "<script".len();
         // Find the closing `>` of the opening tag.
-        let close_attrs = match source[after_open..].find('>') {
-            Some(p) => after_open + p,
-            None => return None,
+        let close_attrs = {
+            let p = source[after_open..].find('>')?;
+            after_open + p
         };
         let tag_attrs = &source[after_open..close_attrs];
         let is_module = is_module_script_attrs(tag_attrs);

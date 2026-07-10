@@ -6,6 +6,7 @@
 //! while preserving position information for accurate source mapping.
 
 use std::fmt;
+use std::fmt::Write as _;
 
 use rustc_hash::FxHashMap;
 type HashMap<K, V> = FxHashMap<K, V>;
@@ -148,7 +149,7 @@ fn json_escape(s: &str) -> String {
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
             c if (c as u32) < 0x20 => {
-                out.push_str(&format!("\\u{:04x}", c as u32));
+                let _ = write!(out, "\\u{:04x}", c as u32);
             }
             c => out.push(c),
         }
@@ -221,8 +222,14 @@ pub struct MagicString {
     /// Index of the last chunk in the linked list.
     last_chunk: usize,
     /// Map from original-source position → chunk index that *starts* at that position.
-    /// Populated lazily via `split_at`.
-    by_start: HashMap<u32, usize>,
+    /// Populated lazily via `split_at`. A `BTreeMap` (not a hash map) so
+    /// `split_at` can locate the chunk containing an arbitrary position with an
+    /// O(log n) `range(..=index).next_back()` lookup instead of an O(n) walk
+    /// from the head of the chunk list — the walk made repeated splits on a
+    /// large edited file O(n²) (the dominant svelte2tsx hotspot). Every chunk's
+    /// start is kept here and entries are never removed, so the greatest start
+    /// `<= index` is always the chunk that contains `index`.
+    by_start: std::collections::BTreeMap<u32, usize>,
     /// Map from original-source position → chunk index that *ends* at that position.
     by_end: HashMap<u32, usize>,
     /// Content prepended before everything.
@@ -239,7 +246,8 @@ impl MagicString {
     /// Create a new `MagicString` from the given source.
     pub fn new(source: &str) -> Self {
         let chunk = Chunk::new(0, source.len() as u32);
-        let mut by_start: HashMap<u32, usize> = HashMap::default();
+        let mut by_start: std::collections::BTreeMap<u32, usize> =
+            std::collections::BTreeMap::new();
         let mut by_end: HashMap<u32, usize> = HashMap::default();
         by_start.insert(0, 0);
         by_end.insert(source.len() as u32, 0);
@@ -260,7 +268,7 @@ impl MagicString {
     /// text (for edited chunks) or the corresponding slice of the original
     /// source (for unedited chunks).
     #[inline]
-    fn chunk_content<'a>(&'a self, ci: usize) -> &'a str {
+    fn chunk_content(&self, ci: usize) -> &str {
         let chunk = &self.chunks[ci];
         match &chunk.content {
             Some(s) => s.as_str(),
@@ -305,29 +313,37 @@ impl MagicString {
             return usize::MAX;
         }
 
-        // Walk the linked list to find the chunk containing `index`.
-        let mut cur = self.first_chunk;
-        loop {
-            let chunk = &self.chunks[cur];
-            if index > chunk.start && index < chunk.end {
-                // Need to split this chunk.
-                break;
+        // Find the chunk containing `index` via the sorted start index in
+        // O(log n). `by_start` holds every chunk's start and chunks partition
+        // the source contiguously, so the greatest start `<= index` is the
+        // chunk that contains `index`. (The `by_start.get(&index)` fast-path
+        // above already handled the case where `index` is itself a boundary,
+        // so here `start < index`.) This replaces an O(n) walk from the head
+        // that made repeated splits O(n²).
+        let cur = match self.by_start.range(..=index).next_back() {
+            Some((_, &chunk_idx)) => chunk_idx,
+            None => {
+                #[cfg(debug_assertions)]
+                eprintln!(
+                    "split_at({}): no chunk start <= index (source length {})",
+                    index,
+                    self.original.len()
+                );
+                return usize::MAX;
             }
-            match chunk.next {
-                Some(next) => cur = next,
-                // The earlier `index >= self.original.len()` guard means we
-                // should not reach the end of the chunk list with `index` past
-                // the source. If we somehow do (e.g. corrupted chunk list),
-                // log in debug and return the sentinel rather than panic.
-                None => {
-                    #[cfg(debug_assertions)]
-                    eprintln!(
-                        "split_at({}): chunk list exhausted (source length {})",
-                        index,
-                        self.original.len()
-                    );
-                    return usize::MAX;
-                }
+        };
+        // Defensive: confirm `index` really falls strictly inside `cur`. With a
+        // well-formed chunk list this always holds; if not, fall back to the
+        // sentinel rather than producing a corrupt split.
+        {
+            let chunk = &self.chunks[cur];
+            if !(index > chunk.start && index < chunk.end) {
+                #[cfg(debug_assertions)]
+                eprintln!(
+                    "split_at({}): located chunk [{}, {}) does not strictly contain index",
+                    index, chunk.start, chunk.end
+                );
+                return usize::MAX;
             }
         }
 
@@ -657,6 +673,41 @@ impl MagicString {
         result
     }
 
+    /// Forward-mapping segments for **unedited** (verbatim-copied) chunks, in
+    /// generated order: each tuple is `(original_start, original_end,
+    /// generated_start)`. An original byte offset `o` within
+    /// `[original_start, original_end)` maps forward to the generated byte
+    /// offset `generated_start + (o - original_start)`.
+    ///
+    /// Edited / synthesized chunks (those whose content was overwritten or
+    /// inserted) are omitted — they have no byte-exact 1:1 original mapping.
+    /// This is the inverse direction of the source map (`generate_map` is
+    /// generated→original); it is what a type-aware consumer needs to place a
+    /// `get_type_at_position` probe byte-exactly on a verbatim-copied
+    /// expression (e.g. a `<script>` identifier carried through to the TSX).
+    ///
+    /// Note: this reflects the chunk graph, i.e. the output of
+    /// [`MagicString::to_string`] *before* any text-level post-pass. Callers
+    /// that apply such a post-pass (e.g. import-specifier rewriting) must
+    /// account for drift after the rewrite point themselves.
+    pub fn forward_segments(&self) -> Vec<(u32, u32, u32)> {
+        let mut segments = Vec::new();
+        let mut generated: u32 = self.intro.len() as u32;
+        let mut cur = Some(self.first_chunk);
+        while let Some(ci) = cur {
+            let chunk = &self.chunks[ci];
+            generated += chunk.intro.len() as u32;
+            let body = self.chunk_content(ci);
+            if !chunk.is_edited() && chunk.end > chunk.start {
+                segments.push((chunk.start, chunk.end, generated));
+            }
+            generated += body.len() as u32;
+            generated += chunk.outro.len() as u32;
+            cur = chunk.next;
+        }
+        segments
+    }
+
     /// Generate a v3 source map.
     pub fn generate_map(&self, options: GenerateMapOptions) -> SourceMap {
         let source_name = options.source.unwrap_or_default();
@@ -695,13 +746,20 @@ impl MagicString {
         let original_line_starts = line_starts(&self.original);
 
         // Helper closure: given an original byte offset, return (line, col) both 0-based.
+        // Source-map columns are UTF-16 code units (source-map spec v3 / LSP), not
+        // bytes — so a multibyte char before `offset` must count its UTF-16 width,
+        // not its byte length. For ASCII this is identical to the byte delta.
         let orig_loc = |offset: u32| -> (i64, i64) {
             let offset = offset as usize;
             let line = match original_line_starts.binary_search(&offset) {
                 Ok(i) => i,
                 Err(i) => i - 1,
             };
-            let col = offset - original_line_starts[line];
+            let line_start = original_line_starts[line];
+            let col: usize = self.original[line_start..offset]
+                .chars()
+                .map(|c| c.len_utf16())
+                .sum();
             (line as i64, col as i64)
         };
 
@@ -747,7 +805,7 @@ impl MagicString {
         }
         // Advance generated column for the last intro line fragment.
         if let Some(last) = intro_lines.last() {
-            generated_column += count_chars(last) as i64;
+            generated_column += count_utf16(last) as i64;
         }
 
         // Walk chunks.
@@ -765,7 +823,7 @@ impl MagicString {
                         generated_column = 0;
                         first_segment_on_line = true;
                     }
-                    generated_column += count_chars(part) as i64;
+                    generated_column += count_utf16(part) as i64;
                 }
             }
 
@@ -827,8 +885,11 @@ impl MagicString {
                                 &mut first_segment_on_line,
                             );
                         } else {
-                            generated_column += 1;
-                            cur_src_col += 1;
+                            // Advance by UTF-16 width so generated and original
+                            // columns stay in UTF-16 units (1 for BMP, 2 for astral).
+                            let w = ch.len_utf16() as i64;
+                            generated_column += w;
+                            cur_src_col += w;
                             emit_segment(
                                 &mut mappings,
                                 generated_column,
@@ -866,7 +927,7 @@ impl MagicString {
                             generated_column = 0;
                             first_segment_on_line = true;
                         } else {
-                            generated_column += 1;
+                            generated_column += ch.len_utf16() as i64;
                         }
                     }
                 }
@@ -882,7 +943,7 @@ impl MagicString {
                         generated_column = 0;
                         first_segment_on_line = true;
                     }
-                    generated_column += count_chars(part) as i64;
+                    generated_column += count_utf16(part) as i64;
                 }
             }
 
@@ -924,9 +985,13 @@ fn line_starts(s: &str) -> Vec<usize> {
     starts
 }
 
-/// Count the number of characters (not bytes) in a string.
-fn count_chars(s: &str) -> usize {
-    s.chars().count()
+/// Count the UTF-16 code units in a string.
+///
+/// Source-map generated columns are measured in UTF-16 code units (spec v3 /
+/// LSP), so an astral char (emoji, 4-byte UTF-8) counts as 2 and a BMP char as
+/// 1. For ASCII this equals both the char count and the byte length.
+fn count_utf16(s: &str) -> usize {
+    s.chars().map(|c| c.len_utf16()).sum()
 }
 
 // ---------------------------------------------------------------------------
@@ -1215,5 +1280,54 @@ mod tests {
         });
         // Should have semicolons for line breaks.
         assert!(map.mappings.contains(';'));
+    }
+
+    #[test]
+    fn count_utf16_counts_code_units() {
+        assert_eq!(count_utf16("abc"), 3); // ASCII: 1 unit each
+        assert_eq!(count_utf16("àb"), 2); // BMP: à is 2 bytes but 1 UTF-16 unit
+        assert_eq!(count_utf16("😀"), 2); // astral: 4 bytes, 2 UTF-16 units
+        assert_eq!(count_utf16("😀x"), 3);
+    }
+
+    // Source-map columns must be UTF-16 code units (spec v3 / LSP), not bytes or
+    // Unicode scalars. The expected original columns below were cross-checked
+    // against the official `magic-string` library. The old byte/char math gave
+    // 3 and 8 respectively.
+
+    #[test]
+    fn source_map_original_column_is_utf16_for_bmp() {
+        // `à` is 2 bytes but 1 UTF-16 unit; overwrite the trailing `x`.
+        let mut s = MagicString::new("àbx");
+        let x = "àb".len() as u32; // byte offset 3
+        s.overwrite(x, x + 1, "Q");
+        let map = s.generate_map(GenerateMapOptions {
+            file: None,
+            source: Some("in.svelte".to_string()),
+            include_content: false,
+        });
+        let sm = sourcemap::SourceMap::from_slice(map.to_json().as_bytes()).unwrap();
+        // `Q` sits at generated UTF-16 column 2 (à=1, b=1) and must map back to
+        // original UTF-16 column 2 — not byte column 3.
+        let t = sm.lookup_token(0, 2).expect("token at generated col 2");
+        assert_eq!(t.get_src_col(), 2);
+    }
+
+    #[test]
+    fn source_map_original_column_is_utf16_for_astral() {
+        // Each `😀` is 4 bytes / 2 UTF-16 units; overwrite the trailing `x`.
+        let mut s = MagicString::new("😀😀x");
+        let x = "😀😀".len() as u32; // byte offset 8
+        s.overwrite(x, x + 1, "QQ");
+        let map = s.generate_map(GenerateMapOptions {
+            file: None,
+            source: Some("in.svelte".to_string()),
+            include_content: false,
+        });
+        let sm = sourcemap::SourceMap::from_slice(map.to_json().as_bytes()).unwrap();
+        // `QQ` starts at generated UTF-16 column 4 (two astral chars = 4 units)
+        // and must map to original UTF-16 column 4 — not byte column 8.
+        let t = sm.lookup_token(0, 4).expect("token at generated col 4");
+        assert_eq!(t.get_src_col(), 4);
     }
 }

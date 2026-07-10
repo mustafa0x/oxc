@@ -179,28 +179,28 @@
       "markdownDescription": "Sort Tailwind CSS classes.\n\nUsing the same algorithm as [prettier-plugin-tailwindcss](https://github.com/tailwindlabs/prettier-plugin-tailwindcss).\nOption names omit the `tailwind` prefix used in the original plugin (e.g., `config` instead of `tailwindConfig`).\nFor details, see each field's documentation.\n\nPass `true` or an object to enable with defaults, or omit/set `false` to disable.\n\n- Languages: JS, JSX, TS, TSX, HTML, Vue, Angular, Handlebars, CSS, SCSS, Less, Svelte\n- Default: Disabled"
     },
     "svelte": {
-      "description": "Compatibility options for native Svelte formatting.\n\nNative `.svelte` formatting is always enabled when the rsvelte backend is built in;\n`false` does not disable it. Script-body indentation is supported; style bodies are\npreserved verbatim. Section order and attribute shorthand options are accepted for config\ncompatibility, but their source spans are also preserved.\n\n- Default: Native Svelte formatting enabled with default options.",
+      "description": "Compatibility options for native Svelte formatting.\n\nNative `.svelte` formatting is always enabled when the rsvelte backend is built in;\n`false` does not disable it. Section order, attribute shorthand, script/style indentation,\nopen-tag layout, and embedded CSS formatting are handled by the native backend.\n\n- Default: Native Svelte formatting enabled with default options.",
       "allOf": [
         {
           "$ref": "#/definitions/SvelteUserConfig"
         }
       ],
-      "markdownDescription": "Compatibility options for native Svelte formatting.\n\nNative `.svelte` formatting is always enabled when the rsvelte backend is built in;\n`false` does not disable it. Script-body indentation is supported; style bodies are\npreserved verbatim. Section order and attribute shorthand options are accepted for config\ncompatibility, but their source spans are also preserved.\n\n- Default: Native Svelte formatting enabled with default options."
+      "markdownDescription": "Compatibility options for native Svelte formatting.\n\nNative `.svelte` formatting is always enabled when the rsvelte backend is built in;\n`false` does not disable it. Section order, attribute shorthand, script/style indentation,\nopen-tag layout, and embedded CSS formatting are handled by the native backend.\n\n- Default: Native Svelte formatting enabled with default options."
     },
     "svelteAllowShorthand": {
-      "description": "Compatibility alias for `svelte.allowShorthand`; open tags are currently preserved verbatim.",
+      "description": "Compatibility alias for `svelte.allowShorthand`.",
       "type": "boolean",
-      "markdownDescription": "Compatibility alias for `svelte.allowShorthand`; open tags are currently preserved verbatim."
+      "markdownDescription": "Compatibility alias for `svelte.allowShorthand`."
     },
     "svelteIndentScriptAndStyle": {
-      "description": "Compatibility alias for `svelte.indentScriptAndStyle`; currently affects script bodies.",
+      "description": "Compatibility alias for `svelte.indentScriptAndStyle`.",
       "type": "boolean",
-      "markdownDescription": "Compatibility alias for `svelte.indentScriptAndStyle`; currently affects script bodies."
+      "markdownDescription": "Compatibility alias for `svelte.indentScriptAndStyle`."
     },
     "svelteSortOrder": {
-      "description": "Compatibility alias for `svelte.sortOrder`; section order is currently preserved verbatim.",
+      "description": "Compatibility alias for `svelte.sortOrder`.",
       "type": "string",
-      "markdownDescription": "Compatibility alias for `svelte.sortOrder`; section order is currently preserved verbatim."
+      "markdownDescription": "Compatibility alias for `svelte.sortOrder`."
     },
     "tabWidth": {
       "description": "Specify the number of spaces per indentation-level.\n\n- Languages: All\n- Default: `2`\n- Overrides `.editorconfig.indent_size` (falls back to `.editorconfig.tab_width`)",
@@ -461,28 +461,28 @@
           "markdownDescription": "Sort Tailwind CSS classes.\n\nUsing the same algorithm as [prettier-plugin-tailwindcss](https://github.com/tailwindlabs/prettier-plugin-tailwindcss).\nOption names omit the `tailwind` prefix used in the original plugin (e.g., `config` instead of `tailwindConfig`).\nFor details, see each field's documentation.\n\nPass `true` or an object to enable with defaults, or omit/set `false` to disable.\n\n- Languages: JS, JSX, TS, TSX, HTML, Vue, Angular, Handlebars, CSS, SCSS, Less, Svelte\n- Default: Disabled"
         },
         "svelte": {
-          "description": "Compatibility options for native Svelte formatting.\n\nNative `.svelte` formatting is always enabled when the rsvelte backend is built in;\n`false` does not disable it. Script-body indentation is supported; style bodies are\npreserved verbatim. Section order and attribute shorthand options are accepted for config\ncompatibility, but their source spans are also preserved.\n\n- Default: Native Svelte formatting enabled with default options.",
+          "description": "Compatibility options for native Svelte formatting.\n\nNative `.svelte` formatting is always enabled when the rsvelte backend is built in;\n`false` does not disable it. Section order, attribute shorthand, script/style indentation,\nopen-tag layout, and embedded CSS formatting are handled by the native backend.\n\n- Default: Native Svelte formatting enabled with default options.",
           "allOf": [
             {
               "$ref": "#/definitions/SvelteUserConfig"
             }
           ],
-          "markdownDescription": "Compatibility options for native Svelte formatting.\n\nNative `.svelte` formatting is always enabled when the rsvelte backend is built in;\n`false` does not disable it. Script-body indentation is supported; style bodies are\npreserved verbatim. Section order and attribute shorthand options are accepted for config\ncompatibility, but their source spans are also preserved.\n\n- Default: Native Svelte formatting enabled with default options."
+          "markdownDescription": "Compatibility options for native Svelte formatting.\n\nNative `.svelte` formatting is always enabled when the rsvelte backend is built in;\n`false` does not disable it. Section order, attribute shorthand, script/style indentation,\nopen-tag layout, and embedded CSS formatting are handled by the native backend.\n\n- Default: Native Svelte formatting enabled with default options."
         },
         "svelteAllowShorthand": {
-          "description": "Compatibility alias for `svelte.allowShorthand`; open tags are currently preserved verbatim.",
+          "description": "Compatibility alias for `svelte.allowShorthand`.",
           "type": "boolean",
-          "markdownDescription": "Compatibility alias for `svelte.allowShorthand`; open tags are currently preserved verbatim."
+          "markdownDescription": "Compatibility alias for `svelte.allowShorthand`."
         },
         "svelteIndentScriptAndStyle": {
-          "description": "Compatibility alias for `svelte.indentScriptAndStyle`; currently affects script bodies.",
+          "description": "Compatibility alias for `svelte.indentScriptAndStyle`.",
           "type": "boolean",
-          "markdownDescription": "Compatibility alias for `svelte.indentScriptAndStyle`; currently affects script bodies."
+          "markdownDescription": "Compatibility alias for `svelte.indentScriptAndStyle`."
         },
         "svelteSortOrder": {
-          "description": "Compatibility alias for `svelte.sortOrder`; section order is currently preserved verbatim.",
+          "description": "Compatibility alias for `svelte.sortOrder`.",
           "type": "string",
-          "markdownDescription": "Compatibility alias for `svelte.sortOrder`; section order is currently preserved verbatim."
+          "markdownDescription": "Compatibility alias for `svelte.sortOrder`."
         },
         "tabWidth": {
           "description": "Specify the number of spaces per indentation-level.\n\n- Languages: All\n- Default: `2`\n- Overrides `.editorconfig.indent_size` (falls back to `.editorconfig.tab_width`)",
@@ -905,19 +905,19 @@
       "type": "object",
       "properties": {
         "allowShorthand": {
-          "description": "Whether to allow attribute shorthand if attribute name and expression are same.\n\nThe native formatter currently preserves open tags verbatim.\n\n- Default: `true`",
+          "description": "Whether to allow attribute shorthand if attribute name and expression are same.\n\n- Default: `true`",
           "type": "boolean",
-          "markdownDescription": "Whether to allow attribute shorthand if attribute name and expression are same.\n\nThe native formatter currently preserves open tags verbatim.\n\n- Default: `true`"
+          "markdownDescription": "Whether to allow attribute shorthand if attribute name and expression are same.\n\n- Default: `true`"
         },
         "indentScriptAndStyle": {
-          "description": "Whether to indent code inside `<script>` and `<style>` tags.\n\nThe native formatter currently applies this to script bodies and preserves style bodies.\n\n- Default: `true`",
+          "description": "Whether to indent code inside `<script>` and `<style>` tags.\n\n- Default: `true`",
           "type": "boolean",
-          "markdownDescription": "Whether to indent code inside `<script>` and `<style>` tags.\n\nThe native formatter currently applies this to script bodies and preserves style bodies.\n\n- Default: `true`"
+          "markdownDescription": "Whether to indent code inside `<script>` and `<style>` tags.\n\n- Default: `true`"
         },
         "sortOrder": {
-          "description": "The requested order for Svelte component sections.\n\nThe native formatter currently preserves section order verbatim.\nFormat: join the keywords `options`, `scripts`, `markup`, `styles` with a `-` in the order you want;\nor `none` if you don't want to reorder anything.\n\n- Default: `\"options-scripts-markup-styles\"`",
+          "description": "The requested order for Svelte component sections.\n\nFormat: join the keywords `options`, `scripts`, `markup`, `styles` with a `-` in the order you want;\nor `none` if you don't want to reorder anything.\n\n- Default: `\"options-scripts-markup-styles\"`",
           "type": "string",
-          "markdownDescription": "The requested order for Svelte component sections.\n\nThe native formatter currently preserves section order verbatim.\nFormat: join the keywords `options`, `scripts`, `markup`, `styles` with a `-` in the order you want;\nor `none` if you don't want to reorder anything.\n\n- Default: `\"options-scripts-markup-styles\"`"
+          "markdownDescription": "The requested order for Svelte component sections.\n\nFormat: join the keywords `options`, `scripts`, `markup`, `styles` with a `-` in the order you want;\nor `none` if you don't want to reorder anything.\n\n- Default: `\"options-scripts-markup-styles\"`"
         }
       }
     },

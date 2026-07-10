@@ -32,6 +32,8 @@
 //! `$derived.by`) go in `other_qualified`.
 
 use std::cell::RefCell;
+// mold principle P6: trusted-input compiler hot path uses FxHash, never SipHash.
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use oxc_allocator::Allocator;
 use oxc_ast::ast::*;
@@ -42,14 +44,123 @@ use oxc_span::GetSpan;
 use oxc_span::SourceType;
 use oxc_syntax::operator::{AssignmentOperator, UpdateOperator};
 
-use super::expression_utils::expression_needs_proxy;
+use super::ast_rewrite::{self, Edit};
+
+/// Scope-less mirror of the official compiler's `should_proxy(node, null)`
+/// (`client/utils.js`): the set of expression shapes that never need a
+/// reactive proxy wrapper. Used both directly on an assignment RHS and to
+/// pre-compute the proxy-ability of every local binding's initializer.
+fn should_proxy_no_trace(expr: &Expression<'_>) -> bool {
+    match expr {
+        Expression::BooleanLiteral(_)
+        | Expression::NullLiteral(_)
+        | Expression::NumericLiteral(_)
+        | Expression::BigIntLiteral(_)
+        | Expression::RegExpLiteral(_)
+        | Expression::StringLiteral(_)
+        | Expression::TemplateLiteral(_)
+        | Expression::ArrowFunctionExpression(_)
+        | Expression::FunctionExpression(_)
+        | Expression::UnaryExpression(_)
+        | Expression::BinaryExpression(_) => false,
+        Expression::TSAsExpression(e) => should_proxy_no_trace(&e.expression),
+        Expression::TSSatisfiesExpression(e) => should_proxy_no_trace(&e.expression),
+        Expression::TSNonNullExpression(e) => should_proxy_no_trace(&e.expression),
+        Expression::TSTypeAssertion(e) => should_proxy_no_trace(&e.expression),
+        Expression::TSInstantiationExpression(e) => should_proxy_no_trace(&e.expression),
+        Expression::ParenthesizedExpression(e) => should_proxy_no_trace(&e.expression),
+        Expression::Identifier(ident) => ident.name != "undefined",
+        // CallExpression, MemberExpression, ObjectExpression, ArrayExpression,
+        // NewExpression, SequenceExpression, … all fall through to `true` in the
+        // official `should_proxy`.
+        _ => true,
+    }
+}
+
+/// Scope-aware mirror of the official `should_proxy(value, scope)`: like
+/// [`should_proxy_no_trace`] but, for an identifier RHS, traces the binding's
+/// initializer (`should_proxy(binding.initial, null)`) when the binding is not
+/// reassigned. Falls back to `true` (proxy) when the binding is unknown or
+/// reassigned, matching upstream's behaviour for params / reassigned vars.
+fn should_proxy_with_bindings(
+    expr: &Expression<'_>,
+    var_proxy: &HashMap<String, bool>,
+    reassigned: &HashSet<String>,
+) -> bool {
+    match expr {
+        Expression::TSAsExpression(e) => {
+            should_proxy_with_bindings(&e.expression, var_proxy, reassigned)
+        }
+        Expression::TSSatisfiesExpression(e) => {
+            should_proxy_with_bindings(&e.expression, var_proxy, reassigned)
+        }
+        Expression::TSNonNullExpression(e) => {
+            should_proxy_with_bindings(&e.expression, var_proxy, reassigned)
+        }
+        Expression::TSTypeAssertion(e) => {
+            should_proxy_with_bindings(&e.expression, var_proxy, reassigned)
+        }
+        Expression::TSInstantiationExpression(e) => {
+            should_proxy_with_bindings(&e.expression, var_proxy, reassigned)
+        }
+        Expression::ParenthesizedExpression(e) => {
+            should_proxy_with_bindings(&e.expression, var_proxy, reassigned)
+        }
+        Expression::Identifier(ident) => {
+            if ident.name == "undefined" {
+                return false;
+            }
+            if !reassigned.contains(ident.name.as_str())
+                && let Some(&proxyable) = var_proxy.get(ident.name.as_str())
+            {
+                return proxyable;
+            }
+            true
+        }
+        other => should_proxy_no_trace(other),
+    }
+}
+
+/// Pre-walk that records, for the whole program, each local binding's
+/// initializer proxy-ability and the set of identifiers ever reassigned —
+/// the inputs [`should_proxy_with_bindings`] needs to mirror upstream's
+/// `scope.get(name)` lookup.
+#[derive(Default)]
+struct BindingInfoCollector {
+    var_proxy: HashMap<String, bool>,
+    reassigned: HashSet<String>,
+}
+
+impl<'ast> Visit<'ast> for BindingInfoCollector {
+    fn visit_variable_declarator(&mut self, decl: &VariableDeclarator<'ast>) {
+        walk::walk_variable_declarator(self, decl);
+        if let BindingPattern::BindingIdentifier(id) = &decl.id
+            && let Some(init) = &decl.init
+        {
+            self.var_proxy
+                .insert(id.name.to_string(), should_proxy_no_trace(init));
+        }
+    }
+
+    fn visit_assignment_expression(&mut self, expr: &AssignmentExpression<'ast>) {
+        walk::walk_assignment_expression(self, expr);
+        if let AssignmentTarget::AssignmentTargetIdentifier(id) = &expr.left {
+            self.reassigned.insert(id.name.to_string());
+        }
+    }
+
+    fn visit_update_expression(&mut self, expr: &UpdateExpression<'ast>) {
+        walk::walk_update_expression(self, expr);
+        if let SimpleAssignmentTarget::AssignmentTargetIdentifier(id) = &expr.argument {
+            self.reassigned.insert(id.name.to_string());
+        }
+    }
+}
 
 thread_local! {
     static MODULE_PRIVATE_CLASS_ASSIGN_ALLOC: RefCell<Allocator> =
         RefCell::new(Allocator::default());
 }
-
-const MAX_FIXED_POINT_ITERS: usize = 16;
 
 /// AST-based rewrite of private-field assignments + updates for
 /// class method bodies. `state_qualified` lists `$state` fields
@@ -72,19 +183,9 @@ pub fn transform_private_class_assign_ast(
         return None;
     }
 
-    let mut current = source.to_string();
-    let mut any_changed = false;
-    for _ in 0..MAX_FIXED_POINT_ITERS {
-        match single_pass(&current, state_qualified, other_qualified) {
-            Some(next) => {
-                current = next;
-                any_changed = true;
-            }
-            None => break,
-        }
-    }
-
-    if any_changed { Some(current) } else { None }
+    ast_rewrite::fixed_point(source, |src| {
+        single_pass(src, state_qualified, other_qualified)
+    })
 }
 
 fn single_pass(
@@ -94,51 +195,81 @@ fn single_pass(
 ) -> Option<String> {
     MODULE_PRIVATE_CLASS_ASSIGN_ALLOC.with(|cell| {
         let allocator = std::mem::take(&mut *cell.borrow_mut());
+
+        // Parse directly.  If that fails (e.g. the content is a block of class
+        // method definitions extracted without their enclosing `class` keyword),
+        // retry by wrapping in a synthetic class so OXC can recognise the
+        // method signatures.  Span offsets are adjusted back to the original
+        // source after collection.
         let parser_ret = Parser::new(&allocator, source, SourceType::mjs())
             .with_options(ParseOptions {
                 allow_return_outside_function: true,
                 ..ParseOptions::default()
             })
             .parse();
-        if !parser_ret.diagnostics.is_empty() {
-            *cell.borrow_mut() = allocator;
-            return None;
-        }
+
+        const CLASS_PREFIX: &str = "class _Dummy_ {\n";
+        let (parse_str_owned, span_offset): (Option<String>, u32) =
+            if !parser_ret.diagnostics.is_empty() {
+                let wrapped = format!("{}{}\n}}", CLASS_PREFIX, source);
+                (Some(wrapped), CLASS_PREFIX.len() as u32)
+            } else {
+                (None, 0u32)
+            };
+
+        let parse_str: &str = match &parse_str_owned {
+            Some(s) => s.as_str(),
+            None => source,
+        };
+
+        let program_to_visit = if parse_str_owned.is_some() {
+            let ret = Parser::new(&allocator, parse_str, SourceType::mjs())
+                .with_options(ParseOptions {
+                    allow_return_outside_function: true,
+                    ..ParseOptions::default()
+                })
+                .parse();
+            if !ret.diagnostics.is_empty() {
+                *cell.borrow_mut() = allocator;
+                return None;
+            }
+            Some(ret)
+        } else {
+            None
+        };
+
+        let program_ref = match &program_to_visit {
+            Some(ret) => &ret.program,
+            None => &parser_ret.program,
+        };
+
+        let mut binding_info = BindingInfoCollector::default();
+        binding_info.visit_program(program_ref);
 
         let mut collector = PrivateClassAssignCollector {
-            source,
+            source: parse_str,
             state_qualified,
             other_qualified,
+            var_proxy: &binding_info.var_proxy,
+            reassigned: &binding_info.reassigned,
             replacements: Vec::new(),
         };
-        collector.visit_program(&parser_ret.program);
+        collector.visit_program(program_ref);
         let mut replacements = collector.replacements;
 
-        if replacements.is_empty() {
-            *cell.borrow_mut() = allocator;
-            return None;
-        }
-
-        let spans: Vec<(u32, u32)> = replacements.iter().map(|r| (r.0, r.1)).collect();
-        replacements.retain(|(s, e, _)| {
-            !spans
-                .iter()
-                .any(|(s2, e2)| (*s2 > *s && *e2 <= *e) || (*s2 >= *s && *e2 < *e))
-        });
-
-        if replacements.is_empty() {
-            *cell.borrow_mut() = allocator;
-            return None;
-        }
-
-        replacements.sort_by_key(|r| std::cmp::Reverse(r.0));
-        let mut out = source.to_string();
-        for (start, end, rewrite) in &replacements {
-            out.replace_range(*start as usize..*end as usize, rewrite);
+        // Adjust span offsets back to the original un-wrapped source.
+        if span_offset > 0 {
+            for (start, end, _) in &mut replacements {
+                *start = start.saturating_sub(span_offset);
+                *end = end.saturating_sub(span_offset);
+            }
+            // Drop any replacement that fell outside the original source range.
+            let src_len = source.len() as u32;
+            replacements.retain(|(_, e, _)| *e <= src_len);
         }
 
         *cell.borrow_mut() = allocator;
-        Some(out)
+        ast_rewrite::splice(source, replacements, true)
     })
 }
 
@@ -146,7 +277,9 @@ struct PrivateClassAssignCollector<'a> {
     source: &'a str,
     state_qualified: &'a [String],
     other_qualified: &'a [String],
-    replacements: Vec<(u32, u32, String)>,
+    var_proxy: &'a HashMap<String, bool>,
+    reassigned: &'a HashSet<String>,
+    replacements: Vec<Edit>,
 }
 
 #[derive(Clone, Copy)]
@@ -194,17 +327,22 @@ impl<'a, 'ast> Visit<'ast> for PrivateClassAssignCollector<'a> {
         let rhs_span = expr.right.span();
         let rhs_text = &self.source[rhs_span.start as usize..rhs_span.end as usize];
 
-        // Proxy logic applies ONLY for $state with proxy-needing RHS.
-        let needs_proxy = matches!(kind, Match::State) && expression_needs_proxy(rhs_text);
+        // Proxy logic mirrors upstream `AssignmentExpression.js` private-state
+        // branch: `needs_proxy = field.type === '$state' &&
+        // is_non_coercive_operator(operator) && should_proxy(value, scope)`.
+        // The only non-coercive operator this pass handles is `=` (compound
+        // arithmetic `+= -= *= …` is coercive, so it never proxies); the
+        // logical compound ops are excluded earlier. `should_proxy` is the
+        // scope-aware check that traces an identifier RHS to its binding's
+        // initializer.
+        let needs_proxy = matches!(kind, Match::State)
+            && op_str.is_none()
+            && should_proxy_with_bindings(&expr.right, self.var_proxy, self.reassigned);
 
-        let rewrite = match (op_str, needs_proxy) {
-            (None, true) => format!("$.set({}, {}, true)", qualified, rhs_text),
-            (None, false) => format!("$.set({}, {})", qualified, rhs_text),
-            (Some(op), true) => format!(
-                "$.set({}, $.get({}) {} {}, true)",
-                qualified, qualified, op, rhs_text
-            ),
-            (Some(op), false) => format!(
+        let rewrite = match op_str {
+            None if needs_proxy => format!("$.set({}, {}, true)", qualified, rhs_text),
+            None => format!("$.set({}, {})", qualified, rhs_text),
+            Some(op) => format!(
                 "$.set({}, $.get({}) {} {})",
                 qualified, qualified, op, rhs_text
             ),
@@ -296,17 +434,30 @@ mod tests {
     }
 
     #[test]
-    fn compound_state_with_proxy_obj_rhs() {
+    fn compound_state_never_proxies() {
+        // Compound arithmetic (`+=`) is a coercive operator, so upstream's
+        // `is_non_coercive_operator(operator)` gate makes `needs_proxy` false
+        // regardless of the RHS shape — no `, true` even for an object literal.
         let out = transform_private_class_assign_ast(
             "this.#data += { x: 1 };",
             &ssv(&["this.#data"]),
             &[],
         )
         .unwrap();
-        assert_eq!(
-            out,
-            "$.set(this.#data, $.get(this.#data) + { x: 1 }, true);"
-        );
+        assert_eq!(out, "$.set(this.#data, $.get(this.#data) + { x: 1 });");
+    }
+
+    #[test]
+    fn state_assign_identifier_traces_to_nonproxyable_initial() {
+        // `fps` is bound to a BinaryExpression initializer, which is not
+        // proxyable, so the assignment to a `$state` field must not proxy.
+        let out = transform_private_class_assign_ast(
+            "const fps = 1000 / delta;\nthis.#fps = fps;",
+            &ssv(&["this.#fps"]),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(out, "const fps = 1000 / delta;\n$.set(this.#fps, fps);");
     }
 
     #[test]
@@ -452,5 +603,54 @@ mod tests {
         let src = "return this.#count = 5;";
         let out = transform_private_class_assign_ast(src, &ssv(&["this.#count"]), &[]).unwrap();
         assert_eq!(out, "return $.set(this.#count, 5);");
+    }
+
+    #[test]
+    fn class_method_body_with_filter_lambda() {
+        // Multi-line assignment inside a class method body.
+        // The source is NOT valid as a standalone module (it's a method definition),
+        // so Fix #2 (class wrapper) must kick in.
+        let src = "remove(item) {\n  this.#files = this.#files.filter((f) => {\n    if (f === item) return false;\n    return true;\n  });\n}";
+        let out = transform_private_class_assign_ast(src, &ssv(&["this.#files"]), &[]).unwrap();
+        // The assignment should be rewritten; no stray ) should appear
+        assert!(
+            out.contains("$.set(this.#files,"),
+            "expected $.set rewrite, got: {}",
+            out
+        );
+        assert!(
+            !out.contains("return false);"),
+            "stray ) detected in: {}",
+            out
+        );
+    }
+
+    #[test]
+    fn multiple_method_bodies_with_filter_lambda() {
+        // Multiple method definitions in a single source block, one of which
+        // has a multi-line filter lambda.  The entire block fails to parse as a
+        // module, so Fix #2 (class wrapper) must kick in.
+        let src = concat!(
+            "get files() {\n  return this.#files;\n}\n",
+            "remove(item) {\n",
+            "  this.#files = this.#files.filter((f) => {\n",
+            "    if (f === item) return false;\n",
+            "    if (f.name.startsWith(item.name + \"/\")) return false;\n",
+            "    return true;\n",
+            "  });\n",
+            "}\n",
+            "add(item) {\n  this.#files = this.#files.concat(item);\n}\n",
+        );
+        let out = transform_private_class_assign_ast(src, &ssv(&["this.#files"]), &[]).unwrap();
+        assert!(
+            out.contains("$.set(this.#files,"),
+            "expected $.set rewrite, got:\n{}",
+            out
+        );
+        assert!(
+            !out.contains("return false);"),
+            "stray ) detected in:\n{}",
+            out
+        );
     }
 }

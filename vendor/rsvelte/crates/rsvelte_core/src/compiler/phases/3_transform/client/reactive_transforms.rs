@@ -4,9 +4,9 @@ use crate::compiler::phases::phase2_analyze::ComponentAnalysis;
 
 use super::{
     body_references_identifier, extract_destructure_targets, extract_member_expression_base,
-    find_assignment_position, get_or_compile_regex, is_only_assignment_target,
-    is_simple_identifier, lhs_starts_with_keyword, transform_destructure_assignments_with_props,
-    transform_prop_assignments, transform_prop_reads_in_expr, transform_store_reads_client,
+    find_assignment_position, get_or_compile_regex, is_simple_identifier, lhs_starts_with_keyword,
+    transform_destructure_assignments_with_props, transform_prop_assignments,
+    transform_prop_reads_in_expr, transform_store_assignments_client, transform_store_reads_client,
     transform_store_sub_calls, wrap_state_vars_in_expr,
 };
 
@@ -126,7 +126,10 @@ pub(super) fn is_assigned_anywhere_in_body(body: &str, var_name: &str) -> bool {
             } else {
                 b' '
             };
-            let before_ok = !before.is_ascii_alphanumeric() && before != b'_' && before != b'$';
+            let before_ok = !before.is_ascii_alphanumeric()
+                && before != b'_'
+                && before != b'$'
+                && before != b'.';
             let after_ok = !after.is_ascii_alphanumeric() && after != b'_' && after != b'$';
             if before_ok && after_ok {
                 return true;
@@ -148,7 +151,10 @@ pub(super) fn is_assigned_anywhere_in_body(body: &str, var_name: &str) -> bool {
             } else {
                 b' '
             };
-            let before_ok = !before.is_ascii_alphanumeric() && before != b'_' && before != b'$';
+            let before_ok = !before.is_ascii_alphanumeric()
+                && before != b'_'
+                && before != b'$'
+                && before != b'.';
             if before_ok {
                 // Also make sure it's not `==` or `=>`
                 let after_eq = pos + var_name.len() + assign_op.len();
@@ -236,7 +242,6 @@ pub(super) fn sort_reactive_statements(
     }
 
     // Reconstruct the result in sorted order
-    #[allow(clippy::type_complexity)]
     let mut statements_opt: Vec<Option<(Vec<String>, Vec<String>, String)>> =
         statements.into_iter().map(Some).collect();
     let mut result = Vec::with_capacity(n);
@@ -263,7 +268,6 @@ pub(super) fn sort_reactive_statements(
 /// The second thunk contains the body of the reactive statement.
 ///
 /// Reference: `LabeledStatement.js` in `svelte/packages/svelte/src/compiler/phases/3-transform/client/visitors/`
-#[allow(clippy::too_many_arguments)]
 pub(super) fn transform_reactive_statement(
     statement: &str,
     state_vars: &[String],
@@ -273,6 +277,11 @@ pub(super) fn transform_reactive_statement(
     store_sub_vars: &[String],
     import_names: &[String],
     var_state_vars: &[String],
+    // Ordered dependency names from Phase 2
+    // (`analysis.reactive_statement_dependencies[ordinal]`): the AST-faithful
+    // dependency set (order + membership) the deps thunk is built from; the legacy
+    // text scan is no longer consulted.
+    dep_names: &[String],
     _analysis: &ComponentAnalysis,
 ) -> String {
     let trimmed = statement.trim();
@@ -398,88 +407,13 @@ pub(super) fn transform_reactive_statement(
     };
     let body = body_owned.trim_end_matches(';').trim();
 
-    // Collect dependencies from the body
-    // Dependencies are variables that need tracking in the dependency thunk.
-    // We track whether each dependency is a prop or a state var, because they
-    // are serialized differently:
-    // - Props (bindable_prop): $.deep_read_state(name()) - deep read with function call
-    // - State vars (mutable_source): $.get(name) - simple get without function call
-    let mut prop_dependencies: Vec<String> = Vec::new();
-    let mut state_dependencies: Vec<String> = Vec::new();
-
-    // Props are dependencies that need tracking
-    for prop_name in prop_assignment_transform_vars {
-        // Check if this prop is referenced in the body (but not on the left side of assignment)
-        if body_references_identifier(body, prop_name)
-            && !super::state_transforms::is_in_lhs_only(body, prop_name)
-        {
-            prop_dependencies.push(prop_name.clone());
-        }
-    }
-
-    // $$props and $$restProps are also treated as prop dependencies in the official compiler.
-    // They are wrapped in $.deep_read_state() just like regular props, BUT without the ()
-    // function call (they are accessed directly, not via getter functions).
-    // Reference: LabeledStatement.js line 44: `if (name === '$$props' || name === '$$restProps' ...)`
-    // Note: In our code, $$props is later replaced by $$sanitized_props in post-processing.
-    let mut special_prop_dependencies: Vec<String> = Vec::new();
-    for special_prop in &["$$props", "$$restProps"] {
-        if body_references_identifier(body, special_prop) {
-            special_prop_dependencies.push(special_prop.to_string());
-        }
-    }
-
-    // State vars are also dependencies, but only if they are READ in the body
-    // (not just assigned). In the official compiler, reactive_statement.dependencies
-    // only includes bindings that are read, not those that are only assigned.
-    for state_var in state_vars {
-        if !non_reactive_state_vars.contains(state_var)
-            && body_references_identifier(body, state_var)
-            && !is_only_assignment_target(body, state_var)
-        {
-            state_dependencies.push(state_var.clone());
-        }
-    }
-
-    // Store subscription vars are also dependencies
-    // e.g., `$: bar = $foo` - `$foo` is a store subscription and should be tracked as a dep.
-    // Store subs appear as `$foo()` calls in the dependency thunk.
-    let mut store_sub_dependencies: Vec<String> = Vec::new();
-    for store_sub in store_sub_vars {
-        // Check if the store subscription is referenced on the RHS of the assignment
-        // (not as the LHS itself, since `$: $foo = ...` would be a store assignment, not a dep)
-        if body_references_identifier(body, store_sub) {
-            // Only add as dependency if it appears on the RHS (not as the target of assignment)
-            // Check if the body is an assignment and `store_sub` is NOT the LHS
-            let is_assignment_target = if let Some(eq_pos) = find_assignment_position(body) {
-                let lhs = body[..eq_pos].trim();
-                lhs == store_sub.as_str()
-            } else {
-                false
-            };
-            if !is_assignment_target {
-                store_sub_dependencies.push(store_sub.clone());
-            }
-        }
-    }
-
-    // Import identifiers referenced in the body are also dependencies.
-    // In the official compiler, import bindings with `declaration_kind === 'import'`
-    // are included as bare identifiers in the dependency list.
-    // This handles cases like `$: selected() ? component = Sub : component = banana`
-    // where `Sub` is an imported component that should appear in the deps.
-    let mut import_dependencies: Vec<String> = Vec::new();
-    for import_name in import_names {
-        if body_references_identifier(body, import_name) {
-            // Don't add if it's already a state var or prop (would be double-counted)
-            if !state_vars.contains(import_name)
-                && !prop_assignment_transform_vars.contains(import_name)
-                && !store_sub_vars.contains(import_name)
-            {
-                import_dependencies.push(import_name.clone());
-            }
-        }
-    }
+    // Dependency membership + ORDER come from the Phase-2 AST reference set
+    // (`dep_names`), mirroring `2-analyze/visitors/LabeledStatement.js`. The
+    // legacy text-scan membership loops were removed: they mis-handled chained
+    // member-property keys (`.add(add)` matched `add` from the `.add(` key),
+    // string-literal text, block mutations, etc. The body-transform code below
+    // re-derives its rewrites from the `*_vars` lists, not from the dep set, so
+    // only the deps-thunk build (further down) consumes `dep_names`.
 
     // Transform the body - apply prop transformations
     // For `$: c = a + b;`, the body should become `c(a() + b());`
@@ -510,8 +444,32 @@ pub(super) fn transform_reactive_statement(
             let temp = transform_prop_update_expressions(body, prop_assignment_transform_vars);
             let temp =
                 transform_state_update_expressions(&temp, state_vars, non_reactive_state_vars);
-            let temp = transform_prop_reads_in_expr(&temp, prop_assignment_transform_vars);
-            let temp = transform_prop_assignments(&temp, prop_assignment_transform_vars, &[]);
+            // Route prop reads through the scope-aware AST wrapper so a prop name
+            // used as a local binding inside the keyword body — e.g.
+            // `$: if (cond) { const [x, y] = f(); … }` where `x`/`y` shadow props —
+            // is neither wrapped in the destructuring binding position
+            // (`[x(), y()]`, invalid) nor in the shadowed reads. Falls back to the
+            // scope-unaware text path on any parse failure / no-match.
+            let temp = super::prop_source_reads_ast::wrap_prop_source_reads_ast(
+                &temp,
+                prop_assignment_transform_vars,
+                &[],
+            )
+            .unwrap_or_else(|| transform_prop_reads_in_expr(&temp, prop_assignment_transform_vars));
+            let temp = transform_prop_assignments(
+                &temp,
+                prop_assignment_transform_vars,
+                &[],
+                &rustc_hash::FxHashMap::default(),
+            );
+            // Wrap state-var member mutations (`obj.a.b = x`) in `$.mutate(obj, …)`.
+            // The keyword branch (a `$: if (cond) X = rhs` reactive statement) was
+            // missing this pass that both sibling branches have, so a state-var
+            // member mutation inside an `if`-guarded reactive statement was emitted
+            // without the `$.mutate` wrap. Must run before `wrap_state_vars_in_expr`
+            // (which rewrites the LHS root to `$.get(obj)`, after which the
+            // member-mutate detector bails).
+            let temp = transform_state_member_mutations(&temp, state_vars, non_reactive_state_vars);
             let temp = transform_state_set_in_reactive(&temp, state_vars, non_reactive_state_vars);
             transformed_body =
                 wrap_state_vars_in_expr(&temp, state_vars, non_reactive_state_vars, proxy_vars);
@@ -538,11 +496,26 @@ pub(super) fn transform_reactive_statement(
             let temp =
                 transform_state_update_expressions(&temp, state_vars, non_reactive_state_vars);
             let temp = transform_prop_reads_in_expr(&temp, prop_assignment_transform_vars);
-            let temp = transform_prop_assignments(&temp, prop_assignment_transform_vars, &[]);
+            let temp = transform_prop_assignments(
+                &temp,
+                prop_assignment_transform_vars,
+                &[],
+                &rustc_hash::FxHashMap::default(),
+            );
             let temp = transform_state_member_mutations(&temp, state_vars, non_reactive_state_vars);
             let temp = transform_state_set_in_reactive(&temp, state_vars, non_reactive_state_vars);
-            transformed_body =
+            let temp =
                 wrap_state_vars_in_expr(&temp, state_vars, non_reactive_state_vars, proxy_vars);
+            // Reassigning a store-holding variable via destructuring
+            // (`$: ({ store } = store_container)`) must unsubscribe the old store
+            // so subsequent `$store` reads re-subscribe: wrap the inner
+            // `$.set(store, …)` in `$.store_unsub(…, '$store', $$stores)`. The
+            // non-destructured `$: z = …` branch below already does this inline.
+            transformed_body = super::state_transforms::wrap_store_unsub_for_state_sets(
+                &temp,
+                state_vars,
+                store_sub_vars,
+            );
         } else {
             // If the LHS is a prop variable, transform to prop(value) call
             if prop_assignment_transform_vars.contains(&lhs.to_string()) {
@@ -564,6 +537,16 @@ pub(super) fn transform_reactive_statement(
                 // State var assignment → $.set(lhs, rhs)
                 let transformed_rhs =
                     transform_prop_reads_in_expr(rhs, prop_assignment_transform_vars);
+                // A nested prop assignment in the RHS (e.g. an arrow default
+                // `() => (isOpen = !isOpen)`) must become a setter call
+                // `isOpen(!isOpen())`. The ternary / destructure branches already
+                // run this pass; the state-var-assignment branch was missing it.
+                let transformed_rhs = transform_prop_assignments(
+                    &transformed_rhs,
+                    prop_assignment_transform_vars,
+                    &[],
+                    &rustc_hash::FxHashMap::default(),
+                );
                 let transformed_rhs = wrap_state_vars_in_expr(
                     &transformed_rhs,
                     state_vars,
@@ -699,17 +682,44 @@ pub(super) fn transform_reactive_statement(
         // `callback(args)` become `callback()(args)` (double-invoke for prop getters).
         // This must happen before transform_prop_assignments to avoid double-wrapping
         // assignment-generated calls like `callback = value` → `callback(value)`.
-        let temp = transform_prop_reads_in_expr(&temp, prop_assignment_transform_vars);
+        //
+        // Route through the scope-aware AST wrapper first so a prop name used as a
+        // local binding inside a nested function — e.g. `$: if (cond) { items.map((p)
+        // => { const [x, y] = f(); … }) }` where `x`/`y` shadow props — is neither
+        // wrapped in the destructuring binding position (`[x(), y()]`, invalid) nor
+        // in the shadowed reads. Falls back to the scope-unaware text path only on
+        // parse failure (`None`); an empty-but-parsed result returns the source
+        // unchanged.
+        let temp = super::prop_source_reads_ast::wrap_prop_source_reads_ast(
+            &temp,
+            prop_assignment_transform_vars,
+            &[],
+        )
+        .unwrap_or_else(|| transform_prop_reads_in_expr(&temp, prop_assignment_transform_vars));
         // Then transform prop compound assignments (e.g., `count += 1` → `count(count() + 1)`)
-        let temp = transform_prop_assignments(&temp, prop_assignment_transform_vars, &[]);
+        let temp = transform_prop_assignments(
+            &temp,
+            prop_assignment_transform_vars,
+            &[],
+            &rustc_hash::FxHashMap::default(),
+        );
         // Transform state member-expression mutations (e.g., `object[key] = []`)
         // to `$.mutate(object, $.get(object)[key] = [])`. Must run before wrap_state_vars_in_expr
         // so identifiers are still in their original form.
         let temp = transform_state_member_mutations(&temp, state_vars, non_reactive_state_vars);
         // Transform state var assignments to $.set() before wrapping reads in $.get()
         let temp = transform_state_set_in_reactive(&temp, state_vars, non_reactive_state_vars);
-        transformed_body =
-            wrap_state_vars_in_expr(&temp, state_vars, non_reactive_state_vars, proxy_vars);
+        let temp = wrap_state_vars_in_expr(&temp, state_vars, non_reactive_state_vars, proxy_vars);
+        // Reassigning a store-holding variable inside a destructuring IIFE
+        // (`$: ({ store } = store_container)`) must unsubscribe the old store so
+        // later `$store` reads re-subscribe: wrap `$.set(store, …)` in
+        // `$.store_unsub(…, '$store', $$stores)`. (The simple-assignment branch
+        // above does this inline.)
+        transformed_body = super::state_transforms::wrap_store_unsub_for_state_sets(
+            &temp,
+            state_vars,
+            store_sub_vars,
+        );
     }
 
     // Apply store subscription transformations to body.
@@ -717,6 +727,16 @@ pub(super) fn transform_reactive_statement(
     // Then, transform store reads: `$foo` -> `$foo()` in the reactive statement body.
     let transformed_body = if !store_sub_vars.is_empty() {
         let transformed_body = transform_store_sub_calls(&transformed_body, store_sub_vars);
+        // Lower store WRITES nested in a reactive block body (`$: { … $store = x }`)
+        // to `$.store_set(store, x)` BEFORE wrapping reads. Without this the read
+        // wrap mangles the assignment LHS into `$store() = x` (invalid JS).
+        let transformed_body = transform_store_assignments_client(
+            &transformed_body,
+            store_sub_vars,
+            prop_assignment_transform_vars,
+            state_vars,
+            non_reactive_state_vars,
+        );
         transform_store_reads_client(&transformed_body, store_sub_vars)
     } else {
         transformed_body
@@ -730,86 +750,41 @@ pub(super) fn transform_reactive_statement(
     //
     // Dependencies are sorted by their first occurrence in the body (left-to-right order),
     // matching the official Svelte compiler's Phase 2 dependency ordering.
-    let has_deps = !prop_dependencies.is_empty()
-        || !state_dependencies.is_empty()
-        || !store_sub_dependencies.is_empty()
-        || !import_dependencies.is_empty()
-        || !special_prop_dependencies.is_empty();
-    let deps_expr = if !has_deps {
-        "".to_string()
-    } else {
-        // Find the first occurrence position of an identifier in the body text.
-        let find_pos = |name: &str| -> usize {
-            let escaped = regex::escape(name);
-            let pattern = if name.starts_with('$') {
-                // `$` is not a word char; use alternation to simulate word boundary
-                format!(r"(^|[^a-zA-Z0-9_$]){}([^a-zA-Z0-9_$]|$)", escaped)
-            } else {
-                format!(r"\b{}\b", escaped)
-            };
-            if let Some(re) = get_or_compile_regex(&pattern) {
-                if let Some(m) = re.find(body) {
-                    // If name starts with `$`, the match may include one leading non-ident char;
-                    // return the position where the identifier actually starts.
-                    let start = m.start();
-                    if name.starts_with('$') && start < body.len() {
-                        let first_char = body[start..].chars().next().unwrap_or('$');
-                        if first_char != '$' {
-                            start + first_char.len_utf8()
-                        } else {
-                            start
-                        }
-                    } else {
-                        start
-                    }
+    // Build the dependency thunk from the AST-derived ordered dependency list
+    // (`dep_names`, from Phase 2). Order = upstream traversal order; membership =
+    // upstream scope-reference set (member-property keys are never present, so a
+    // chained `.add(add)` resolves to the `add` argument, not the method key).
+    // Each name is classified to its serialized getter form, mirroring
+    // `3-transform/client/visitors/LabeledStatement.js`'s build_getter +
+    // deep_read_state. A name that matches no `*_vars` list is a plain local /
+    // non-reactive `normal` binding and is skipped (upstream `continue`).
+    let deps_expr = {
+        let mut parts: Vec<String> = Vec::with_capacity(dep_names.len());
+        for name in dep_names {
+            if name == "$$props" || name == "$$restProps" {
+                parts.push(format!("$.deep_read_state({})", name));
+            } else if prop_assignment_transform_vars.iter().any(|p| p == name) {
+                parts.push(format!("$.deep_read_state({}())", name));
+            } else if store_sub_vars.iter().any(|s| s == name) {
+                parts.push(format!("{}()", name));
+            } else if state_vars.iter().any(|s| s == name)
+                && !non_reactive_state_vars.iter().any(|s| s == name)
+            {
+                let getter = if var_state_vars.iter().any(|v| v == name) {
+                    "$.safe_get"
                 } else {
-                    usize::MAX
-                }
-            } else {
-                usize::MAX
+                    "$.get"
+                };
+                parts.push(format!("{}({})", getter, name));
+            } else if import_names.iter().any(|i| i == name)
+                && !state_vars.iter().any(|s| s == name)
+                && !prop_assignment_transform_vars.iter().any(|p| p == name)
+                && !store_sub_vars.iter().any(|s| s == name)
+            {
+                parts.push(name.clone());
             }
-        };
-        // Build unified dep list: (position, expression_string)
-        let mut unified_deps: Vec<(usize, String)> = Vec::new();
-        for dep in &prop_dependencies {
-            let pos = find_pos(dep);
-            unified_deps.push((pos, format!("$.deep_read_state({}())", dep)));
         }
-        for dep in &state_dependencies {
-            let pos = find_pos(dep);
-            let getter = if var_state_vars.iter().any(|v| v == dep) {
-                "$.safe_get"
-            } else {
-                "$.get"
-            };
-            unified_deps.push((pos, format!("{}({})", getter, dep)));
-        }
-        // Store subscription vars: `$foo()` - call the getter to track dependency
-        for dep in &store_sub_dependencies {
-            let pos = find_pos(dep);
-            unified_deps.push((pos, format!("{}()", dep)));
-        }
-        // Import identifiers: appear as bare identifiers in the dependency list.
-        // In the official compiler, import bindings pass through build_getter()
-        // which returns them unchanged (no transform registered).
-        for dep in &import_dependencies {
-            let pos = find_pos(dep);
-            unified_deps.push((pos, dep.clone()));
-        }
-        // $$props and $$restProps: wrapped in $.deep_read_state() without function call.
-        // Unlike regular props which are accessed via getter functions (prop_name()),
-        // $$props/$$restProps are accessed directly.
-        for dep in &special_prop_dependencies {
-            let pos = find_pos(dep);
-            unified_deps.push((pos, format!("$.deep_read_state({})", dep)));
-        }
-        // Sort by first occurrence in body so deps match official compiler output order
-        unified_deps.sort_by_key(|&(pos, _)| pos);
-        unified_deps
-            .into_iter()
-            .map(|(_, expr)| expr)
-            .collect::<Vec<_>>()
-            .join(", ")
+        parts.join(", ")
     };
 
     // Replace `break $;` with `return;` since the reactive block becomes a function callback.

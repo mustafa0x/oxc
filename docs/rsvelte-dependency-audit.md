@@ -2,63 +2,68 @@
 
 Date: 2026-07-10
 
+Source pin: `mustafa0x/rsvelte@93eac0b77c5fb3bef56a91bfde0b6fc9e939d623`
+
 Command:
 
 ```bash
 mise x -- cargo tree -p oxlint --features svelte-rsvelte-backend -d
 ```
 
-Summary:
+## Vendored source
 
-- The rsvelte-enabled `oxlint` graph resolves Oxc workspace crates from this
-  checkout for the core parser, AST, semantic, formatter, linter, diagnostics,
-  and syntax crates.
-- No `oxc_*` or `oxlint` package names resolve to multiple versions.
+The source under `vendor/rsvelte` contains the three crates required by this
+fork:
 
-Resolved duplicate:
+- `rsvelte_core` 0.7.16
+- `rsvelte_formatter` 0.1.0
+- `rsvelte_esrap` 0.7.11
 
-| Crate | Versions | Cause | Cutover action |
-| --- | --- | --- | --- |
-| `oxc_sourcemap` | `6.1.1`, `7.0.0` | `string_wizard@1.0.3` pulled `oxc_sourcemap@^6`; Oxc workspace crates use `oxc_sourcemap@7.0.0` | removed unused `string_wizard` in pinned rsvelte commit `672bb074` |
+The vendored tree omits rsvelte's apps, tests, benches, and unrelated nested
+repositories. Builds do not depend on a sibling checkout, Git submodule, or
+moving branch.
 
-Original trace:
+## Oxc graph
 
-```text
-oxc_sourcemap@6.1.1
-  declared by string_wizard@1.0.3 req ^6
+The vendored manifests point directly at this workspace's Oxc crates. The
+rsvelte-enabled graph therefore uses one version of each Oxc package name:
 
-oxc_sourcemap@7.0.0
-  declared by oxc_codegen@0.133.0 req ^7.0.0
-  declared by oxc_minifier@0.133.0 req ^7.0.0
-  declared by oxc_minify_napi@0.133.0 req ^7.0.0
-  declared by oxc_transform_napi@0.133.0 req ^7.0.0
-  declared by oxc_transformer_plugins@0.133.0 req ^7.0.0
-```
+- core parser, AST, semantic, codegen, span, syntax, and allocator crates use
+  the workspace 0.139 packages;
+- formatter, formatter-core, formatter-css, and formatter-json use the
+  workspace 0.58 packages;
+- `oxc_sourcemap` resolves to 8.1.0.
 
-Resolved source model:
+`cargo tree -d` still reports normal third-party version duplication and some
+host/target instances of the same workspace package. It does not report two
+versions of any `oxc_*` or `oxlint` package name.
 
-- The source under `vendor/rsvelte` vendors `svelte-compiler-rust` and
-  `rsvelte_formatter` from `mustafa0x/rsvelte` commit
-  `672bb074b0faed092b4093d500fb3f02e94205ed`.
-- That commit removes the unused `string_wizard` dependency, so
-  `oxc_sourcemap@6.1.1` is absent from this fork's `Cargo.lock`.
-- Builds no longer depend on a sibling `../rsvelte` checkout, Git submodule, or
-  moving branch. The vendored tree omits rsvelte's apps, tests, benches, and
-  unrelated nested repositories.
-- A metadata audit after the removal reports no duplicate `oxc_*` or `oxlint`
-  package names.
+The old `string_wizard` dependency remains absent, so the historical
+`oxc_sourcemap` 6.x duplication does not return.
 
-Phase 0 status:
+## Compatibility adaptations
 
-- The hard-cutover "no duplicate Oxc crate versions" gate is satisfied for the
-  rsvelte-enabled `oxlint` graph.
+The rsvelte pin was written against the immediately preceding Oxc AST builder
+API. This fork carries two narrow adaptations:
 
-Validation:
+- a copyable allocator-backed builder provider implements Oxc's current
+  `GetAstBuilder`, `AstBuild`, and `GetAllocator` traits for rsvelte transform
+  helpers;
+- the formatter removes Oxc's synthetic leading ASI guard semicolon after
+  formatting wrapped Svelte attribute expressions.
+
+These adaptations are covered by the backend build, component reparse test,
+and formatter idempotence test. They must be re-audited whenever either Oxc or
+the rsvelte pin changes.
+
+## Validation
 
 ```bash
-mise x -- cargo check -p oxlint --features svelte-rsvelte-backend
 mise x -- cargo check -p oxc_svelte_backend --features rsvelte
+mise x -- cargo test -p oxc_svelte_backend --features rsvelte
+mise x -- cargo check -p oxlint --features svelte-rsvelte-backend
+mise x -- cargo tree -p oxlint --features svelte-rsvelte-backend -d
 ```
 
-Both commands run from this Oxc checkout and resolve rsvelte from the pinned
-source under `vendor/rsvelte`.
+All commands resolve rsvelte from `vendor/rsvelte` and Oxc crates from this
+checkout.

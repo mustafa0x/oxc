@@ -3,7 +3,7 @@
 //! diagnostics into `Diagnostic` records that point at the user's
 //! Svelte source.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use sourcemap::SourceMap;
@@ -22,6 +22,128 @@ struct EntryMap {
     map: SourceMap,
 }
 
+/// TS `1xxx` codes that are emitted by the BINDER/CHECKER (semantic), not the
+/// parser, despite living in the range otherwise reserved for parse errors.
+///
+/// The `1xxx` range is *mostly* syntactic, but TypeScript reuses a handful of
+/// codes in it for module/import semantics that require symbol resolution.
+/// These do NOT cause the parser to fail, so they do NOT trigger the
+/// program-wide semantic-diagnostic suppression that `is_syntactic_ts_code`
+/// guards against — treating them as syntactic raises a spurious
+/// `overlay-invalid-tsx` / `tsgo-semantics-suppressed` alarm when, in fact,
+/// every real type error is still reported (e.g. a `.svelte` component with a
+/// sibling `Foo.svelte.ts` companion re-exported into the shadow can surface
+/// `TS1192` while `TS7006` & friends keep flowing — proof semantics were never
+/// suppressed).
+const SEMANTIC_TS_1XXX_CODES: &[u32] = &[
+    1192, // "Module '{0}' has no default export."
+    1259, // "Module '{0}' can only be default-imported using the '{1}' flag."
+    1361, // "'{0}' cannot be used as a value because it was imported using 'import type'."
+    1371, // "This import is never used as a value and must use 'import type' ..."
+];
+
+/// Whether a TypeScript diagnostic code denotes a SYNTACTIC error.
+///
+/// TypeScript groups syntax (parse) errors under the `TS1xxx` range — e.g.
+/// `TS1005` (`',' expected`), `TS1109` (`Expression expected`), `TS1128`
+/// (`Declaration or statement expected`), `TS1136` (`Property assignment
+/// expected`). Semantic / type errors live in `TS2xxx`+ — plus the handful of
+/// binder/checker-emitted `1xxx` codes listed in `SEMANTIC_TS_1XXX_CODES`,
+/// which are explicitly excluded here.
+///
+/// This distinction is load-bearing: TypeScript (and tsgo) suppress ALL
+/// semantic diagnostics program-wide as soon as the program contains ANY
+/// syntactic error. So a single generated `.tsx` overlay that fails to
+/// parse silently drops every real type error in the whole project — the
+/// dangerous false-negative this module guards against (#728).
+pub fn is_syntactic_ts_code(code: &str) -> bool {
+    code.strip_prefix("TS")
+        .and_then(|n| n.parse::<u32>().ok())
+        .map(|n| (1000..2000).contains(&n) && !SEMANTIC_TS_1XXX_CODES.contains(&n))
+        .unwrap_or(false)
+}
+
+/// svelte2tsx wraps the synthesised helper code it emits for type-checking
+/// (e.g. a `bind:value` reverse-assignment `() => x.y = …`, cast shims) in
+/// `/*Ωignore_startΩ*/ … /*Ωignore_endΩ*/`. Diagnostics landing inside such a
+/// region are artefacts of the generated TSX, not user errors — official
+/// svelte-check drops them (`isInGeneratedCode`). We mirror that exactly.
+const IGNORE_START_COMMENT: &str = "/*Ωignore_startΩ*/";
+const IGNORE_END_COMMENT: &str = "/*Ωignore_endΩ*/";
+
+/// `str.lastIndexOf(needle, from)` — last occurrence starting at or before
+/// byte index `from`, or `-1`.
+fn last_index_of(text: &str, needle: &str, from: usize) -> isize {
+    // `match_indices` yields in increasing order, so the last one at or before
+    // `from` is the answer (string searchers aren't reversible).
+    text.match_indices(needle)
+        .take_while(|(i, _)| *i <= from)
+        .last()
+        .map(|(i, _)| i as isize)
+        .unwrap_or(-1)
+}
+
+/// `str.indexOf(needle, from)` — first occurrence at or after byte index
+/// `from`, or `-1`.
+fn index_of_from(text: &str, needle: &str, from: usize) -> isize {
+    let from = from.min(text.len());
+    text[from..]
+        .find(needle)
+        .map(|i| (i + from) as isize)
+        .unwrap_or(-1)
+}
+
+/// Port of svelte-check's `isInGeneratedCode`: is the `[start, end)` span
+/// inside a `/*Ωignore_startΩ*/ … /*Ωignore_endΩ*/` region?
+fn is_in_generated_code(text: &str, start: usize, end: usize) -> bool {
+    let last_start = last_index_of(text, IGNORE_START_COMMENT, start);
+    let last_end = last_index_of(text, IGNORE_END_COMMENT, start);
+    let next_end = index_of_from(text, IGNORE_END_COMMENT, end);
+    (last_start > last_end || last_end == next_end) && last_start < next_end
+}
+
+/// Byte offset of a 1-indexed (line, column) position. `column` is treated as
+/// a byte column; only used to test ignore-region membership, where the few
+/// multi-byte chars that precede an ASCII identifier on a line can nudge the
+/// offset slightly without crossing a region boundary.
+fn line_col_to_byte_offset(text: &str, line: usize, column: usize) -> usize {
+    let mut offset = 0usize;
+    for (idx, l) in text.split_inclusive('\n').enumerate() {
+        if idx + 1 == line {
+            // `column` is a 1-based *character* index within the line, not a
+            // byte offset — multi-byte content (e.g. Japanese) makes the two
+            // diverge. Walk char boundaries so the result always lands on a
+            // valid boundary; otherwise slicing it later (`text[off..]` in
+            // `index_of_from`) panics mid-codepoint. Past the line end clamps
+            // to the line's end (also a boundary).
+            let target = column.saturating_sub(1);
+            let byte_in_line = l
+                .char_indices()
+                .nth(target)
+                .map(|(b, _)| b)
+                .unwrap_or(l.len());
+            return offset + byte_in_line;
+        }
+        offset += l.len();
+    }
+    text.len()
+}
+
+/// Result of mapping a tsgo diagnostic stream back to `.svelte` source.
+pub struct MappedTsDiagnostics {
+    /// Diagnostics with `file` / `range` pointing at the original source.
+    pub diagnostics: Vec<Diagnostic>,
+    /// `.svelte` source files whose GENERATED overlay `.tsx` produced at
+    /// least one SYNTACTIC (`TS1xxx`) diagnostic. Because TypeScript
+    /// suppresses every semantic diagnostic program-wide once any syntax
+    /// error exists, a syntactically-invalid overlay hides all real type
+    /// errors elsewhere. The runner cross-references these against the
+    /// Svelte-side compile errors to decide whether the bad TSX is an
+    /// rsvelte/svelte2tsx defect (overlay generated from a `.svelte` that
+    /// rsvelte itself parsed cleanly) and surfaces it loudly.
+    pub overlay_syntax_sources: Vec<PathBuf>,
+}
+
 /// Map every tsgo diagnostic to a `Diagnostic` whose `file` / `range`
 /// point at the original `.svelte` source. Diagnostics on `.tsx` files
 /// without a sourcemap are passed through unchanged (file points at the
@@ -30,7 +152,7 @@ pub fn map_tsgo_diagnostics(
     raw: &[RawTsDiagnostic],
     overlay: &OverlayLayout,
     workspace: &Path,
-) -> Vec<Diagnostic> {
+) -> MappedTsDiagnostics {
     // Build a lookup from absolute / canonicalised tsx path → entry.
     // tsc emits paths relative to its cwd (= workspace), so we key on
     // (a) the absolute tsx_path, (b) its canonicalised form, and
@@ -60,8 +182,42 @@ pub fn map_tsgo_diagnostics(
             by_kit.insert(rel.to_path_buf(), entry);
         }
     }
+    // The raw source route file (`+layout.ts` / `+page.ts`) is a program root
+    // and is type-checked WITHOUT rsvelte's kit injection (which wraps `load`
+    // in `(… ) satisfies …Load` so its destructured event is typed). That
+    // un-injected check yields false `implicit-any` on un-annotated `load`
+    // params. The injected mirror under `<cache>/svelte/…` (matched via
+    // `by_kit` → `out_path`) is the authoritative version, so drop diagnostics
+    // landing directly on the raw source route file.
+    let mut kit_source_paths: HashSet<PathBuf> = HashSet::new();
+    for entry in &overlay.kit_entries {
+        let canon = entry
+            .source_path
+            .canonicalize()
+            .unwrap_or_else(|_| entry.source_path.clone());
+        kit_source_paths.insert(canon);
+        kit_source_paths.insert(entry.source_path.clone());
+    }
+    // Shadows for imported external packages live under `<cache>/ext/<n>/`.
+    // Diagnostics landing on those files are library *internals* — official
+    // svelte-check never type-checks a node_modules `.svelte` as a reported
+    // document, so its unresolved transitive deps (`Cannot find module
+    // '@floating-ui/dom'`) and internal errors must not leak to the consumer
+    // (#941). The shadows still exist purely to resolve the imported module's
+    // named-export shape (#782); we only drop their diagnostics here.
+    let ext_root = overlay.cache_dir.join("ext");
+    let ext_root_canon = ext_root.canonicalize().unwrap_or_else(|_| ext_root.clone());
     let mut maps: HashMap<PathBuf, EntryMap> = HashMap::new();
+    // Generated `.tsx` text per shadow, read on demand to test whether a
+    // diagnostic falls inside a svelte2tsx `Ωignore` region.
+    let mut tsx_texts: HashMap<PathBuf, String> = HashMap::new();
     let mut out: Vec<Diagnostic> = Vec::with_capacity(raw.len());
+    // `.svelte` sources whose generated overlay produced a TS1xxx syntax
+    // diagnostic, in first-seen order (deduped). Recorded regardless of
+    // whether the position mapped back cleanly — any syntax error on a
+    // generated `.tsx` is overlay-attributable.
+    let mut overlay_syntax_sources: Vec<PathBuf> = Vec::new();
+    let mut overlay_syntax_seen: HashSet<PathBuf> = HashSet::new();
     for diag in raw {
         // tsc emits relative paths (cwd = workspace). Resolve them
         // against `workspace` so canonicalize / map lookup work even
@@ -72,6 +228,15 @@ pub fn map_tsgo_diagnostics(
             workspace.join(&diag.file)
         };
         let canon = absolute.canonicalize().unwrap_or_else(|_| absolute.clone());
+        // Suppress imported-library-internal diagnostics (see `ext_root` above).
+        if absolute.starts_with(&ext_root) || canon.starts_with(&ext_root_canon) {
+            continue;
+        }
+        // Drop the raw (pre-injection) source route file's diagnostics; the
+        // injected kit mirror is the authoritative version (see above).
+        if kit_source_paths.contains(&canon) || kit_source_paths.contains(&absolute) {
+            continue;
+        }
         let kit_match = by_kit
             .get(&canon)
             .copied()
@@ -87,6 +252,24 @@ pub fn map_tsgo_diagnostics(
             .or_else(|| by_tsx.get(&absolute).copied())
             .or_else(|| by_tsx.get(&diag.file).copied());
         if let Some(entry) = entry_match {
+            // Drop diagnostics inside svelte2tsx `Ωignore` regions (synthesised
+            // helper code such as `bind:value` reverse-assignments) — official
+            // svelte-check's `isInGeneratedCode`. These are not user errors.
+            let tsx_text = tsx_texts
+                .entry(entry.tsx_path.clone())
+                .or_insert_with(|| std::fs::read_to_string(&entry.tsx_path).unwrap_or_default());
+            let off = line_col_to_byte_offset(tsx_text, diag.line as usize, diag.column as usize);
+            if is_in_generated_code(tsx_text, off, off) {
+                continue;
+            }
+            // A syntax error in this generated `.tsx` overlay taints the
+            // whole program's semantic checking — record its `.svelte`
+            // source so the runner can surface it loudly.
+            if is_syntactic_ts_code(&diag.code)
+                && overlay_syntax_seen.insert(entry.source_path.clone())
+            {
+                overlay_syntax_sources.push(entry.source_path.clone());
+            }
             let entry_map = match maps.get(&entry.tsx_path) {
                 Some(em) => em,
                 None => match build_entry_map(entry) {
@@ -143,7 +326,10 @@ pub fn map_tsgo_diagnostics(
             out.push(passthrough(diag, &diag.file, workspace));
         }
     }
-    out
+    MappedTsDiagnostics {
+        diagnostics: out,
+        overlay_syntax_sources,
+    }
 }
 
 /// Map a tsc/tsgo diagnostic on the augmented kit-file overlay back to
@@ -288,5 +474,139 @@ fn passthrough(diag: &RawTsDiagnostic, file: &Path, _workspace: &Path) -> Diagno
             },
         }),
         source: "ts",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classifies_ts1xxx_as_syntactic() {
+        // Representative TS1xxx syntax codes.
+        for code in ["TS1005", "TS1109", "TS1128", "TS1136", "TS1003"] {
+            assert!(is_syntactic_ts_code(code), "{code} should be syntactic");
+        }
+    }
+
+    #[test]
+    fn classifies_ts2xxx_plus_as_semantic() {
+        // TS2xxx (type), TS6xxx (lint-ish), TS7xxx (implicit-any) are NOT
+        // syntactic and must not trip the loud-error path.
+        for code in ["TS2322", "TS2304", "TS6133", "TS7006", "TS18047"] {
+            assert!(!is_syntactic_ts_code(code), "{code} should be semantic");
+        }
+    }
+
+    #[test]
+    fn is_in_generated_code_matches_ignore_regions() {
+        let t = "abc/*Ωignore_startΩ*/HIDDEN/*Ωignore_endΩ*/def";
+        let hidden = t.find("HIDDEN").unwrap();
+        let abc = t.find("abc").unwrap();
+        let def = t.find("def").unwrap();
+        assert!(is_in_generated_code(t, hidden, hidden + 6), "inside region");
+        assert!(!is_in_generated_code(t, abc, abc + 3), "before region");
+        assert!(!is_in_generated_code(t, def, def + 3), "after region");
+        // No markers at all → never generated.
+        assert!(!is_in_generated_code("plain text", 2, 4));
+    }
+
+    #[test]
+    fn line_col_to_byte_offset_handles_lines() {
+        let t = "ab\ncde\nfg";
+        assert_eq!(line_col_to_byte_offset(t, 1, 1), 0);
+        assert_eq!(line_col_to_byte_offset(t, 2, 2), 4); // 'd'
+        assert_eq!(line_col_to_byte_offset(t, 3, 1), 7); // 'f'
+    }
+
+    #[test]
+    fn line_col_to_byte_offset_multibyte_stays_on_char_boundary() {
+        // `column` is a char index; a line with multi-byte chars (Japanese)
+        // must still yield a valid UTF-8 boundary. Regression for the panic
+        // `byte index … is not a char boundary; it is inside '社'`.
+        let t = "本社で働く\n次の行";
+        // col 3 → 3rd char '' starts at byte 6 (each kanji = 3 bytes).
+        let off = line_col_to_byte_offset(t, 1, 3);
+        assert_eq!(off, 6);
+        assert!(t.is_char_boundary(off), "offset must be a char boundary");
+        // Column past the line end clamps to the line's end (still a boundary).
+        let end = line_col_to_byte_offset(t, 1, 99);
+        assert!(t.is_char_boundary(end));
+        // Slicing at the offset (as index_of_from does) must not panic.
+        let _ = &t[off..];
+    }
+
+    #[test]
+    fn classifies_binder_emitted_ts1xxx_as_semantic() {
+        // A handful of `1xxx` codes are checker/binder-emitted module-import
+        // semantics, NOT parse errors — they must not be treated as syntactic
+        // (which would falsely flag an `overlay-invalid-tsx` and claim
+        // program-wide suppression). Regression guard for the `Foo.svelte` +
+        // sibling `Foo.svelte.ts` companion re-export case (`TS1192`).
+        for code in ["TS1192", "TS1259", "TS1361", "TS1371"] {
+            assert!(!is_syntactic_ts_code(code), "{code} should be semantic");
+        }
+    }
+
+    #[test]
+    fn classifies_malformed_codes_as_non_syntactic() {
+        assert!(!is_syntactic_ts_code(""));
+        assert!(!is_syntactic_ts_code("TS"));
+        assert!(!is_syntactic_ts_code("nonsense"));
+        assert!(!is_syntactic_ts_code("TS999")); // below the 1000 floor
+    }
+
+    fn empty_layout(workspace: &Path) -> OverlayLayout {
+        OverlayLayout {
+            workspace: workspace.to_path_buf(),
+            cache_dir: workspace.join(".svelte-check"),
+            emit_dir: workspace.join(".svelte-check").join("svelte"),
+            overlay_tsconfig: workspace.join(".svelte-check").join("tsconfig.json"),
+            entries: Vec::new(),
+            kit_entries: Vec::new(),
+        }
+    }
+
+    fn raw(file: &str, code: &str, msg: &str) -> RawTsDiagnostic {
+        RawTsDiagnostic {
+            file: PathBuf::from(file),
+            line: 1,
+            column: 1,
+            severity: "error".to_string(),
+            code: code.to_string(),
+            message: msg.to_string(),
+        }
+    }
+
+    #[test]
+    fn suppresses_external_package_internal_diagnostics() {
+        // #941: a `Cannot find module` on an imported library's shadow under
+        // `<cache>/ext/<n>/` is a library internal — official svelte-check
+        // never reports it, so it must be dropped. A diagnostic on the
+        // consumer's own (non-overlay) file still passes through.
+        let workspace = Path::new("/tmp/ws941");
+        let overlay = empty_layout(workspace);
+        let diags = [
+            raw(
+                ".svelte-check/ext/1/src/lib/Dropdown.svelte.tsx",
+                "TS2307",
+                "Cannot find module '@floating-ui/dom'",
+            ),
+            raw("src/App.svelte.tsx", "TS2304", "Cannot find name 'oops'"),
+        ];
+        let mapped = map_tsgo_diagnostics(&diags, &overlay, workspace);
+        assert_eq!(
+            mapped.diagnostics.len(),
+            1,
+            "ext/<n> internal diagnostic should be suppressed:\n{:#?}",
+            mapped.diagnostics
+        );
+        assert!(
+            mapped.diagnostics[0]
+                .message
+                .contains("Cannot find name 'oops'"),
+            "consumer-file diagnostic must survive:\n{:#?}",
+            mapped.diagnostics
+        );
     }
 }

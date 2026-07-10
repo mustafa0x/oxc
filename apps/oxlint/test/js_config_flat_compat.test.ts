@@ -20,6 +20,93 @@ async function writeConfigFile(source: string): Promise<string> {
 }
 
 describe("JS config flat-config compatibility", () => {
+  it("normalizes a root flat config array in order", async () => {
+    const configPath = await writeConfigFile(`
+const parser = {
+  meta: { name: "svelte-eslint-parser" },
+  parseForESLint(code) {
+    return {
+      ast: {
+        type: "Program",
+        sourceType: "module",
+        body: [],
+        range: [0, code.length],
+        loc: {
+          start: { line: 1, column: 0 },
+          end: { line: 1, column: code.length },
+        },
+      },
+    };
+  },
+};
+
+const plugin = {
+  meta: { name: "eslint-plugin-example" },
+  rules: {},
+};
+const importX = {
+  meta: { name: "eslint-plugin-import-x" },
+  rules: {},
+};
+
+export default [
+  {
+    ignores: ["dist//**"],
+    rules: {
+      "no-dupe-args": "error",
+      "no-octal": "error",
+      "no-redeclare": "error",
+      "no-unused-vars": "error",
+    },
+  },
+  {
+    files: ["**/*.svelte"],
+    languageOptions: { parser, globals: { window: "readonly" } },
+    processor: "svelte/svelte",
+    rules: { "no-unused-vars": "error" },
+  },
+  {
+    plugins: { example: plugin, "import-x": importX },
+    rules: { "example/rule": "warn", "import-x/first": "error" },
+  },
+];
+`);
+
+    const result = await loadJsConfigs([configPath]);
+    const payload = JSON.parse(result);
+
+    expect(payload.Failures).toBeUndefined();
+    expect(payload).toHaveProperty("Success");
+    expect(payload.Success[0].config.ignorePatterns).toEqual(["dist/**"]);
+    expect(payload.Success[0].config.categories).toEqual({ correctness: "off" });
+    expect(payload.Success[0].config.extends).toEqual([
+      {
+        ignorePatterns: ["dist/**"],
+        rules: {
+          "no-redeclare": ["error", { builtinGlobals: false }],
+          "no-unused-vars": "error",
+        },
+      },
+      {
+        overrides: [
+          {
+            files: ["**/*.svelte"],
+            _languageOptionsId: expect.any(Number),
+            _languageOptionsHasParser: true,
+            env: { svelte: true },
+            globals: { window: "readonly" },
+            rules: { "no-unused-vars": "error" },
+          },
+        ],
+      },
+      {
+        rules: { "example/rule": "warn", "import-x/first": "error" },
+        jsPlugins: [{ name: "example", specifier: "eslint-plugin-example" }],
+        plugins: ["import"],
+      },
+    ]);
+  });
+
   it("normalizes real-package-shaped flat config fragments in extends", async () => {
     const configPath = await writeConfigFile(`
 const parser = {

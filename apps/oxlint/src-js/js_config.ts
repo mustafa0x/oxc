@@ -10,8 +10,35 @@ interface JsConfigResult {
 const LANGUAGE_OPTIONS_ID_FIELD = "_languageOptionsId";
 const LANGUAGE_OPTIONS_HAS_PARSER_FIELD = "_languageOptionsHasParser";
 
-const isObject = (v: unknown) => typeof v === "object" && v !== null && !Array.isArray(v);
+const isObject = (v: unknown): v is Record<string, unknown> =>
+  typeof v === "object" && v !== null && !Array.isArray(v);
 const SUPPORTED_REDUNDANT_PROCESSORS = new Set(["svelte/svelte", "svelte/.svelte"]);
+const PARSER_ENFORCED_ESLINT_RULES = new Set(["no-dupe-args", "no-octal"]);
+const NATIVE_PLUGIN_ALIASES = new Map([
+  ["react", "react"],
+  ["react-hooks", "react"],
+  ["unicorn", "unicorn"],
+  ["typescript", "typescript"],
+  ["typescript-eslint", "typescript"],
+  ["@typescript-eslint", "typescript"],
+  ["oxc", "oxc"],
+  ["deepscan", "oxc"],
+  ["import", "import"],
+  ["import-x", "import"],
+  ["jsdoc", "jsdoc"],
+  ["jest", "jest"],
+  ["vitest", "vitest"],
+  ["jsx-a11y", "jsx-a11y"],
+  ["jsx-a11y-x", "jsx-a11y"],
+  ["@next", "nextjs"],
+  ["@next/next", "nextjs"],
+  ["nextjs", "nextjs"],
+  ["react-perf", "react-perf"],
+  ["promise", "promise"],
+  ["node", "node"],
+  ["vue", "vue"],
+  ["eslint", "eslint"],
+]);
 
 type NormalizedConfig = Record<string, unknown>;
 type ExternalPluginConfigEntry = string | { name: string; specifier: string };
@@ -100,27 +127,74 @@ function isSupportedRedundantProcessor(processor: unknown): processor is string 
   return typeof processor === "string" && SUPPORTED_REDUNDANT_PROCESSORS.has(processor);
 }
 
+function usesSvelteParser(languageOptions: Record<string, unknown>): boolean {
+  const { parser } = languageOptions;
+  if (!isObject(parser)) return false;
+  const { meta } = parser;
+  return isObject(meta) && meta.name === "svelte-eslint-parser";
+}
+
+function mergeNormalizedRecord(
+  existing: unknown,
+  additions: Record<string, unknown>,
+  path: string,
+): Record<string, unknown> {
+  if (existing === undefined) return additions;
+  if (!isObject(existing)) throw new Error(`${path} must be an object.`);
+  return { ...existing, ...additions };
+}
+
+function normalizeIgnorePatterns(patterns: string[]): string[] {
+  return patterns.map((pattern) => pattern.replace(/\/{2,}/g, "/"));
+}
+
+function normalizeRules(value: Record<string, unknown>): Record<string, unknown> {
+  return Object.fromEntries(
+    Object.entries(value).flatMap(([ruleName, ruleConfig]) => {
+      if (PARSER_ENFORCED_ESLINT_RULES.has(ruleName)) return [];
+      if (ruleName !== "no-redeclare") return [[ruleName, ruleConfig]];
+
+      if (Array.isArray(ruleConfig) && ruleConfig.length > 1) {
+        return [[ruleName, ruleConfig]];
+      }
+      const severity = Array.isArray(ruleConfig) ? ruleConfig[0] : ruleConfig;
+      return [[ruleName, [severity, { builtinGlobals: false }]]];
+    }),
+  );
+}
+
 function normalizeFlatPluginMap(
   value: Record<string, unknown>,
   path: string,
-): ExternalPluginConfigEntry[] {
-  return Object.entries(value).map(([pluginName, pluginValue]) => {
+): { native: string[]; external: ExternalPluginConfigEntry[] } {
+  const native: string[] = [];
+  const external: ExternalPluginConfigEntry[] = [];
+
+  for (const [pluginName, pluginValue] of Object.entries(value)) {
+    const nativePluginName = NATIVE_PLUGIN_ALIASES.get(pluginName);
+    if (nativePluginName !== undefined) {
+      native.push(nativePluginName);
+      continue;
+    }
+
     if (!isObject(pluginValue)) {
       throw new Error(`${path}.plugins.${pluginName} must be a plugin object.`);
     }
 
-    const meta = (pluginValue as Record<string, unknown>).meta;
+    const { meta } = pluginValue;
     if (!isObject(meta) || typeof meta.name !== "string" || meta.name.length === 0) {
       throw new Error(
         `${path}.plugins.${pluginName} must define \`meta.name\` as a package name string so Oxlint can resolve it.`,
       );
     }
 
-    return {
+    external.push({
       name: pluginName,
       specifier: meta.name,
-    };
-  });
+    });
+  }
+
+  return { native, external };
 }
 
 function mergeExternalPluginEntries(
@@ -177,6 +251,7 @@ function normalizeConfigForRust(root: object): Record<string, unknown> {
     target: NormalizationTarget,
   ): void => {
     let inferredJsPlugins: ExternalPluginConfigEntry[] = [];
+    let inferredNativePlugins: string[] = [];
 
     for (const [key, value] of Object.entries(config as Record<string, unknown>)) {
       if (key === "languageOptions") {
@@ -186,12 +261,32 @@ function normalizeConfigForRust(root: object): Record<string, unknown> {
           normalized[LANGUAGE_OPTIONS_HAS_PARSER_FIELD] =
             (value as Record<string, unknown>).parser != null;
         }
+        if (value.globals !== undefined) {
+          if (!isObject(value.globals)) {
+            throw new Error(`${path}.languageOptions.globals must be an object.`);
+          }
+          normalized.globals = mergeNormalizedRecord(
+            normalized.globals,
+            value.globals,
+            `${path}.globals`,
+          );
+        }
+        if (usesSvelteParser(value)) {
+          normalized.env = mergeNormalizedRecord(normalized.env, { svelte: true }, `${path}.env`);
+        }
+        continue;
+      }
+
+      if (key === "rules" && isObject(value)) {
+        normalized.rules = normalizeRules(value);
         continue;
       }
 
       if (key === "extends" && value !== undefined) {
         if (target === "override") {
-          throw new Error(`${path}.extends is not supported inside override-like flat config fragments.`);
+          throw new Error(
+            `${path}.extends is not supported inside override-like flat config fragments.`,
+          );
         }
         normalized.extends = normalizeExtends(value, path);
         continue;
@@ -217,7 +312,9 @@ function normalizeConfigForRust(root: object): Record<string, unknown> {
           continue;
         }
         if (!isObject(value)) throw new Error(`${path}.plugins must be an array or object.`);
-        inferredJsPlugins = inferredJsPlugins.concat(normalizeFlatPluginMap(value, path));
+        const plugins = normalizeFlatPluginMap(value, path);
+        inferredNativePlugins = inferredNativePlugins.concat(plugins.native);
+        inferredJsPlugins = inferredJsPlugins.concat(plugins.external);
         continue;
       }
 
@@ -229,7 +326,9 @@ function normalizeConfigForRust(root: object): Record<string, unknown> {
 
       if (key === "files") {
         if (target !== "override") {
-          throw new Error(`${path}.files is only supported in flat config fragments inside \`extends\`.`);
+          throw new Error(
+            `${path}.files is only supported in flat config fragments inside \`extends\`.`,
+          );
         }
         normalized.files = value;
         continue;
@@ -241,6 +340,7 @@ function normalizeConfigForRust(root: object): Record<string, unknown> {
             `${path}.processor=${JSON.stringify(value)} is not supported by Oxlint's flat-config compatibility layer.`,
           );
         }
+        normalized.env = mergeNormalizedRecord(normalized.env, { svelte: true }, `${path}.env`);
         continue;
       }
 
@@ -253,11 +353,12 @@ function normalizeConfigForRust(root: object): Record<string, unknown> {
           throw new Error(`${path}.ignorePatterns must be an array of glob strings.`);
         }
 
-        const ignorePatterns = normalized.ignorePatterns;
+        const { ignorePatterns } = normalized;
+        const patterns = normalizeIgnorePatterns(value);
         if (ignorePatterns === undefined) {
-          normalized.ignorePatterns = value;
+          normalized.ignorePatterns = patterns;
         } else if (Array.isArray(ignorePatterns)) {
-          normalized.ignorePatterns = [...ignorePatterns, ...value];
+          normalized.ignorePatterns = [...ignorePatterns, ...patterns];
         } else {
           throw new Error(`${path}.ignorePatterns must be an array.`);
         }
@@ -274,13 +375,16 @@ function normalizeConfigForRust(root: object): Record<string, unknown> {
           );
         }
 
-        const ignorePatterns = normalized.ignorePatterns;
+        const { ignorePatterns } = normalized;
+        const patterns = normalizeIgnorePatterns(value);
         if (ignorePatterns === undefined) {
-          normalized.ignorePatterns = value;
+          normalized.ignorePatterns = patterns;
         } else if (Array.isArray(ignorePatterns)) {
-          normalized.ignorePatterns = [...ignorePatterns, ...value];
+          normalized.ignorePatterns = [...ignorePatterns, ...patterns];
         } else {
-          throw new Error(`${path}.ignorePatterns must be an array when combined with flat-config \`ignores\`.`);
+          throw new Error(
+            `${path}.ignorePatterns must be an array when combined with flat-config \`ignores\`.`,
+          );
         }
         continue;
       }
@@ -289,7 +393,18 @@ function normalizeConfigForRust(root: object): Record<string, unknown> {
     }
 
     if (inferredJsPlugins.length > 0) {
-      normalized.jsPlugins = mergeExternalPluginEntries(normalized.jsPlugins, inferredJsPlugins, path);
+      normalized.jsPlugins = mergeExternalPluginEntries(
+        normalized.jsPlugins,
+        inferredJsPlugins,
+        path,
+      );
+    }
+    if (inferredNativePlugins.length > 0) {
+      const existing = normalized.plugins;
+      if (existing !== undefined && !Array.isArray(existing)) {
+        throw new Error(`${path}.plugins must be an array.`);
+      }
+      normalized.plugins = [...new Set([...(existing ?? []), ...inferredNativePlugins])];
     }
   };
 
@@ -324,18 +439,33 @@ function normalizeConfigForRust(root: object): Record<string, unknown> {
     return normalized;
   };
 
+  if (Array.isArray(root)) {
+    const extended = normalizeExtends(root, "<root>");
+    const ignorePatterns = extended.flatMap((config) => {
+      if (typeof config === "string") return [];
+      return Array.isArray(config.ignorePatterns) ? config.ignorePatterns : [];
+    });
+    return {
+      extends: extended,
+      categories: { correctness: "off" },
+      ...(ignorePatterns.length > 0 ? { ignorePatterns: [...new Set(ignorePatterns)] } : {}),
+    };
+  }
+
   return normalizeRoot(root, "<root>");
 }
 
 /**
  * Resolve a single config path to a `JsConfigResult`.
- * Standard mode: default export must be a plain object.
+ * Standard mode: default export must be a config object or flat config array.
  */
 async function resolveJsConfig(path: string, cacheKey: number): Promise<JsConfigResult> {
-  const config = await importJsConfig(path, cacheKey);
+  const config = await importJsConfig(path, cacheKey, true);
 
-  if (!isObject(config)) {
-    throw new Error(`Configuration file must have a default export that is an object.`);
+  if (!isObject(config) && !Array.isArray(config)) {
+    throw new Error(
+      `Configuration file must have a default export that is an object or flat config array.`,
+    );
   }
   validateConfigExtends(config as object);
   return { path, config: normalizeConfigForRust(config as object) };

@@ -1,4 +1,4 @@
-//! # svelte-compiler-rust
+//! # rsvelte_core
 //!
 //! A high-performance Rust implementation of the Svelte compiler.
 //!
@@ -10,7 +10,7 @@
 //! ## Usage
 //!
 //! ```rust,no_run
-//! use svelte_compiler_rust::{parse, ParseOptions};
+//! use rsvelte_core::{parse, ParseOptions};
 //!
 //! let source = r#"<h1>Hello, {name}!</h1>"#;
 //! let ast = parse(source, ParseOptions::default()).unwrap();
@@ -53,10 +53,11 @@ pub use compiler::print::{PrintError, PrintOptions, PrintResult, print};
 #[cfg(feature = "native")]
 pub use compiler::{
     CompileError, CompileOptions, CompileResult, ExperimentalOptions, GenerateMode,
-    ModuleCompileOptions, Warning, WarningFilterFn, compile, compile_batch, compile_module,
+    ModuleCompileOptions, Warning, WarningFilterFn, compile, compile_batch, compile_both,
+    compile_module,
 };
 #[cfg(not(feature = "native"))]
 pub use compiler::{
     CompileError, CompileOptions, CompileResult, ExperimentalOptions, GenerateMode,
-    ModuleCompileOptions, Warning, WarningFilterFn, compile, compile_module,
+    ModuleCompileOptions, Warning, WarningFilterFn, compile, compile_both, compile_module,
 };

@@ -100,6 +100,30 @@ mod rsvelte_backend {
         pub range: SvelteSourceRange,
     }
 
+    /// Svelte-specific formatting controls layered on top of Oxc's JS options.
+    #[derive(Debug, Clone)]
+    pub struct SvelteFormatOptions {
+        pub indent_script_and_style: bool,
+        pub sort_order: Option<String>,
+        pub allow_shorthand: bool,
+        pub single_attribute_per_line: bool,
+        pub bracket_same_line: bool,
+        pub style_options: Option<rsvelte_formatter::CssFormatOptions>,
+    }
+
+    impl Default for SvelteFormatOptions {
+        fn default() -> Self {
+            Self {
+                indent_script_and_style: true,
+                sort_order: None,
+                allow_shorthand: true,
+                single_attribute_per_line: false,
+                bracket_same_line: false,
+                style_options: None,
+            }
+        }
+    }
+
     impl fmt::Display for SvelteParseError {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             write!(f, "{}: {}", self.code, self.message)
@@ -162,6 +186,10 @@ mod rsvelte_backend {
     ///
     /// This path extracts scripts and comments for linting while leaving Svelte compiler
     /// diagnostics to configured lint rules.
+    ///
+    /// # Errors
+    ///
+    /// Returns the normalized rsvelte parse error when the source is invalid.
     pub fn parse_svelte_syntax(source: &str) -> Result<SvelteParseResult, SvelteParseError> {
         let root = parse(source, ParseOptions::default())
             .map_err(|error| convert_parse_error(source, &error))?;
@@ -253,15 +281,46 @@ mod rsvelte_backend {
     }
 
     /// Format Svelte source with Oxc JS options and script/style indentation control.
+    ///
+    /// # Errors
+    ///
+    /// Returns the rsvelte formatter error message when formatting fails.
     pub fn format_svelte_with_options_and_indent(
         source: &str,
         js_options: rsvelte_formatter::JsFormatOptions,
         indent_script_and_style: bool,
     ) -> Result<String, String> {
+        let svelte_options =
+            SvelteFormatOptions { indent_script_and_style, ..SvelteFormatOptions::default() };
+        format_svelte_with_config(source, js_options, &svelte_options)
+    }
+
+    /// Format Svelte source with the full native rsvelte option set.
+    ///
+    /// # Errors
+    ///
+    /// Returns the rsvelte formatter error message when formatting fails.
+    pub fn format_svelte_with_config(
+        source: &str,
+        js_options: rsvelte_formatter::JsFormatOptions,
+        svelte_options: &SvelteFormatOptions,
+    ) -> Result<String, String> {
+        let sort_order = svelte_options
+            .sort_order
+            .as_deref()
+            .and_then(rsvelte_formatter::SortOrderSpec::parse)
+            .unwrap_or_default();
         let options = rsvelte_formatter::FormatOptions {
             js: js_options,
-            indent_script_and_style,
-            style_formatter: None,
+            style_formatter: svelte_options
+                .style_options
+                .map(rsvelte_formatter::native_style_formatter),
+            single_attribute_per_line: svelte_options.single_attribute_per_line,
+            allow_shorthand: svelte_options.allow_shorthand,
+            indent_script_and_style: svelte_options.indent_script_and_style,
+            sort_order,
+            bracket_same_line: svelte_options.bracket_same_line,
+            ..rsvelte_formatter::FormatOptions::default()
         };
         rsvelte_formatter::format(source, &options).map_err(|error| error.to_string())
     }
@@ -352,7 +411,6 @@ mod rsvelte_backend {
             ParseError::InvalidExpression { .. } => "invalid_expression",
             ParseError::Generic { .. } => "generic",
             ParseError::SvelteError { code, .. } => code.as_str(),
-            ParseError::TypeScriptInvalidFeature { .. } => "typescript_invalid_feature",
         }
     }
 
@@ -524,6 +582,10 @@ let { value }: Props = $props();
 
         #[test]
         fn formatted_svelte_with_components_reparses() {
+            #[expect(
+                clippy::literal_string_with_formatting_args,
+                reason = "the literal is Svelte source, not a format string"
+            )]
             let source = r#"<script>let items=[{id:1}]</script>
 <svelte:head><title>Example</title><meta name="description" content="test" /></svelte:head>
 {#each items as item (item.id)}
@@ -541,7 +603,9 @@ let { value }: Props = $props();
 
             assert!(formatted.contains("<Icon value={item.id} />"));
             assert!(!formatted.contains("__rsvelte_fmt_rhs__"));
-            parse_svelte(&formatted).expect("formatted Svelte source should reparse");
+            parse_svelte(&formatted).unwrap_or_else(|error| {
+                panic!("formatted Svelte source should reparse: {error:?}\n{formatted}")
+            });
         }
 
         #[test]
@@ -621,6 +685,31 @@ let count:number=1;
         }
 
         #[test]
+        fn formats_else_if_blocks_idempotently() {
+            let source = r"{#if first}
+<p>first</p>
+{:else if second}
+<p>second</p>
+{:else}
+<p>other</p>
+{/if}";
+            let expected = r"{#if first}
+  <p>first</p>
+{:else if second}
+  <p>second</p>
+{:else}
+  <p>other</p>
+{/if}
+";
+
+            let formatted = format_svelte(source).expect("Svelte if block should format");
+
+            assert_eq!(formatted, expected);
+            assert_eq!(format_svelte(&formatted).unwrap(), formatted);
+            parse_svelte_syntax(&formatted).expect("formatted Svelte if block should reparse");
+        }
+
+        #[test]
         fn parse_error_includes_code_and_range() {
             let source = r#"<script context="not-module"></script>"#;
             let error = parse_svelte(source).expect_err("Svelte source should fail to parse");
@@ -634,8 +723,8 @@ let count:number=1;
 
 #[cfg(feature = "rsvelte")]
 pub use rsvelte_backend::{
-    SvelteComment, SvelteCommentKind, SvelteParseError, SvelteParseResult, SvelteParseSummary,
-    SvelteParseWarning, SvelteScript, SvelteScriptKind, SvelteSourcePosition, SvelteSourceRange,
-    format_svelte, format_svelte_with_options, format_svelte_with_options_and_indent, parse_svelte,
-    parse_svelte_summary, parse_svelte_syntax,
+    SvelteComment, SvelteCommentKind, SvelteFormatOptions, SvelteParseError, SvelteParseResult,
+    SvelteParseSummary, SvelteParseWarning, SvelteScript, SvelteScriptKind, SvelteSourcePosition,
+    SvelteSourceRange, format_svelte, format_svelte_with_config, format_svelte_with_options,
+    format_svelte_with_options_and_indent, parse_svelte, parse_svelte_summary, parse_svelte_syntax,
 };

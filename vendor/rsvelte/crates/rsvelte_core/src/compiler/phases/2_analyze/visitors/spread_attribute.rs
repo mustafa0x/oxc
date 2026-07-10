@@ -13,8 +13,9 @@ pub fn visit(
     attribute: &SpreadAttribute,
     context: &mut VisitorContext,
 ) -> Result<(), AnalysisError> {
-    // Spreads can contain class/style, so we can't safely prune CSS
+    // Spreads can contain class/style/id, so we can't safely prune CSS
     context.analysis.css.has_dynamic_classes = true;
+    context.analysis.css.has_dynamic_ids = true;
 
     // Check if this is a $$restProps or $$props spread (for legacy mode)
     if !context.analysis.runes
@@ -33,7 +34,14 @@ pub fn visit(
     // recursively visits the expression, calling CallExpression visitor which sets
     // `needs_context = true` for calls to imported or prop functions.
     // Corresponds to SpreadAttribute.js: `context.next({ ...context.state, expression: node.metadata.expression })`
-    super::script::walk_expression(&attribute.expression, context)?;
+    // Mark the reactive expression context so the AwaitExpression visitor applies
+    // the `suspend` gate (`experimental_async` / `legacy_await_invalid`), mirroring
+    // upstream's `expression: node.metadata.expression`.
+    let saved_in_expression_tag = context.in_expression_tag;
+    context.in_expression_tag = true;
+    let result = super::script::walk_expression(&attribute.expression, context);
+    context.in_expression_tag = saved_in_expression_tag;
+    result?;
 
     Ok(())
 }

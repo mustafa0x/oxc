@@ -11,6 +11,7 @@ use crate::compiler::phases::phase3_transform::client::visitors::expression_conv
 use crate::compiler::phases::phase3_transform::client::visitors::fragment::collect_ids_from_expr;
 use crate::compiler::phases::phase3_transform::client::visitors::shared::utils::{
     apply_transforms_to_expression, expression_has_await, expression_has_reactive_state,
+    get_literal_value, is_expression_defined,
 };
 use crate::compiler::phases::phase3_transform::js_ast::builders as b;
 use crate::compiler::phases::phase3_transform::js_ast::nodes::*;
@@ -292,6 +293,17 @@ fn build_title_content(
         let mut has_state = false;
         for node in nodes {
             if let TemplateNode::ExpressionTag(expr) = node {
+                // Upstream `TitleElement`: `evaluated.is_known ? b.literal(value)`
+                // with `has_state = false` → a plain (non-reactive) `$.effect`.
+                // Inline string-valued knowns only; numeric/boolean knowns would
+                // need a numeric `b.literal` (`title = 0`, not `"0"`) to
+                // byte-match, so they fall through to the existing path.
+                if let Some(Some(v)) = get_literal_value(&expr.expression, context) {
+                    let is_num_or_bool = v.parse::<f64>().is_ok() || v == "true" || v == "false";
+                    if !is_num_or_bool {
+                        return (b::string(v), false, memo_entries);
+                    }
+                }
                 if expression_has_reactive_state(&expr.expression, context) {
                     has_state = true;
                 }
@@ -366,12 +378,12 @@ fn build_title_content(
                         is_async: has_await,
                     });
                     let param_ref = b::id(&param_name);
-                    if !is_known_defined_expr(&expr.expression) {
+                    if !is_expression_defined(&expr.expression, context) {
                         expressions.push(b::nullish(&context.arena, param_ref, b::string("")));
                     } else {
                         expressions.push(param_ref);
                     }
-                } else if !is_known_defined_expr(&expr.expression) {
+                } else if !is_expression_defined(&expr.expression, context) {
                     expressions.push(b::nullish(&context.arena, value, b::string("")));
                 } else {
                     expressions.push(value);
@@ -421,10 +433,6 @@ fn is_known_defined_expr(expr: &crate::ast::js::Expression) -> bool {
             match &*node {
                 crate::ast::typed_expr::JsNode::Literal { value, .. } => {
                     !matches!(value, crate::ast::typed_expr::LiteralValue::Null)
-                }
-                crate::ast::typed_expr::JsNode::Raw(val) => {
-                    let value = val.get("value");
-                    !matches!(value, Some(serde_json::Value::Null) | None)
                 }
                 _ => false,
             }

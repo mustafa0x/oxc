@@ -63,12 +63,13 @@ use std::cell::RefCell;
 use oxc_allocator::Allocator;
 use oxc_ast::ast::*;
 use oxc_ast_visit::{Visit, walk};
-use oxc_parser::{ParseOptions, Parser};
+use oxc_parser::ParseOptions;
 use oxc_semantic::{Semantic, SemanticBuilder};
 use oxc_span::SourceType;
 use oxc_syntax::symbol::SymbolId;
 use rustc_hash::FxHashSet;
 
+use super::ast_rewrite;
 use super::scope_analysis::{find_state_var_symbols, is_state_var_reference_or_unresolved};
 
 thread_local! {
@@ -116,6 +117,42 @@ fn contains_top_level_semicolon(s: &str) -> bool {
     false
 }
 
+/// True when a `{...}` string is a STATEMENT BLOCK rather than an object
+/// literal, detected by its first inner token being a statement keyword in
+/// statement position — i.e. NOT immediately followed by `:` (which would make
+/// it an object-literal key like `{ if: 1 }`). Catches single-statement blocks
+/// such as `{ if (x) { y(); } }` whose only `;` is nested, so
+/// `contains_top_level_semicolon` misses it and the block would otherwise be
+/// mis-wrapped in `(...)` as an object literal and fail to parse.
+fn inner_is_block_statement(s: &str) -> bool {
+    let Some(inner) = s.trim().strip_prefix('{') else {
+        return false;
+    };
+    let inner = inner.trim_start();
+    // A nested block `{ { … } }` or an empty statement `{ ; }` is a block.
+    if inner.starts_with('{') || inner.starts_with(';') {
+        return true;
+    }
+    const KEYWORDS: &[&str] = &[
+        "if", "for", "while", "do", "switch", "try", "return", "throw", "break", "continue",
+        "const", "let", "var", "function", "class", "debugger", "with",
+    ];
+    for kw in KEYWORDS {
+        if let Some(rest) = inner.strip_prefix(kw) {
+            // Word boundary after the keyword (so `letter` isn't matched as `let`).
+            let boundary = rest
+                .chars()
+                .next()
+                .is_none_or(|c| !c.is_alphanumeric() && c != '_' && c != '$');
+            // Not an object key (`kw:`).
+            if boundary && !rest.trim_start().starts_with(':') {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// AST-based rewrite of state-var reads to `$.get(...)`. See
 /// module docs for the precise contract.
 pub fn transform_state_reads_ast(
@@ -156,7 +193,8 @@ pub fn transform_state_reads_ast(
     let trimmed = source.trim();
     let needs_paren_wrap = trimmed.starts_with('{')
         && trimmed.ends_with('}')
-        && !contains_top_level_semicolon(trimmed);
+        && !contains_top_level_semicolon(trimmed)
+        && !inner_is_block_statement(trimmed);
     let leading_ws = source.len() - source.trim_start().len();
     let parse_source: std::borrow::Cow<str> = if needs_paren_wrap {
         let trimmed_start = &source[leading_ws..];
@@ -173,51 +211,46 @@ pub fn transform_state_reads_ast(
     };
     let span_offset: i32 = if needs_paren_wrap { 1 } else { 0 };
 
-    STATE_READS_ALLOC.with(|cell| {
-        let allocator = std::mem::take(&mut *cell.borrow_mut());
-        let parser_ret = Parser::new(&allocator, &parse_source, SourceType::mjs())
-            .with_options(ParseOptions {
-                allow_return_outside_function: true,
-                ..ParseOptions::default()
-            })
-            .parse();
-        if !parser_ret.diagnostics.is_empty() {
-            *cell.borrow_mut() = allocator;
-            return None;
-        }
-        let program: &Program = allocator.alloc(parser_ret.program);
-        let semantic_ret = SemanticBuilder::new().build(program);
-        let semantic = &semantic_ret.semantic;
-        let effective_names: Vec<String> = effective.iter().map(|s| s.to_string()).collect();
-        let state_var_symbols = find_state_var_symbols(semantic, &effective_names);
+    ast_rewrite::with_program(
+        &STATE_READS_ALLOC,
+        &parse_source,
+        SourceType::mjs(),
+        ParseOptions {
+            allow_return_outside_function: true,
+            ..ParseOptions::default()
+        },
+        |program| {
+            let semantic_ret = SemanticBuilder::new().with_build_nodes(true).build(program);
+            let semantic = &semantic_ret.semantic;
+            let effective_names: Vec<String> = effective.iter().map(|s| s.to_string()).collect();
+            let state_var_symbols = find_state_var_symbols(semantic, &effective_names);
 
-        let mut collector = StateReadsCollector {
-            semantic,
-            effective: &effective,
-            effective_names: &effective_names,
-            state_var_symbols,
-            replacements: Vec::new(),
-            skip_spans: FxHashSet::default(),
-        };
-        collector.visit_program(program);
+            let mut collector = StateReadsCollector {
+                semantic,
+                effective: &effective,
+                effective_names: &effective_names,
+                state_var_symbols,
+                replacements: Vec::new(),
+                skip_spans: FxHashSet::default(),
+            };
+            collector.visit_program(program);
 
-        let mut replacements = collector.replacements;
-        if replacements.is_empty() {
-            *cell.borrow_mut() = allocator;
-            return None;
-        }
+            let mut replacements = collector.replacements;
+            if replacements.is_empty() {
+                return None;
+            }
 
-        replacements.sort_by_key(|r| std::cmp::Reverse(r.0));
-        let mut out = source.to_string();
-        for (start, end, rewrite) in &replacements {
-            let s = (*start as i32 - span_offset) as usize;
-            let e = (*end as i32 - span_offset) as usize;
-            out.replace_range(s..e, rewrite);
-        }
+            replacements.sort_by_key(|r| std::cmp::Reverse(r.0));
+            let mut out = source.to_string();
+            for (start, end, rewrite) in &replacements {
+                let s = (*start as i32 - span_offset) as usize;
+                let e = (*end as i32 - span_offset) as usize;
+                out.replace_range(s..e, rewrite);
+            }
 
-        *cell.borrow_mut() = allocator;
-        Some(out)
-    })
+            Some(out)
+        },
+    )
 }
 
 struct StateReadsCollector<'a, 'sem> {

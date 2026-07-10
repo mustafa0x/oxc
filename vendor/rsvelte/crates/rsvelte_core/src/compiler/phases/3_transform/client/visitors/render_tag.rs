@@ -306,16 +306,8 @@ fn unwrap_optional(expr: &Expression, arena: &crate::ast::arena::ParseArena) -> 
     use crate::ast::typed_expr::JsNode;
     if expr.node_type() == Some("ChainExpression") {
         let node = expr.as_node();
-        match &*node {
-            JsNode::ChainExpression { expression, .. } => {
-                return Expression::from_node(arena.get_js_node(*expression).clone());
-            }
-            JsNode::Raw(val) => {
-                if let Some(inner) = val.get("expression") {
-                    return Expression::Value(inner.clone());
-                }
-            }
-            _ => {}
+        if let JsNode::ChainExpression { expression, .. } = &*node {
+            return Expression::from_node(arena.get_js_node(*expression).clone());
         }
     }
     expr.clone()
@@ -330,17 +322,6 @@ fn extract_call_arguments(
     if expr.node_type() != Some("CallExpression") {
         return Vec::new();
     }
-    // Fast path for Expression::Value: extract directly from JSON to avoid
-    // JsNode conversion that allocates into a different (DESER) arena.
-    if let Expression::Value(val) = expr {
-        if let Some(args) = val.get("arguments").and_then(|a| a.as_array()) {
-            return args
-                .iter()
-                .map(|arg| Expression::Value(arg.clone()))
-                .collect();
-        }
-        return Vec::new();
-    }
     let node = expr.as_node();
     match &*node {
         JsNode::CallExpression { arguments, .. } => arena
@@ -348,15 +329,6 @@ fn extract_call_arguments(
             .iter()
             .map(|arg| Expression::from_node(arg.clone()))
             .collect(),
-        JsNode::Raw(val) => {
-            if let Some(args) = val.get("arguments").and_then(|a| a.as_array()) {
-                args.iter()
-                    .map(|arg| Expression::Value(arg.clone()))
-                    .collect()
-            } else {
-                Vec::new()
-            }
-        }
         _ => Vec::new(),
     }
 }
@@ -370,17 +342,11 @@ fn extract_call_callee(
     if expr.node_type() != Some("CallExpression") {
         return None;
     }
-    // Fast path for Expression::Value: extract directly from JSON to avoid
-    // JsNode conversion that allocates into a different (DESER) arena.
-    if let Expression::Value(val) = expr {
-        return val.get("callee").map(|c| Expression::Value(c.clone()));
-    }
     let node = expr.as_node();
     match &*node {
         JsNode::CallExpression { callee, .. } => {
             Some(Expression::from_node(arena.get_js_node(*callee).clone()))
         }
-        JsNode::Raw(val) => val.get("callee").map(|c| Expression::Value(c.clone())),
         _ => None,
     }
 }
@@ -393,11 +359,20 @@ fn render_tag_has_call(expr: &Expression) -> bool {
 /// Recursively check if a JSON value (ESTree node) contains a CallExpression.
 /// Stops recursion at function boundaries (ArrowFunctionExpression, FunctionExpression)
 /// since calls inside those don't affect the outer expression's reactivity.
+///
+/// `SpreadElement` and `TaggedTemplateExpression` also count: the official Phase-2
+/// analyzer sets `expression.has_call = true` for both (SpreadElement.js,
+/// TaggedTemplateExpression.js), because e.g. `[...x]` is treated like
+/// `[...x.values()]`. This makes a render-tag argument such as
+/// `{ props, ...snippetProps }` memoize into a `$.derived`, matching upstream.
 fn json_value_has_call(val: &serde_json::Value) -> bool {
     match val {
         serde_json::Value::Object(obj) => {
             if let Some(expr_type) = obj.get("type").and_then(|v| v.as_str()) {
-                if expr_type == "CallExpression" {
+                if expr_type == "CallExpression"
+                    || expr_type == "SpreadElement"
+                    || expr_type == "TaggedTemplateExpression"
+                {
                     return true;
                 }
                 if expr_type == "ArrowFunctionExpression"
@@ -420,16 +395,16 @@ mod tests {
 
     #[test]
     fn test_extract_call_callee() {
-        let call_expr = Expression::Value(serde_json::json!({
-            "type": "CallExpression",
-            "callee": {
-                "type": "Identifier",
-                "name": "snip"
-            },
-            "arguments": []
-        }));
-
+        // Build the typed expression *within* the arena so its child node ids
+        // resolve against the same `arena` that `extract_call_callee` reads.
         let arena = crate::ast::arena::ParseArena::new();
+        let call_expr = crate::ast::arena::with_serialize_arena(&arena, || {
+            Expression::from_json(serde_json::json!({
+                "type": "CallExpression",
+                "callee": { "type": "Identifier", "name": "snip" },
+                "arguments": []
+            }))
+        });
         let callee = extract_call_callee(&call_expr, &arena);
         assert!(callee.is_some());
 
@@ -441,18 +416,14 @@ mod tests {
 
     #[test]
     fn test_extract_call_arguments() {
-        let call_expr = Expression::Value(serde_json::json!({
-            "type": "CallExpression",
-            "callee": {
-                "type": "Identifier",
-                "name": "snip"
-            },
-            "arguments": [
-                { "type": "Literal", "value": 42 }
-            ]
-        }));
-
         let arena = crate::ast::arena::ParseArena::new();
+        let call_expr = crate::ast::arena::with_serialize_arena(&arena, || {
+            Expression::from_json(serde_json::json!({
+                "type": "CallExpression",
+                "callee": { "type": "Identifier", "name": "snip" },
+                "arguments": [ { "type": "Literal", "value": 42 } ]
+            }))
+        });
         let args = extract_call_arguments(&call_expr, &arena);
         assert_eq!(args.len(), 1);
     }

@@ -18,10 +18,29 @@ use memchr::memmem;
 use serde_json::{Map, Value};
 
 use crate::ast::css::{StyleSheet, StyleSheetContent, StyleSheetType};
-use crate::ast::template::TemplateNode;
+use crate::ast::template::{AttributeValue, AttributeValuePart, TemplateNode};
 use crate::error::ParseResult;
 
 use super::super::parser::Parser;
+
+/// Returns `true` when the `<style>` has a `lang` attribute whose value is not
+/// plain CSS (e.g. `sass`, `scss`, `stylus`, `less`, `postcss`). Such a block
+/// is preprocessed before the compiler normally sees it, so its body is NOT
+/// CSS — used (in lenient/lint mode only) to skip CSS-shaped validation that
+/// would otherwise abort the whole-file parse.
+fn has_non_css_lang(attributes: &[crate::ast::Attribute]) -> bool {
+    for attr in attributes {
+        if let crate::ast::Attribute::Attribute(node) = attr
+            && node.name.as_str() == "lang"
+            && let AttributeValue::Sequence(parts) = &node.value
+            && let Some(AttributeValuePart::Text(t)) = parts.first()
+        {
+            let lang = t.data.as_str().trim().to_ascii_lowercase();
+            return !lang.is_empty() && lang != "css";
+        }
+    }
+    false
+}
 
 // ============================================================================
 // Public API
@@ -73,6 +92,7 @@ impl Parser<'_> {
         &mut self,
         start: usize,
         attributes: Vec<crate::ast::Attribute>,
+        self_closing: bool,
     ) -> ParseResult<Option<TemplateNode>> {
         // Check for duplicate style tags
         if self.stylesheet.is_some() {
@@ -82,6 +102,46 @@ impl Parser<'_> {
                 (start, start),
             ));
         }
+
+        // A self-closed `<style />` (lenient/lint mode only) has no content and
+        // no closing tag — produce an empty stylesheet spanning `<style … />` so
+        // layout/style lint rules can still see it. Mirrors svelte-eslint-parser.
+        if self_closing {
+            let here = self.index;
+            let style_attributes: Vec<serde_json::Value> = attributes
+                .iter()
+                .filter_map(|attr| {
+                    if let crate::ast::Attribute::Attribute(attr_node) = attr {
+                        serde_json::to_value(attr_node).ok()
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            self.stylesheet = Some(StyleSheet {
+                node_type: StyleSheetType::StyleSheet,
+                start: start as u32,
+                end: here as u32,
+                attributes: style_attributes,
+                children: Vec::new(),
+                content: StyleSheetContent {
+                    start: here as u32,
+                    end: here as u32,
+                    styles: String::new(),
+                    comment: self.pending_leading_comments.last().cloned(),
+                },
+            });
+            return Ok(None);
+        }
+
+        // Lenient (lint) mode only: a non-CSS `lang` block (sass/scss/stylus/…)
+        // is not CSS, so its body must not drive CSS-shaped validation — that
+        // would spuriously abort the whole template parse and suppress every
+        // other lint on the file. Plain-CSS `<style>` keeps full strictness, so
+        // invalid plain CSS still fails to parse exactly as the official
+        // compiler (and the eslint oracle) treats it.
+        let lenient_non_css = (self.options.lenient_script || self.options.skip_non_css_lang_style)
+            && has_non_css_lang(&attributes);
 
         let content_start = self.index;
 
@@ -113,7 +173,11 @@ impl Parser<'_> {
         // A string that starts with `"` must end with `"`, and `'` must end with `'`.
         // If a string is not properly closed, we report `unexpected_eof`.
         // This corresponds to CSS-Tree's lexer error handling in the official Svelte compiler.
-        {
+        //
+        // Skipped only for a non-CSS `lang` block in lenient (lint) mode (see
+        // `lenient_non_css` above). Plain CSS keeps this check, so invalid plain
+        // CSS still errors exactly as the compiler/oracle do.
+        if !lenient_non_css {
             let mut in_string = false;
             let mut string_byte = 0u8;
             let mut in_block_comment = false;
@@ -207,7 +271,10 @@ impl Parser<'_> {
         // it cannot be valid CSS (no rules can be formed).
         // This corresponds to CSS-Tree's error when encountering invalid CSS in the
         // official Svelte compiler.
-        {
+        //
+        // Skipped only for a non-CSS `lang` block in lenient (lint) mode (see
+        // the string-quote check above).
+        if !lenient_non_css {
             let trimmed = style_content.trim();
             if !trimmed.is_empty() {
                 // Strip CSS comments to check if there's real content
@@ -262,6 +329,12 @@ impl Parser<'_> {
         // silently dropped.
         let css_children = if self.options.defer_script_parse {
             Vec::new() // Will be resolved by ensure_css_parsed() before analysis
+        } else if lenient_non_css {
+            // Non-CSS `lang` block in lint mode: the body is sass/scss/stylus/…,
+            // not CSS — don't parse it as CSS (CSS-aware rules handle the raw
+            // text themselves via their own `lang` branch). Yields no CSS AST
+            // children, so the surrounding template still lints normally.
+            Vec::new()
         } else {
             parse_css_strict(style_content, content_start)?
         };
@@ -395,6 +468,13 @@ impl<'a> CssParser<'a> {
                 self.skip_whitespace();
                 if self.is_eof() || self.current_char() == '}' {
                     break;
+                }
+
+                // Skip comments so they don't get folded into the next child's
+                // span (they're preserved via source gap copying in the printer).
+                if self.match_str("/*") {
+                    self.skip_block_comment();
+                    continue;
                 }
 
                 // Check for nested at-rule
@@ -1125,78 +1205,14 @@ impl<'a> CssParser<'a> {
                 continue;
             }
 
-            // Handle nested at-rules (like @apply, @media, etc.)
+            // Handle nested at-rules (like @media, @supports, etc.) using the same
+            // parsing as top-level at-rules so the block children (declarations and
+            // nested rules) are fully populated. Mirrors the official parser, where
+            // `read_block_item` recurses into at-rules regardless of nesting depth.
             if self.current_char() == '@' {
-                let at_start = self.offset + self.index;
-                // Read the at-rule name
-                self.advance(); // skip '@'
-                let name_start = self.index;
-                while !self.is_eof()
-                    && !self.current_char().is_whitespace()
-                    && self.current_char() != '{'
-                    && self.current_char() != ';'
-                    && self.current_char() != '('
-                {
-                    self.advance();
+                if let Some(at_rule) = self.parse_atrule() {
+                    declarations.push(at_rule);
                 }
-                let at_name = self.source[name_start..self.index].to_string();
-
-                // Read the prelude (everything before { or ;)
-                let prelude_start = self.index;
-                let mut paren_depth = 0;
-                while !self.is_eof() {
-                    let ch = self.current_char();
-                    if ch == '(' {
-                        paren_depth += 1;
-                    } else if ch == ')' {
-                        paren_depth -= 1;
-                    } else if paren_depth == 0 && (ch == '{' || ch == ';') {
-                        break;
-                    }
-                    self.advance();
-                }
-                let at_prelude = self.source[prelude_start..self.index].trim().to_string();
-
-                // Check if the at-rule has a block
-                let block = if !self.is_eof() && self.current_char() == '{' {
-                    self.eat_optional("{");
-                    // Track brace depth to properly skip nested blocks
-                    let mut brace_depth = 1;
-                    while !self.is_eof() && brace_depth > 0 {
-                        match self.current_char() {
-                            '{' => brace_depth += 1,
-                            '}' => brace_depth -= 1,
-                            _ => {}
-                        }
-                        if brace_depth > 0 {
-                            self.advance();
-                        }
-                    }
-                    self.eat_optional("}");
-                    // Return a non-null block value so the at-rule is recognized as having a block
-                    let block_end = self.offset + self.index;
-                    let mut block_obj = Map::new();
-                    block_obj.insert("type".to_string(), Value::String("Block".to_string()));
-                    block_obj.insert("start".to_string(), Value::Number((at_start as i64).into()));
-                    block_obj.insert("end".to_string(), Value::Number((block_end as i64).into()));
-                    block_obj.insert("children".to_string(), Value::Array(Vec::new()));
-                    Value::Object(block_obj)
-                } else {
-                    self.eat_optional(";");
-                    Value::Null
-                };
-
-                let at_end = self.offset + self.index;
-
-                let mut at_obj = Map::new();
-                at_obj.insert("type".to_string(), Value::String("Atrule".to_string()));
-                at_obj.insert("start".to_string(), Value::Number((at_start as i64).into()));
-                at_obj.insert("end".to_string(), Value::Number((at_end as i64).into()));
-                at_obj.insert("name".to_string(), Value::String(at_name));
-                at_obj.insert("prelude".to_string(), Value::String(at_prelude));
-                at_obj.insert("block".to_string(), block);
-                declarations.push(Value::Object(at_obj));
-
                 self.skip_whitespace();
                 continue;
             }
@@ -1389,7 +1405,31 @@ impl<'a> CssParser<'a> {
         }
         let property = self.source[property_start..self.index].trim().to_string();
 
-        if property.is_empty() || self.current_char() != ':' {
+        if property.is_empty() || self.is_eof() || self.current_char() != ':' {
+            // No `property: value` shape. Upstream's `read_declaration` reads
+            // the property up to the first whitespace-or-colon, optionally eats
+            // a `:`, then reads the value up to `;` / `}`. When that value is
+            // empty (and the property is not a `--custom-property`), it raises
+            // `css_empty_declaration` (read/style.js L474-476). Examples:
+            // `div { ... }`, `div { ; }`, `:global { p {...} }`.
+            // A non-empty remainder after the first token (`div { foo bar }`)
+            // parses upstream as a declaration with property `foo` and value
+            // `bar`, so it is NOT an error — keep skipping it silently.
+            let upstream_property = property.split_whitespace().next().unwrap_or("");
+            let upstream_value = property
+                .split_once(char::is_whitespace)
+                .map(|(_, rest)| rest.trim())
+                .unwrap_or("");
+            if upstream_value.is_empty() && !upstream_property.starts_with("--") {
+                record_first_error(
+                    &self.error,
+                    crate::error::ParseError::svelte(
+                        "css_empty_declaration",
+                        "Declaration cannot be empty",
+                        (start, self.offset + self.index),
+                    ),
+                );
+            }
             return None;
         }
 

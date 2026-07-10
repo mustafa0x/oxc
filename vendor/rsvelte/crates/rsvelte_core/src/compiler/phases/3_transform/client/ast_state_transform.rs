@@ -10,6 +10,7 @@
 //! 4. Applies all replacements in a single pass (right-to-left to preserve offsets)
 
 use std::cell::RefCell;
+use std::fmt::Write as _;
 
 use oxc_allocator::Allocator;
 use oxc_ast::ast::*;
@@ -108,14 +109,11 @@ fn should_proxy_ast(expr: &Expression<'_>, non_proxy_vars: &[String]) -> bool {
         Expression::ParenthesizedExpression(paren) => {
             should_proxy_ast(&paren.expression, non_proxy_vars)
         }
-        // SequenceExpression (comma): check last expression
-        Expression::SequenceExpression(seq) => {
-            if let Some(last) = seq.expressions.last() {
-                should_proxy_ast(last, non_proxy_vars)
-            } else {
-                true
-            }
-        }
+        // SequenceExpression (comma): upstream `should_proxy` does NOT whitelist
+        // SequenceExpression, so it falls through to `return true` — a comma
+        // expression like `(void 0, 1)` IS proxied. (Do not recurse into the
+        // last operand: that would wrongly skip the proxy for a literal tail.)
+        Expression::SequenceExpression(_) => true,
         // Everything else (CallExpression, MemberExpression, etc.) might need proxy
         _ => true,
     }
@@ -157,7 +155,14 @@ struct StateVarCollector<'a, 's> {
     /// Variables declared with `$derived()` / `$derived.by()` — assignments should never proxy.
     derived_vars: FxHashSet<String>,
     /// Variables known to not need proxy wrapping (literals, non-object types).
+    /// Used for the `$state(arg)` INITIALIZER proxy decision — must NOT contain
+    /// props (a `$state(prop)` initializer always proxies the getter-call value).
     non_proxy_vars: &'a [String],
+    /// Like `non_proxy_vars` but additionally includes props whose default value
+    /// is a non-proxy primitive. Used ONLY for the REASSIGNMENT proxy decision
+    /// (`state = prop` → `$.set(state, prop(), proxy)`), where upstream traces the
+    /// prop's default and omits the proxy for a primitive default.
+    reassign_non_proxy_vars: &'a [String],
     /// Whether the component is in runes mode.
     is_runes: bool,
     /// Whether dev-mode rewrites should fire (currently used by the
@@ -234,7 +239,6 @@ struct StateVarCollector<'a, 's> {
 }
 
 impl<'a, 's> StateVarCollector<'a, 's> {
-    #[allow(clippy::too_many_arguments)]
     fn new(
         source: &'s str,
         state_vars: &'a FxHashSet<&'a str>,
@@ -242,6 +246,7 @@ impl<'a, 's> StateVarCollector<'a, 's> {
         raw_state_vars: &'a FxHashSet<&'a str>,
         derived_vars: &[String],
         non_proxy_vars: &'a [String],
+        reassign_non_proxy_vars: &'a [String],
         is_runes: bool,
         dev: bool,
         analysis_source: Option<&'s str>,
@@ -274,6 +279,7 @@ impl<'a, 's> StateVarCollector<'a, 's> {
             raw_state_vars,
             derived_vars: derived_vars.iter().cloned().collect(),
             non_proxy_vars,
+            reassign_non_proxy_vars,
             is_runes,
             dev,
             analysis_source,
@@ -392,6 +398,8 @@ impl<'a, 's> StateVarCollector<'a, 's> {
     /// For `$count`, the base is `count`. The access depends on whether
     /// `count` is a prop, state var, or plain variable.
     fn store_access_for(&self, store_sub: &str) -> String {
+        use crate::compiler::phases::phase2_analyze::scope::BindingKind;
+        use crate::compiler::phases::phase3_transform::client::utils::is_prop_source;
         let store_name = &store_sub[1..]; // Strip leading $
         if self.prop_vars_for_store.contains(store_name) {
             format!("{}()", store_name) // prop getter
@@ -399,6 +407,19 @@ impl<'a, 's> StateVarCollector<'a, 's> {
             && !self.non_reactive_vars.contains(store_name)
         {
             format!("$.get({})", store_name) // reactive state getter
+        } else if let Some(analysis) = self.analysis
+            && let Some(idx) = analysis.root.find_binding_any_scope(store_name)
+            && let Some(binding) = analysis.root.bindings.get(idx)
+            && matches!(binding.kind, BindingKind::Prop | BindingKind::BindableProp)
+            && !is_prop_source(binding, analysis)
+        {
+            // Non-source prop store (`const { store } = $props()`): the store
+            // object is the prop value, read via `$$props.store` /
+            // `$$props['alias']` — mirrors the store-getter declaration.
+            match binding.prop_alias.as_deref().filter(|a| *a != store_name) {
+                Some(alias) => format!("$$props[\"{}\"]", alias),
+                None => format!("$$props.{}", store_name),
+            }
         } else {
             store_name.to_string() // regular variable
         }
@@ -712,7 +733,9 @@ impl<'a, 's> StateVarCollector<'a, 's> {
         // by node kind here (not by post-rewrite text).
         let (needs_proxy, is_explicit_undefined) = if let Some(arg) = call.arguments.first() {
             let arg_expr = arg.as_expression();
-            let needs_proxy = arg_expr.map(|e| should_proxy_ast(e, &[])).unwrap_or(false);
+            let needs_proxy = arg_expr
+                .map(|e| should_proxy_ast(e, self.non_proxy_vars))
+                .unwrap_or(false);
             let is_undef = matches!(
                 arg_expr,
                 Some(Expression::Identifier(id)) if id.name == "undefined"
@@ -1599,10 +1622,13 @@ impl<'a, 's> StateVarCollector<'a, 's> {
         }
 
         // Case 4: bare store-sub / prop-source identifier — already callable.
+        // Pass the bare identifier name directly (not the walked version which would be `name()`),
+        // because store-sub / prop-source vars are already getter functions.
+        // This mirrors upstream's `b.thunk(test())` → `unthunk(() => test())` → `test` collapsing.
         if let Some(Expression::Identifier(ident)) = arg_expr_opt {
             let name = ident.name.as_str();
             if self.store_sub_vars.contains(name) || self.prop_source_vars.contains(name) {
-                let replacement = format!("$.derived({})", walked_for_emit);
+                let replacement = format!("$.derived({})", name);
                 let replacement = self.maybe_tag_declarator(var_name, replacement);
                 self.add_replacement(call.span.start, call.span.end, replacement);
                 return true;
@@ -2059,6 +2085,17 @@ impl<'a, 's, 'ast> Visit<'ast> for StateVarCollector<'a, 's> {
     }
 
     fn visit_function(&mut self, it: &Function<'ast>, flags: ScopeFlags) {
+        // A `function foo()` DECLARATION binds `foo` in the ENCLOSING scope,
+        // shadowing any same-named prop/state var for references elsewhere — so
+        // `executing.then(enter)` (where a local `async function enter()` shadows
+        // an `enter` prop) must stay bare, not become `enter()`. Register it before
+        // walk_function pushes the function's own scope. Named function EXPRESSIONS
+        // bind only in their own scope, so they are excluded.
+        if it.r#type == oxc_ast::ast::FunctionType::FunctionDeclaration
+            && let Some(id) = &it.id
+        {
+            self.declare_in_current_scope(&id.name);
+        }
         // Track enclosing function depth so the `$derived(await …)`
         // declarator handler can choose between `await $.async_derived(…)`
         // (top-level instance script, depth 0) and
@@ -2286,6 +2323,19 @@ impl<'a, 's, 'ast> Visit<'ast> for StateVarCollector<'a, 's> {
             return;
         }
 
+        // `$host()` -> `$$props.$$host`. Whole-call replacement.
+        // Reference: 3-transform/client/visitors/CallExpression.js `case '$host'`.
+        if self.is_runes
+            && !self.is_shadowed("$host")
+            && !self.store_sub_vars.contains("$host")
+            && expr.arguments.is_empty()
+            && let Expression::Identifier(callee) = &expr.callee
+            && callee.name == "$host"
+        {
+            self.add_replacement(expr.span.start, expr.span.end, "$$props.$$host".to_string());
+            return;
+        }
+
         // `$state.eager(x)` -> `$.eager(() => x)`. Whole-call rewrite that
         // wraps the single argument in a thunk; inner state-var refs in
         // the argument still need `$.get(...)` wrapping, so we walk the
@@ -2454,10 +2504,20 @@ impl<'a, 's, 'ast> Visit<'ast> for StateVarCollector<'a, 's> {
             // pre-rewrite tokens around the store-sub reference.
             let before_start = start as usize;
             let trimmed_before = self.source[..before_start].trim_end();
-            let in_getter_context = trimmed_before.ends_with("$.untrack(")
+            let prefix_is_getter_call = trimmed_before.ends_with("$.untrack(")
                 || trimmed_before.ends_with("$.derived(")
                 || trimmed_before.ends_with("$derived(")
                 || trimmed_before.ends_with("untrack(");
+            // Only keep the store reference bare when it is the SOLE argument to
+            // the getter-context call (`$derived($store)` / `untrack($store)`) —
+            // i.e. the store getter IS the derivation/untrack function. When the
+            // store read is merely part of a larger expression
+            // (`$derived($store.x / 2)`), it must still be wrapped to `$store()`.
+            // Mirrors the `is_sole_derived_arg` check in the prop-source branch.
+            let in_getter_context = prefix_is_getter_call && {
+                let after = &self.source[end as usize..];
+                after.trim_start().starts_with(')')
+            };
             if !in_getter_context {
                 if self.in_shorthand_property {
                     self.add_replacement(start, end, format!("{}: {}()", name, name));
@@ -2500,7 +2560,7 @@ impl<'a, 's, 'ast> Visit<'ast> for StateVarCollector<'a, 's> {
                         let needs_proxy = self.is_runes
                             && !is_raw
                             && !is_derived
-                            && should_proxy_ast(&expr.right, self.non_proxy_vars);
+                            && should_proxy_ast(&expr.right, self.reassign_non_proxy_vars);
 
                         let replacement = if needs_proxy {
                             format!("$.set({}, {}, true)", name, rhs_text)
@@ -2539,7 +2599,7 @@ impl<'a, 's, 'ast> Visit<'ast> for StateVarCollector<'a, 's> {
                             && self.is_runes
                             && !is_raw
                             && !is_derived
-                            && should_proxy_ast(&expr.right, self.non_proxy_vars);
+                            && should_proxy_ast(&expr.right, self.reassign_non_proxy_vars);
 
                         let replacement = if needs_proxy {
                             format!(
@@ -2894,6 +2954,33 @@ impl<'a, 's, 'ast> Visit<'ast> for StateVarCollector<'a, 's> {
         // Walk normally
         walk::walk_static_member_expression(self, expr);
     }
+
+    fn visit_new_expression(&mut self, expr: &NewExpression<'ast>) {
+        // A `new X.Y(args)` whose callee member-spine bottoms out in a state var
+        // (rewritten to `$.get(name)`) gains a CallExpression in the callee after
+        // transformation, so it must be parenthesised — `new ($.get(x).Y)(args)` —
+        // else `(args)` parses as the `new` arguments. esrap/codegen apply this
+        // for proper AST `new` nodes, but this Raw-text state path can't, so we
+        // insert the parens here. The inserts are added AFTER the walk so the
+        // inner `name -> $.get(name)` replacement (which shares the callee start
+        // offset) is applied first; the right-to-left, stable-sorted apply then
+        // places `(` immediately before the rewritten callee.
+        let mut leftmost = &expr.callee;
+        let wrap = loop {
+            match leftmost {
+                Expression::StaticMemberExpression(m) => leftmost = &m.object,
+                Expression::ComputedMemberExpression(m) => leftmost = &m.object,
+                Expression::Identifier(id) => break self.is_active_state_var(id.name.as_str()),
+                _ => break false,
+            }
+        };
+        walk::walk_new_expression(self, expr);
+        if wrap {
+            let s = expr.callee.span();
+            self.add_replacement(s.start, s.start, "(".to_string());
+            self.add_replacement(s.end, s.end, ")".to_string());
+        }
+    }
 }
 
 impl<'a, 's> StateVarCollector<'a, 's> {
@@ -3113,23 +3200,25 @@ impl<'a, 's> StateVarCollector<'a, 's> {
 
         let length = arr.elements.len();
         let mut body = String::new();
-        body.push_str(&format!(
-            "\t\t\tvar {} = $.to_array($$value, {});\n",
+        let _ = writeln!(
+            body,
+            "\t\t\tvar {} = $.to_array($$value, {});",
             array_name, length
-        ));
+        );
 
         for (i, target) in targets.iter().enumerate() {
             match target {
                 ArrayTarget::Null => {}
                 ArrayTarget::Prop(name) => {
-                    body.push_str(&format!("\t\t\t{}({}[{}]);\n", name, array_name, i));
+                    let _ = writeln!(body, "\t\t\t{}({}[{}]);", name, array_name, i);
                 }
                 ArrayTarget::MemberOnProp { prop_name, .. } => {
                     let member_text = transformed_member_texts[i].as_ref().unwrap();
-                    body.push_str(&format!(
-                        "\t\t\t{}({} = {}[{}], true);\n",
+                    let _ = writeln!(
+                        body,
+                        "\t\t\t{}({} = {}[{}], true);",
                         prop_name, member_text, array_name, i
-                    ));
+                    );
                 }
             }
         }
@@ -3534,6 +3623,9 @@ pub(super) struct AstTransformConfig<'a> {
     pub raw_state_vars: &'a [String],
     pub derived_vars: &'a [String],
     pub non_proxy_vars: &'a [String],
+    /// `non_proxy_vars` + props with a non-proxy primitive default — used ONLY for
+    /// the reassignment proxy decision (see `StateVarCollector::reassign_non_proxy_vars`).
+    pub reassign_non_proxy_vars: &'a [String],
     pub is_runes: bool,
     /// Whether dev-mode rune rewrites should fire (e.g. the `$inspect(...)`
     /// expansion into `$.inspect(() => [args], ...)` — non-dev removal of
@@ -3573,6 +3665,7 @@ pub(super) fn transform_state_vars_ast(
     let raw_state_vars = config.raw_state_vars;
     let derived_vars = config.derived_vars;
     let non_proxy_vars = config.non_proxy_vars;
+    let reassign_non_proxy_vars = config.reassign_non_proxy_vars;
     let is_runes = config.is_runes;
     let prop_source_vars = config.prop_source_vars;
     let prop_assignment_transform_vars = config.prop_assignment_transform_vars;
@@ -3605,6 +3698,10 @@ pub(super) fn transform_state_vars_ast(
     let has_props_calls = is_runes
         && !store_sub_vars.iter().any(|v| v == "$props")
         && memchr::memmem::find(script.as_bytes(), b"$props").is_some();
+    // `$host()` → `$$props.$$host` (custom elements).
+    let has_host_calls = is_runes
+        && !store_sub_vars.iter().any(|v| v == "$host")
+        && memchr::memmem::find(script.as_bytes(), b"$host").is_some();
     // Dev-mode `===` / `!==` → `$.strict_equals(...)` rewrite (formerly
     // `rune_transforms::transform_strict_equals`). The visitor walks
     // every BinaryExpression so we only need a byte probe to know
@@ -3622,6 +3719,7 @@ pub(super) fn transform_state_vars_ast(
         && !has_state_calls
         && !has_derived_calls
         && !has_props_calls
+        && !has_host_calls
         && !has_strict_equals
     {
         return None;
@@ -3647,6 +3745,10 @@ pub(super) fn transform_state_vars_ast(
             {
                 i += 1;
             }
+            // SAFETY: `bytes` come from `script.as_bytes()`. The slice spans
+            // `start..i`, a run that begins at an ASCII ident-start byte and
+            // continues only over ASCII ident-continue bytes, so it is
+            // entirely ASCII and therefore valid UTF-8 on char boundaries.
             let word = unsafe { std::str::from_utf8_unchecked(&bytes[start..i]) };
             set.insert(word);
         }
@@ -3673,6 +3775,7 @@ pub(super) fn transform_state_vars_ast(
         || (has_state_calls && script_ids.contains("$state"))
         || (has_derived_calls && script_ids.contains("$derived"))
         || (has_props_calls && script_ids.contains("$props"))
+        || (has_host_calls && script_ids.contains("$host"))
         || has_strict_equals;
 
     if !has_any_match {
@@ -3699,6 +3802,7 @@ pub(super) fn transform_state_vars_ast(
             &raw_set,
             derived_vars,
             non_proxy_vars,
+            reassign_non_proxy_vars,
             is_runes,
             config.dev,
             config.analysis_source,
@@ -3747,6 +3851,7 @@ mod tests {
             raw_state_vars: &[],
             derived_vars: &[],
             non_proxy_vars: &[],
+            reassign_non_proxy_vars: &[],
             is_runes: true,
             dev: false,
             analysis_source: None,
@@ -3777,6 +3882,7 @@ mod tests {
             raw_state_vars: &[],
             derived_vars: &[],
             non_proxy_vars: &[],
+            reassign_non_proxy_vars: &[],
             is_runes: true,
             dev: false,
             analysis_source: None,
@@ -4028,6 +4134,7 @@ mod tests {
             raw_state_vars: &[],
             derived_vars: &[],
             non_proxy_vars: &[],
+            reassign_non_proxy_vars: &[],
             is_runes: true,
             dev: false,
             analysis_source: None,

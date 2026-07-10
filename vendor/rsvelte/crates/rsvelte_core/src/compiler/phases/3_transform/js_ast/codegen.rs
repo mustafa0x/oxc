@@ -682,7 +682,25 @@ impl<'a> JsCodegen<'a> {
         self.output.push_str("while (");
         self.emit_expression(self.arena.get_expr(while_stmt.test));
         self.output.push_str(") ");
-        self.emit_statement_as_block(self.arena.get_stmt(while_stmt.body));
+        // Like esrap, emit the body as-is without forcing braces.
+        // A BlockStatement body will naturally emit with { ... };
+        // a bare single-statement body stays bare (matching upstream behaviour).
+        self.emit_loop_body(self.arena.get_stmt(while_stmt.body));
+    }
+
+    /// Emit a loop body (while/for), mirroring how esrap emits while/for bodies:
+    /// block bodies are emitted inline, non-block bodies are emitted bare.
+    fn emit_loop_body(&mut self, stmt: &JsStatement) {
+        match stmt {
+            JsStatement::Block(block) => self.emit_block_inline(block),
+            _ => {
+                self.emit_statement_inner(stmt);
+                if self.needs_semicolon {
+                    self.output.push(';');
+                    self.needs_semicolon = false;
+                }
+            }
+        }
     }
 
     fn emit_do_while_statement(&mut self, do_while: &JsDoWhileStatement) {
@@ -799,6 +817,7 @@ impl<'a> JsCodegen<'a> {
     fn emit_expression(&mut self, expr: &JsExpr) {
         match expr {
             JsExpr::Identifier(name) => self.output.push_str(name),
+            JsExpr::OpaqueIdentifier(name) => self.output.push_str(name),
             JsExpr::Literal(lit) => self.emit_literal(lit),
             JsExpr::TemplateLiteral(template) => self.emit_template_literal(template),
             JsExpr::TaggedTemplate(tagged) => self.emit_tagged_template(tagged),
@@ -821,6 +840,21 @@ impl<'a> JsCodegen<'a> {
                 self.emit_expression(self.arena.get_expr(*inner_id));
             }
             JsExpr::This => self.output.push_str("this"),
+            JsExpr::Super => self.output.push_str("super"),
+            JsExpr::MetaProperty(meta, property) => {
+                self.output.push_str(meta);
+                self.output.push('.');
+                self.output.push_str(property);
+            }
+            JsExpr::ImportExpression { source, options } => {
+                self.output.push_str("import(");
+                self.emit_expression(self.arena.get_expr(*source));
+                if let Some(options_id) = options {
+                    self.output.push_str(", ");
+                    self.emit_expression(self.arena.get_expr(*options_id));
+                }
+                self.output.push(')');
+            }
             JsExpr::Await(inner_id) => {
                 self.output.push_str("await ");
                 let arg = self.arena.get_expr(*inner_id);
@@ -897,6 +931,9 @@ impl<'a> JsCodegen<'a> {
             JsLiteral::Boolean(b) => {
                 self.output.push_str(if *b { "true" } else { "false" });
             }
+            JsLiteral::RawString { raw, .. } => self.output.push_str(raw),
+            JsLiteral::RawNumber { raw, .. } => self.output.push_str(raw),
+            JsLiteral::BigInt(s) => self.output.push_str(s),
             JsLiteral::Null => self.output.push_str("null"),
             JsLiteral::Undefined => self.output.push_str("undefined"),
             JsLiteral::Regex { pattern, flags } => {
@@ -1275,8 +1312,12 @@ impl<'a> JsCodegen<'a> {
                 | JsExpr::Await(_)
                 | JsExpr::Assignment(_)
                 | JsExpr::Sequence(_)
-                | JsExpr::Yield(_)
-        );
+                | JsExpr::Yield(_) // `new` binds tighter than a call, so a callee whose member spine
+                                   // contains a CallExpression (`new $.get(x).Member(args)`) — or a chain —
+                                   // must be parenthesised, else the trailing `(args)` would be parsed as
+                                   // the `new` arguments. Mirrors esrap's `callee_has_call_expression`.
+        ) || matches!(callee, JsExpr::Chain(_))
+            || self.callee_has_call_expression(callee);
         if needs_parens {
             self.output.push('(');
         }
@@ -1287,6 +1328,20 @@ impl<'a> JsCodegen<'a> {
         self.output.push('(');
         self.emit_call_args(&new_expr.arguments);
         self.output.push(')');
+    }
+
+    /// True when a `new` callee's member spine contains a `CallExpression`
+    /// (`$.get(x).Member`), which forces the callee to be parenthesised so the
+    /// `new` arguments aren't mis-parsed as a call. Mirrors esrap.
+    fn callee_has_call_expression(&self, expr: &JsExpr) -> bool {
+        let mut node = expr;
+        loop {
+            match node {
+                JsExpr::Call(_) => return true,
+                JsExpr::Member(m) => node = self.arena.get_expr(m.object),
+                _ => return false,
+            }
+        }
     }
 
     #[inline]
@@ -1308,6 +1363,14 @@ impl<'a> JsCodegen<'a> {
                 | JsExpr::Object(_)
                 | JsExpr::Class(_)
                 | JsExpr::Yield(_)
+                // A `ChainExpression` object must be parenthesised so a
+                // non-optional member doesn't join the optional chain:
+                // `($$arg0?.()).href` (mirrors esrap's `MemberExpression`
+                // `node.object.type === 'ChainExpression'` clause). A parsed
+                // chain `a?.b.c` is one top-level `Chain` whose inner member
+                // objects are plain members, so this only fires on an
+                // explicitly nested chain (the snippet-argument base).
+                | JsExpr::Chain(_)
         );
         if needs_parens {
             self.output.push('(');
@@ -1457,8 +1520,14 @@ impl<'a> JsCodegen<'a> {
     /// - Assignment or conditional sub-expressions
     fn logical_operand_needs_parens(&self, operand: &JsExpr, parent_op: &JsLogicalOp) -> bool {
         match operand {
-            // Assignment and conditional expressions always need parens inside logical
-            JsExpr::Assignment(_) | JsExpr::Conditional(_) => true,
+            // Assignment and conditional expressions always need parens inside logical.
+            // Arrow functions and `yield` bind LOWER than `&&`/`||`/`??`, so an arrow
+            // operand (`a && (e) => …`) would otherwise mis-parse — wrap it:
+            // `a && ((e) => …)`. (Function *expressions* bind tighter, so they don't.)
+            JsExpr::Assignment(_)
+            | JsExpr::Conditional(_)
+            | JsExpr::Arrow(_)
+            | JsExpr::Yield(_) => true,
             JsExpr::Logical(inner) => {
                 let is_parent_nullish = matches!(parent_op, JsLogicalOp::NullishCoalescing);
                 let is_inner_nullish = matches!(inner.operator, JsLogicalOp::NullishCoalescing);
@@ -2144,6 +2213,7 @@ fn raw_stmt_type_name(code: &str) -> &'static str {
             }
         }
         b'v' if trimmed.starts_with("var ") => "VariableDeclaration",
+        b'd' if (trimmed == "debugger" || trimmed.starts_with("debugger;")) => "DebuggerStatement",
         b'l' if trimmed.starts_with("let ") => "VariableDeclaration",
         b'c' => {
             if trimmed.starts_with("const ") {
@@ -2205,10 +2275,12 @@ fn binary_op_precedence(op: &JsBinaryOp) -> u8 {
 fn escape_string_single(s: &str) -> std::borrow::Cow<'_, str> {
     // Fast path: use memchr to check if any escaping is needed.
     // This is faster than iterating all bytes for strings that don't need escaping.
+    // Mirrors esrap's `quote()` (esrap src/languages/ts/index.js), which only
+    // escapes the backslash, the quote character, `\n` and `\r` — tabs and
+    // other control characters are emitted literally.
     let bytes = s.as_bytes();
     if memchr::memchr3(b'\'', b'\\', b'\n', bytes).is_none()
-        && memchr::memchr3(b'\r', b'\t', 0x0c /* \f */, bytes).is_none()
-        && memchr::memchr2(0x08 /* \b */, 0x0b /* \v */, bytes).is_none()
+        && memchr::memchr(b'\r', bytes).is_none()
     {
         return std::borrow::Cow::Borrowed(s);
     }
@@ -2222,10 +2294,6 @@ fn escape_string_single(s: &str) -> std::borrow::Cow<'_, str> {
             b'\\' => "\\\\",
             b'\n' => "\\n",
             b'\r' => "\\r",
-            b'\t' => "\\t",
-            0x08 => "\\b",
-            0x0b => "\\v",
-            0x0c => "\\f",
             _ => continue,
         };
         // Copy the unmodified slice before this special character

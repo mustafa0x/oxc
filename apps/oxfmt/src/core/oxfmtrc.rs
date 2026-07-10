@@ -276,9 +276,8 @@ pub struct FormatConfig {
     /// Compatibility options for native Svelte formatting.
     ///
     /// Native `.svelte` formatting is always enabled when the rsvelte backend is built in;
-    /// `false` does not disable it. Script-body indentation is supported; style bodies are
-    /// preserved verbatim. Section order and attribute shorthand options are accepted for config
-    /// compatibility, but their source spans are also preserved.
+    /// `false` does not disable it. Section order, attribute shorthand, script/style indentation,
+    /// open-tag layout, and embedded CSS formatting are handled by the native backend.
     ///
     /// - Default: Native Svelte formatting enabled with default options.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -291,15 +290,15 @@ pub struct FormatConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub plugins: Option<Vec<String>>,
 
-    /// Compatibility alias for `svelte.sortOrder`; section order is currently preserved verbatim.
+    /// Compatibility alias for `svelte.sortOrder`.
     #[serde(skip_serializing_if = "Option::is_none", rename = "svelteSortOrder")]
     pub svelte_sort_order: Option<String>,
 
-    /// Compatibility alias for `svelte.allowShorthand`; open tags are currently preserved verbatim.
+    /// Compatibility alias for `svelte.allowShorthand`.
     #[serde(skip_serializing_if = "Option::is_none", rename = "svelteAllowShorthand")]
     pub svelte_allow_shorthand: Option<bool>,
 
-    /// Compatibility alias for `svelte.indentScriptAndStyle`; currently affects script bodies.
+    /// Compatibility alias for `svelte.indentScriptAndStyle`.
     #[serde(skip_serializing_if = "Option::is_none", rename = "svelteIndentScriptAndStyle")]
     pub svelte_indent_script_and_style: Option<bool>,
 }
@@ -940,7 +939,6 @@ impl SvelteUserConfig {
 pub struct SvelteConfig {
     /// The requested order for Svelte component sections.
     ///
-    /// The native formatter currently preserves section order verbatim.
     /// Format: join the keywords `options`, `scripts`, `markup`, `styles` with a `-` in the order you want;
     /// or `none` if you don't want to reorder anything.
     ///
@@ -949,14 +947,10 @@ pub struct SvelteConfig {
     pub sort_order: Option<String>,
     /// Whether to allow attribute shorthand if attribute name and expression are same.
     ///
-    /// The native formatter currently preserves open tags verbatim.
-    ///
     /// - Default: `true`
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allow_shorthand: Option<bool>,
     /// Whether to indent code inside `<script>` and `<style>` tags.
-    ///
-    /// The native formatter currently applies this to script bodies and preserves style bodies.
     ///
     /// - Default: `true`
     #[serde(skip_serializing_if = "Option::is_none")]

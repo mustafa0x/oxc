@@ -83,7 +83,6 @@ where
 fn expr_to_node(expr: Expression) -> JsNode {
     match expr {
         Expression::Typed(te) => te.node,
-        Expression::Value(v) => JsNode::Raw(v),
         Expression::Lazy { .. } => {
             panic!("Expression::Lazy must be resolved before converting to JsNode")
         }
@@ -259,6 +258,7 @@ fn get_loose_identifier(
             end: end as u32,
             loc: None,
             name: CompactString::from(""),
+            type_annotation: None,
         }));
     }
     None
@@ -841,6 +841,7 @@ fn try_parse_arrow_function(
                 end: 0,
                 loc: None,
                 name: CompactString::from(p),
+                type_annotation: None,
             });
         }
     }
@@ -1306,6 +1307,7 @@ fn try_parse_ident_or_member(
             end: (offset + seg_end) as u32,
             loc: create_typed_loc(offset + seg_start, offset + seg_end, line_offsets),
             name: CompactString::from(prop_name),
+            type_annotation: None,
         };
 
         result = Expression::from_node(JsNode::MemberExpression {
@@ -1392,7 +1394,6 @@ fn try_parse_numeric_literal(
 /// # Returns
 /// A parsed `Expression` or an empty identifier in loose mode.
 /// Returns an error message if parsing fails and loose mode is disabled.
-#[allow(clippy::too_many_arguments)]
 pub fn parse_expression(
     arena: &ParseArena,
     content: &str,
@@ -1493,7 +1494,7 @@ pub fn parse_destructuring_pattern(
                     adjusted_offset,
                     line_offsets,
                 );
-                return Some(Expression::Value(pattern_json));
+                return Some(Expression::from_json(pattern_json));
             }
 
             None
@@ -1525,7 +1526,6 @@ pub fn parse_destructuring_pattern(
 /// # Returns
 /// A parsed `Expression` or an empty identifier in loose mode.
 /// Returns an error message if parsing fails and loose mode is disabled.
-#[allow(clippy::too_many_arguments)]
 pub fn parse_expression_with_end(
     arena: &ParseArena,
     content: &str,
@@ -1599,7 +1599,7 @@ pub fn check_js_parse_error_with_pos(content: &str) -> Option<(String, usize)> {
                 let pos = first_error
                     .labels
                     .first()
-                    .map(|label| (label.offset() + label.len()) as usize)
+                    .map(|label| label.offset() as usize + label.len() as usize)
                     .map(|wrapped_end| {
                         // Strip the leading `(` we added and clamp.
                         wrapped_end.saturating_sub(1).min(content.len())
@@ -1631,6 +1631,69 @@ pub fn check_js_parse_error_with_pos(content: &str) -> Option<(String, usize)> {
     js_result.as_ref()?;
 
     js_result.or(ts_result)
+}
+
+/// Check whether a parameter list (e.g. snippet params) parses as valid
+/// function parameters in the given language mode.
+///
+/// Mirrors upstream's snippet handling (1-parse/state/tag.js), which builds
+/// `${params} => {}` and parses it with `parse_expression_at` using the
+/// file's `parser.ts` mode — so TypeScript annotations in a snippet's
+/// parameters are a `js_parse_error` unless the component uses `lang="ts"`.
+///
+/// Returns `Some((message, pos_in_params))` when parsing fails.
+pub fn check_params_parse_error(params: &str, ts: bool) -> Option<(String, usize)> {
+    let mut wrapped = String::with_capacity(params.len() + 9);
+    wrapped.push('(');
+    wrapped.push_str(params);
+    wrapped.push_str(") => {}");
+
+    with_oxc_allocator(|allocator| {
+        let source_type = if ts {
+            SourceType::ts()
+        } else {
+            SourceType::mjs()
+        };
+        let result = OxcParser::new(allocator, &wrapped, source_type).parse();
+        result.diagnostics.first().map(|first_error| {
+            let pos = first_error
+                .labels
+                .first()
+                .map(|label| {
+                    (label.offset() as usize)
+                        .saturating_sub(1)
+                        .min(params.len())
+                })
+                .unwrap_or(0);
+            (first_error.message.to_string(), pos)
+        })
+    })
+}
+
+/// Check whether `content` parses as a JS/TS *statement* (program), returning
+/// the first parse error as `Some((message, pos_in_content))`.
+///
+/// Mirrors upstream's `parse_statement_at` (acorn) used by
+/// `read_declaration()` in `1-parse/state/tag.js`: a declaration-tag body that
+/// does not parse as a statement is rethrown in strict mode and surfaces as
+/// `js_parse_error` (e.g. `{let }` → "The keyword 'let' is reserved").
+pub fn check_js_statement_parse_error(content: &str, ts: bool) -> Option<(String, usize)> {
+    with_oxc_allocator(|allocator| {
+        let source_type = if ts {
+            SourceType::ts()
+        } else {
+            SourceType::mjs()
+        };
+        let result = OxcParser::new(allocator, content, source_type).parse();
+        result.diagnostics.first().map(|first_error| {
+            let pos = first_error
+                .labels
+                .first()
+                .map(|label| (label.offset() as usize).min(content.len()))
+                .unwrap_or(0);
+            (first_error.message.to_string(), pos)
+        })
+    })
 }
 
 /// For an *invalid* expression string, determine whether the failure is caused
@@ -1685,6 +1748,7 @@ fn create_invalid_identifier(start: usize, end: usize, _line_offsets: &[usize]) 
         end: end as u32,
         loc: None,
         name: CompactString::from(""),
+        type_annotation: None,
     })
 }
 
@@ -1867,8 +1931,51 @@ fn parse_expression_with_typescript(
                     })
                     .collect();
 
+                // Interior comments: a comment that sits *inside* the
+                // expression (after its start, before its end) is attached as a
+                // `leadingComments` entry on the sub-node it immediately
+                // precedes — mirroring acorn (e.g. `a instanceof /* c */ B`
+                // attaches `/* c */` to `B`). Svelte 5.56.1 #18330.
+                let interior_comments: Vec<(usize, Value)> = result
+                    .program
+                    .comments
+                    .iter()
+                    .filter(|c| c.span.end > expr_start && c.span.start < expr_end)
+                    .map(|c| {
+                        let comment_start = offset + c.span.start as usize - 1;
+                        let comment_end = offset + c.span.end as usize - 1;
+                        let raw = &wrapped[c.span.start as usize..c.span.end as usize];
+                        let mut value = extract_comment_value(raw, c.kind);
+                        if matches!(
+                            c.kind,
+                            oxc_ast::ast::CommentKind::SingleLineBlock
+                                | oxc_ast::ast::CommentKind::MultiLineBlock
+                        ) {
+                            value = normalize_block_comment_indentation(
+                                &value,
+                                content,
+                                c.span.start as usize - 1,
+                            );
+                        }
+                        (
+                            comment_end,
+                            create_comment_object(
+                                c.kind,
+                                value,
+                                comment_start,
+                                comment_end,
+                                line_offsets,
+                            )
+                            .to_value(),
+                        )
+                    })
+                    .collect();
+
                 // Attach comments to the expression
-                if !leading_comments.is_empty() || !trailing_comments.is_empty() {
+                if !leading_comments.is_empty()
+                    || !trailing_comments.is_empty()
+                    || !interior_comments.is_empty()
+                {
                     let mut json_val = expr.as_json().clone();
                     if let Value::Object(ref mut obj) = json_val {
                         if !leading_comments.is_empty() {
@@ -1884,7 +1991,19 @@ fn parse_expression_with_typescript(
                             );
                         }
                     }
-                    expr = Expression::Value(json_val);
+                    // Attach each interior comment to the node it precedes.
+                    for (comment_end, comment_obj) in interior_comments {
+                        if let Some(target) =
+                            json_min_node_start_at_or_after(&json_val, comment_end)
+                        {
+                            json_attach_leading_comment_at_start(
+                                &mut json_val,
+                                target,
+                                &comment_obj,
+                            );
+                        }
+                    }
+                    expr = Expression::from_json(json_val);
                 }
             }
 
@@ -1893,6 +2012,89 @@ fn parse_expression_with_typescript(
 
         None
     })
+}
+
+/// Smallest `start` among AST nodes (objects carrying a non-comment `type`)
+/// whose `start >= threshold`. Used to find the node an interior comment
+/// immediately precedes.
+fn json_min_node_start_at_or_after(node: &Value, threshold: usize) -> Option<usize> {
+    fn walk(node: &Value, threshold: usize, best: &mut Option<usize>) {
+        match node {
+            Value::Object(map) => {
+                let is_ast_node = map
+                    .get("type")
+                    .and_then(|t| t.as_str())
+                    .is_some_and(|t| t != "Block" && t != "Line");
+                if is_ast_node
+                    && let Some(s) = map
+                        .get("start")
+                        .and_then(|v| v.as_u64())
+                        .map(|v| v as usize)
+                    && s >= threshold
+                    && best.is_none_or(|b| s < b)
+                {
+                    *best = Some(s);
+                }
+                for v in map.values() {
+                    walk(v, threshold, best);
+                }
+            }
+            Value::Array(arr) => {
+                for v in arr {
+                    walk(v, threshold, best);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut best = None;
+    walk(node, threshold, &mut best);
+    best
+}
+
+/// Attach `comment` to the `leadingComments` of the first (pre-order /
+/// outermost) AST node whose `start == target_start`.
+fn json_attach_leading_comment_at_start(
+    node: &mut Value,
+    target_start: usize,
+    comment: &Value,
+) -> bool {
+    match node {
+        Value::Object(map) => {
+            let is_ast_node = map
+                .get("type")
+                .and_then(|t| t.as_str())
+                .is_some_and(|t| t != "Block" && t != "Line");
+            let start = map
+                .get("start")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize);
+            if is_ast_node && start == Some(target_start) {
+                let entry = map
+                    .entry("leadingComments".to_string())
+                    .or_insert_with(|| Value::Array(Vec::new()));
+                if let Value::Array(arr) = entry {
+                    arr.push(comment.clone());
+                }
+                return true;
+            }
+            for v in map.values_mut() {
+                if json_attach_leading_comment_at_start(v, target_start, comment) {
+                    return true;
+                }
+            }
+            false
+        }
+        Value::Array(arr) => {
+            for v in arr.iter_mut() {
+                if json_attach_leading_comment_at_start(v, target_start, comment) {
+                    return true;
+                }
+            }
+            false
+        }
+        _ => false,
+    }
 }
 
 /// Unwrap ParenthesizedExpression to get the inner expression.
@@ -2060,6 +2262,21 @@ pub fn parse_typescript_params(
             for param in &arrow.params.items {
                 let param_expr = convert_formal_parameter(arena, param, offset - 1, line_offsets);
                 p.push(param_expr);
+            }
+            // A rest parameter (`...args`) lives in `params.rest`, not `items`.
+            // Without this it was silently dropped (a snippet `(...args)`
+            // emitted `()` in svelte2tsx). Mirror the function-param rest handling.
+            if let Some(rest) = &arrow.params.rest {
+                let rest_start = (offset - 1) + rest.span.start as usize;
+                let rest_end = (offset - 1) + rest.span.end as usize;
+                let argument =
+                    convert_binding_pattern(arena, &rest.rest.argument, offset - 1, line_offsets);
+                p.push(Expression::from_node(JsNode::RestElement {
+                    start: rest_start as u32,
+                    end: rest_end as u32,
+                    loc: create_typed_loc(rest_start, rest_end, line_offsets),
+                    argument: arena.alloc_js_node(argument),
+                }));
             }
             ParseOutcome::Ok(p)
         } else {
@@ -2263,7 +2480,7 @@ fn convert_formal_parameter_with_remap(
         }
     }
 
-    Expression::Value(val)
+    Expression::from_json(val)
 }
 
 /// Convert oxc FormalParameter to our Expression format with type annotations.
@@ -2307,7 +2524,7 @@ fn convert_formal_parameter(
         // Include the parameter itself so remove_typescript_nodes can extract it
         let inner = convert_formal_parameter_inner(arena, param, adjusted_offset, line_offsets);
         obj.insert("parameter".to_string(), inner.as_json().clone());
-        return Expression::Value(Value::Object(obj));
+        return Expression::from_json(Value::Object(obj));
     }
 
     convert_formal_parameter_inner(arena, param, adjusted_offset, line_offsets)
@@ -2346,17 +2563,29 @@ fn convert_formal_parameter_inner(
                     convert_type_annotation_adjusted(type_ann, adjusted_offset, line_offsets);
                 obj.insert("typeAnnotation".to_string(), type_ann_obj);
 
-                Expression::Value(Value::Object(obj))
+                Expression::from_json(Value::Object(obj))
             } else {
                 let end = adjusted_offset + id.span.end as usize;
                 create_identifier(name, start, end, line_offsets)
             }
         }
         BindingPattern::ObjectPattern(obj_pat) => {
-            convert_object_pattern_to_expr(arena, obj_pat, adjusted_offset, line_offsets)
+            let expr =
+                convert_object_pattern_to_expr(arena, obj_pat, adjusted_offset, line_offsets);
+            // A destructuring param can carry a type annotation on the
+            // FormalParameter (`{ a }: { a?: string }`), but the pattern's own
+            // span stops at the closing `}`. The BindingIdentifier branch above
+            // already folds the annotation into its span + attaches
+            // `typeAnnotation`; mirror that for object patterns so the param's
+            // `end` covers the annotation. svelte2tsx slices the snippet
+            // parameter's source by this span — without it the explicit type and
+            // its optionality are lost and the member is inferred as `any` /
+            // required (#912).
+            attach_param_type_annotation(expr, param, adjusted_offset, line_offsets)
         }
         BindingPattern::ArrayPattern(arr_pat) => {
-            convert_array_pattern_to_expr(arena, arr_pat, adjusted_offset, line_offsets)
+            let expr = convert_array_pattern_to_expr(arena, arr_pat, adjusted_offset, line_offsets);
+            attach_param_type_annotation(expr, param, adjusted_offset, line_offsets)
         }
         BindingPattern::AssignmentPattern(assign_pat) => {
             convert_assignment_pattern_to_expr(arena, assign_pat, adjusted_offset, line_offsets)
@@ -2381,6 +2610,39 @@ fn convert_formal_parameter_inner(
     pattern_expr
 }
 
+/// Fold a FormalParameter's type annotation into a destructuring-pattern
+/// expression: extend the node's `end` to cover the annotation and attach a
+/// `typeAnnotation` field (mirroring the `BindingIdentifier` branch of
+/// `convert_formal_parameter_inner`). No-op when the parameter is untyped.
+///
+/// `adjusted_offset` is the offset already applied to the pattern's own spans
+/// (the OXC span is relative to the parser's wrapped source); the annotation's
+/// spans use the same base, so callers needing original-source positions
+/// (e.g. the optional-marker remap path) still remap the top-level `end`.
+fn attach_param_type_annotation(
+    expr: Expression,
+    param: &oxc_ast::ast::FormalParameter,
+    adjusted_offset: usize,
+    line_offsets: &[usize],
+) -> Expression {
+    let Some(type_ann) = &param.type_annotation else {
+        return expr;
+    };
+    let mut json = expr.as_json().clone();
+    if let Some(obj) = json.as_object_mut() {
+        let start = obj.get("start").and_then(|s| s.as_u64()).unwrap_or(0) as usize;
+        let end = adjusted_offset + type_ann.span.end as usize;
+        obj.insert("end".to_string(), Value::Number((end as i64).into()));
+        if let Some(loc) = create_loc(start, end, line_offsets) {
+            obj.insert("loc".to_string(), loc);
+        }
+        let type_ann_obj =
+            convert_type_annotation_adjusted(type_ann, adjusted_offset, line_offsets);
+        obj.insert("typeAnnotation".to_string(), type_ann_obj);
+    }
+    Expression::from_json(json)
+}
+
 /// Convert oxc ObjectPattern to our Expression format (for function parameters).
 fn convert_object_pattern_to_expr(
     arena: &ParseArena,
@@ -2397,9 +2659,13 @@ fn convert_object_pattern_to_expr(
         .map(|prop| {
             let prop_start = adjusted_offset + prop.span.start as usize;
             let prop_end = adjusted_offset + prop.span.end as usize;
-            let key_value =
-                convert_property_key_for_param(arena, &prop.key, adjusted_offset, line_offsets);
-            let value_value = convert_binding_pattern_for_param(
+            let key_node = convert_property_key_for_param_as_node(
+                arena,
+                &prop.key,
+                adjusted_offset,
+                line_offsets,
+            );
+            let value_node = convert_binding_pattern_for_param_as_node(
                 arena,
                 &prop.value,
                 adjusted_offset,
@@ -2412,8 +2678,8 @@ fn convert_object_pattern_to_expr(
                 method: false,
                 shorthand: prop.shorthand,
                 computed: prop.computed,
-                key: arena.alloc_js_node(JsNode::Raw(key_value)),
-                value: arena.alloc_js_node(JsNode::Raw(value_value)),
+                key: arena.alloc_js_node(key_node),
+                value: arena.alloc_js_node(value_node),
                 kind: CompactString::from("init"),
             }
         })
@@ -2422,13 +2688,17 @@ fn convert_object_pattern_to_expr(
     if let Some(rest) = &obj_pat.rest {
         let rest_start = adjusted_offset + rest.span.start as usize;
         let rest_end = adjusted_offset + rest.span.end as usize;
-        let argument =
-            convert_binding_pattern_for_param(arena, &rest.argument, adjusted_offset, line_offsets);
+        let argument = convert_binding_pattern_for_param_as_node(
+            arena,
+            &rest.argument,
+            adjusted_offset,
+            line_offsets,
+        );
         properties.push(JsNode::RestElement {
             start: rest_start as u32,
             end: rest_end as u32,
             loc: create_typed_loc(rest_start, rest_end, line_offsets),
-            argument: arena.alloc_js_node(JsNode::Raw(argument)),
+            argument: arena.alloc_js_node(argument),
         });
     }
 
@@ -2437,6 +2707,7 @@ fn convert_object_pattern_to_expr(
         end: end as u32,
         loc: create_typed_loc(start, end, line_offsets),
         properties: arena.alloc_js_children(properties),
+        type_annotation: None,
     })
 }
 
@@ -2455,12 +2726,12 @@ fn convert_array_pattern_to_expr(
         .iter()
         .map(|elem| {
             elem.as_ref().map(|pattern| {
-                JsNode::Raw(convert_binding_pattern_for_param(
+                convert_binding_pattern_for_param_as_node(
                     arena,
                     pattern,
                     adjusted_offset,
                     line_offsets,
-                ))
+                )
             })
         })
         .collect();
@@ -2468,13 +2739,17 @@ fn convert_array_pattern_to_expr(
     if let Some(rest) = &arr_pat.rest {
         let rest_start = adjusted_offset + rest.span.start as usize;
         let rest_end = adjusted_offset + rest.span.end as usize;
-        let argument =
-            convert_binding_pattern_for_param(arena, &rest.argument, adjusted_offset, line_offsets);
+        let argument = convert_binding_pattern_for_param_as_node(
+            arena,
+            &rest.argument,
+            adjusted_offset,
+            line_offsets,
+        );
         elements.push(Some(JsNode::RestElement {
             start: rest_start as u32,
             end: rest_end as u32,
             loc: create_typed_loc(rest_start, rest_end, line_offsets),
-            argument: arena.alloc_js_node(JsNode::Raw(argument)),
+            argument: arena.alloc_js_node(argument),
         }));
     }
 
@@ -2483,6 +2758,7 @@ fn convert_array_pattern_to_expr(
         end: end as u32,
         loc: create_typed_loc(start, end, line_offsets),
         elements,
+        type_annotation: None,
     })
 }
 
@@ -2496,10 +2772,19 @@ fn convert_assignment_pattern_to_expr(
     let start = adjusted_offset + assign_pat.span.start as usize;
     let end = adjusted_offset + assign_pat.span.end as usize;
 
-    let left =
-        convert_binding_pattern_for_param(arena, &assign_pat.left, adjusted_offset, line_offsets);
+    let left = convert_binding_pattern_for_param_as_node(
+        arena,
+        &assign_pat.left,
+        adjusted_offset,
+        line_offsets,
+    );
 
-    // Convert right (the default value) - simplified for now
+    // Convert right (the default value) - simplified for now. This top-level
+    // param assignment-pattern path emits a bare `{ type: "Expression" }`
+    // placeholder (no real expression conversion); keep it as `JsNode::Raw`
+    // since it is not a well-formed typed node. (The recursive
+    // `convert_binding_pattern_for_param_as_node` AssignmentPattern arm DOES
+    // produce a real typed default value.)
     let right_start = adjusted_offset + assign_pat.right.span().start as usize;
     let right_end = adjusted_offset + assign_pat.right.span().end as usize;
     let mut right_obj = Map::new();
@@ -2514,69 +2799,9 @@ fn convert_assignment_pattern_to_expr(
         start: start as u32,
         end: end as u32,
         loc: create_typed_loc(start, end, line_offsets),
-        left: arena.alloc_js_node(JsNode::Raw(left)),
-        right: arena.alloc_js_node(JsNode::Raw(Value::Object(right_obj))),
+        left: arena.alloc_js_node(left),
+        right: arena.alloc_js_node(JsNode::from_value(Value::Object(right_obj))),
     })
-}
-
-/// Convert oxc PropertyKey to our JSON format (for function parameters).
-fn convert_property_key_for_param(
-    arena: &ParseArena,
-    key: &oxc_ast::ast::PropertyKey,
-    adjusted_offset: usize,
-    line_offsets: &[usize],
-) -> Value {
-    use oxc_ast::ast::PropertyKey;
-
-    match key {
-        PropertyKey::StaticIdentifier(id) => {
-            let start = adjusted_offset + id.span.start as usize;
-            let end = adjusted_offset + id.span.end as usize;
-            let mut obj = Map::new();
-            obj.insert("type".to_string(), Value::String("Identifier".to_string()));
-            obj.insert("name".to_string(), Value::String(id.name.to_string()));
-            obj.insert("start".to_string(), Value::Number((start as i64).into()));
-            obj.insert("end".to_string(), Value::Number((end as i64).into()));
-            if let Some(loc) = create_loc(start, end, line_offsets) {
-                obj.insert("loc".to_string(), loc);
-            }
-            Value::Object(obj)
-        }
-        PropertyKey::PrivateIdentifier(id) => {
-            let start = adjusted_offset + id.span.start as usize;
-            let end = adjusted_offset + id.span.end as usize;
-            let mut obj = Map::new();
-            obj.insert(
-                "type".to_string(),
-                Value::String("PrivateIdentifier".to_string()),
-            );
-            obj.insert("name".to_string(), Value::String(id.name.to_string()));
-            obj.insert("start".to_string(), Value::Number((start as i64).into()));
-            obj.insert("end".to_string(), Value::Number((end as i64).into()));
-            if let Some(loc) = create_loc(start, end, line_offsets) {
-                obj.insert("loc".to_string(), loc);
-            }
-            Value::Object(obj)
-        }
-        _ => {
-            // For computed keys, convert the expression properly.
-            // Must use with_serialize_arena to resolve IdRange children
-            // allocated in the parse arena during serialization.
-            if let Some(expr) = key.as_expression() {
-                let converted = convert_expression(arena, expr, adjusted_offset, line_offsets);
-                crate::ast::arena::with_serialize_arena(arena, || converted.as_json().clone())
-            } else {
-                // Fallback placeholder for truly unhandled cases
-                let mut obj = Map::new();
-                obj.insert("type".to_string(), Value::String("Identifier".to_string()));
-                obj.insert(
-                    "name".to_string(),
-                    Value::String("__computed__".to_string()),
-                );
-                Value::Object(obj)
-            }
-        }
-    }
 }
 
 /// Convert oxc BindingPattern to our JSON format (for function parameters).
@@ -2707,6 +2932,118 @@ fn convert_binding_pattern_for_param(
     }
 }
 
+/// Typed object-pattern property-key converter (param path).
+///
+/// Produces a typed `JsNode` (Identifier / PrivateIdentifier / converted
+/// expression) that serializes identically to the Value form, so object-pattern
+/// keys route through the typed analyze walker instead of `JsNode::Raw`. Falls
+/// back to `JsNode::Raw` only for the truly-unhandled placeholder
+/// (`{ type: "Identifier", name: "__computed__" }`), which carries no span and
+/// is therefore not representable as a well-formed typed `Identifier`.
+fn convert_property_key_for_param_as_node(
+    arena: &ParseArena,
+    key: &oxc_ast::ast::PropertyKey,
+    adjusted_offset: usize,
+    line_offsets: &[usize],
+) -> JsNode {
+    use oxc_ast::ast::PropertyKey;
+
+    match key {
+        PropertyKey::StaticIdentifier(id) => {
+            let start = adjusted_offset + id.span.start as usize;
+            let end = adjusted_offset + id.span.end as usize;
+            expr_to_node(create_identifier(&id.name, start, end, line_offsets))
+        }
+        PropertyKey::PrivateIdentifier(id) => {
+            let start = adjusted_offset + id.span.start as usize;
+            let end = adjusted_offset + id.span.end as usize;
+            expr_to_node(create_private_identifier(
+                &id.name,
+                start,
+                end,
+                line_offsets,
+            ))
+        }
+        _ => {
+            if let Some(expr) = key.as_expression() {
+                expr_to_node(convert_expression(
+                    arena,
+                    expr,
+                    adjusted_offset,
+                    line_offsets,
+                ))
+            } else {
+                // Fallback placeholder for truly unhandled cases (no span).
+                let mut obj = Map::new();
+                obj.insert("type".to_string(), Value::String("Identifier".to_string()));
+                obj.insert(
+                    "name".to_string(),
+                    Value::String("__computed__".to_string()),
+                );
+                JsNode::from_value(Value::Object(obj))
+            }
+        }
+    }
+}
+
+/// Typed sibling of [`convert_binding_pattern_for_param`].
+///
+/// Produces typed `JsNode` pattern subtrees (Identifier / ObjectPattern /
+/// ArrayPattern / AssignmentPattern) that serialize byte-identically to the
+/// Value form, so pattern interiors route through the typed analyze walker
+/// instead of `JsNode::Raw`. The ObjectPattern / ArrayPattern arms delegate to
+/// the now-fully-typed `convert_object_pattern_to_expr` /
+/// `convert_array_pattern_to_expr`; the AssignmentPattern arm mirrors the Value
+/// arm exactly — the default value uses `convert_expression` (the param-path
+/// converter, with its synthetic-paren offset semantics), NOT the program-path
+/// `convert_expression_for_program`.
+fn convert_binding_pattern_for_param_as_node(
+    arena: &ParseArena,
+    pattern: &oxc_ast::ast::BindingPattern,
+    adjusted_offset: usize,
+    line_offsets: &[usize],
+) -> JsNode {
+    use oxc_ast::ast::BindingPattern;
+
+    match pattern {
+        BindingPattern::BindingIdentifier(id) => {
+            let start = adjusted_offset + id.span.start as usize;
+            let end = adjusted_offset + id.span.end as usize;
+            expr_to_node(create_identifier(&id.name, start, end, line_offsets))
+        }
+        BindingPattern::ObjectPattern(obj_pat) => expr_to_node(convert_object_pattern_to_expr(
+            arena,
+            obj_pat,
+            adjusted_offset,
+            line_offsets,
+        )),
+        BindingPattern::ArrayPattern(arr_pat) => expr_to_node(convert_array_pattern_to_expr(
+            arena,
+            arr_pat,
+            adjusted_offset,
+            line_offsets,
+        )),
+        BindingPattern::AssignmentPattern(assign_pat) => {
+            let start = adjusted_offset + assign_pat.span.start as usize;
+            let end = adjusted_offset + assign_pat.span.end as usize;
+            let left = convert_binding_pattern_for_param_as_node(
+                arena,
+                &assign_pat.left,
+                adjusted_offset,
+                line_offsets,
+            );
+            let right = convert_expression(arena, &assign_pat.right, adjusted_offset, line_offsets);
+            JsNode::AssignmentPattern {
+                start: start as u32,
+                end: end as u32,
+                loc: create_typed_loc(start, end, line_offsets),
+                left: arena.alloc_js_node(left),
+                right: arena.alloc_js_node(expr_to_node(right)),
+            }
+        }
+    }
+}
+
 /// Convert type annotation with pre-adjusted offset.
 fn convert_type_annotation_adjusted(
     type_ann: &oxc_ast::ast::TSTypeAnnotation,
@@ -2736,67 +3073,17 @@ fn convert_type_annotation_adjusted(
 }
 
 /// Convert TSType with pre-adjusted offset.
+///
+/// This is a thin alias for [`convert_ts_type`]: both take an absolute base
+/// offset and add the node span (`base + span.start/end`). Keeping the alias
+/// avoids churning the FunctionParameter / declarator call sites that already
+/// pass an `adjusted_offset`.
 fn convert_ts_type_adjusted(
     ts_type: &oxc_ast::ast::TSType,
     adjusted_offset: usize,
     line_offsets: &[usize],
 ) -> Value {
-    use oxc_ast::ast::TSType;
-
-    let span = ts_type.span();
-    let start = adjusted_offset + span.start as usize;
-    let end = adjusted_offset + span.end as usize;
-
-    match ts_type {
-        TSType::TSStringKeyword(_) => {
-            create_ts_keyword("TSStringKeyword", start, end, line_offsets)
-        }
-        TSType::TSNumberKeyword(_) => {
-            create_ts_keyword("TSNumberKeyword", start, end, line_offsets)
-        }
-        TSType::TSBooleanKeyword(_) => {
-            create_ts_keyword("TSBooleanKeyword", start, end, line_offsets)
-        }
-        TSType::TSAnyKeyword(_) => create_ts_keyword("TSAnyKeyword", start, end, line_offsets),
-        TSType::TSVoidKeyword(_) => create_ts_keyword("TSVoidKeyword", start, end, line_offsets),
-        TSType::TSNullKeyword(_) => create_ts_keyword("TSNullKeyword", start, end, line_offsets),
-        TSType::TSUndefinedKeyword(_) => {
-            create_ts_keyword("TSUndefinedKeyword", start, end, line_offsets)
-        }
-        TSType::TSTypeReference(type_ref) => {
-            let mut obj = Map::new();
-            obj.insert(
-                "type".to_string(),
-                Value::String("TSTypeReference".to_string()),
-            );
-            obj.insert("start".to_string(), Value::Number((start as i64).into()));
-            obj.insert("end".to_string(), Value::Number((end as i64).into()));
-            if let Some(loc) = create_loc(start, end, line_offsets) {
-                obj.insert("loc".to_string(), loc);
-            }
-
-            // Convert typeName
-            let type_name =
-                convert_ts_type_name_adjusted(&type_ref.type_name, adjusted_offset, line_offsets);
-            obj.insert("typeName".to_string(), type_name);
-
-            Value::Object(obj)
-        }
-        _ => {
-            // Fallback for unsupported types
-            let mut obj = Map::new();
-            obj.insert(
-                "type".to_string(),
-                Value::String("TSUnknownKeyword".to_string()),
-            );
-            obj.insert("start".to_string(), Value::Number((start as i64).into()));
-            obj.insert("end".to_string(), Value::Number((end as i64).into()));
-            if let Some(loc) = create_loc(start, end, line_offsets) {
-                obj.insert("loc".to_string(), loc);
-            }
-            Value::Object(obj)
-        }
-    }
+    convert_ts_type(ts_type, adjusted_offset, line_offsets)
 }
 
 /// Convert TSTypeName with pre-adjusted offset.
@@ -2838,6 +3125,19 @@ fn convert_ts_type_name_adjusted(
                 obj.insert("loc".to_string(), loc);
             }
 
+            // `left` recurses (it may itself be a qualified name); `right` is a
+            // plain Identifier. Matches svelte/compiler's TSQualifiedName shape.
+            obj.insert(
+                "left".to_string(),
+                convert_ts_type_name_adjusted(&qualified.left, adjusted_offset, line_offsets),
+            );
+            let r_start = adjusted_offset + qualified.right.span.start as usize;
+            let r_end = adjusted_offset + qualified.right.span.end as usize;
+            obj.insert(
+                "right".to_string(),
+                ts_identifier_value(&qualified.right.name, r_start, r_end, line_offsets),
+            );
+
             Value::Object(obj)
         }
         oxc_ast::ast::TSTypeName::ThisExpression(this) => {
@@ -2861,56 +3161,425 @@ fn convert_ts_type_name_adjusted(
     }
 }
 
-/// Convert oxc TSType to a serde_json::Value.
+/// Convert an oxc `TSType` to a serde_json `Value` matching svelte/compiler's
+/// (acorn-typescript) ESTree shape.
+///
+/// `offset` is an absolute base such that `offset + span.{start,end}` is the
+/// node's absolute position in the original source. Both the program path
+/// (`$props()` destructuring annotations) and the FunctionParameter / pattern
+/// path route through here so inline annotations no longer collapse to a
+/// members-less `TSUnknownKeyword` stub (#791).
 fn convert_ts_type(ts_type: &oxc_ast::ast::TSType, offset: usize, line_offsets: &[usize]) -> Value {
     use oxc_ast::ast::TSType;
 
+    let span = ts_type.span();
+    let start = offset + span.start as usize;
+    let end = offset + span.end as usize;
+
+    // Build a `{ type, start, end, loc }` object the rest of the arms extend.
+    let base = |type_name: &str| -> Map<String, Value> {
+        let mut obj = Map::new();
+        obj.insert("type".to_string(), Value::String(type_name.to_string()));
+        obj.insert("start".to_string(), Value::Number((start as i64).into()));
+        obj.insert("end".to_string(), Value::Number((end as i64).into()));
+        if let Some(loc) = create_loc(start, end, line_offsets) {
+            obj.insert("loc".to_string(), loc);
+        }
+        obj
+    };
+
     match ts_type {
-        TSType::TSStringKeyword(kw) => {
-            let start = offset + kw.span.start as usize;
-            let end = offset + kw.span.end as usize;
+        // ---- keyword / leaf types -------------------------------------------
+        TSType::TSStringKeyword(_) => {
             create_ts_keyword("TSStringKeyword", start, end, line_offsets)
         }
-        TSType::TSNumberKeyword(kw) => {
-            let start = offset + kw.span.start as usize;
-            let end = offset + kw.span.end as usize;
+        TSType::TSNumberKeyword(_) => {
             create_ts_keyword("TSNumberKeyword", start, end, line_offsets)
         }
-        TSType::TSBooleanKeyword(kw) => {
-            let start = offset + kw.span.start as usize;
-            let end = offset + kw.span.end as usize;
+        TSType::TSBooleanKeyword(_) => {
             create_ts_keyword("TSBooleanKeyword", start, end, line_offsets)
         }
-        TSType::TSAnyKeyword(kw) => {
-            let start = offset + kw.span.start as usize;
-            let end = offset + kw.span.end as usize;
-            create_ts_keyword("TSAnyKeyword", start, end, line_offsets)
-        }
-        TSType::TSVoidKeyword(kw) => {
-            let start = offset + kw.span.start as usize;
-            let end = offset + kw.span.end as usize;
-            create_ts_keyword("TSVoidKeyword", start, end, line_offsets)
-        }
-        TSType::TSNullKeyword(kw) => {
-            let start = offset + kw.span.start as usize;
-            let end = offset + kw.span.end as usize;
-            create_ts_keyword("TSNullKeyword", start, end, line_offsets)
-        }
-        TSType::TSUndefinedKeyword(kw) => {
-            let start = offset + kw.span.start as usize;
-            let end = offset + kw.span.end as usize;
+        TSType::TSAnyKeyword(_) => create_ts_keyword("TSAnyKeyword", start, end, line_offsets),
+        TSType::TSVoidKeyword(_) => create_ts_keyword("TSVoidKeyword", start, end, line_offsets),
+        TSType::TSNullKeyword(_) => create_ts_keyword("TSNullKeyword", start, end, line_offsets),
+        TSType::TSUndefinedKeyword(_) => {
             create_ts_keyword("TSUndefinedKeyword", start, end, line_offsets)
         }
-        _ => {
-            // Fallback for unsupported types
-            let mut obj = Map::new();
+        TSType::TSObjectKeyword(_) => {
+            create_ts_keyword("TSObjectKeyword", start, end, line_offsets)
+        }
+        TSType::TSSymbolKeyword(_) => {
+            create_ts_keyword("TSSymbolKeyword", start, end, line_offsets)
+        }
+        TSType::TSUnknownKeyword(_) => {
+            create_ts_keyword("TSUnknownKeyword", start, end, line_offsets)
+        }
+        TSType::TSNeverKeyword(_) => create_ts_keyword("TSNeverKeyword", start, end, line_offsets),
+        TSType::TSBigIntKeyword(_) => {
+            create_ts_keyword("TSBigIntKeyword", start, end, line_offsets)
+        }
+        TSType::TSIntrinsicKeyword(_) => {
+            create_ts_keyword("TSIntrinsicKeyword", start, end, line_offsets)
+        }
+        TSType::TSThisType(_) => create_ts_keyword("TSThisType", start, end, line_offsets),
+
+        // ---- references -----------------------------------------------------
+        TSType::TSTypeReference(type_ref) => {
+            let mut obj = base("TSTypeReference");
             obj.insert(
-                "type".to_string(),
-                Value::String("TSUnknownKeyword".to_string()),
+                "typeName".to_string(),
+                convert_ts_type_name_adjusted(&type_ref.type_name, offset, line_offsets),
+            );
+            if let Some(args) = &type_ref.type_arguments {
+                obj.insert(
+                    "typeArguments".to_string(),
+                    convert_ts_type_param_instantiation(args, offset, line_offsets),
+                );
+            }
+            Value::Object(obj)
+        }
+
+        // ---- object type literal: `{ a: T; b: U }` --------------------------
+        TSType::TSTypeLiteral(lit) => {
+            let mut obj = base("TSTypeLiteral");
+            let members: Vec<Value> = lit
+                .members
+                .iter()
+                .map(|m| convert_ts_signature(m, offset, line_offsets))
+                .collect();
+            obj.insert("members".to_string(), Value::Array(members));
+            Value::Object(obj)
+        }
+
+        // ---- unions / intersections ----------------------------------------
+        TSType::TSUnionType(u) => {
+            let mut obj = base("TSUnionType");
+            let types: Vec<Value> = u
+                .types
+                .iter()
+                .map(|t| convert_ts_type(t, offset, line_offsets))
+                .collect();
+            obj.insert("types".to_string(), Value::Array(types));
+            Value::Object(obj)
+        }
+        TSType::TSIntersectionType(i) => {
+            let mut obj = base("TSIntersectionType");
+            let types: Vec<Value> = i
+                .types
+                .iter()
+                .map(|t| convert_ts_type(t, offset, line_offsets))
+                .collect();
+            obj.insert("types".to_string(), Value::Array(types));
+            Value::Object(obj)
+        }
+
+        // ---- arrays / tuples ------------------------------------------------
+        TSType::TSArrayType(a) => {
+            let mut obj = base("TSArrayType");
+            obj.insert(
+                "elementType".to_string(),
+                convert_ts_type(&a.element_type, offset, line_offsets),
             );
             Value::Object(obj)
         }
+        // ---- literal types: `'a'`, `403`, `true` ----------------------------
+        TSType::TSLiteralType(l) => {
+            let mut obj = base("TSLiteralType");
+            obj.insert(
+                "literal".to_string(),
+                convert_ts_literal(&l.literal, offset, line_offsets),
+            );
+            Value::Object(obj)
+        }
+
+        // ---- wrappers / operators ------------------------------------------
+        TSType::TSParenthesizedType(p) => {
+            let mut obj = base("TSParenthesizedType");
+            obj.insert(
+                "typeAnnotation".to_string(),
+                convert_ts_type(&p.type_annotation, offset, line_offsets),
+            );
+            Value::Object(obj)
+        }
+        TSType::TSTypeOperatorType(op) => {
+            use oxc_ast::ast::TSTypeOperatorOperator;
+            // svelte/compiler emits the node as `TSTypeOperator` (no `Type` suffix).
+            let mut obj = base("TSTypeOperator");
+            let operator = match op.operator {
+                TSTypeOperatorOperator::Keyof => "keyof",
+                TSTypeOperatorOperator::Unique => "unique",
+                TSTypeOperatorOperator::Readonly => "readonly",
+            };
+            obj.insert("operator".to_string(), Value::String(operator.to_string()));
+            obj.insert(
+                "typeAnnotation".to_string(),
+                convert_ts_type(&op.type_annotation, offset, line_offsets),
+            );
+            Value::Object(obj)
+        }
+        TSType::TSIndexedAccessType(ia) => {
+            let mut obj = base("TSIndexedAccessType");
+            obj.insert(
+                "objectType".to_string(),
+                convert_ts_type(&ia.object_type, offset, line_offsets),
+            );
+            obj.insert(
+                "indexType".to_string(),
+                convert_ts_type(&ia.index_type, offset, line_offsets),
+            );
+            Value::Object(obj)
+        }
+
+        // ---- span-bearing fallback for still-unhandled exotic types ---------
+        // Never the old span-less stub: keep offsets so downstream tooling can
+        // still address the node even when its inner shape isn't modelled yet.
+        _ => Value::Object(base("TSUnknownKeyword")),
     }
+}
+
+/// Convert a member of a `TSTypeLiteral` / interface body. Currently models
+/// `TSPropertySignature` exactly (the common inline-props case); other
+/// signature kinds degrade to a span-bearing node.
+fn convert_ts_signature(
+    sig: &oxc_ast::ast::TSSignature,
+    offset: usize,
+    line_offsets: &[usize],
+) -> Value {
+    use oxc_ast::ast::TSSignature;
+
+    match sig {
+        TSSignature::TSPropertySignature(prop) => {
+            let start = offset + prop.span.start as usize;
+            let end = offset + prop.span.end as usize;
+
+            let mut obj = Map::new();
+            obj.insert(
+                "type".to_string(),
+                Value::String("TSPropertySignature".to_string()),
+            );
+            obj.insert("start".to_string(), Value::Number((start as i64).into()));
+            obj.insert("end".to_string(), Value::Number((end as i64).into()));
+            if let Some(loc) = create_loc(start, end, line_offsets) {
+                obj.insert("loc".to_string(), loc);
+            }
+            obj.insert("computed".to_string(), Value::Bool(prop.computed));
+            // svelte/compiler omits `optional` / `readonly` when false.
+            if prop.optional {
+                obj.insert("optional".to_string(), Value::Bool(true));
+            }
+            if prop.readonly {
+                obj.insert("readonly".to_string(), Value::Bool(true));
+            }
+            obj.insert(
+                "key".to_string(),
+                convert_ts_property_key(&prop.key, offset, line_offsets),
+            );
+            if let Some(type_ann) = &prop.type_annotation {
+                obj.insert(
+                    "typeAnnotation".to_string(),
+                    convert_type_annotation_adjusted(type_ann, offset, line_offsets),
+                );
+            }
+            Value::Object(obj)
+        }
+        // Index / method / call / construct signatures: span-bearing node so
+        // the member is still addressable even though it isn't fully modelled.
+        _ => {
+            let span = sig.span();
+            let start = offset + span.start as usize;
+            let end = offset + span.end as usize;
+            let type_name = match sig {
+                TSSignature::TSIndexSignature(_) => "TSIndexSignature",
+                TSSignature::TSCallSignatureDeclaration(_) => "TSCallSignatureDeclaration",
+                TSSignature::TSConstructSignatureDeclaration(_) => {
+                    "TSConstructSignatureDeclaration"
+                }
+                TSSignature::TSMethodSignature(_) => "TSMethodSignature",
+                TSSignature::TSPropertySignature(_) => "TSPropertySignature",
+            };
+            let mut obj = Map::new();
+            obj.insert("type".to_string(), Value::String(type_name.to_string()));
+            obj.insert("start".to_string(), Value::Number((start as i64).into()));
+            obj.insert("end".to_string(), Value::Number((end as i64).into()));
+            if let Some(loc) = create_loc(start, end, line_offsets) {
+                obj.insert("loc".to_string(), loc);
+            }
+            Value::Object(obj)
+        }
+    }
+}
+
+/// Convert a `TSPropertySignature` key (Identifier / string / numeric).
+fn convert_ts_property_key(
+    key: &oxc_ast::ast::PropertyKey,
+    offset: usize,
+    line_offsets: &[usize],
+) -> Value {
+    use oxc_ast::ast::PropertyKey;
+
+    match key {
+        PropertyKey::StaticIdentifier(id) => {
+            let start = offset + id.span.start as usize;
+            let end = offset + id.span.end as usize;
+            ts_identifier_value(&id.name, start, end, line_offsets)
+        }
+        PropertyKey::StringLiteral(s) => {
+            let start = offset + s.span.start as usize;
+            let end = offset + s.span.end as usize;
+            ts_literal_value(
+                start,
+                end,
+                Value::String(s.value.to_string()),
+                s.raw.as_ref().map(|r| r.to_string()),
+                line_offsets,
+            )
+        }
+        PropertyKey::NumericLiteral(n) => {
+            let start = offset + n.span.start as usize;
+            let end = offset + n.span.end as usize;
+            ts_literal_value(
+                start,
+                end,
+                number_value(n.value),
+                n.raw.as_ref().map(|r| r.to_string()),
+                line_offsets,
+            )
+        }
+        _ => {
+            let span = key.span();
+            let start = offset + span.start as usize;
+            let end = offset + span.end as usize;
+            ts_identifier_value("", start, end, line_offsets)
+        }
+    }
+}
+
+/// Convert a `TSLiteralType` literal into an ESTree `Literal` node.
+fn convert_ts_literal(
+    literal: &oxc_ast::ast::TSLiteral,
+    offset: usize,
+    line_offsets: &[usize],
+) -> Value {
+    use oxc_ast::ast::TSLiteral;
+
+    match literal {
+        TSLiteral::StringLiteral(s) => {
+            let start = offset + s.span.start as usize;
+            let end = offset + s.span.end as usize;
+            ts_literal_value(
+                start,
+                end,
+                Value::String(s.value.to_string()),
+                s.raw.as_ref().map(|r| r.to_string()),
+                line_offsets,
+            )
+        }
+        TSLiteral::NumericLiteral(n) => {
+            let start = offset + n.span.start as usize;
+            let end = offset + n.span.end as usize;
+            ts_literal_value(
+                start,
+                end,
+                number_value(n.value),
+                n.raw.as_ref().map(|r| r.to_string()),
+                line_offsets,
+            )
+        }
+        TSLiteral::BooleanLiteral(b) => {
+            let start = offset + b.span.start as usize;
+            let end = offset + b.span.end as usize;
+            ts_literal_value(
+                start,
+                end,
+                Value::Bool(b.value),
+                Some(b.value.to_string()),
+                line_offsets,
+            )
+        }
+        _ => {
+            let span = literal.span();
+            let start = offset + span.start as usize;
+            let end = offset + span.end as usize;
+            ts_literal_value(start, end, Value::Null, None, line_offsets)
+        }
+    }
+}
+
+/// Build an ESTree `Identifier` node `{ type, start, end, loc, name }` as a
+/// `serde_json::Value` (the `create_identifier` helper returns an `Expression`,
+/// which the TS-type converters can't use directly).
+fn ts_identifier_value(name: &str, start: usize, end: usize, line_offsets: &[usize]) -> Value {
+    let mut obj = Map::new();
+    obj.insert("type".to_string(), Value::String("Identifier".to_string()));
+    obj.insert("start".to_string(), Value::Number((start as i64).into()));
+    obj.insert("end".to_string(), Value::Number((end as i64).into()));
+    if let Some(loc) = create_loc(start, end, line_offsets) {
+        obj.insert("loc".to_string(), loc);
+    }
+    obj.insert("name".to_string(), Value::String(name.to_string()));
+    Value::Object(obj)
+}
+
+/// Build an ESTree `Literal` node `{ type, start, end, loc, value, raw }`.
+fn ts_literal_value(
+    start: usize,
+    end: usize,
+    value: Value,
+    raw: Option<String>,
+    line_offsets: &[usize],
+) -> Value {
+    let mut obj = Map::new();
+    obj.insert("type".to_string(), Value::String("Literal".to_string()));
+    obj.insert("start".to_string(), Value::Number((start as i64).into()));
+    obj.insert("end".to_string(), Value::Number((end as i64).into()));
+    if let Some(loc) = create_loc(start, end, line_offsets) {
+        obj.insert("loc".to_string(), loc);
+    }
+    obj.insert("value".to_string(), value);
+    if let Some(raw) = raw {
+        obj.insert("raw".to_string(), Value::String(raw));
+    }
+    Value::Object(obj)
+}
+
+/// Encode an f64 literal value as an integer JSON number when it is integral
+/// (so `403` serializes as `403`, not `403.0`), else as a float.
+fn number_value(v: f64) -> Value {
+    if v.fract() == 0.0 && v.is_finite() && v.abs() < 9.007_199_254_740_992e15 {
+        Value::Number((v as i64).into())
+    } else {
+        serde_json::Number::from_f64(v)
+            .map(Value::Number)
+            .unwrap_or(Value::Null)
+    }
+}
+
+/// Convert a `TSTypeParameterInstantiation` (`<A, B>`) into svelte/compiler's
+/// shape: `{ type: 'TSTypeParameterInstantiation', start, end, loc, params }`.
+fn convert_ts_type_param_instantiation(
+    args: &oxc_ast::ast::TSTypeParameterInstantiation,
+    offset: usize,
+    line_offsets: &[usize],
+) -> Value {
+    let start = offset + args.span.start as usize;
+    let end = offset + args.span.end as usize;
+    let mut obj = Map::new();
+    obj.insert(
+        "type".to_string(),
+        Value::String("TSTypeParameterInstantiation".to_string()),
+    );
+    obj.insert("start".to_string(), Value::Number((start as i64).into()));
+    obj.insert("end".to_string(), Value::Number((end as i64).into()));
+    if let Some(loc) = create_loc(start, end, line_offsets) {
+        obj.insert("loc".to_string(), loc);
+    }
+    let params: Vec<Value> = args
+        .params
+        .iter()
+        .map(|t| convert_ts_type(t, offset, line_offsets))
+        .collect();
+    obj.insert("params".to_string(), Value::Array(params));
+    Value::Object(obj)
 }
 
 /// Create a TypeScript keyword type node.
@@ -3267,6 +3936,7 @@ fn create_identifier(name: &str, start: usize, end: usize, line_offsets: &[usize
         end: end as u32,
         loc: create_typed_loc(start, end, line_offsets),
         name: CompactString::from(name),
+        type_annotation: None,
     })
 }
 
@@ -3297,6 +3967,7 @@ fn create_identifier_for_binding(
         end: end as u32,
         loc: create_typed_loc_for_binding(start, end, line_offsets),
         name: CompactString::from(name),
+        type_annotation: None,
     }
 }
 
@@ -3328,6 +3999,7 @@ fn create_identifier_for_binding_toplevel(
         end: end as u32,
         loc: create_typed_loc_for_binding_identifier(start, end, line_offsets),
         name: CompactString::from(name),
+        type_annotation: None,
     }
 }
 
@@ -3398,6 +4070,7 @@ pub fn create_identifier_with_character(
         end: end as u32,
         loc: create_typed_loc_with_character(start, end, line_offsets),
         name: CompactString::from(name),
+        type_annotation: None,
     })
 }
 
@@ -3409,6 +4082,7 @@ pub fn create_empty_identifier(name: &str, start: usize, end: usize) -> Expressi
         end: end as u32,
         loc: None,
         name: CompactString::from(name),
+        type_annotation: None,
     })
 }
 
@@ -3463,7 +4137,6 @@ fn create_string_literal(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 fn create_binary_expression(
     arena: &ParseArena,
     left: &OxcExpression,
@@ -3615,6 +4288,7 @@ fn create_static_member_expression(
             end: prop_end as u32,
             loc: create_typed_loc(prop_start, prop_end, line_offsets),
             name: CompactString::from(member.property.name.as_str()),
+            type_annotation: None,
         }),
         computed: false,
         optional: member.optional,
@@ -3818,7 +4492,7 @@ fn create_class_expression(
         loc: create_typed_loc(start, end, line_offsets),
         id,
         super_class,
-        body: arena.alloc_js_node(JsNode::Raw(body)),
+        body: arena.alloc_js_node(JsNode::from_value(body)),
     })
 }
 
@@ -4241,6 +4915,7 @@ fn convert_object_assignment_target(
         end: end as u32,
         loc: create_typed_loc(start, end, line_offsets),
         properties: arena.alloc_js_children(properties),
+        type_annotation: None,
     }
 }
 
@@ -4288,6 +4963,7 @@ fn convert_array_assignment_target(
         end: end as u32,
         loc: create_typed_loc(start, end, line_offsets),
         elements,
+        type_annotation: None,
     }
 }
 
@@ -4500,6 +5176,20 @@ fn convert_assignment_target(
         AssignmentTarget::ArrayAssignmentTarget(arr_target) => {
             convert_array_assignment_target(arena, arr_target, offset, line_offsets)
         }
+        AssignmentTarget::PrivateFieldExpression(member) => {
+            // `this.#field = …` LHS — mirror the simple-target arm so the
+            // `this.#field` MemberExpression is visited in 2-analyze.
+            let start = offset + member.span.start as usize - 1;
+            let end = offset + member.span.end as usize - 1;
+            expr_to_node(create_private_member_expression(
+                arena,
+                member,
+                start,
+                end,
+                offset,
+                line_offsets,
+            ))
+        }
         _ => {
             // Fallback for other complex patterns (e.g., TSAsExpression, TSNonNullExpression)
             JsNode::Null
@@ -4592,6 +5282,22 @@ fn convert_simple_assignment_target(
                 line_offsets,
             ))
         }
+        SimpleAssignmentTarget::PrivateFieldExpression(member) => {
+            // `this.#field = …` LHS — without this arm it falls to `JsNode::Null`,
+            // so 2-analyze never visits the `this.#field` MemberExpression and
+            // `is_safe_identifier` can't flag it, leaving `needs_context` unset
+            // (no `$.push`/`$.pop`). Mirror the program-path arm.
+            let start = offset + member.span.start as usize - 1;
+            let end = offset + member.span.end as usize - 1;
+            expr_to_node(create_private_member_expression(
+                arena,
+                member,
+                start,
+                end,
+                offset,
+                line_offsets,
+            ))
+        }
         _ => JsNode::Null,
     }
 }
@@ -4622,13 +5328,17 @@ fn create_arrow_function(
     if let Some(rest) = &arrow.params.rest {
         let rest_start = offset + rest.span.start as usize - 1;
         let rest_end = offset + rest.span.end as usize - 1;
-        let argument =
-            convert_binding_pattern_for_param(arena, &rest.rest.argument, offset - 1, line_offsets);
+        let argument = convert_binding_pattern_for_param_as_node(
+            arena,
+            &rest.rest.argument,
+            offset - 1,
+            line_offsets,
+        );
         params.push(JsNode::RestElement {
             start: rest_start as u32,
             end: rest_end as u32,
             loc: create_typed_loc(rest_start, rest_end, line_offsets),
-            argument: arena.alloc_js_node(JsNode::Raw(argument)),
+            argument: arena.alloc_js_node(argument),
         });
     }
 
@@ -4869,12 +5579,12 @@ fn convert_statement(
                 let h_start = offset + handler.span.start as usize - 1;
                 let h_end = offset + handler.span.end as usize - 1;
                 let param = handler.param.as_ref().map(|param| {
-                    arena.alloc_js_node(JsNode::Raw(convert_binding_pattern_for_param(
+                    arena.alloc_js_node(convert_binding_pattern_for_param_as_node(
                         arena,
                         &param.pattern,
                         offset - 1,
                         line_offsets,
-                    )))
+                    ))
                 });
                 let h_body_start = offset + handler.body.span.start as usize - 1;
                 let h_body_end = offset + handler.body.span.end as usize - 1;
@@ -4961,7 +5671,7 @@ fn convert_statement(
             if let Some(rest) = &func_decl.params.rest {
                 let rest_start = offset + rest.span.start as usize - 1;
                 let rest_end = offset + rest.span.end as usize - 1;
-                let argument = convert_binding_pattern_for_param(
+                let argument = convert_binding_pattern_for_param_as_node(
                     arena,
                     &rest.rest.argument,
                     offset - 1,
@@ -4971,7 +5681,7 @@ fn convert_statement(
                     start: rest_start as u32,
                     end: rest_end as u32,
                     loc: create_typed_loc(rest_start, rest_end, line_offsets),
-                    argument: arena.alloc_js_node(JsNode::Raw(argument)),
+                    argument: arena.alloc_js_node(argument),
                 });
             }
 
@@ -5044,13 +5754,13 @@ fn convert_variable_declarator(
     let end = offset + decl.span.end as usize - 1;
 
     // Convert id (pattern) with type annotation
-    let id = JsNode::Raw(convert_binding_pattern_for_decl(
+    let id = convert_binding_pattern_for_decl_as_node(
         arena,
         &decl.id,
         offset,
         line_offsets,
         decl.type_annotation.as_deref(),
-    ));
+    );
 
     // Convert init
     let init = decl.init.as_ref().map(|expr| {
@@ -5071,50 +5781,52 @@ fn convert_variable_declarator(
     }
 }
 
-/// Convert a binding pattern for variable declarations.
-fn convert_binding_pattern_for_decl(
+/// Convert a binding pattern for a variable declarator id, returning a typed
+/// `JsNode` directly so the id routes through the typed analyze walker instead
+/// of `JsNode::Raw`. The Object / Array / Assignment pattern arms reuse the
+/// already-typed program-path converters (`offset - 1`). A bare
+/// `BindingIdentifier` produces a typed `Identifier`.
+///
+/// A TS-type-annotated `BindingIdentifier` carries its `typeAnnotation` as an
+/// opaque, output-only boundary blob on the typed `Identifier` node (analyze
+/// never walks into it), with the extended `end`, recomputed `loc`, and the
+/// `convert_type_annotation_adjusted` blob.
+fn convert_binding_pattern_for_decl_as_node(
     arena: &ParseArena,
     pattern: &oxc_ast::ast::BindingPattern,
     offset: usize,
     line_offsets: &[usize],
     type_annotation: Option<&oxc_ast::ast::TSTypeAnnotation>,
-) -> Value {
+) -> JsNode {
     match pattern {
         oxc_ast::ast::BindingPattern::BindingIdentifier(id) => {
             let start = offset + id.span.start as usize - 1;
-            // If there's a type annotation, extend the end to include it
-            let end = if let Some(type_ann) = type_annotation {
-                offset + type_ann.span.end as usize - 1
-            } else {
-                offset + id.span.end as usize - 1
-            };
-
-            let mut obj = Map::new();
-            obj.insert("type".to_string(), Value::String("Identifier".to_string()));
-            obj.insert("start".to_string(), Value::Number((start as i64).into()));
-            obj.insert("end".to_string(), Value::Number((end as i64).into()));
-            if let Some(loc) = create_loc(start, end, line_offsets) {
-                obj.insert("loc".to_string(), loc);
-            }
-            obj.insert("name".to_string(), Value::String(id.name.to_string()));
-
-            // OXC v0.107: type annotations are on VariableDeclarator, not BindingIdentifier
             if let Some(type_ann) = type_annotation {
-                let type_ann_value =
-                    convert_type_annotation_adjusted(type_ann, offset - 1, line_offsets);
-                obj.insert("typeAnnotation".to_string(), type_ann_value);
+                // TS-annotated: extend `end` over the annotation and carry the
+                // annotation blob verbatim (same as the Value form at
+                // `convert_binding_pattern_for_decl`).
+                let end = offset + type_ann.span.end as usize - 1;
+                let ta_value = convert_type_annotation_adjusted(type_ann, offset - 1, line_offsets);
+                JsNode::Identifier {
+                    start: start as u32,
+                    end: end as u32,
+                    loc: create_typed_loc(start, end, line_offsets),
+                    name: CompactString::from(id.name.as_str()),
+                    type_annotation: Some(Box::new(ta_value)),
+                }
+            } else {
+                let end = offset + id.span.end as usize - 1;
+                expr_to_node(create_identifier(&id.name, start, end, line_offsets))
             }
-
-            Value::Object(obj)
         }
         oxc_ast::ast::BindingPattern::ObjectPattern(obj_pat) => {
-            convert_object_pattern(arena, obj_pat, offset - 1, line_offsets).to_value()
+            convert_object_pattern(arena, obj_pat, offset - 1, line_offsets)
         }
         oxc_ast::ast::BindingPattern::ArrayPattern(arr_pat) => {
-            convert_array_pattern(arena, arr_pat, offset - 1, line_offsets).to_value()
+            convert_array_pattern(arena, arr_pat, offset - 1, line_offsets)
         }
         oxc_ast::ast::BindingPattern::AssignmentPattern(assign_pat) => {
-            convert_assignment_pattern(arena, assign_pat, offset - 1, line_offsets).to_value()
+            convert_assignment_pattern(arena, assign_pat, offset - 1, line_offsets)
         }
     }
 }
@@ -5452,14 +6164,20 @@ fn create_typed_loc_for_script(
     }))
 }
 
-/// Parse a JavaScript program (script content) and return it as an Expression.
-/// This is used for script tags.
+/// Parse a JavaScript program (script content) and return it as an Expression,
+/// surfacing the first JS parse error as a `js_parse_error` `ParseError`
+/// (mirroring upstream `acorn.parse`, which throws `e.js_parse_error` via
+/// `handle_parse_error` for any script that acorn rejects — read/script.js →
+/// acorn.js). The recovered partial program is still returned so lenient
+/// callers (e.g. the profiling binary) can keep operating on a best-effort
+/// AST.
+///
 /// Set `is_typescript` to true if the script contains TypeScript.
 /// `leading_comments` are HTML comments that appeared before the script tag.
 /// `script_tag_start` and `script_tag_end` are positions for loc calculation
 /// (Svelte uses locator(start) for loc.start and locator(parser.index) for loc.end).
 #[allow(clippy::too_many_arguments)]
-pub fn parse_program(
+pub fn parse_program_with_error(
     arena: &ParseArena,
     content: &str,
     offset: usize,
@@ -5468,7 +6186,7 @@ pub fn parse_program(
     leading_comments: &[String],
     script_tag_start: usize,
     script_tag_end: usize,
-) -> Expression {
+) -> (Expression, Option<crate::error::ParseError>) {
     with_oxc_allocator(|allocator| {
         let source_type = if is_typescript {
             SourceType::ts()
@@ -5477,6 +6195,49 @@ pub fn parse_program(
         };
         let parser = OxcParser::new(allocator, content, source_type);
         let result = parser.parse();
+
+        // Mirror upstream acorn's throw-on-error behaviour: capture the first
+        // parse error (acorn reports `err.pos` where it stopped consuming
+        // input; OXC's first label is the closest equivalent).
+        let mut parse_error = result.diagnostics.first().map(|first_error| {
+            let pos = first_error
+                .labels
+                .first()
+                .map(|label| (label.offset() as usize).min(content.len()))
+                .unwrap_or(0)
+                + offset;
+            crate::error::ParseError::svelte(
+                "js_parse_error",
+                first_error.message.to_string(),
+                (pos, pos),
+            )
+        });
+
+        // OXC accepts Stage-3 `@decorator` syntax even in plain JS; upstream's
+        // acorn (no decorator plugin) raises js_parse_error at the `@` token.
+        // A bare `@` is never legal JS outside decorators, so flag the first
+        // decorator's position. Gated on a cheap byte scan first.
+        if parse_error.is_none() && !is_typescript && content.contains('@') {
+            use oxc_ast_visit::Visit;
+            struct FindDecorator(Option<u32>);
+            impl<'a> Visit<'a> for FindDecorator {
+                fn visit_decorator(&mut self, dec: &oxc_ast::ast::Decorator<'a>) {
+                    if self.0.is_none() {
+                        self.0 = Some(dec.span.start);
+                    }
+                }
+            }
+            let mut finder = FindDecorator(None);
+            finder.visit_program(&result.program);
+            if let Some(at) = finder.0 {
+                let pos = at as usize + offset;
+                parse_error = Some(crate::error::ParseError::svelte(
+                    "js_parse_error",
+                    "Unexpected character '@'".to_string(),
+                    (pos, pos),
+                ));
+            }
+        }
 
         let program = &result.program;
 
@@ -5527,14 +6288,34 @@ pub fn parse_program(
         }
 
         // Build body as Vec<JsNode> (typed, no Value conversion needed for common case).
+        //
+        // `ignore_comment_map` accumulates `node_start -> [svelte-ignore comment text]`
+        // for every node that carries a `svelte-ignore` leading comment (at any depth).
+        // It replaces the former `JsNode::Raw(value_with_leadingComments)` wrapping: the
+        // only Phase-2 consumer of those statement-level `leadingComments` is svelte-ignore
+        // warning suppression, so we keep the statement TYPED and surface just the ignore
+        // texts. Comments still reach `Root.comments` independently via `record_oxc_comment`
+        // above, and codegen re-parses script text, so dropping the Raw wrapping changes no
+        // output.
+        let mut ignore_comment_map: Vec<(u32, Vec<CompactString>)> = Vec::new();
         let body: Vec<JsNode> = if has_comments {
-            // When there are comments, we need to:
-            // 1. Attach leadingComments to individual statements
-            // 2. Distribute comments to nested bodies
-            // For statements with comments, we wrap as JsNode::Raw(Value) since
-            // leadingComments is a JSON-only concept not modeled in JsNode variants.
             let mut comment_idx = 0;
             let mut body_nodes: Vec<JsNode> = Vec::with_capacity(program.body.len());
+
+            // Pre-compute comment entries (absolute positions + Value) once, used for
+            // distributing comments onto nested statement bodies.
+            let comment_entries: Vec<CommentEntry> = all_comments
+                .iter()
+                .map(|comment| {
+                    let comment_start = offset + comment.span.start as usize;
+                    let comment_end = offset + comment.span.end as usize;
+                    CommentEntry {
+                        start: comment_start as u32,
+                        end: comment_end as u32,
+                        value: build_comment_value(comment, content, offset),
+                    }
+                })
+                .collect();
 
             for stmt in program.body.iter() {
                 if let Some(stmt_node) =
@@ -5542,7 +6323,8 @@ pub fn parse_program(
                 {
                     let stmt_start = stmt.span().start;
 
-                    // Collect comments that appear before this statement
+                    // Collect comments that appear before this statement (its own leading
+                    // comments).
                     let mut stmt_leading = Vec::new();
                     while comment_idx < all_comments.len()
                         && all_comments[comment_idx].span.end <= stmt_start
@@ -5559,44 +6341,22 @@ pub fn parse_program(
                         comment_idx += 1;
                     }
 
-                    if !stmt_leading.is_empty() {
-                        // Convert to Value to attach leadingComments, then wrap as Raw
-                        let mut stmt_value = stmt_node.to_value();
-                        if let Value::Object(ref mut obj) = stmt_value {
+                    // Reproduce the exact comment-attachment the old code used (own leading
+                    // comments + nested distribution) on a throwaway Value, then harvest
+                    // svelte-ignore texts into the map. The statement itself stays TYPED.
+                    if !stmt_leading.is_empty() || !comment_entries.is_empty() {
+                        let mut val = stmt_node.to_value();
+                        if !stmt_leading.is_empty()
+                            && let Value::Object(ref mut obj) = val
+                        {
                             obj.insert("leadingComments".to_string(), Value::Array(stmt_leading));
                         }
-                        body_nodes.push(JsNode::Raw(stmt_value));
-                    } else {
-                        // No leading comments - keep as typed JsNode
-                        body_nodes.push(stmt_node);
+                        distribute_comments_to_node(&mut val, &comment_entries);
+                        harvest_ignore_comments(&val, &mut ignore_comment_map);
                     }
+
+                    body_nodes.push(stmt_node);
                 }
-            }
-
-            // Post-process: distribute comments to nested statement bodies.
-            // Build a temporary Value body array, run distribution, then extract back.
-            let comment_entries: Vec<CommentEntry> = all_comments
-                .iter()
-                .map(|comment| {
-                    let comment_start = offset + comment.span.start as usize;
-                    let comment_end = offset + comment.span.end as usize;
-                    CommentEntry {
-                        start: comment_start as u32,
-                        end: comment_end as u32,
-                        value: build_comment_value(comment, content, offset),
-                    }
-                })
-                .collect();
-
-            // Distribute comments to nested bodies within each statement.
-            // We convert each statement to a mutable Value, run distribution, then wrap back.
-            for node in body_nodes.iter_mut() {
-                let mut val = node.to_value();
-                distribute_comments_to_node(&mut val, &comment_entries);
-                // Check if the value was actually modified (has nested leadingComments added)
-                // by comparing against the original. Since distribute_comments_to_node modifies
-                // in-place, we always wrap back as Raw to preserve any changes.
-                *node = JsNode::Raw(val);
             }
 
             body_nodes
@@ -5638,15 +6398,19 @@ pub fn parse_program(
             None
         };
 
-        Expression::from_node(JsNode::Program {
-            start: start as u32,
-            end: end as u32,
-            loc,
-            body: arena.alloc_js_children(body),
-            source_type: CompactString::from("module"),
-            leading_comments: leading_comments_val,
-            trailing_comments: trailing_comments_val,
-        })
+        (
+            Expression::from_node(JsNode::Program {
+                start: start as u32,
+                end: end as u32,
+                loc,
+                body: arena.alloc_js_children(body),
+                source_type: CompactString::from("module"),
+                leading_comments: leading_comments_val,
+                trailing_comments: trailing_comments_val,
+                ignore_comment_map,
+            }),
+            parse_error,
+        )
     })
 }
 
@@ -5689,6 +6453,49 @@ fn build_comment_value(comment: &oxc_ast::ast::Comment, content: &str, offset: u
     Value::Object(comment_obj)
 }
 
+/// Walk a comment-annotated statement `Value` (after `distribute_comments_to_node`)
+/// and harvest every `svelte-ignore` leading-comment text into `map`, keyed by the
+/// owning node's absolute `start` offset.
+///
+/// Only `svelte-ignore` comments are kept (the sole Phase-2 consumer of statement-level
+/// `leadingComments`); a comment is a candidate when its value text — after leading
+/// whitespace — begins with `svelte-ignore` (a strict superset of the analyze-side
+/// `^\s*svelte-ignore\s` match, so nothing relevant is dropped and non-matching texts
+/// that survive simply extract to zero codes downstream).
+fn harvest_ignore_comments(node: &Value, map: &mut Vec<(u32, Vec<CompactString>)>) {
+    let Value::Object(obj) = node else {
+        return;
+    };
+
+    if let Some(Value::Array(comments)) = obj.get("leadingComments")
+        && let Some(start) = obj.get("start").and_then(|s| s.as_u64())
+    {
+        let kept: Vec<CompactString> = comments
+            .iter()
+            .filter_map(|c| c.get("value").and_then(|v| v.as_str()))
+            .filter(|v| v.trim_start().starts_with("svelte-ignore"))
+            .map(CompactString::from)
+            .collect();
+        if !kept.is_empty() {
+            map.push((start as u32, kept));
+        }
+    }
+
+    // Recurse into every nested object / array so nested `svelte-ignore` comments
+    // (attached by `distribute_comments_to_node`) are harvested too.
+    for value in obj.values() {
+        match value {
+            Value::Object(_) => harvest_ignore_comments(value, map),
+            Value::Array(items) => {
+                for item in items {
+                    harvest_ignore_comments(item, map);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// A pre-computed comment entry with positions extracted to avoid repeated Value lookups.
 struct CommentEntry {
     start: u32,
@@ -5701,10 +6508,13 @@ struct CommentEntry {
 /// This function operates entirely in-place: it never clones statement Values.
 /// Comments are attached by inserting `leadingComments` directly into existing
 /// statement Map objects via mutable references.
-fn distribute_comments_to_node(node: &mut Value, comments: &[CommentEntry]) {
+/// Distribute comments to nested statement bodies. Returns `true` if any
+/// `leadingComments` field was actually inserted (i.e. the node was mutated).
+fn distribute_comments_to_node(node: &mut Value, comments: &[CommentEntry]) -> bool {
     let Some(obj) = node.as_object_mut() else {
-        return;
+        return false;
     };
+    let mut modified = false;
 
     let node_type = obj
         .get("type")
@@ -5750,6 +6560,7 @@ fn distribute_comments_to_node(node: &mut Value, comments: &[CommentEntry]) {
 
                         if !leading.is_empty() {
                             stmt_obj.insert("leadingComments".to_string(), Value::Array(leading));
+                            modified = true;
                         }
                     }
 
@@ -5787,14 +6598,16 @@ fn distribute_comments_to_node(node: &mut Value, comments: &[CommentEntry]) {
             if child.is_array() {
                 if let Some(items) = child.as_array_mut() {
                     for item in items {
-                        distribute_comments_to_node(item, comments);
+                        modified |= distribute_comments_to_node(item, comments);
                     }
                 }
             } else if child.is_object() {
-                distribute_comments_to_node(child, comments);
+                modified |= distribute_comments_to_node(child, comments);
             }
         }
     }
+
+    modified
 }
 
 /// Convert a statement to JSON value (for program context, no -1 offset adjustment).
@@ -5849,53 +6662,7 @@ fn convert_statement_for_program(
             })
         }
         oxc_ast::ast::Statement::FunctionDeclaration(func_decl) => {
-            // Filter out TypeScript declare functions and function overload signatures (no body)
-            if func_decl.r#type == oxc_ast::ast::FunctionType::TSDeclareFunction
-                || func_decl.body.is_none()
-            {
-                return None;
-            }
-            let start = offset + func_decl.span.start as usize;
-            let end = offset + func_decl.span.end as usize;
-            let loc = create_typed_loc(start, end, line_offsets);
-
-            let id_node = func_decl.id.as_ref().map(|id| {
-                let id_start = offset + id.span.start as usize;
-                let id_end = offset + id.span.end as usize;
-                let id_expr = create_identifier(&id.name, id_start, id_end, line_offsets);
-                arena.alloc_js_node(expr_to_node(id_expr))
-            });
-
-            // Convert params
-            let params: Vec<JsNode> = func_decl
-                .params
-                .items
-                .iter()
-                .map(|param| {
-                    expr_to_node(convert_formal_parameter(arena, param, offset, line_offsets))
-                })
-                .collect();
-
-            // Convert body
-            let body_node = func_decl.body.as_ref().map(|body| {
-                arena.alloc_js_node(convert_function_body_for_program_as_node(
-                    arena,
-                    body,
-                    offset,
-                    line_offsets,
-                ))
-            });
-
-            Some(JsNode::FunctionDeclaration {
-                start: start as u32,
-                end: end as u32,
-                loc,
-                id: id_node,
-                params: arena.alloc_js_children(params),
-                body: body_node,
-                generator: func_decl.generator,
-                r#async: func_decl.r#async,
-            })
+            convert_function_declaration_as_node(arena, func_decl, offset, line_offsets)
         }
         oxc_ast::ast::Statement::ExportNamedDeclaration(export_decl) => {
             let start = offset + export_decl.span.start as usize;
@@ -5904,8 +6671,12 @@ fn convert_statement_for_program(
 
             // Handle declaration if present (e.g., export let x;)
             let declaration = export_decl.declaration.as_ref().map(|decl| {
-                let decl_value = convert_declaration_for_program(arena, decl, offset, line_offsets);
-                arena.alloc_js_node(JsNode::Raw(decl_value))
+                arena.alloc_js_node(convert_declaration_for_program_as_node(
+                    arena,
+                    decl,
+                    offset,
+                    line_offsets,
+                ))
             });
 
             // Handle specifiers
@@ -6042,8 +6813,21 @@ fn convert_statement_for_program(
                         r#async: func_decl.r#async,
                     }
                 }
+                oxc_ast::ast::ExportDefaultDeclarationKind::ClassDeclaration(class_decl)
+                    if !class_decl.declare
+                        && !class_decl.r#abstract
+                        && class_decl.implements.is_empty()
+                        && class_decl.decorators.is_empty() =>
+                {
+                    // Plain-JS class: the typed `ClassDeclaration` node omits the
+                    // TS-only `abstract`/`declare`/`implements`/`decorators`
+                    // fields, so it serializes byte-identical to the former Value
+                    // blob while routing the class body through the typed walker.
+                    convert_class_declaration_as_node(arena, class_decl, offset, line_offsets)
+                }
                 oxc_ast::ast::ExportDefaultDeclarationKind::ClassDeclaration(class_decl) => {
-                    // Class declarations in export default are complex, use Raw fallback
+                    // Class declarations with TS modifiers / decorators are not
+                    // representable in the byte-identical typed shape; use Raw.
                     let class_start = offset + class_decl.span.start as usize;
                     let class_end = offset + class_decl.span.end as usize;
                     let mut class_obj = Map::new();
@@ -6089,7 +6873,7 @@ fn convert_statement_for_program(
                     );
                     class_obj.insert("body".to_string(), body);
 
-                    JsNode::Raw(Value::Object(class_obj))
+                    JsNode::from_value(Value::Object(class_obj))
                 }
                 oxc_ast::ast::ExportDefaultDeclarationKind::TSInterfaceDeclaration(_) => {
                     JsNode::Null
@@ -6199,85 +6983,9 @@ fn convert_statement_for_program(
                 body: arena.alloc_js_children(body),
             })
         }
-        oxc_ast::ast::Statement::ClassDeclaration(class_decl) => {
-            let start = offset + class_decl.span.start as usize;
-            let end = offset + class_decl.span.end as usize;
-            let mut obj = Map::new();
-            obj.insert(
-                "type".to_string(),
-                Value::String("ClassDeclaration".to_string()),
-            );
-            obj.insert("start".to_string(), Value::Number((start as i64).into()));
-            obj.insert("end".to_string(), Value::Number((end as i64).into()));
-            if let Some(loc) = create_loc(start, end, line_offsets) {
-                obj.insert("loc".to_string(), loc);
-            }
-
-            // id
-            if let Some(id) = &class_decl.id {
-                let id_start = offset + id.span.start as usize;
-                let id_end = offset + id.span.end as usize;
-                let id_expr = create_identifier(&id.name, id_start, id_end, line_offsets);
-                obj.insert("id".to_string(), id_expr.as_json().clone());
-            } else {
-                obj.insert("id".to_string(), Value::Null);
-            }
-
-            // superClass
-            if let Some(super_class) = &class_decl.super_class {
-                let super_class_value =
-                    convert_expression_for_program(arena, super_class, offset, line_offsets);
-                obj.insert(
-                    "superClass".to_string(),
-                    super_class_value.as_json().clone(),
-                );
-            } else {
-                obj.insert("superClass".to_string(), Value::Null);
-            }
-
-            // body (ClassBody)
-            let body_value =
-                convert_class_body_for_program(arena, &class_decl.body, offset, line_offsets);
-            obj.insert("body".to_string(), body_value);
-
-            // TypeScript: declare field
-            if class_decl.declare {
-                obj.insert("declare".to_string(), Value::Bool(true));
-            }
-
-            // TypeScript: abstract field
-            if class_decl.r#abstract {
-                obj.insert("abstract".to_string(), Value::Bool(true));
-            }
-
-            // TypeScript: implements (presence indicates it should be removed by remove_typescript_nodes)
-            if !class_decl.implements.is_empty() {
-                obj.insert("implements".to_string(), Value::Bool(true));
-            }
-
-            // Decorators: include so remove_typescript_nodes can detect them
-            if !class_decl.decorators.is_empty() {
-                let decorators: Vec<Value> = class_decl
-                    .decorators
-                    .iter()
-                    .map(|dec| {
-                        let dec_start = offset + dec.span.start as usize;
-                        let dec_end = offset + dec.span.end as usize;
-                        let mut dec_obj = Map::new();
-                        dec_obj.insert("type".to_string(), Value::String("Decorator".to_string()));
-                        dec_obj.insert(
-                            "start".to_string(),
-                            Value::Number((dec_start as i64).into()),
-                        );
-                        dec_obj.insert("end".to_string(), Value::Number((dec_end as i64).into()));
-                        Value::Object(dec_obj)
-                    })
-                    .collect();
-                obj.insert("decorators".to_string(), Value::Array(decorators));
-            }
-
-            Some(JsNode::Raw(Value::Object(obj)))
-        }
+        oxc_ast::ast::Statement::ClassDeclaration(class_decl) => Some(
+            convert_class_declaration_as_node(arena, class_decl, offset, line_offsets),
+        ),
         oxc_ast::ast::Statement::ReturnStatement(ret_stmt) => {
             let start = offset + ret_stmt.span.start as usize;
             let end = offset + ret_stmt.span.end as usize;
@@ -6615,7 +7323,12 @@ fn convert_statement_for_program(
             let end = offset + switch_stmt.span.end as usize;
             let loc = create_typed_loc(start, end, line_offsets);
 
-            let discriminant = expr_to_node(convert_expression(
+            // Program context: the offset is already program-adjusted, so use
+            // `convert_expression_for_program` (no `-1` paren shift) like every
+            // other statement here. Using `convert_expression` double-counts the
+            // paren and shifts the discriminant span one unit left onto the `(`
+            // (#916).
+            let discriminant = expr_to_node(convert_expression_for_program(
                 arena,
                 &switch_stmt.discriminant,
                 offset,
@@ -6631,7 +7344,7 @@ fn convert_statement_for_program(
                     let case_loc = create_typed_loc(case_start, case_end, line_offsets);
 
                     let test = case.test.as_ref().map(|test| {
-                        arena.alloc_js_node(expr_to_node(convert_expression(
+                        arena.alloc_js_node(expr_to_node(convert_expression_for_program(
                             arena,
                             test,
                             offset,
@@ -6670,7 +7383,7 @@ fn convert_statement_for_program(
             let end = offset + do_while_stmt.span.end as usize;
             let loc = create_typed_loc(start, end, line_offsets);
 
-            let test = expr_to_node(convert_expression(
+            let test = expr_to_node(convert_expression_for_program(
                 arena,
                 &do_while_stmt.test,
                 offset,
@@ -6807,6 +7520,196 @@ fn convert_statement_for_program(
 }
 
 /// Convert a Declaration to JSON value (for program context).
+/// Convert a `FunctionDeclaration` to a typed `JsNode` (program context, no -1
+/// offset adjustment). Returns `None` for TypeScript `declare function` and
+/// overload signatures (no body) so the caller can drop them, mirroring the
+/// `remove_typescript_nodes` filter. Note: rest parameters are not emitted (only
+/// `params.items`); callers that need rest-param fidelity must route through the
+/// `JsNode::Raw` Value form (`convert_declaration_for_program`).
+fn convert_function_declaration_as_node(
+    arena: &ParseArena,
+    func_decl: &oxc_ast::ast::Function,
+    offset: usize,
+    line_offsets: &[usize],
+) -> Option<JsNode> {
+    // Filter out TypeScript declare functions and function overload signatures (no body)
+    if func_decl.r#type == oxc_ast::ast::FunctionType::TSDeclareFunction || func_decl.body.is_none()
+    {
+        return None;
+    }
+    let start = offset + func_decl.span.start as usize;
+    let end = offset + func_decl.span.end as usize;
+    let loc = create_typed_loc(start, end, line_offsets);
+
+    let id_node = func_decl.id.as_ref().map(|id| {
+        let id_start = offset + id.span.start as usize;
+        let id_end = offset + id.span.end as usize;
+        let id_expr = create_identifier(&id.name, id_start, id_end, line_offsets);
+        arena.alloc_js_node(expr_to_node(id_expr))
+    });
+
+    // Convert params
+    let params: Vec<JsNode> = func_decl
+        .params
+        .items
+        .iter()
+        .map(|param| expr_to_node(convert_formal_parameter(arena, param, offset, line_offsets)))
+        .collect();
+
+    // Convert body
+    let body_node = func_decl.body.as_ref().map(|body| {
+        arena.alloc_js_node(convert_function_body_for_program_as_node(
+            arena,
+            body,
+            offset,
+            line_offsets,
+        ))
+    });
+
+    Some(JsNode::FunctionDeclaration {
+        start: start as u32,
+        end: end as u32,
+        loc,
+        id: id_node,
+        params: arena.alloc_js_children(params),
+        body: body_node,
+        generator: func_decl.generator,
+        r#async: func_decl.r#async,
+    })
+}
+
+/// Convert a `ClassDeclaration` to a typed `JsNode` (program context, no -1
+/// offset adjustment). The body is typed when every member is plain JS,
+/// otherwise it falls back to a `JsNode::Raw` blob (TS modifiers / decorators /
+/// declare / accessor).
+fn convert_class_declaration_as_node(
+    arena: &ParseArena,
+    class_decl: &oxc_ast::ast::Class,
+    offset: usize,
+    line_offsets: &[usize],
+) -> JsNode {
+    let start = offset + class_decl.span.start as usize;
+    let end = offset + class_decl.span.end as usize;
+    let loc = create_typed_loc(start, end, line_offsets);
+
+    // id
+    let id = class_decl.id.as_ref().map(|id| {
+        let id_start = offset + id.span.start as usize;
+        let id_end = offset + id.span.end as usize;
+        let id_expr = create_identifier(&id.name, id_start, id_end, line_offsets);
+        arena.alloc_js_node(expr_to_node(id_expr))
+    });
+
+    // superClass
+    let super_class = class_decl.super_class.as_ref().map(|super_class| {
+        let super_class_value =
+            convert_expression_for_program(arena, super_class, offset, line_offsets);
+        arena.alloc_js_node(expr_to_node(super_class_value))
+    });
+
+    // body (ClassBody) — typed when every member is plain JS; otherwise a
+    // Raw blob fallback (TS modifiers / decorators / declare / accessor).
+    let body =
+        match convert_class_body_for_program_as_node(arena, &class_decl.body, offset, line_offsets)
+        {
+            Some(node) => arena.alloc_js_node(node),
+            None => {
+                let body_value =
+                    convert_class_body_for_program(arena, &class_decl.body, offset, line_offsets);
+                arena.alloc_js_node(JsNode::from_value(body_value))
+            }
+        };
+
+    // Decorators: include so remove_typescript_nodes can detect them.
+    let decorators = if class_decl.decorators.is_empty() {
+        IdRange::empty()
+    } else {
+        let decorator_nodes: Vec<JsNode> = class_decl
+            .decorators
+            .iter()
+            .map(|dec| {
+                let dec_start = offset + dec.span.start as usize;
+                let dec_end = offset + dec.span.end as usize;
+                JsNode::Decorator {
+                    start: dec_start as u32,
+                    end: dec_end as u32,
+                    loc: None,
+                }
+            })
+            .collect();
+        arena.alloc_js_children(decorator_nodes)
+    };
+
+    JsNode::ClassDeclaration {
+        start: start as u32,
+        end: end as u32,
+        loc,
+        id,
+        super_class,
+        body,
+        declare: class_decl.declare,
+        r#abstract: class_decl.r#abstract,
+        implements: !class_decl.implements.is_empty(),
+        decorators,
+    }
+}
+
+/// Typed sibling of `convert_declaration_for_program`: returns a typed `JsNode`
+/// for the plain-JS `VariableDeclaration` / `FunctionDeclaration` /
+/// `ClassDeclaration` cases (so an `export <decl>` declaration routes through the
+/// typed analyze walker instead of `JsNode::Raw`). Cases whose byte-identical
+/// serialization needs the Value form — TS `declare`/overload functions, rest
+/// parameters (the typed function path drops `params.rest`), abstract / declare
+/// / implements / decorated classes, and all TS-only declarations — fall back to
+/// `JsNode::from_value(convert_declaration_for_program(...))`.
+fn convert_declaration_for_program_as_node(
+    arena: &ParseArena,
+    decl: &oxc_ast::ast::Declaration,
+    offset: usize,
+    line_offsets: &[usize],
+) -> JsNode {
+    use oxc_ast::ast::Declaration;
+    match decl {
+        Declaration::VariableDeclaration(var_decl) => {
+            convert_variable_declaration_as_node(arena, var_decl, offset, line_offsets)
+        }
+        // The typed function path emits only `params.items`, so a rest parameter
+        // would be dropped relative to the Value form — keep Raw in that case.
+        Declaration::FunctionDeclaration(func_decl)
+            if func_decl.r#type != oxc_ast::ast::FunctionType::TSDeclareFunction
+                && func_decl.body.is_some()
+                && func_decl.params.rest.is_none() =>
+        {
+            convert_function_declaration_as_node(arena, func_decl, offset, line_offsets)
+                .unwrap_or_else(|| {
+                    JsNode::from_value(convert_declaration_for_program(
+                        arena,
+                        decl,
+                        offset,
+                        line_offsets,
+                    ))
+                })
+        }
+        // The typed class node adds `abstract` / `declare` / `implements` /
+        // `decorators` fields that the Value form omits, so only the plain-JS
+        // shape is byte-identical.
+        Declaration::ClassDeclaration(class_decl)
+            if !class_decl.declare
+                && !class_decl.r#abstract
+                && class_decl.implements.is_empty()
+                && class_decl.decorators.is_empty() =>
+        {
+            convert_class_declaration_as_node(arena, class_decl, offset, line_offsets)
+        }
+        _ => JsNode::from_value(convert_declaration_for_program(
+            arena,
+            decl,
+            offset,
+            line_offsets,
+        )),
+    }
+}
+
 fn convert_declaration_for_program(
     arena: &ParseArena,
     decl: &oxc_ast::ast::Declaration,
@@ -7193,43 +8096,86 @@ fn convert_variable_declarator_for_program(
     let end = offset + decl.span.end as usize;
     let loc = create_typed_loc(start, end, line_offsets);
 
-    // Convert the id (pattern).
-    // Only use JsNode::Raw when TypeScript type annotation is present,
-    // otherwise keep the typed JsNode so the scope builder's typed path works.
+    // Convert the id (pattern). When a TS type annotation is present, a plain
+    // annotated identifier (`let x: T = …`) routes through the typed walker
+    // carrying the annotation as an opaque boundary blob; an annotated
+    // destructuring pattern (`let { a }: T = …`) keeps the Value (Raw) form
+    // since the annotation hangs off a pattern node.
     let id_pattern = convert_binding_pattern(arena, &decl.id, offset, line_offsets);
     let id_node = if let Some(type_annotation) = &decl.type_annotation {
-        let mut id_value = id_pattern.to_value();
-        if let Value::Object(ref mut id_obj) = id_value {
-            let ts_start = type_annotation.span.start as usize + offset;
-            let ts_end = type_annotation.span.end as usize + offset;
+        let ts_start = type_annotation.span.start as usize + offset;
+        let ts_end = type_annotation.span.end as usize + offset;
 
-            let mut ts_obj = Map::new();
-            ts_obj.insert(
-                "type".to_string(),
-                Value::String("TSTypeAnnotation".to_string()),
-            );
-            ts_obj.insert("start".to_string(), Value::Number((ts_start as i64).into()));
-            ts_obj.insert("end".to_string(), Value::Number((ts_end as i64).into()));
-            if let Some(loc) = create_loc(ts_start, ts_end, line_offsets) {
-                ts_obj.insert("loc".to_string(), loc);
-            }
+        let mut ts_obj = Map::new();
+        ts_obj.insert(
+            "type".to_string(),
+            Value::String("TSTypeAnnotation".to_string()),
+        );
+        ts_obj.insert("start".to_string(), Value::Number((ts_start as i64).into()));
+        ts_obj.insert("end".to_string(), Value::Number((ts_end as i64).into()));
+        if let Some(loc) = create_loc(ts_start, ts_end, line_offsets) {
+            ts_obj.insert("loc".to_string(), loc);
+        }
+        let type_value = convert_ts_type(&type_annotation.type_annotation, offset, line_offsets);
+        ts_obj.insert("typeAnnotation".to_string(), type_value);
+        let ts_value = Value::Object(ts_obj);
 
-            let type_value =
-                convert_ts_type(&type_annotation.type_annotation, offset, line_offsets);
-            ts_obj.insert("typeAnnotation".to_string(), type_value);
-
-            id_obj.insert("typeAnnotation".to_string(), Value::Object(ts_obj));
-
-            id_obj.insert("end".to_string(), Value::Number((ts_end as i64).into()));
-            if let Some(loc) = create_loc(
-                id_obj.get("start").and_then(|v| v.as_i64()).unwrap_or(0) as usize,
-                ts_end,
-                line_offsets,
-            ) {
-                id_obj.insert("loc".to_string(), loc);
+        match id_pattern {
+            JsNode::Identifier {
+                start: id_start,
+                name,
+                ..
+            } => arena.alloc_js_node(JsNode::Identifier {
+                start: id_start,
+                end: ts_end as u32,
+                loc: create_typed_loc(id_start as usize, ts_end, line_offsets),
+                name,
+                type_annotation: Some(Box::new(ts_value)),
+            }),
+            // Annotated destructuring declarator id (`let { a }: T` / `let [ a ]: T`):
+            // keep the pattern typed and carry the TS annotation as an opaque
+            // boundary blob (mirrors the Identifier branch above). The outer
+            // `end`/`loc` extend to cover the annotation; the pattern's own
+            // children keep their original spans — byte-identical to the former
+            // `JsNode::Raw(to_value + typeAnnotation/end/loc override)` shape.
+            JsNode::ObjectPattern {
+                start: p_start,
+                properties,
+                ..
+            } => arena.alloc_js_node(JsNode::ObjectPattern {
+                start: p_start,
+                end: ts_end as u32,
+                loc: create_typed_loc(p_start as usize, ts_end, line_offsets),
+                properties,
+                type_annotation: Some(Box::new(ts_value)),
+            }),
+            JsNode::ArrayPattern {
+                start: p_start,
+                elements,
+                ..
+            } => arena.alloc_js_node(JsNode::ArrayPattern {
+                start: p_start,
+                end: ts_end as u32,
+                loc: create_typed_loc(p_start as usize, ts_end, line_offsets),
+                elements,
+                type_annotation: Some(Box::new(ts_value)),
+            }),
+            other => {
+                let mut id_value = other.to_value();
+                if let Value::Object(ref mut id_obj) = id_value {
+                    id_obj.insert("typeAnnotation".to_string(), ts_value);
+                    id_obj.insert("end".to_string(), Value::Number((ts_end as i64).into()));
+                    if let Some(loc) = create_loc(
+                        id_obj.get("start").and_then(|v| v.as_i64()).unwrap_or(0) as usize,
+                        ts_end,
+                        line_offsets,
+                    ) {
+                        id_obj.insert("loc".to_string(), loc);
+                    }
+                }
+                arena.alloc_js_node(JsNode::from_value(id_value))
             }
         }
-        arena.alloc_js_node(JsNode::Raw(id_value))
     } else {
         arena.alloc_js_node(id_pattern)
     };
@@ -7479,12 +8425,7 @@ fn convert_expression_for_program(
                     line_offsets,
                 ))
             } else {
-                JsNode::Raw(convert_function_body_for_program(
-                    arena,
-                    &arrow.body,
-                    offset,
-                    line_offsets,
-                ))
+                convert_function_body_for_program_as_node(arena, &arrow.body, offset, line_offsets)
             };
 
             Expression::from_node(JsNode::ArrowFunctionExpression {
@@ -7499,9 +8440,9 @@ fn convert_expression_for_program(
                 body: arena.alloc_js_node(body_node),
             })
         }
-        OxcExpression::FunctionExpression(func) => Expression::from_node(JsNode::Raw(
-            convert_function_expression_for_program(arena, func, offset, line_offsets),
-        )),
+        OxcExpression::FunctionExpression(func) => Expression::from_node(
+            convert_function_expression_for_program_as_node(arena, func, offset, line_offsets),
+        ),
         OxcExpression::StaticMemberExpression(member) => {
             let start = offset + member.span.start as usize;
             let end = offset + member.span.end as usize;
@@ -7541,6 +8482,33 @@ fn convert_expression_for_program(
                 object: arena.alloc_js_node(expr_to_node(object)),
                 property: arena.alloc_js_node(expr_to_node(property)),
                 computed: true,
+                optional: member.optional,
+            })
+        }
+        OxcExpression::PrivateFieldExpression(member) => {
+            // `this.#field` — without this arm the object falls through to the
+            // `unknown` identifier fallback, which defeats `is_safe_identifier`
+            // in 2-analyze (so `needs_context` is never set). Mirror
+            // `create_private_member_expression` with the program-offset
+            // convention (`offset + span.start`, no `-1`).
+            let start = offset + member.span.start as usize;
+            let end = offset + member.span.end as usize;
+            let object =
+                convert_expression_for_program(arena, &member.object, offset, line_offsets);
+            let prop_start = offset + member.field.span.start as usize;
+            let prop_end = offset + member.field.span.end as usize;
+            Expression::from_node(JsNode::MemberExpression {
+                start: start as u32,
+                end: end as u32,
+                loc: create_typed_loc(start, end, line_offsets),
+                object: arena.alloc_js_node(expr_to_node(object)),
+                property: arena.alloc_js_node(JsNode::PrivateIdentifier {
+                    start: prop_start as u32,
+                    end: prop_end as u32,
+                    loc: create_typed_loc(prop_start, prop_end, line_offsets),
+                    name: CompactString::from(member.field.name.as_str()),
+                }),
+                computed: false,
                 optional: member.optional,
             })
         }
@@ -7659,8 +8627,20 @@ fn convert_expression_for_program(
                 )))
             });
 
-            let body =
-                convert_class_body_for_program(arena, &class_expr.body, offset, line_offsets);
+            let body = match convert_class_body_for_program_as_node(
+                arena,
+                &class_expr.body,
+                offset,
+                line_offsets,
+            ) {
+                Some(node) => arena.alloc_js_node(node),
+                None => arena.alloc_js_node(JsNode::from_value(convert_class_body_for_program(
+                    arena,
+                    &class_expr.body,
+                    offset,
+                    line_offsets,
+                ))),
+            };
 
             Expression::from_node(JsNode::ClassExpression {
                 start: start as u32,
@@ -7668,7 +8648,7 @@ fn convert_expression_for_program(
                 loc: create_typed_loc(start, end, line_offsets),
                 id,
                 super_class,
-                body: arena.alloc_js_node(JsNode::Raw(body)),
+                body,
             })
         }
         OxcExpression::Super(super_expr) => {
@@ -8086,6 +9066,36 @@ fn convert_expression_for_program(
         OxcExpression::TSInstantiationExpression(ts_inst) => {
             convert_expression_for_program(arena, &ts_inst.expression, offset, line_offsets)
         }
+        OxcExpression::MetaProperty(meta) => {
+            // `import.meta` / `new.target`. Without this arm the fallback
+            // below turns the node into a placeholder `Identifier("unknown")`,
+            // which Phase 2's `is_safe_identifier` then misclassifies as a
+            // safe global — `import.meta.glob(...)` must set `needs_context`
+            // (upstream: a non-Identifier base is never "safe").
+            let start = offset + meta.span.start as usize;
+            let end = offset + meta.span.end as usize;
+            let meta_start = offset + meta.meta.span.start as usize;
+            let meta_end = offset + meta.meta.span.end as usize;
+            let prop_start = offset + meta.property.span.start as usize;
+            let prop_end = offset + meta.property.span.end as usize;
+            Expression::from_node(JsNode::MetaProperty {
+                start: start as u32,
+                end: end as u32,
+                loc: create_typed_loc(start, end, line_offsets),
+                meta: arena.alloc_js_node(expr_to_node(create_identifier(
+                    &meta.meta.name,
+                    meta_start,
+                    meta_end,
+                    line_offsets,
+                ))),
+                property: arena.alloc_js_node(expr_to_node(create_identifier(
+                    &meta.property.name,
+                    prop_start,
+                    prop_end,
+                    line_offsets,
+                ))),
+            })
+        }
         _ => {
             // Fallback for unsupported expression types
             let span = expr.span();
@@ -8124,6 +9134,154 @@ fn convert_class_body_for_program(
     obj.insert("body".to_string(), Value::Array(body_elements));
 
     Value::Object(obj)
+}
+
+/// Outcome of attempting to build a typed program-path class member.
+enum TypedClassElem {
+    /// A fully typed member node.
+    Node(JsNode),
+    /// Element intentionally dropped (mirrors the Value path's `None`).
+    Skip,
+    /// Member carries data the typed variants can't represent byte-identically
+    /// (TS modifiers / decorators / `declare` / accessor); the whole class body
+    /// must fall back to a `JsNode::Raw(Value)` blob.
+    Bail,
+}
+
+/// Typed twin of [`convert_class_body_for_program`]. Returns `Some(ClassBody)`
+/// when every member can be represented byte-identically by the typed
+/// `MethodDefinition` / `PropertyDefinition` variants; returns `None` when any
+/// member carries TS modifiers / decorators / `declare` / accessor (the caller
+/// then falls back to the `Raw(Value)` blob via `convert_class_body_for_program`).
+///
+/// Serializes byte-identically to the Value blob (modulo the method value's
+/// `expression: false` field, which the official ESTree output also emits and
+/// the `convert_function_expression_for_program` Value blob was missing — same
+/// improvement landed in D2 for top-level `FunctionExpression`s).
+fn convert_class_body_for_program_as_node(
+    arena: &ParseArena,
+    body: &oxc_ast::ast::ClassBody,
+    offset: usize,
+    line_offsets: &[usize],
+) -> Option<JsNode> {
+    let start = offset + body.span.start as usize;
+    let end = offset + body.span.end as usize;
+
+    let mut members: Vec<JsNode> = Vec::with_capacity(body.body.len());
+    for element in &body.body {
+        match convert_class_element_for_program_as_node(arena, element, offset, line_offsets) {
+            TypedClassElem::Node(node) => members.push(node),
+            TypedClassElem::Skip => {}
+            TypedClassElem::Bail => return None,
+        }
+    }
+
+    Some(JsNode::ClassBody {
+        start: start as u32,
+        end: end as u32,
+        loc: create_typed_loc(start, end, line_offsets),
+        body: arena.alloc_js_children(members),
+    })
+}
+
+/// Typed twin of [`convert_class_element_for_program`]. Bails (to a `Raw` class
+/// body) on any member that carries TS modifiers / decorators / `declare` /
+/// accessor, so the typed path is only taken for plain-JS class members whose
+/// shape matches the Value blob exactly.
+fn convert_class_element_for_program_as_node(
+    arena: &ParseArena,
+    element: &oxc_ast::ast::ClassElement,
+    offset: usize,
+    line_offsets: &[usize],
+) -> TypedClassElem {
+    match element {
+        oxc_ast::ast::ClassElement::MethodDefinition(method) => {
+            // Abstract methods are dropped by the Value path (`return None`).
+            if method.r#type == oxc_ast::ast::MethodDefinitionType::TSAbstractMethodDefinition {
+                return TypedClassElem::Skip;
+            }
+            // TS modifiers / decorators have no typed representation here.
+            if !method.decorators.is_empty()
+                || method.r#override
+                || method.optional
+                || method.accessibility.is_some()
+            {
+                return TypedClassElem::Bail;
+            }
+            let start = offset + method.span.start as usize;
+            let end = offset + method.span.end as usize;
+            let kind = match method.kind {
+                oxc_ast::ast::MethodDefinitionKind::Constructor => "constructor",
+                oxc_ast::ast::MethodDefinitionKind::Method => "method",
+                oxc_ast::ast::MethodDefinitionKind::Get => "get",
+                oxc_ast::ast::MethodDefinitionKind::Set => "set",
+            };
+            let key = convert_property_key(arena, &method.key, offset, line_offsets);
+            let value = convert_function_expression_for_program_as_node(
+                arena,
+                &method.value,
+                offset,
+                line_offsets,
+            );
+            TypedClassElem::Node(JsNode::MethodDefinition {
+                start: start as u32,
+                end: end as u32,
+                loc: create_typed_loc(start, end, line_offsets),
+                key: arena.alloc_js_node(key),
+                value: arena.alloc_js_node(value),
+                kind: CompactString::from(kind),
+                r#static: method.r#static,
+                computed: method.computed,
+            })
+        }
+        oxc_ast::ast::ClassElement::PropertyDefinition(prop) => {
+            if prop.r#type == oxc_ast::ast::PropertyDefinitionType::TSAbstractPropertyDefinition {
+                return TypedClassElem::Skip;
+            }
+            // The Value path emits a conditional `declare` field and never the
+            // other TS modifiers / decorators — bail so those still route through
+            // the Raw blob unchanged.
+            if !prop.decorators.is_empty()
+                || prop.declare
+                || prop.r#override
+                || prop.optional
+                || prop.definite
+                || prop.readonly
+                || prop.accessibility.is_some()
+                || prop.type_annotation.is_some()
+            {
+                return TypedClassElem::Bail;
+            }
+            let start = offset + prop.span.start as usize;
+            let end = offset + prop.span.end as usize;
+            let key = convert_property_key(arena, &prop.key, offset, line_offsets);
+            let value = prop.value.as_ref().map(|value| {
+                arena.alloc_js_node(expr_to_node(convert_expression_for_program(
+                    arena,
+                    value,
+                    offset,
+                    line_offsets,
+                )))
+            });
+            TypedClassElem::Node(JsNode::PropertyDefinition {
+                start: start as u32,
+                end: end as u32,
+                loc: create_typed_loc(start, end, line_offsets),
+                key: arena.alloc_js_node(key),
+                value,
+                r#static: prop.r#static,
+                computed: prop.computed,
+                // AccessorProperty bails above, so a typed PropertyDefinition is
+                // never an `accessor` field.
+                accessor: false,
+            })
+        }
+        // AccessorProperty: the Value path emits a `PropertyDefinition` with an
+        // `accessor: true` field that the typed variant can't carry.
+        oxc_ast::ast::ClassElement::AccessorProperty(_) => TypedClassElem::Bail,
+        // StaticBlock and TS-only members are dropped by the Value path (`_ => None`).
+        _ => TypedClassElem::Skip,
+    }
 }
 
 /// Convert a class element to JSON value (for program context).
@@ -8313,6 +9471,70 @@ fn convert_function_expression_for_program(
     Value::Object(obj)
 }
 
+/// Typed twin of `convert_function_expression_for_program`: builds a typed
+/// `JsNode::FunctionExpression` (program-offset convention) instead of a
+/// `JsNode::Raw(Value)` blob, so the function body subtree routes through the
+/// typed analyze walker. Serializes byte-identically to the Value blob (modulo
+/// the `expression: false` field, which the official ESTree output also emits
+/// and the Value blob was missing). `id` is always `null` to match the Value
+/// blob, and params keep the TS-aware `convert_formal_parameter` shape (TS bits
+/// fall through to `JsNode::Raw` via `expr_to_node`).
+fn convert_function_expression_for_program_as_node(
+    arena: &ParseArena,
+    func: &oxc_ast::ast::Function,
+    offset: usize,
+    line_offsets: &[usize],
+) -> JsNode {
+    let start = offset + func.span.start as usize;
+    let end = offset + func.span.end as usize;
+
+    // params
+    let mut params: Vec<JsNode> = func
+        .params
+        .items
+        .iter()
+        .map(|param| expr_to_node(convert_formal_parameter(arena, param, offset, line_offsets)))
+        .collect();
+    if let Some(rest) = &func.params.rest {
+        let rest_start = offset + rest.span.start as usize;
+        let rest_end = offset + rest.span.end as usize;
+        let argument = convert_binding_pattern_for_param_as_node(
+            arena,
+            &rest.rest.argument,
+            offset,
+            line_offsets,
+        );
+        params.push(JsNode::RestElement {
+            start: rest_start as u32,
+            end: rest_end as u32,
+            loc: create_typed_loc(rest_start, rest_end, line_offsets),
+            argument: arena.alloc_js_node(argument),
+        });
+    }
+
+    // body
+    let body = func.body.as_ref().map(|body| {
+        arena.alloc_js_node(convert_function_body_for_program_as_node(
+            arena,
+            body,
+            offset,
+            line_offsets,
+        ))
+    });
+
+    JsNode::FunctionExpression {
+        start: start as u32,
+        end: end as u32,
+        loc: create_typed_loc(start, end, line_offsets),
+        id: None,
+        params: arena.alloc_js_children(params),
+        body,
+        generator: func.generator,
+        r#async: func.r#async,
+        expression: false,
+    }
+}
+
 /// Convert a function body (statement or expression) to JSON value.
 fn convert_function_body_for_program(
     arena: &ParseArena,
@@ -8433,6 +9655,7 @@ fn convert_object_pattern(
         end: end as u32,
         loc: create_typed_loc(start, end, line_offsets),
         properties: arena.alloc_js_children(properties),
+        type_annotation: None,
     }
 }
 
@@ -8477,6 +9700,7 @@ fn convert_array_pattern(
         end: end as u32,
         loc: create_typed_loc(start, end, line_offsets),
         elements,
+        type_annotation: None,
     }
 }
 
@@ -8500,7 +9724,13 @@ fn convert_assignment_pattern(
             offset,
             line_offsets,
         )),
-        right: arena.alloc_js_node(expr_to_node(convert_expression(
+        // Program context: `offset` is already program-adjusted (the pattern's
+        // own `start`/`end` and `left` use it raw), so the default value must
+        // also use `convert_expression_for_program`. `convert_expression` would
+        // re-apply the synthetic-paren `-1`, shifting the default expression one
+        // unit left — e.g. the `$bindable` callee in `let { open = $bindable() }`
+        // spanned ` $bindabl` (#916).
+        right: arena.alloc_js_node(expr_to_node(convert_expression_for_program(
             arena,
             &assign_pat.right,
             offset,
@@ -8566,12 +9796,39 @@ fn convert_assignment_target_for_program(
                 optional: member.optional,
             }
         }
-        AssignmentTarget::ObjectAssignmentTarget(obj_target) => JsNode::Raw(
-            convert_object_assignment_target_for_program(arena, obj_target, offset, line_offsets),
-        ),
-        AssignmentTarget::ArrayAssignmentTarget(arr_target) => JsNode::Raw(
-            convert_array_assignment_target_for_program(arena, arr_target, offset, line_offsets),
-        ),
+        AssignmentTarget::ObjectAssignmentTarget(obj_target) => {
+            convert_object_assignment_target_for_program(arena, obj_target, offset, line_offsets)
+        }
+        AssignmentTarget::ArrayAssignmentTarget(arr_target) => {
+            convert_array_assignment_target_for_program(arena, arr_target, offset, line_offsets)
+        }
+        AssignmentTarget::PrivateFieldExpression(member) => {
+            // `this.#field = …` LHS in a function-body statement (program
+            // context). Without this arm it falls to `JsNode::Null`, so the
+            // `this.#field` MemberExpression is never visited in 2-analyze and
+            // `needs_context` stays unset (no `$.push`/`$.pop`) — e.g. a class
+            // constructor reassigning a private field.
+            let start = offset + member.span.start as usize;
+            let end = offset + member.span.end as usize;
+            let object =
+                convert_expression_for_program(arena, &member.object, offset, line_offsets);
+            let prop_start = offset + member.field.span.start as usize;
+            let prop_end = offset + member.field.span.end as usize;
+            JsNode::MemberExpression {
+                start: start as u32,
+                end: end as u32,
+                loc: create_typed_loc(start, end, line_offsets),
+                object: arena.alloc_js_node(expr_to_node(object)),
+                property: arena.alloc_js_node(JsNode::PrivateIdentifier {
+                    start: prop_start as u32,
+                    end: prop_end as u32,
+                    loc: create_typed_loc(prop_start, prop_end, line_offsets),
+                    name: CompactString::from(member.field.name.as_str()),
+                }),
+                computed: false,
+                optional: member.optional,
+            }
+        }
         _ => {
             // For other complex patterns (e.g., TSAsExpression, TSNonNullExpression)
             JsNode::Null
@@ -8579,28 +9836,18 @@ fn convert_assignment_target_for_program(
     }
 }
 
-/// Convert an ObjectAssignmentTarget to ObjectPattern JSON (no -1 offset adjustment).
+/// Convert an ObjectAssignmentTarget to a typed `ObjectPattern` `JsNode`
+/// (no -1 offset adjustment).
 fn convert_object_assignment_target_for_program(
     arena: &ParseArena,
     obj_target: &oxc_ast::ast::ObjectAssignmentTarget,
     offset: usize,
     line_offsets: &[usize],
-) -> Value {
+) -> JsNode {
     let start = offset + obj_target.span.start as usize;
     let end = offset + obj_target.span.end as usize;
 
-    let mut obj = Map::new();
-    obj.insert(
-        "type".to_string(),
-        Value::String("ObjectPattern".to_string()),
-    );
-    obj.insert("start".to_string(), Value::Number((start as i64).into()));
-    obj.insert("end".to_string(), Value::Number((end as i64).into()));
-    if let Some(loc) = create_loc(start, end, line_offsets) {
-        obj.insert("loc".to_string(), loc);
-    }
-
-    let mut properties: Vec<Value> = obj_target
+    let mut properties: Vec<JsNode> = obj_target
         .properties
         .iter()
         .map(|prop| {
@@ -8612,62 +9859,51 @@ fn convert_object_assignment_target_for_program(
     if let Some(rest) = &obj_target.rest {
         let rest_start = offset + rest.span.start as usize;
         let rest_end = offset + rest.span.end as usize;
-
-        let mut rest_obj = Map::new();
-        rest_obj.insert("type".to_string(), Value::String("RestElement".to_string()));
-        rest_obj.insert(
-            "start".to_string(),
-            Value::Number((rest_start as i64).into()),
-        );
-        rest_obj.insert("end".to_string(), Value::Number((rest_end as i64).into()));
-        if let Some(loc) = create_loc(rest_start, rest_end, line_offsets) {
-            rest_obj.insert("loc".to_string(), loc);
-        }
-        rest_obj.insert(
-            "argument".to_string(),
-            convert_assignment_target_for_program(arena, &rest.target, offset, line_offsets)
-                .to_value(),
-        );
-        properties.push(Value::Object(rest_obj));
+        properties.push(JsNode::RestElement {
+            start: rest_start as u32,
+            end: rest_end as u32,
+            loc: create_typed_loc(rest_start, rest_end, line_offsets),
+            argument: arena.alloc_js_node(convert_assignment_target_for_program(
+                arena,
+                &rest.target,
+                offset,
+                line_offsets,
+            )),
+        });
     }
 
-    obj.insert("properties".to_string(), Value::Array(properties));
-
-    Value::Object(obj)
+    JsNode::ObjectPattern {
+        start: start as u32,
+        end: end as u32,
+        loc: create_typed_loc(start, end, line_offsets),
+        properties: arena.alloc_js_children(properties),
+        type_annotation: None,
+    }
 }
 
-/// Convert an ArrayAssignmentTarget to ArrayPattern JSON (no -1 offset adjustment).
+/// Convert an ArrayAssignmentTarget to a typed `ArrayPattern` `JsNode`
+/// (no -1 offset adjustment).
 fn convert_array_assignment_target_for_program(
     arena: &ParseArena,
     arr_target: &oxc_ast::ast::ArrayAssignmentTarget,
     offset: usize,
     line_offsets: &[usize],
-) -> Value {
+) -> JsNode {
     let start = offset + arr_target.span.start as usize;
     let end = offset + arr_target.span.end as usize;
 
-    let mut obj = Map::new();
-    obj.insert(
-        "type".to_string(),
-        Value::String("ArrayPattern".to_string()),
-    );
-    obj.insert("start".to_string(), Value::Number((start as i64).into()));
-    obj.insert("end".to_string(), Value::Number((end as i64).into()));
-    if let Some(loc) = create_loc(start, end, line_offsets) {
-        obj.insert("loc".to_string(), loc);
-    }
-
-    let mut elements: Vec<Value> = arr_target
+    let mut elements: Vec<Option<JsNode>> = arr_target
         .elements
         .iter()
-        .map(|elem| match elem {
-            Some(target) => convert_assignment_target_maybe_default_for_program(
-                arena,
-                target,
-                offset,
-                line_offsets,
-            ),
-            None => Value::Null,
+        .map(|elem| {
+            elem.as_ref().map(|target| {
+                convert_assignment_target_maybe_default_for_program(
+                    arena,
+                    target,
+                    offset,
+                    line_offsets,
+                )
+            })
         })
         .collect();
 
@@ -8675,37 +9911,36 @@ fn convert_array_assignment_target_for_program(
     if let Some(rest) = &arr_target.rest {
         let rest_start = offset + rest.span.start as usize;
         let rest_end = offset + rest.span.end as usize;
-
-        let mut rest_obj = Map::new();
-        rest_obj.insert("type".to_string(), Value::String("RestElement".to_string()));
-        rest_obj.insert(
-            "start".to_string(),
-            Value::Number((rest_start as i64).into()),
-        );
-        rest_obj.insert("end".to_string(), Value::Number((rest_end as i64).into()));
-        if let Some(loc) = create_loc(rest_start, rest_end, line_offsets) {
-            rest_obj.insert("loc".to_string(), loc);
-        }
-        rest_obj.insert(
-            "argument".to_string(),
-            convert_assignment_target_for_program(arena, &rest.target, offset, line_offsets)
-                .to_value(),
-        );
-        elements.push(Value::Object(rest_obj));
+        elements.push(Some(JsNode::RestElement {
+            start: rest_start as u32,
+            end: rest_end as u32,
+            loc: create_typed_loc(rest_start, rest_end, line_offsets),
+            argument: arena.alloc_js_node(convert_assignment_target_for_program(
+                arena,
+                &rest.target,
+                offset,
+                line_offsets,
+            )),
+        }));
     }
 
-    obj.insert("elements".to_string(), Value::Array(elements));
-
-    Value::Object(obj)
+    JsNode::ArrayPattern {
+        start: start as u32,
+        end: end as u32,
+        loc: create_typed_loc(start, end, line_offsets),
+        elements,
+        type_annotation: None,
+    }
 }
 
-/// Convert an AssignmentTargetProperty to Property JSON (no -1 offset adjustment).
+/// Convert an AssignmentTargetProperty to a typed `Property` `JsNode`
+/// (no -1 offset adjustment).
 fn convert_assignment_target_property_for_program(
     arena: &ParseArena,
     prop: &oxc_ast::ast::AssignmentTargetProperty,
     offset: usize,
     line_offsets: &[usize],
-) -> Value {
+) -> JsNode {
     use oxc_ast::ast::AssignmentTargetProperty;
 
     match prop {
@@ -8713,81 +9948,72 @@ fn convert_assignment_target_property_for_program(
             let start = offset + id_prop.span.start as usize;
             let end = offset + id_prop.span.end as usize;
 
-            let mut obj = Map::new();
-            obj.insert("type".to_string(), Value::String("Property".to_string()));
-            obj.insert("start".to_string(), Value::Number((start as i64).into()));
-            obj.insert("end".to_string(), Value::Number((end as i64).into()));
-            if let Some(loc) = create_loc(start, end, line_offsets) {
-                obj.insert("loc".to_string(), loc);
-            }
-            obj.insert("method".to_string(), Value::Bool(false));
-            obj.insert("shorthand".to_string(), Value::Bool(true));
-            obj.insert("computed".to_string(), Value::Bool(false));
-            obj.insert("kind".to_string(), Value::String("init".to_string()));
-
             let id_start = offset + id_prop.binding.span.start as usize;
             let id_end = offset + id_prop.binding.span.end as usize;
-            let identifier =
-                create_identifier(&id_prop.binding.name, id_start, id_end, line_offsets)
-                    .as_json()
-                    .clone();
+            let make_identifier = || {
+                expr_to_node(create_identifier(
+                    &id_prop.binding.name,
+                    id_start,
+                    id_end,
+                    line_offsets,
+                ))
+            };
 
-            obj.insert("key".to_string(), identifier.clone());
+            let key = arena.alloc_js_node(make_identifier());
 
-            if let Some(init) = &id_prop.init {
-                let mut assign_pat = Map::new();
-                assign_pat.insert(
-                    "type".to_string(),
-                    Value::String("AssignmentPattern".to_string()),
-                );
-                assign_pat.insert("start".to_string(), Value::Number((id_start as i64).into()));
+            let value = if let Some(init) = &id_prop.init {
                 let init_end = offset + init.span().end as usize;
-                assign_pat.insert("end".to_string(), Value::Number((init_end as i64).into()));
-                if let Some(loc) = create_loc(id_start, init_end, line_offsets) {
-                    assign_pat.insert("loc".to_string(), loc);
-                }
-                assign_pat.insert("left".to_string(), identifier);
-                assign_pat.insert(
-                    "right".to_string(),
-                    convert_expression_for_program(arena, init, offset, line_offsets)
-                        .as_json()
-                        .clone(),
-                );
-                obj.insert("value".to_string(), Value::Object(assign_pat));
+                arena.alloc_js_node(JsNode::AssignmentPattern {
+                    start: id_start as u32,
+                    end: init_end as u32,
+                    loc: create_typed_loc(id_start, init_end, line_offsets),
+                    left: arena.alloc_js_node(make_identifier()),
+                    right: arena.alloc_js_node(expr_to_node(convert_expression_for_program(
+                        arena,
+                        init,
+                        offset,
+                        line_offsets,
+                    ))),
+                })
             } else {
-                obj.insert("value".to_string(), identifier);
-            }
+                arena.alloc_js_node(make_identifier())
+            };
 
-            Value::Object(obj)
+            JsNode::Property {
+                start: start as u32,
+                end: end as u32,
+                loc: create_typed_loc(start, end, line_offsets),
+                key,
+                value,
+                kind: CompactString::from("init"),
+                method: false,
+                shorthand: true,
+                computed: false,
+            }
         }
         AssignmentTargetProperty::AssignmentTargetPropertyProperty(prop_prop) => {
             let start = offset + prop_prop.span.start as usize;
             let end = offset + prop_prop.span.end as usize;
 
-            let mut obj = Map::new();
-            obj.insert("type".to_string(), Value::String("Property".to_string()));
-            obj.insert("start".to_string(), Value::Number((start as i64).into()));
-            obj.insert("end".to_string(), Value::Number((end as i64).into()));
-            if let Some(loc) = create_loc(start, end, line_offsets) {
-                obj.insert("loc".to_string(), loc);
-            }
-            obj.insert("method".to_string(), Value::Bool(false));
-            obj.insert("shorthand".to_string(), Value::Bool(false));
-            obj.insert("computed".to_string(), Value::Bool(prop_prop.computed));
-            obj.insert("kind".to_string(), Value::String("init".to_string()));
-
             let key = convert_property_key(arena, &prop_prop.name, offset, line_offsets);
-            obj.insert("key".to_string(), key.to_value());
-
             let value = convert_assignment_target_maybe_default_for_program(
                 arena,
                 &prop_prop.binding,
                 offset,
                 line_offsets,
             );
-            obj.insert("value".to_string(), value);
 
-            Value::Object(obj)
+            JsNode::Property {
+                start: start as u32,
+                end: end as u32,
+                loc: create_typed_loc(start, end, line_offsets),
+                key: arena.alloc_js_node(key),
+                value: arena.alloc_js_node(value),
+                kind: CompactString::from("init"),
+                method: false,
+                shorthand: false,
+                computed: prop_prop.computed,
+            }
         }
     }
 }
@@ -8849,17 +10075,43 @@ fn convert_simple_assignment_target_for_program(
                 optional: member.optional,
             }
         }
+        SimpleAssignmentTarget::PrivateFieldExpression(member) => {
+            // `this.#field = …` LHS — without this arm it becomes `JsNode::Null`,
+            // which breaks constructor state-field dedup and `is_safe_identifier`.
+            let start = offset + member.span.start as usize;
+            let end = offset + member.span.end as usize;
+            let object =
+                convert_expression_for_program(arena, &member.object, offset, line_offsets);
+            let prop_start = offset + member.field.span.start as usize;
+            let prop_end = offset + member.field.span.end as usize;
+            JsNode::MemberExpression {
+                start: start as u32,
+                end: end as u32,
+                loc: create_typed_loc(start, end, line_offsets),
+                object: arena.alloc_js_node(expr_to_node(object)),
+                property: arena.alloc_js_node(JsNode::PrivateIdentifier {
+                    start: prop_start as u32,
+                    end: prop_end as u32,
+                    loc: create_typed_loc(prop_start, prop_end, line_offsets),
+                    name: CompactString::from(member.field.name.as_str()),
+                }),
+                computed: false,
+                optional: member.optional,
+            }
+        }
         _ => JsNode::Null,
     }
 }
 
-/// Convert an AssignmentTargetMaybeDefault to JSON (no -1 offset adjustment).
+/// Convert an AssignmentTargetMaybeDefault to a typed `JsNode` (no -1 offset
+/// adjustment). A `WithDefault` becomes an `AssignmentPattern`; a bare target
+/// delegates to `convert_assignment_target_for_program`.
 fn convert_assignment_target_maybe_default_for_program(
     arena: &ParseArena,
     target: &oxc_ast::ast::AssignmentTargetMaybeDefault,
     offset: usize,
     line_offsets: &[usize],
-) -> Value {
+) -> JsNode {
     use oxc_ast::ast::AssignmentTargetMaybeDefault;
 
     match target {
@@ -8867,40 +10119,29 @@ fn convert_assignment_target_maybe_default_for_program(
             let start = offset + with_default.span.start as usize;
             let end = offset + with_default.span.end as usize;
 
-            let mut obj = Map::new();
-            obj.insert(
-                "type".to_string(),
-                Value::String("AssignmentPattern".to_string()),
-            );
-            obj.insert("start".to_string(), Value::Number((start as i64).into()));
-            obj.insert("end".to_string(), Value::Number((end as i64).into()));
-            if let Some(loc) = create_loc(start, end, line_offsets) {
-                obj.insert("loc".to_string(), loc);
-            }
-            obj.insert(
-                "left".to_string(),
-                convert_assignment_target_for_program(
+            JsNode::AssignmentPattern {
+                start: start as u32,
+                end: end as u32,
+                loc: create_typed_loc(start, end, line_offsets),
+                left: arena.alloc_js_node(convert_assignment_target_for_program(
                     arena,
                     &with_default.binding,
                     offset,
                     line_offsets,
-                )
-                .to_value(),
-            );
-            obj.insert(
-                "right".to_string(),
-                convert_expression_for_program(arena, &with_default.init, offset, line_offsets)
-                    .as_json()
-                    .clone(),
-            );
-
-            Value::Object(obj)
+                )),
+                right: arena.alloc_js_node(expr_to_node(convert_expression_for_program(
+                    arena,
+                    &with_default.init,
+                    offset,
+                    line_offsets,
+                ))),
+            }
         }
         _ => {
             if let Some(inner) = target.as_assignment_target() {
-                convert_assignment_target_for_program(arena, inner, offset, line_offsets).to_value()
+                convert_assignment_target_for_program(arena, inner, offset, line_offsets)
             } else {
-                Value::Null
+                JsNode::Null
             }
         }
     }
@@ -9026,13 +10267,9 @@ pub fn parse_binding_pattern(
                 ));
             }
 
-            return Ok(Expression::Value(convert_binding_pattern_with_adjustment(
-                arena,
-                &decl.id,
-                offset,
-                4,
-                line_offsets,
-            )));
+            return Ok(Expression::from_json(
+                convert_binding_pattern_with_adjustment(arena, &decl.id, offset, 4, line_offsets),
+            ));
         }
 
         // Fallback: return as simple identifier
@@ -9678,6 +10915,55 @@ fn convert_expression_with_adjustment(
             obj.insert("object".to_string(), object);
             obj.insert("property".to_string(), property);
             obj.insert("computed".to_string(), Value::Bool(true));
+            obj.insert("optional".to_string(), Value::Bool(member.optional));
+            Value::Object(obj)
+        }
+        OxcExpression::PrivateFieldExpression(member) => {
+            // `this.#field` — without this arm the object falls through to the
+            // `unknown` identifier fallback, defeating `is_safe_identifier` in
+            // 2-analyze. Build a MemberExpression with a PrivateIdentifier
+            // property (binding-offset convention: `doc_offset + span - prefix_len`).
+            let start = doc_offset + member.span.start as usize - prefix_len;
+            let end = doc_offset + member.span.end as usize - prefix_len;
+            let object = convert_expression_with_adjustment(
+                arena,
+                &member.object,
+                doc_offset,
+                prefix_len,
+                line_offsets,
+            );
+            let prop_start = doc_offset + member.field.span.start as usize - prefix_len;
+            let prop_end = doc_offset + member.field.span.end as usize - prefix_len;
+            let mut prop = Map::new();
+            prop.insert(
+                "type".to_string(),
+                Value::String("PrivateIdentifier".to_string()),
+            );
+            prop.insert(
+                "start".to_string(),
+                Value::Number((prop_start as i64).into()),
+            );
+            prop.insert("end".to_string(), Value::Number((prop_end as i64).into()));
+            if let Some(loc) = create_loc_for_binding(prop_start, prop_end, line_offsets) {
+                prop.insert("loc".to_string(), loc);
+            }
+            prop.insert(
+                "name".to_string(),
+                Value::String(member.field.name.as_str().to_string()),
+            );
+            let mut obj = Map::new();
+            obj.insert(
+                "type".to_string(),
+                Value::String("MemberExpression".to_string()),
+            );
+            obj.insert("start".to_string(), Value::Number((start as i64).into()));
+            obj.insert("end".to_string(), Value::Number((end as i64).into()));
+            if let Some(loc) = create_loc_for_binding(start, end, line_offsets) {
+                obj.insert("loc".to_string(), loc);
+            }
+            obj.insert("object".to_string(), object);
+            obj.insert("property".to_string(), Value::Object(prop));
+            obj.insert("computed".to_string(), Value::Bool(false));
             obj.insert("optional".to_string(), Value::Bool(member.optional));
             Value::Object(obj)
         }

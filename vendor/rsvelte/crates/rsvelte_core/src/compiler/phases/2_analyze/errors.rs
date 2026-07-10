@@ -429,7 +429,7 @@ pub fn block_unexpected_character(expected: &str) -> AnalysisError {
 pub fn each_key_without_as() -> AnalysisError {
     error(
         "each_key_without_as",
-        "`{#each}` block with a key requires an `as` binding",
+        "An `{#each ...}` block without an `as` clause cannot have a key",
     )
 }
 
@@ -855,6 +855,14 @@ pub fn legacy_export_invalid() -> AnalysisError {
     error(
         "legacy_export_invalid",
         "Cannot use `export let` in runes mode — use `$props()` instead\nhttps://svelte.dev/e/legacy_export_invalid",
+    )
+}
+
+/// `$:` is not allowed in runes mode, use `$derived` or `$effect` instead
+pub fn legacy_reactive_statement_invalid() -> AnalysisError {
+    error(
+        "legacy_reactive_statement_invalid",
+        "`$:` is not allowed in runes mode, use `$derived` or `$effect` instead\nhttps://svelte.dev/e/legacy_reactive_statement_invalid",
     )
 }
 

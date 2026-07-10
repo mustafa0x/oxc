@@ -2,10 +2,9 @@
 
 Date: 2026-07-10
 
-Status: implementation and local verification complete on the `svelte` branch.
-The native Cargo backend, oxlint cutover, oxfmt runtime cutover, and npm package
-artifacts are verified for every publish target. The branch remains local and
-must not be pushed until explicitly requested.
+Status: latest rsvelte source integrated and Kunuz acceptance complete on the
+`svelte` branch. Full Rust and Node/NAPI build and test verification passes. The
+branch remains local and must not be pushed until explicitly requested.
 
 Repos:
 
@@ -60,7 +59,8 @@ The local implementation now uses a single native backend:
 
 The vendored `rsvelte` source provides the pieces used by the adapter:
 
-- `svelte-compiler-rust` exposes `parse`, `parse_parallel`, `compile`,
+- `rsvelte_core` (aliased as `svelte-compiler-rust` at the workspace boundary)
+  exposes `parse`, `parse_parallel`, `compile`,
   `compile_module`, `print`, and `svelte2tsx`.
 - `rsvelte_formatter` formats Svelte source in-process using rsvelte parsing and
   `oxc_formatter` for JS/TS expressions and script bodies.
@@ -71,16 +71,16 @@ Current formatter boundaries:
 
 - JS/TS module and instance scripts are formatted with Oxc, including imports,
   TypeScript, and Svelte runes.
-- `svelteIndentScriptAndStyle` controls script-body indentation; Rukn's existing
-  `false` configuration is covered by API and real-project smoke tests.
+- `svelteIndentScriptAndStyle` controls script and style indentation; Kunuz's
+  `false` configuration is covered by a real-project smoke test.
 - Template expressions, block expressions, typed snippet parameters,
   destructuring patterns, and whitespace-only indentation are formatted.
-- Element open tags and attributes are preserved verbatim. The vendored
-  open-tag rewrite is intentionally disabled because real-project validation
-  found destructive range handling for self-closing components and attributes.
-- `<style>` bodies, `{@const}` bodies, non-whitespace text, and
-  whitespace-sensitive elements are preserved verbatim when no dedicated
-  formatter exists.
+- Element open tags and attributes support shorthand, one-attribute-per-line,
+  and bracket placement options.
+- Section ordering and embedded CSS formatting use the native rsvelte and Oxc
+  formatter implementations.
+- Non-whitespace text and whitespace-sensitive elements remain conservative
+  where rsvelte has no dedicated rewrite.
 - Formatted real-project copies must reparse and be idempotent; preserving an
   unsupported span is preferred over speculative rewriting.
 
@@ -155,12 +155,13 @@ local path dependency as the final state.
 
 Current Phase 0 implementation decision:
 
-- Vendor the two required crates from immutable `mustafa0x/rsvelte` commit
-  `672bb074` under `vendor/rsvelte` and consume them by path. Local, CI, and
+- Vendor the three required crates from immutable `mustafa0x/rsvelte` commit
+  `93eac0b77c5fb3bef56a91bfde0b6fc9e939d623` under `vendor/rsvelte` and consume
+  them by path. Local, CI, and
   release builds use the same source without a sibling checkout, Git submodule,
   or rsvelte's unrelated apps, tests, and nested repositories.
-- Add Cargo patches in this Oxc workspace so rsvelte's `oxc_*` dependencies and
-  git-pinned formatter dependencies resolve to this checkout's local crates.
+- Point the vendored manifests directly at this checkout's `oxc_*` crates so
+  parser, AST, semantic, codegen, and formatter types remain unified.
 - Keep the adapter behind an explicit Cargo feature, enabled by default in the
   product crates that ship native Svelte support.
 - Update the pinned rsvelte revision deliberately and validate the unified Cargo
@@ -458,11 +459,11 @@ Current implementation decision:
   workflow are removed.
 - Native CLI, API, stdin, walk, and LSP tests remain. Migration tests verify
   that `prettier-plugin-svelte` is dropped with a warning.
-- Unsupported open-tag/attribute, style, const-tag, and whitespace-sensitive
-  text spans are preserved. Real-project regression tests prove formatted
-  output reparses and no internal sentinel text leaks into output.
-- Section sort order and shorthand settings remain accepted compatibility
-  inputs but preserve their corresponding source spans.
+- Native open-tag/attribute layout, section sorting, shorthand, embedded CSS,
+  and script/style indentation are enabled. Real-project regression tests prove
+  formatted output reparses, is idempotent, and leaks no internal sentinel text.
+- Whitespace-sensitive text remains conservative where rsvelte has no dedicated
+  rewrite.
 
 ## Phase 5: API, LSP, stdin, and walk integration
 
@@ -488,7 +489,7 @@ Current status:
   strategy and pass without a resolvable Svelte plugin.
 - Linter CLI walking and LSP diagnostics use the native parser gate. Oxlint has
   no stdin lint CLI surface; this item is not applicable unless one is added.
-- Real-project CLI checks cover both Rukn and rsvelte's playground. Node API and
+- Real-project CLI checks cover Kunuz and rsvelte's formatter suite. Node API and
   LSP behavior are covered by repository tests rather than by modifying those
   sibling projects.
 
@@ -595,9 +596,9 @@ in `docs/rsvelte-lint-coverage.md`.
 
 Real project smoke tests:
 
-- `../rukn`
-- `../rsvelte/apps/playground`
-- at least one larger Svelte app if available
+- `../kunuz`
+- rsvelte's formatter regression suite
+- another large Svelte app when expanding formatter coverage
 
 For each project:
 
@@ -608,7 +609,7 @@ For each project:
 
 Real-project pass criteria and current evidence:
 
-- Formatter: representative copies from Rukn and rsvelte's playground format,
+- Formatter: a disposable Kunuz copy and rsvelte's regression fixtures format,
   reparse with zero errors, contain no formatter sentinel text, and pass an
   idempotent `--check`. Original sibling worktrees are never modified.
 - Linter: compare native rsvelte diagnostics against the previous JS-backed
@@ -619,13 +620,17 @@ Real-project pass criteria and current evidence:
   native `.svelte` path.
 - LSP/stdin/API: test at least one representative `.svelte` file through each
   entrypoint, not only through recursive CLI file walking.
+- Repository validation: `cargo test --all-features`, `pnpm run build-test`, and
+  `pnpm test` pass. The rsvelte adapter also passes Clippy with all targets and
+  features under `-D warnings`.
 
 ## Risk register
 
 Dependency skew:
 
-The required rsvelte crates are vendored at immutable revision `672bb074` and
-Cargo patches unify every used Oxc dependency with this workspace. Future pin
+The required rsvelte crates are vendored at immutable revision
+`93eac0b77c5fb3bef56a91bfde0b6fc9e939d623`, and their manifests point every
+used Oxc dependency at this workspace. Future pin
 updates must repeat the dependency audit and native regression suite.
 
 AST compatibility:
@@ -637,10 +642,9 @@ be implemented through rsvelte diagnostics or native Rust rules.
 
 Formatter completeness:
 
-`rsvelte_formatter` is not behavior-compatible with `prettier-plugin-svelte`.
-Unsupported spans are intentionally preserved, and the destructive open-tag
-rewrite is disabled. Every expansion of native formatting scope must include
-reparse and idempotence tests against real components.
+`rsvelte_formatter` is not byte-for-byte compatible with
+`prettier-plugin-svelte`. Every expansion of native formatting scope must
+include reparse and idempotence tests against real components.
 
 Source locations:
 
@@ -663,9 +667,18 @@ because the local host cannot execute PE binaries.
 
 Performance:
 
-The rsvelte path should be faster than JS package fallbacks, but adapter
-conversion can erase those gains if it serializes large ASTs through JSON or
-duplicates source text.
+Warmed process-level benchmarks against Awn's previous fork packages used the
+same checkout, configuration, arguments, and file sets:
+
+- Oxfmt `0.58.0` with rsvelte formatted the same 94 Svelte files in 157 ms on
+  average, versus 789 ms for plugin-backed Oxfmt `0.44.0` (5.0x faster).
+- Oxlint `1.73.0` linted the same 133 files in 665 ms on average, versus 1.60 s
+  for Oxlint `1.59.0` (2.4x faster); both produced zero diagnostics.
+
+The current packages used the coverage build profile for these measurements,
+while the installed previous packages were release builds. Native release
+artifacts should therefore be measured again after publication, but the result
+already rules out a performance regression from the rsvelte adapter.
 
 ## Release follow-up
 
@@ -681,11 +694,11 @@ duplicates source text.
 - [x] `oxfmt` formats `.svelte` without `prettier-plugin-svelte`.
 - [x] `oxlint` parses `.svelte` without `svelte-eslint-parser`.
 - [x] `.svelte` lint and format use the native backend through applicable CLI,
-  API, stdin, walk, and LSP surfaces.
+      API, stdin, walk, and LSP surfaces.
 - [x] Supported disable directives, comments, and diagnostics retain source
-  locations. Template-node fixes/suggestions are an accepted dropped surface.
+      locations. Template-node fixes/suggestions are an accepted dropped surface.
 - [x] npm packages build for every publish target with the rsvelte backend
-  included and pass artifact inspection.
+      included and pass artifact inspection.
 - [x] Representative real Svelte project smoke tests pass on formatted copies.
 - [x] Remaining behavior differences from Prettier or ESLint are documented as
-  intentional rsvelte/Oxc behavior, not accidental fallback gaps.
+      intentional rsvelte/Oxc behavior, not accidental fallback gaps.

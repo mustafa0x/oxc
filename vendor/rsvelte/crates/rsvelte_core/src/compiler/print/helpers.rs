@@ -4,6 +4,7 @@
 //! such as formatting blocks and handling attributes.
 
 use super::Context;
+use std::fmt::Write as _;
 
 /// Threshold for when content should be formatted on separate lines.
 ///
@@ -825,20 +826,6 @@ pub fn source_expression_to_string(
                     }
                 }
             }
-            crate::ast::js::Expression::Value(val) => {
-                // Extract start/end from JSON value
-                let start = val
-                    .get("start")
-                    .and_then(|s| s.as_u64())
-                    .map(|n| n as usize);
-                let end = val.get("end").and_then(|e| e.as_u64()).map(|n| n as usize);
-                if let (Some(start), Some(end)) = (start, end)
-                    && start < end
-                    && end <= src.len()
-                {
-                    return src[start..end].to_string();
-                }
-            }
             crate::ast::js::Expression::Lazy { .. } => {
                 panic!("Expression::Lazy must be resolved before printing");
             }
@@ -1299,7 +1286,7 @@ fn format_export_declaration(stmt: &serde_json::Value) -> String {
                 if exported == local {
                     result.push_str(&exported);
                 } else {
-                    result.push_str(&format!("{local} as {exported}"));
+                    let _ = write!(result, "{local} as {exported}");
                 }
             }
             result.push_str(" }");

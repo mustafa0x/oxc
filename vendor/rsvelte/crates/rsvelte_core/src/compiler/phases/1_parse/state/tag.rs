@@ -40,151 +40,136 @@ impl Parser<'_> {
         // whitespace. Peek at the next bytes to detect `let ` / `const `;
         // require a trailing whitespace / line-ending byte so we don't
         // accidentally swallow `{letter}` or `{constant}` expressions.
-        fn is_kw_terminator(b: u8) -> bool {
-            matches!(b, b' ' | b'\t' | b'\n' | b'\r')
-        }
+        let decl_start = self.index;
 
-        // Reject `var`/`interface`/`enum` declarations and certain `type`
-        // forms outright with `declaration_tag_invalid_type` (mirrors the
-        // upstream `regex_unsupported_declaration` check in #18282 +
-        // #18321). The bare `{type}` expression and other operator-prefixed
-        // `type …` patterns continue to fall through to the expression-tag
-        // parser.
-        let kw_terminator_at = |off: usize| {
+        // The keyword must be followed by whitespace to open a declaration tag
+        // (`{let ` / `{const ` / `{type `), so `{letter}` / `{constant}` /
+        // `{type}` stay expression tags and contrived calls like `{let(x)}`
+        // remain expressions rather than malformed declarations. (Upstream uses
+        // a `\b` word boundary and then parses to disambiguate; requiring
+        // whitespace reaches the same result for every real-world tag without a
+        // statement parse.)
+        let kw_terminated_at = |off: usize| {
             self.bytes
                 .get(self.index + off)
                 .copied()
-                .is_some_and(is_kw_terminator)
+                .is_some_and(|b| matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
         };
-        if (self.match_str("var") && kw_terminator_at(3))
-            || (self.match_str("interface") && kw_terminator_at(9))
-            || (self.match_str("enum") && kw_terminator_at(4))
-            || (self.match_str("type") && kw_terminator_at(4) && {
-                // Skip past `type` + whitespace and peek at the next
-                // non-whitespace byte. If it's a "type expression
-                // starter" character (identifier / `{` / `[` / `"` /
-                // `'`), this looks like a TS-style `type Foo = ...`
-                // declaration and we should emit the error. Operator-
-                // prefixed `type ?…` / `type .x` / `type ()` / etc.
-                // fall through to the regular expression-tag parser.
-                let mut p = self.index + 4;
-                while self.bytes.get(p).copied().is_some_and(is_kw_terminator) {
-                    p += 1;
-                }
-                let next = self.bytes.get(p).copied();
-                matches!(
-                    next,
-                    Some(b) if b.is_ascii_alphabetic() || b == b'_' || b == b'$'
-                )
-            })
+
+        // `var` / `interface` / `enum` are reserved words that can never be a
+        // valid declaration tag — error immediately with the keyword span
+        // (mirrors upstream `regex_unsupported_declaration`).
+        if (self.match_str("var") && kw_terminated_at(3))
+            || (self.match_str("interface") && kw_terminated_at(9))
+            || (self.match_str("enum") && kw_terminated_at(4))
         {
-            // Find end of the unsupported keyword for the error span.
             let kw_len = if self.match_str("var") {
                 3
-            } else if self.match_str("enum") || self.match_str("type") {
+            } else if self.match_str("enum") {
                 4
             } else {
                 9
             };
-            let kw_end = self.index + kw_len;
             return Err(crate::error::ParseError::svelte(
                 "declaration_tag_invalid_type",
                 "Declaration tags must be `let` or `const` declarations",
-                (self.index, kw_end),
+                (decl_start, decl_start + kw_len),
             ));
         }
 
-        let (kind, kw_len) = if self.match_str("let") && kw_terminator_at(3) {
-            ("let", 3usize)
-        } else if self.match_str("const") && kw_terminator_at(5) {
-            ("const", 5usize)
-        } else {
+        // A supported `let` / `const` declaration, or a `type` keyword that
+        // *might* be a TS type-alias declaration (confirmed below from the
+        // body). Anything else is not a declaration tag — return `Ok(None)`
+        // with `self.index` untouched so the expression-tag parser re-reads it.
+        let is_const = self.match_str("const") && kw_terminated_at(5);
+        let is_let = self.match_str("let") && kw_terminated_at(3);
+        let is_maybe_type = self.match_str("type") && kw_terminated_at(4);
+        if !is_let && !is_const && !is_maybe_type {
             return Ok(None);
+        }
+        let kind = if is_const { "const" } else { "let" };
+        let kw_len = if is_const {
+            5
+        } else if is_let {
+            3
+        } else {
+            4
         };
 
-        let decl_start = self.index;
-        self.index += kw_len;
+        // Find the matching `}` for the tag. `find_matching_bracket` correctly
+        // skips `}` inside strings, regexes, division operators, and comments,
+        // and bails to `None` on an unterminated tag (e.g. `{let x = a /`),
+        // where the previous hand-rolled brace walk would silently succeed.
+        let body_end = match find_matching_bracket(self.source, start + 1, '{') {
+            Some(p) => p,
+            None => {
+                // Unterminated declaration tag: upstream rethrows the parse
+                // error in both strict and loose mode, surfacing as
+                // `unexpected_eof` at the end of the input (Svelte 5.56.1
+                // #18350).
+                return Err(crate::error::ParseError::svelte(
+                    "unexpected_eof",
+                    "Unexpected end of input",
+                    (self.source.len(), self.source.len()),
+                ));
+            }
+        };
+
+        // Disambiguate a `type` keyword (Svelte 5.56.1 #18330). A TS type-alias
+        // declaration is `type <Identifier> … = …`: the first non-whitespace
+        // byte after `type` starts an identifier AND there is a top-level
+        // assignment `=` in the body. Otherwise `type` is an ordinary
+        // identifier expression (`{type}`, `type instanceof X`, `type === y`,
+        // …) and the tag is a regular expression tag. Upstream confirms this by
+        // parsing the body; we use the same structural shape so identifier
+        // expressions are not misclassified as malformed declarations.
+        if is_maybe_type {
+            let body_after = &self.source[decl_start + 4..body_end];
+            let ident_next = body_after
+                .trim_start()
+                .as_bytes()
+                .first()
+                .copied()
+                .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_' || b == b'$');
+            let has_assignment = find_top_level_assignment(body_after).is_some();
+            if !(ident_next && has_assignment) {
+                return Ok(None);
+            }
+            // Genuine `type Foo = …` alias → invalid declaration tag. The span
+            // covers the whole declaration (trailing whitespace trimmed),
+            // mirroring upstream's `{ start: declaration.start, end:
+            // declaration.end }`.
+            let decl_text_end = decl_start + self.source[decl_start..body_end].trim_end().len();
+            return Err(crate::error::ParseError::svelte(
+                "declaration_tag_invalid_type",
+                "Declaration tags must be `let` or `const` declarations",
+                (decl_start, decl_text_end),
+            ));
+        }
+
+        // Committed to a `let` / `const` declaration tag.
+        self.index = decl_start + kw_len;
         self.skip_whitespace();
         let body_start = self.index;
-
-        // Scan to the matching closing `}` of the tag, respecting nested
-        // braces inside object patterns / template literals / strings —
-        // mirrors the brace-walk used by the `{@const}` reader above.
-        let mut brace_depth = 0i32;
-        let mut in_string = false;
-        let mut string_char = '\0';
-        let mut prev_char = '\0';
-        while !self.is_eof() {
-            let c = self.current_char();
-            if in_string {
-                if c == string_char && prev_char != '\\' {
-                    in_string = false;
-                }
-                prev_char = c;
-                self.advance();
-                continue;
-            }
-            if c == '"' || c == '\'' || c == '`' {
-                in_string = true;
-                string_char = c;
-                prev_char = c;
-                self.advance();
-                continue;
-            }
-            if c == '{' {
-                brace_depth += 1;
-            } else if c == '}' {
-                if brace_depth == 0 {
-                    break;
-                }
-                brace_depth -= 1;
-            }
-            prev_char = c;
-            self.advance();
-        }
-
-        let body_end = self.index;
         let body_text = self.source[body_start..body_end].trim_end();
+        self.index = body_end;
         self.advance(); // consume `}`
 
-        // Split at the first top-level `=` (skipping `==`, `===`, `!=`,
-        // `!==`, `<=`, `>=`, `=>`) — same ASCII-byte walk as the
-        // `{@const}` reader so destructuring patterns are handled
-        // correctly.
-        let mut depth = 0i32;
-        let mut in_string_b = false;
-        let mut string_b = 0u8;
-        let mut first_equals: Option<usize> = None;
-        let bytes = body_text.as_bytes();
-        let mut i = 0;
-        while i < bytes.len() {
-            let c = bytes[i];
-            if in_string_b {
-                if c == string_b && (i == 0 || bytes[i - 1] != b'\\') {
-                    in_string_b = false;
-                }
-                i += 1;
-                continue;
-            }
-            if c == b'"' || c == b'\'' || c == b'`' {
-                in_string_b = true;
-                string_b = c;
-                i += 1;
-                continue;
-            }
-            if c == b'(' || c == b'[' || c == b'{' {
-                depth += 1;
-            } else if c == b')' || c == b']' || c == b'}' {
-                depth -= 1;
-            } else if c == b'=' && first_equals.is_none() && depth == 0 {
-                let next = bytes.get(i + 1).copied().unwrap_or(0);
-                let prev = if i > 0 { bytes[i - 1] } else { 0 };
-                if next != b'=' && next != b'>' && prev != b'!' && prev != b'<' && prev != b'>' {
-                    first_equals = Some(i);
-                }
-            }
-            i += 1;
+        // Multiple declarators (`{let a = $state(0), b = $derived(a * 2)}`,
+        // Svelte 5.56.1 #18348): split the body on top-level commas and build
+        // one declarator per segment so a later declarator can reference an
+        // earlier one.
+        let segments = split_top_level_commas(body_text);
+        if segments.len() > 1 {
+            let owned: Vec<(usize, String)> =
+                segments.iter().map(|(o, s)| (*o, s.to_string())).collect();
+            return Ok(Some(self.build_multi_declarator_tag(
+                start, decl_start, body_start, body_end, kind, &owned,
+            )));
         }
+
+        // Single declarator: split at the first top-level assignment `=`.
+        let first_equals = find_top_level_assignment(body_text);
 
         // The body must contain an assignment with an initializer — upstream
         // emits `declaration_tag_invalid_type` in strict mode, and falls back
@@ -194,6 +179,26 @@ impl Parser<'_> {
             Some(i) => i,
             None => {
                 if !self.options.loose {
+                    // Upstream `read_declaration()` parses the tag body as a
+                    // statement with acorn and rethrows the failure in strict
+                    // mode (`if (!parser.loose) throw error;`), so a body
+                    // that doesn't parse (e.g. `{let }`) surfaces as
+                    // `js_parse_error` — only a parseable statement that
+                    // isn't a `let`/`const` declaration becomes
+                    // `declaration_tag_invalid_type`.
+                    let stmt_text = self.source[decl_start..body_end].trim_end();
+                    if let Some((msg, pos)) =
+                        super::super::read::expression::check_js_statement_parse_error(
+                            stmt_text, self.ts,
+                        )
+                    {
+                        let abs = decl_start + pos.min(stmt_text.len());
+                        return Err(crate::error::ParseError::svelte(
+                            "js_parse_error",
+                            msg,
+                            (abs, abs),
+                        ));
+                    }
                     return Err(crate::error::ParseError::svelte(
                         "declaration_tag_invalid_type",
                         "Declaration tags can only contain `let` or `const` variable declarations",
@@ -247,7 +252,8 @@ impl Parser<'_> {
                     "end".to_string(),
                     serde_json::Value::Number(empty_pos.into()),
                 );
-                let declaration_expr = Expression::Value(serde_json::Value::Object(declaration));
+                let declaration_expr =
+                    Expression::from_json(serde_json::Value::Object(declaration));
                 return Ok(Some(TemplateNode::DeclarationTag(Box::new(
                     DeclarationTag {
                         start: start as u32,
@@ -315,7 +321,7 @@ impl Parser<'_> {
                 DeclarationTag {
                     start: start as u32,
                     end: self.index as u32,
-                    declaration: Expression::Value(serde_json::Value::Object(declaration)),
+                    declaration: Expression::from_json(serde_json::Value::Object(declaration)),
                     metadata: Default::default(),
                 },
             ))));
@@ -340,7 +346,35 @@ impl Parser<'_> {
             + eq_idx
             + 1
             + (body_text[eq_idx + 1..].len() - body_text[eq_idx + 1..].trim_start().len());
-        let init_expr = self.parse_js_expression(init_str, init_offset);
+        // In loose mode an initializer that is not a complete expression
+        // (e.g. `a /`) cannot be parsed. Upstream always parses the declaration
+        // statement with acorn (non-loose); only the *fallback* is loose. So
+        // validate the init the same way (`loose = false`) and, on failure,
+        // synthesize a single empty-name declarator at the closing brace
+        // (Svelte 5.56.1 #18353/#18330) instead of emitting a half-parsed loose
+        // identifier.
+        let init_expr = if self.options.loose {
+            match super::super::expression::parse_expression(
+                &self.arena,
+                init_str,
+                init_offset,
+                self.expression_line_offsets(),
+                self.source,
+                false,
+                false,
+                '{',
+                self.ts,
+            ) {
+                Ok(expr) => expr,
+                Err(_) => {
+                    return Ok(Some(build_empty_loose_declaration(
+                        start, self.index, decl_start, body_end, kind,
+                    )));
+                }
+            }
+        } else {
+            self.parse_js_expression(init_str, init_offset)
+        };
 
         let declaration = build_kind_variable_declaration(
             &self.arena,
@@ -359,6 +393,108 @@ impl Parser<'_> {
                 metadata: Default::default(),
             },
         ))))
+    }
+
+    /// Build a `DeclarationTag` whose declaration has multiple declarators
+    /// (`{let a = $state(0), b = $derived(a * 2)}`). The body has already been
+    /// split into top-level-comma segments; each segment is `pattern = init`
+    /// (or a bare `pattern`). Mirrors upstream parsing the whole
+    /// `VariableDeclaration` statement at once (Svelte 5.56.1 #18348).
+    fn build_multi_declarator_tag(
+        &mut self,
+        start: usize,
+        decl_start: usize,
+        body_start: usize,
+        body_end: usize,
+        kind: &str,
+        segments: &[(usize, String)],
+    ) -> TemplateNode {
+        use serde_json::{Map, Value};
+
+        let mut declarators: Vec<Value> = Vec::with_capacity(segments.len());
+        for (seg_off, raw) in segments {
+            let lead = raw.len() - raw.trim_start().len();
+            let seg = raw.trim();
+            if seg.is_empty() {
+                continue;
+            }
+            let seg_off = body_start + seg_off + lead;
+
+            let (pattern_str, init_str, init_off) = match find_top_level_assignment(seg) {
+                Some(eq) => {
+                    let init_lead = seg[eq + 1..].len() - seg[eq + 1..].trim_start().len();
+                    (
+                        seg[..eq].trim().to_string(),
+                        seg[eq + 1..].trim().to_string(),
+                        seg_off + eq + 1 + init_lead,
+                    )
+                }
+                None => (seg.to_string(), String::new(), seg_off + seg.len()),
+            };
+
+            let pattern_clean = strip_type_annotation(&pattern_str);
+            let pattern_expr = if pattern_clean.starts_with('{') || pattern_clean.starts_with('[') {
+                super::super::read::expression::parse_destructuring_pattern(
+                    &self.arena,
+                    &pattern_clean,
+                    seg_off,
+                    self.expression_line_offsets(),
+                )
+                .unwrap_or_else(|| self.parse_js_expression(&pattern_clean, seg_off))
+            } else {
+                self.parse_js_expression(&pattern_clean, seg_off)
+            };
+
+            let init_value: Value = if init_str.is_empty() {
+                Value::Null
+            } else {
+                let init_expr = self.parse_js_expression(&init_str, init_off);
+                crate::ast::arena::with_serialize_arena(&self.arena, || init_expr.as_json()).clone()
+            };
+            let pattern_value: Value =
+                crate::ast::arena::with_serialize_arena(&self.arena, || pattern_expr.as_json())
+                    .clone();
+
+            let id_start = pattern_value
+                .get("start")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(seg_off as u64);
+            let decl_end = init_value
+                .get("end")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(id_start + seg.len() as u64);
+
+            let mut declarator = Map::new();
+            declarator.insert(
+                "type".to_string(),
+                Value::String("VariableDeclarator".to_string()),
+            );
+            declarator.insert("id".to_string(), pattern_value);
+            declarator.insert("init".to_string(), init_value);
+            declarator.insert("start".to_string(), Value::Number((id_start as i64).into()));
+            declarator.insert("end".to_string(), Value::Number((decl_end as i64).into()));
+            declarators.push(Value::Object(declarator));
+        }
+
+        let mut declaration = Map::new();
+        declaration.insert(
+            "type".to_string(),
+            Value::String("VariableDeclaration".to_string()),
+        );
+        declaration.insert("kind".to_string(), Value::String(kind.to_string()));
+        declaration.insert("declarations".to_string(), Value::Array(declarators));
+        declaration.insert(
+            "start".to_string(),
+            Value::Number((decl_start as i64).into()),
+        );
+        declaration.insert("end".to_string(), Value::Number((body_end as i64).into()));
+
+        TemplateNode::DeclarationTag(Box::new(DeclarationTag {
+            start: start as u32,
+            end: self.index as u32,
+            declaration: Expression::from_json(Value::Object(declaration)),
+            metadata: Default::default(),
+        }))
     }
 
     /// Parse a mustache expression.
@@ -461,12 +597,13 @@ impl Parser<'_> {
     /// block — in which case the marker is left intact for an outer block to
     /// consume (best-effort recovery).
     fn expect_block_close(&mut self, keyword: &str) -> ParseResult<bool> {
-        // No close marker present (e.g. EOF): nothing to consume.
-        if !self.match_str("{/") {
+        // No close marker present (e.g. EOF): nothing to consume. Whitespace
+        // between `{` and `/` is allowed (upstream `allow_whitespace()`).
+        let Some(slash_pos) = self.match_block_close_marker() else {
             return Ok(false);
-        }
+        };
         let checkpoint = self.index;
-        self.advance_by(2); // consume '{/'
+        self.index = slash_pos + 1; // consume '{' + whitespace + '/'
 
         // Require the exact block keyword. `eat(keyword, true, false)` errors in
         // strict mode on a mismatch and returns false (without erroring) in
@@ -552,12 +689,13 @@ impl Parser<'_> {
 
     /// Parse {:else} or {:else if} blocks recursively
     pub fn parse_if_alternate(&mut self) -> ParseResult<Option<Fragment>> {
-        if !self.match_str("{:") {
+        // Whitespace between `{` and `:` is allowed (upstream `allow_whitespace()`).
+        let Some(colon_pos) = self.match_block_continuation_marker() else {
             return Ok(None);
-        }
+        };
 
         let else_block_start = self.index;
-        self.advance_by(2); // consume '{:'
+        self.index = colon_pos + 1; // consume '{' + whitespace + ':'
         self.skip_whitespace();
 
         if !self.eat_optional("else") {
@@ -603,7 +741,10 @@ impl Parser<'_> {
         } else {
             // {:else}
             self.skip_whitespace(); // Handle {:else } with space before }
-            self.eat_optional("}");
+            // Upstream: `parser.eat('}', true)` — anything other than `}`
+            // after `{:else` (e.g. `{:else +++if cond}`) is an
+            // `expected_token` error, in loose mode too.
+            self.eat("}", true, true)?;
             let alt_fragment = self.parse_fragment()?;
 
             // Don't consume {/if} here - let parse_if_block handle it
@@ -648,6 +789,23 @@ impl Parser<'_> {
     /// Syntax: {#each expression as context}...{:else}...{/each}
     /// Or: {#each expression as context, index}...{/each}
     /// Or: {#each expression as context (key)}...{/each}
+    /// Whether `self.index` (positioned on a whitespace byte) begins a
+    /// `WS* as WS` run — the `as` alias separator of an `{#each … as …}` header.
+    /// Tolerates arbitrary whitespace (incl. newlines) on both sides so a
+    /// newline-split header parses like a single-spaced one.
+    fn looks_like_as_separator(&self) -> bool {
+        let mut j = self.index;
+        while j < self.bytes.len() && self.bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        self.bytes.get(j) == Some(&b'a')
+            && self.bytes.get(j + 1) == Some(&b's')
+            && self
+                .bytes
+                .get(j + 2)
+                .is_some_and(|c| c.is_ascii_whitespace())
+    }
+
     pub fn parse_each_block(&mut self, start: usize) -> ParseResult<Option<TemplateNode>> {
         self.skip_whitespace();
 
@@ -705,11 +863,16 @@ impl Parser<'_> {
                     }
                     depth -= 1;
                 }
-                b' ' if depth == 0 && self.match_str(" as ") => {
+                // The alias separator is the `as` keyword bounded by whitespace.
+                // Match it across *arbitrary* whitespace (including newlines), so
+                // a newline-split header like `{#each\ncats\nas\n{ id }\n}` parses
+                // the same as `{#each cats as { id }}`. We trigger on the first
+                // whitespace byte of the run and skip the whole `WS* as` so it
+                // is not re-scanned; the rightmost top-level `as` wins.
+                _ if depth == 0 && b.is_ascii_whitespace() && self.looks_like_as_separator() => {
                     last_as = Some(self.index);
-                    // Skip past this ` as ` and keep scanning. If there's a
-                    // later top-level ` as `, that one's the alias separator.
-                    self.index += 4;
+                    self.skip_whitespace();
+                    self.index += 2; // consume `as`
                     continue;
                 }
                 _ => {}
@@ -738,7 +901,7 @@ impl Parser<'_> {
             // No "as" found - check for ", identifier" index syntax
             // For "{#each expr, index}", expr_content contains "expr, index"
 
-            let (final_expr, index_name, has_key) = {
+            let (final_expr, index_name, key) = {
                 let s = expr_content.to_string();
                 // Find the last top-level comma (not inside braces, brackets, or parens)
                 let mut depth = 0;
@@ -785,30 +948,51 @@ impl Parser<'_> {
                         };
 
                         if idx_name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                            // A key without an `as` clause (`{#each items, i (key)}`)
+                            // is invalid, but svelte raises `each_key_without_as`
+                            // in the 2-analyze EachBlock visitor, NOT the parser
+                            // (svelte2tsx, which skips analyze, still compiles it).
+                            // Parse the key so analyze can flag it and svelte2tsx
+                            // can emit it; the parser no longer errors here.
+                            let key_opt = if idx_has_key {
+                                let raw_slice = &self.source[expr_start..expr_end];
+                                let lead_ws = raw_slice.len() - raw_slice.trim_start().len();
+                                let base = expr_start + lead_ws;
+                                if let Some(rel_paren) = s[comma_pos + 1..].find('(') {
+                                    let key_start = base + comma_pos + 1 + rel_paren + 1;
+                                    let key_end =
+                                        find_matching_bracket(self.source, key_start, '(')
+                                            .unwrap_or(self.bytes.len());
+                                    let key_raw = &self.source[key_start..key_end];
+                                    let key_lead = key_raw.len() - key_raw.trim_start().len();
+                                    let key_content = key_raw.trim().to_string();
+                                    Some(self.parse_head_expression(
+                                        &key_content,
+                                        key_start + key_lead,
+                                        false,
+                                        ')',
+                                    )?)
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            };
                             (
                                 self.parse_js_expression(expr_part, expr_start),
                                 Some(CompactString::from(idx_name)),
-                                idx_has_key,
+                                key_opt,
                             )
                         } else {
-                            (expression, None, false)
+                            (expression, None, None)
                         }
                     } else {
-                        (expression, None, false)
+                        (expression, None, None)
                     }
                 } else {
-                    (expression, None, false)
+                    (expression, None, None)
                 }
             };
-
-            // Error if we have a key without "as" clause
-            if has_key {
-                return Err(crate::error::ParseError::svelte(
-                    "each_key_without_as",
-                    "An `{#each ...}` block without an `as` clause cannot have a key",
-                    (start, self.index),
-                ));
-            }
 
             // Consume the closing }
             if self.current_char() == '}' {
@@ -825,9 +1009,9 @@ impl Parser<'_> {
 
             // Check for {:else}
             let mut fallback = None;
-            if self.match_str("{:") {
+            if let Some(colon_pos) = self.match_block_continuation_marker() {
                 let continuation_start = self.index;
-                self.advance_by(2);
+                self.index = colon_pos + 1;
                 self.skip_whitespace();
                 if self.eat_optional("else") {
                     self.skip_whitespace();
@@ -857,15 +1041,19 @@ impl Parser<'_> {
                 expression: final_expr,
                 context: None, // No context when no "as" clause
                 index: index_name,
-                key: None,
+                key,
                 body,
                 fallback,
                 metadata: Default::default(),
             }))));
         }
 
-        // Consume " as "
-        self.advance_by(4);
+        // Consume the `as` keyword and the whitespace around it. `self.index`
+        // is at the start of the whitespace run preceding `as` (see
+        // `looks_like_as_separator`), which may be arbitrary whitespace
+        // (newline-split headers), so we can't assume a fixed-width ` as `.
+        self.skip_whitespace();
+        self.advance_by(2); // `as`
         self.skip_whitespace();
 
         // Parse the context (binding pattern)
@@ -1032,9 +1220,9 @@ impl Parser<'_> {
 
         // Check for {:else}
         let mut fallback = None;
-        if self.match_str("{:") {
+        if let Some(colon_pos) = self.match_block_continuation_marker() {
             let continuation_start = self.index;
-            self.advance_by(2);
+            self.index = colon_pos + 1;
             self.skip_whitespace();
             if self.eat_optional("else") {
                 self.skip_whitespace();
@@ -1345,8 +1533,8 @@ impl Parser<'_> {
         }
 
         // Check for {:then} or {:catch} intermediate clauses
-        while self.match_str("{:") {
-            self.advance_by(2);
+        while let Some(colon_pos) = self.match_block_continuation_marker() {
+            self.index = colon_pos + 1;
             self.skip_whitespace();
 
             if self.eat_optional("then") {
@@ -1555,8 +1743,13 @@ impl Parser<'_> {
             let params_content = &self.source[params_start..params_end];
 
             // Check for rest parameters (snippets don't support them)
-            // Look for ... at top level (not inside nested parens/brackets)
-            {
+            // Look for ... at top level (not inside nested parens/brackets).
+            // svelte raises this in the 2-analyze SnippetBlock visitor, NOT the
+            // parser — so svelte2tsx (parse-only) still COMPILES a snippet with
+            // a rest param. rsvelte keeps the parse-time check for the compiler
+            // (the compiler-errors fixture needs its position), but skips it in
+            // svelte2tsx mode (`script_ts`, set only by `parse_script_ts`).
+            if !self.script_ts {
                 let trimmed = params_content.trim();
                 let chars: Vec<char> = trimmed.chars().collect();
                 let mut depth = 0;
@@ -1585,6 +1778,36 @@ impl Parser<'_> {
 
             // Parse parameters with TypeScript type annotations
             if !params_content.trim().is_empty() {
+                // Upstream parses `${params} => {}` with `parse_expression_at`
+                // in the file's `parser.ts` mode (1-parse/state/tag.js), so
+                // TS annotations without `lang="ts"` raise `js_parse_error`.
+                // Probe (JS-only) before the lenient TS-stripping param
+                // parser below. Only probe when:
+                // - the file is NOT TypeScript: in TS mode acorn-typescript
+                //   is more lenient than OXC (it accepts `c?: number = 5`,
+                //   which OXC rejects), so an OXC probe would reject params
+                //   upstream compiles — keep the lenient path there;
+                // - the closing `)` was actually found (`depth == 0`): an
+                //   unclosed param list (`{#snippet a(hi{/snippet}`) surfaces
+                //   as `expected_token` downstream, matching upstream's
+                //   `parser.eat(')', true)`.
+                if !self.options.loose
+                    && !self.ts
+                    && depth == 0
+                    && let Some((msg, pos)) =
+                        super::super::read::expression::check_params_parse_error(
+                            params_content,
+                            false,
+                        )
+                {
+                    let abs = params_start + pos;
+                    return Err(crate::error::ParseError::svelte(
+                        "js_parse_error",
+                        msg,
+                        (abs, abs),
+                    ));
+                }
+
                 parameters = super::super::expression::parse_typescript_params(
                     &self.arena,
                     params_content,
@@ -1854,19 +2077,14 @@ impl Parser<'_> {
                 let expr_content = &self.source[expr_start..self.index];
                 self.advance(); // consume '}'
 
-                // Check for invalid call patterns (apply, bind, call)
+                // `render_tag_invalid_call_expression` (snippet via `.apply`/
+                // `.bind`/`.call`) is an ANALYSIS-phase error in official Svelte
+                // (`2-analyze/visitors/RenderTag.js`), NOT a parse error — the
+                // parser accepts the call expression. Our `2_analyze/visitors/
+                // render_tag.rs` performs the precise AST-based check, so we must
+                // not reject it here at parse time (svelte2tsx, which only parses,
+                // would otherwise diverge from official by erroring).
                 let trimmed = expr_content.trim();
-                if memchr::memmem::find(trimmed.as_bytes(), b".apply(").is_some()
-                    || memchr::memmem::find(trimmed.as_bytes(), b".bind(").is_some()
-                    || memchr::memmem::find(trimmed.as_bytes(), b".call(").is_some()
-                {
-                    return Err(crate::error::ParseError::svelte(
-                        "render_tag_invalid_call_expression",
-                        "Calling a snippet function using apply, bind or call is not allowed",
-                        (expr_start, expr_start),
-                    ));
-                }
-
                 let expression = self.parse_js_expression(trimmed, expr_start);
 
                 Ok(Some(TemplateNode::RenderTag(Box::new(RenderTag {
@@ -2030,16 +2248,23 @@ impl Parser<'_> {
                         + (trimmed[eq_idx + 1..].len() - trimmed[eq_idx + 1..].trim_start().len());
                     let init_expr = self.parse_js_expression(init_str, init_offset);
 
-                    // Build VariableDeclaration JSON node like the official compiler.
-                    // Use expr_start / expr_end so that the server-side handler
-                    // can still extract the original source text via
-                    // tag.declaration.start() / tag.declaration.end().
+                    // Position just past the initializer text (including any
+                    // wrapping parens) but before trailing whitespace — mirrors
+                    // upstream's `declarator_end = parser.index` captured right
+                    // after `read_expression` (Svelte 5.56.4), rather than the
+                    // bare `init.end` (which stops inside the parens).
+                    let declarator_end = init_offset + init_str.trim_end().len();
+                    // The VariableDeclaration starts at the `const` keyword
+                    // (`start + 2`, i.e. past the leading `{@`), matching
+                    // upstream's `start: start + 2 // start at const, not at @const`.
+                    let decl_keyword_start = start + 2;
                     build_const_variable_declaration(
                         &self.arena,
                         &pattern_expr,
                         &init_expr,
-                        expr_start,
+                        decl_keyword_start,
                         expr_end,
+                        declarator_end,
                     )
                 } else {
                     // No `=` found – fall back to parsing as a single expression
@@ -2099,7 +2324,7 @@ impl Parser<'_> {
                             {
                                 expressions
                                     .iter()
-                                    .map(|e| Expression::Value(e.clone()))
+                                    .map(|e| Expression::from_json(e.clone()))
                                     .collect()
                             } else {
                                 vec![expression]
@@ -2237,6 +2462,42 @@ impl Parser<'_> {
         self.parse_js_expression_internal(content, offset, false, '{')
     }
 
+    /// Like `parse_js_expression_strict`, but always parses eagerly (never
+    /// creates a `Lazy` expression). Used for attribute values, which may be
+    /// inspected at parse time (e.g. `<svelte:options runes={false} />`), so
+    /// they cannot be deferred — while still propagating `js_parse_error` for
+    /// invalid expressions like upstream's `read_expression`.
+    pub fn parse_js_expression_strict_eager(
+        &self,
+        content: &str,
+        offset: usize,
+    ) -> crate::error::ParseResult<Expression> {
+        // Adjust offset for leading whitespace that gets trimmed
+        let leading_ws = content.len() - content.trim_start().len();
+        let trimmed = content.trim();
+        let trimmed_offset = offset + leading_ws;
+        super::super::expression::parse_expression(
+            &self.arena,
+            trimmed,
+            trimmed_offset,
+            self.expression_line_offsets(),
+            self.source,
+            self.options.loose,
+            false,
+            '{',
+            self.ts,
+        )
+        .map_err(|(msg, _)| {
+            // Recover the precise failure position from OXC's labeled span,
+            // mirroring upstream Svelte's `js_parse_error(err.pos, ...)`.
+            let abs_pos = super::super::read::expression::check_js_parse_error_with_pos(trimmed)
+                .map_or(trimmed_offset, |(_, content_pos)| {
+                    trimmed_offset + content_pos
+                });
+            crate::error::ParseError::svelte("js_parse_error", msg, (abs_pos, abs_pos))
+        })
+    }
+
     /// Parse a block / directive head expression that, in strict (non-loose)
     /// mode, must be a single complete JS expression terminated by `close_char`
     /// (`'}'` or `')'`). Mirrors upstream Svelte, which parses one expression
@@ -2317,6 +2578,124 @@ impl Parser<'_> {
 /// This handles nested braces/brackets so that colons inside destructuring
 /// patterns (like `{ x: aliasX }`) are not mistakenly treated as type
 /// annotations.
+/// Find the byte offset of the first top-level assignment `=` in a declaration
+/// body, skipping `==` / `===` / `!=` / `<=` / `>=` / `=>` and any `=` inside
+/// strings or `()` / `[]` / `{}` nesting. Returns `None` when there is none.
+fn find_top_level_assignment(body: &str) -> Option<usize> {
+    let bytes = body.as_bytes();
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut string_ch = 0u8;
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_string {
+            if c == string_ch && (i == 0 || bytes[i - 1] != b'\\') {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'"' | b'\'' | b'`' => {
+                in_string = true;
+                string_ch = c;
+            }
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            b'=' if depth == 0 => {
+                let next = bytes.get(i + 1).copied().unwrap_or(0);
+                let prev = if i > 0 { bytes[i - 1] } else { 0 };
+                if next != b'='
+                    && next != b'>'
+                    && prev != b'!'
+                    && prev != b'<'
+                    && prev != b'>'
+                    && prev != b'='
+                {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Split a declaration body into declarator segments on top-level commas,
+/// ignoring commas inside strings or `()` / `[]` / `{}` nesting. Each entry is
+/// `(byte offset of the segment within `body`, the raw segment text)`.
+fn split_top_level_commas(body: &str) -> Vec<(usize, &str)> {
+    let bytes = body.as_bytes();
+    let mut segments = Vec::new();
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut string_ch = 0u8;
+    let mut seg_start = 0usize;
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_string {
+            if c == string_ch && (i == 0 || bytes[i - 1] != b'\\') {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'"' | b'\'' | b'`' => {
+                in_string = true;
+                string_ch = c;
+            }
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            b',' if depth == 0 => {
+                segments.push((seg_start, &body[seg_start..i]));
+                seg_start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    segments.push((seg_start, &body[seg_start..]));
+    segments
+}
+
+/// Build a loose-mode `DeclarationTag` with a single empty-name declarator at
+/// the closing brace (`init: null`). Used when a declaration tag has no
+/// assignment, an empty RHS, or an un-parseable initializer — mirroring the
+/// `loose` fallback in upstream `read_declaration`.
+fn build_empty_loose_declaration(
+    start: usize,
+    tag_end: usize,
+    decl_start: usize,
+    body_end: usize,
+    kind: &str,
+) -> TemplateNode {
+    use serde_json::{Value, json};
+    let empty_pos = body_end as u32;
+    let declaration = json!({
+        "type": "VariableDeclaration",
+        "kind": kind,
+        "declarations": [{
+            "type": "VariableDeclarator",
+            "id": { "type": "Identifier", "name": "", "start": empty_pos, "end": empty_pos },
+            "init": Value::Null,
+            "start": empty_pos,
+            "end": empty_pos,
+        }],
+        "start": decl_start as u32,
+        "end": empty_pos,
+    });
+    TemplateNode::DeclarationTag(Box::new(DeclarationTag {
+        start: start as u32,
+        end: tag_end as u32,
+        declaration: Expression::from_json(declaration),
+        metadata: Default::default(),
+    }))
+}
+
 fn strip_type_annotation(pattern: &str) -> String {
     let chars: Vec<char> = pattern.chars().collect();
     let mut depth = 0;
@@ -2404,7 +2783,7 @@ fn build_kind_variable_declaration(
     );
     declaration.insert("end".to_string(), Value::Number((decl_end as i64).into()));
 
-    Expression::Value(Value::Object(declaration))
+    Expression::from_json(Value::Object(declaration))
 }
 
 fn build_const_variable_declaration(
@@ -2413,6 +2792,7 @@ fn build_const_variable_declaration(
     init: &Expression,
     decl_start: usize,
     decl_end: usize,
+    declarator_end: usize,
 ) -> Expression {
     use serde_json::{Map, Value};
 
@@ -2425,10 +2805,6 @@ fn build_const_variable_declaration(
         .get("start")
         .and_then(|v| v.as_u64())
         .unwrap_or(decl_start as u64);
-    let init_end = init_value
-        .get("end")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(decl_end as u64);
 
     // Build VariableDeclarator
     let mut declarator = Map::new();
@@ -2439,7 +2815,14 @@ fn build_const_variable_declaration(
     declarator.insert("id".to_string(), pattern_value.clone());
     declarator.insert("init".to_string(), init_value.clone());
     declarator.insert("start".to_string(), Value::Number((id_start as i64).into()));
-    declarator.insert("end".to_string(), Value::Number((init_end as i64).into()));
+    // `declarator_end` is the parser position just past the initializer text
+    // (including any wrapping parens) but before trailing whitespace, mirroring
+    // upstream's `declarator_end = parser.index` (Svelte 5.56.4) rather than the
+    // bare `init.end` (which stops inside the parens).
+    declarator.insert(
+        "end".to_string(),
+        Value::Number((declarator_end as i64).into()),
+    );
 
     // Build VariableDeclaration
     let mut declaration = Map::new();
@@ -2458,5 +2841,5 @@ fn build_const_variable_declaration(
     );
     declaration.insert("end".to_string(), Value::Number((decl_end as i64).into()));
 
-    Expression::Value(Value::Object(declaration))
+    Expression::from_json(Value::Object(declaration))
 }

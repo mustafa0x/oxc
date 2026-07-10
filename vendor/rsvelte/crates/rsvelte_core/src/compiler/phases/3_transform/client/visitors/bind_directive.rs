@@ -197,6 +197,10 @@ pub fn unified_build_bind_this(
         ) {
             if let JsExpr::Member(member) = expr {
                 member.optional = true;
+                // SAFETY: `take_expr` requires no live alias to the slot. The
+                // `member.object` id is owned solely by this `member`; we take
+                // it out, recurse, and reinstall a fresh id, so no other
+                // reference to that slot is live during the replacement.
                 let mut inner = unsafe { arena.take_expr(member.object) };
                 make_optional(arena, &mut inner);
                 member.object = arena.alloc_expr(inner);
@@ -428,13 +432,16 @@ fn bind_directive_inner(
     // Check if it's a sequence expression (getter/setter pair)
     let (get, set) = if is_sequence_expression(&expression) {
         let (raw_get, raw_set) = extract_getter_setter(&expression);
-        // For sequence expressions (user-provided getter/setter pair), the getter
-        // needs read transforms applied (e.g., wrapping $state vars with $.get()).
-        // The setter already has assignment transforms from convert_expression
-        // (e.g., time = value → $.set(time, value, true)), so we only transform the getter.
+        // For a user-provided getter/setter pair, BOTH bodies need read transforms
+        // (e.g. wrapping $state/each-item/`@const` reads with `$.get()`). The setter
+        // body can read reactive bindings too (`(v) => { … control.min … }`). The
+        // read-wrap's Call arm skips the first arg of `$.set`/`$.update` (so an
+        // already-converted assignment target isn't double-wrapped) and its Arrow
+        // arm shadows the setter's `v` param, so this does not over-wrap.
         use crate::compiler::phases::phase3_transform::client::visitors::shared::utils::apply_transforms_to_expression;
         let transformed_get = apply_transforms_to_expression(&raw_get, context);
-        (transformed_get, raw_set)
+        let transformed_set = raw_set.map(|s| apply_transforms_to_expression(&s, context));
+        (transformed_get, transformed_set)
     } else if binding_name == "this" {
         // bind:this is handled specially below in build_special_binding_call
         build_getter_setter(&node.expression, &expression, context)
@@ -1603,10 +1610,9 @@ fn build_bind_this_each_block(
     let property_path =
         if let Some(stripped) = get_str.strip_prefix(&format!("$.get({})", item_name)) {
             stripped.trim_start_matches('.').to_string()
-        } else if let Some(stripped) = get_str.strip_prefix(&format!("{}.", item_name)) {
-            stripped.to_string()
         } else {
-            return None;
+            let stripped = get_str.strip_prefix(&format!("{}.", item_name))?;
+            stripped.to_string()
         };
 
     if property_path.is_empty() {

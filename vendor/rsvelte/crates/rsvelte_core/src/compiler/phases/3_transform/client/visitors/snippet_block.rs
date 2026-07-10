@@ -70,6 +70,12 @@ use crate::compiler::phases::phase3_transform::js_ast::nodes::*;
 /// 5. Creates either an arrow function or wrapped function (dev mode)
 /// 6. Places the declaration in the appropriate snippet collection
 pub fn snippet_block(node: &SnippetBlock, context: &mut ComponentContext) {
+    // Statements to duplicate at the very top of this snippet's body
+    // (set by `<svelte:boundary>` for boundary-level `{@const}` declarations
+    // — upstream SvelteBoundary.js unshifts them into each hoisted snippet).
+    // Taken eagerly so nested snippet bodies don't also receive them.
+    let body_prepend = std::mem::take(&mut context.state.snippet_body_prepend);
+
     // Get the snippet name and register it
     let snippet_name = get_snippet_name(&node.expression);
     context.state.snippet_names.insert(snippet_name.clone());
@@ -87,6 +93,25 @@ pub fn snippet_block(node: &SnippetBlock, context: &mut ComponentContext) {
     // transforms (e.g., a $state variable with the same name).
     let saved_transform = context.state.transform.clone();
     let saved_transform_deep_read = context.state.transform_deep_read.clone();
+
+    // Switch `state.scope` to the snippet body's Phase-2 scope (keyed by the
+    // snippet block's start in `template_scope_map`) for the duration of body
+    // processing. Mirrors upstream's visitor, which carries the snippet's own
+    // scope: identifier resolution (and `scope.evaluate`-style constant
+    // folding in `get_literal_value`) then resolves template declarations
+    // lexically — a `{@const}` declared in a SIBLING snippet is not reachable
+    // from here, so it is referenced as a (possibly global) identifier rather
+    // than substituted.
+    let saved_scope = context.state.scope;
+    if let Some(snippet_scope) = context
+        .state
+        .scope_root
+        .template_scope_map
+        .get(&node.start)
+        .and_then(|idx| context.state.scope_root.all_scopes.get(*idx))
+    {
+        context.state.scope = snippet_scope;
+    }
 
     // Process each parameter
     for (i, param) in node.parameters.iter().enumerate() {
@@ -129,6 +154,7 @@ pub fn snippet_block(node: &SnippetBlock, context: &mut ComponentContext) {
     let body_statements = visit_fragment(&node.body, context);
 
     // Restore the transform map and blocker_map to the outer scope
+    context.state.scope = saved_scope;
     context.state.transform = saved_transform;
     context.state.transform_deep_read = saved_transform_deep_read;
     *context.state.blocker_map.borrow_mut() = saved_blocker_map;
@@ -136,6 +162,10 @@ pub fn snippet_block(node: &SnippetBlock, context: &mut ComponentContext) {
 
     // Build the full body with declarations and visited body
     let mut full_body = Vec::new();
+
+    // Boundary-level `{@const}` duplicates go before everything else
+    // (upstream unshifts them ahead of the dev validation statement).
+    full_body.extend(body_prepend);
 
     // In dev mode, add validation at the start
     if context.state.dev {
@@ -612,7 +642,7 @@ fn object_pattern_key_literal(
 /// parameter access expressions.
 fn convert_snippet_expr(value: &serde_json::Value, context: &mut ComponentContext) -> JsExpr {
     use crate::compiler::phases::phase3_transform::client::visitors::expression_converter::convert_expression;
-    convert_expression(&Expression::Value(value.clone()), context)
+    convert_expression(&Expression::from_json(value.clone()), context)
 }
 
 /// Process an AssignmentPattern parameter (parameter with default value).
@@ -725,7 +755,8 @@ fn build_fallback_args(
         // Simple default: $.fallback(arg?.(), default). Apply reactive-read
         // transforms so a default like `x = count` becomes `$.get(count)`
         // (the default expression was previously emitted untransformed). M-068.
-        let default_expr = convert_expression(&Expression::Value(default_value.clone()), context);
+        let default_expr =
+            convert_expression(&Expression::from_json(default_value.clone()), context);
         let default_expr = apply_transforms_to_expression(&default_expr, context);
         vec![default_expr]
     } else {
@@ -743,7 +774,7 @@ fn build_fallback_args(
         {
             // Optimization: pass just the callee identifier instead of thunking
             let callee_expr = convert_expression(
-                &Expression::Value(serde_json::Value::Object(callee.clone())),
+                &Expression::from_json(serde_json::Value::Object(callee.clone())),
                 context,
             );
             vec![callee_expr, JsExpr::Literal(JsLiteral::Boolean(true))]
@@ -751,7 +782,7 @@ fn build_fallback_args(
             // General case: thunk the (transformed) expression so reactive reads
             // inside a complex default (`x = a + b`) are wrapped. M-068.
             let default_expr =
-                convert_expression(&Expression::Value(default_value.clone()), context);
+                convert_expression(&Expression::from_json(default_value.clone()), context);
             let default_expr = apply_transforms_to_expression(&default_expr, context);
             vec![
                 b::thunk(&context.arena, default_expr),
@@ -904,7 +935,8 @@ fn visit_fragment(frag: &Fragment, context: &mut ComponentContext) -> Vec<JsStat
     // For example:
     //   - {#snippet} inside <svg> with <p> children -> "html"
     //   - {#snippet} inside <svg> with <a><text>...</text></a> children -> "svg"
-    let snippet_namespace = infer_namespace_from_children(&frag.nodes);
+    let snippet_namespace =
+        infer_namespace_from_children(&frag.nodes, &context.state.metadata.namespace);
     let saved_namespace =
         std::mem::replace(&mut context.state.metadata.namespace, snippet_namespace);
 
@@ -913,68 +945,47 @@ fn visit_fragment(frag: &Fragment, context: &mut ComponentContext) -> Vec<JsStat
     // The snippet body is its own template scope.
     let saved_path = std::mem::take(&mut context.path);
 
+    // Bump template_nesting_level so that snippets nested INSIDE this snippet body
+    // are not treated as component-root snippets. The fragment visitor uses
+    // `context.state.template_nesting_level` (not a hardcoded 0) when is_root_fragment=true,
+    // so bumping here before the call ensures the inner fragment state inherits level >= 1.
+    // Mirrors upstream's `context.path.length === 1` check: a snippet body's direct
+    // children live at path-length 2+, so nested snippets must NOT land at level 0.
+    let saved_nesting = context.state.template_nesting_level;
+    context.state.template_nesting_level += 1;
+
     // Snippet body needs is_root_fragment=true to get $.next() when text-first
     let block = fragment_visitor(frag, context, true);
 
-    // Restore the parent path and namespace
+    // Restore the parent path, namespace, and nesting level
     context.path = saved_path;
     context.state.metadata.namespace = saved_namespace;
+    context.state.template_nesting_level = saved_nesting;
 
     block.body
 }
 
-/// Infer namespace from snippet body children.
+/// Infer namespace for a snippet body, mirroring upstream's
+/// `infer_namespace()` for a `SnippetBlock` parent.
 ///
-/// Matches the official Svelte compiler's `check_nodes_for_namespace()` logic:
-/// - If all elements are SVG -> "svg"
-/// - If all elements are MathML -> "mathml"
-/// - If any element is regular HTML -> "html"
-/// - If no elements found -> "html" (default)
-fn infer_namespace_from_children(nodes: &[crate::ast::template::TemplateNode]) -> String {
-    use crate::ast::template::TemplateNode;
-
-    let mut found_namespace: Option<&str> = None;
-
-    for node in nodes {
-        match node {
-            TemplateNode::RegularElement(elem) => {
-                if !elem.metadata.svg && !elem.metadata.mathml {
-                    return "html".to_string();
-                }
-                if elem.metadata.svg {
-                    found_namespace = Some(match found_namespace {
-                        None | Some("svg") => "svg",
-                        _ => return "html".to_string(),
-                    });
-                } else if elem.metadata.mathml {
-                    found_namespace = Some(match found_namespace {
-                        None | Some("mathml") => "mathml",
-                        _ => return "html".to_string(),
-                    });
-                }
-            }
-            TemplateNode::SvelteElement(elem) => {
-                if !elem.metadata.svg && !elem.metadata.mathml {
-                    return "html".to_string();
-                }
-                if elem.metadata.svg {
-                    found_namespace = Some(match found_namespace {
-                        None | Some("svg") => "svg",
-                        _ => return "html".to_string(),
-                    });
-                } else if elem.metadata.mathml {
-                    found_namespace = Some(match found_namespace {
-                        None | Some("mathml") => "mathml",
-                        _ => return "html".to_string(),
-                    });
-                }
-            }
-            // For non-element nodes (text, expressions, blocks), continue checking
-            _ => {}
-        }
+/// Delegates to the shared `check_nodes_for_namespace()` port in
+/// `3_transform/utils.rs` (a faithful port of upstream's function), mapping a
+/// `keep`/`maybe_html` result to the *inherited* namespace rather than
+/// defaulting to `html`. Defaulting to `"html"` would wrongly emit
+/// `$.from_html` (and a spurious whitespace text anchor) for a `{#snippet}` of
+/// adjacent component/render anchors inside `<svg>` (issue #1227).
+fn infer_namespace_from_children(
+    nodes: &[crate::ast::template::TemplateNode],
+    inherited: &str,
+) -> String {
+    use crate::compiler::phases::phase3_transform::utils::{NsScan, check_nodes_for_namespace};
+    match check_nodes_for_namespace(nodes) {
+        NsScan::Html => "html".to_string(),
+        NsScan::Svg => "svg".to_string(),
+        NsScan::Mathml => "mathml".to_string(),
+        // `keep` / `maybe_html` → inherit the surrounding namespace.
+        NsScan::Keep | NsScan::MaybeHtml => inherited.to_string(),
     }
-
-    found_namespace.unwrap_or("html").to_string()
 }
 
 #[cfg(test)]
@@ -983,7 +994,7 @@ mod tests {
 
     #[test]
     fn test_get_snippet_name() {
-        let expr = Expression::Value(serde_json::json!({
+        let expr = Expression::from_json(serde_json::json!({
             "type": "Identifier",
             "name": "greeting"
         }));
@@ -993,7 +1004,7 @@ mod tests {
 
     #[test]
     fn test_get_snippet_name_fallback() {
-        let expr = Expression::Value(serde_json::json!({
+        let expr = Expression::from_json(serde_json::json!({
             "type": "CallExpression"
         }));
 

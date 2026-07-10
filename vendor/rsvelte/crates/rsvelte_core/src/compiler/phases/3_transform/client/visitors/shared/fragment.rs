@@ -58,7 +58,7 @@ fn is_text_attribute(attr: &Attribute) -> bool {
 }
 
 /// Recursively check if any child nodes contain dynamic content or special attributes.
-fn has_dynamic_children(nodes: &[TemplateNode]) -> bool {
+pub(crate) fn has_dynamic_children(nodes: &[TemplateNode]) -> bool {
     for node in nodes {
         match node {
             TemplateNode::ExpressionTag(_) => return true,
@@ -634,6 +634,16 @@ fn push_static_element_to_template_inner(
 
             // Push the element opening tag
             template.push_element(elem_name.clone(), elem.start, is_html);
+
+            // `<video>` and authored custom elements need `importNode` cloning.
+            // The dynamic path sets this in `visit_regular_element`; this static
+            // builder must mirror it so a fully-static `<video>` still flips the
+            // TEMPLATE_USE_IMPORT_NODE bit. (Synthetic wrappers like
+            // `<svelte-css-wrapper>` are pushed via the component visitors, not
+            // here, so they correctly stay un-flagged.)
+            if elem.name == "video" || is_custom_element_node(elem) {
+                template.needs_import_node = true;
+            }
 
             // Handle <noscript> - it's rendered empty (children are stripped)
             // This matches the behavior in visit_regular_element

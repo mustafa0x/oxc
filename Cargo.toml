@@ -280,8 +280,8 @@ windows-sys = { version = "0.61.2" } # Windows API bindings
 
 # Native Svelte backend. Vendoring pins the source so Cargo, CI, and release
 # builds do not depend on a sibling checkout or a moving branch.
-svelte-compiler-rust = { path = "vendor/rsvelte/crates/rsvelte_core", default-features = false }
-rsvelte_formatter = { path = "vendor/rsvelte/crates/rsvelte_formatter" }
+svelte-compiler-rust = { package = "rsvelte_core", path = "vendor/rsvelte/crates/rsvelte_core", default-features = false }
+rsvelte_formatter = { path = "vendor/rsvelte/crates/rsvelte_formatter", default-features = false }
 
 [workspace.metadata.cargo-shear]
 ignored = [

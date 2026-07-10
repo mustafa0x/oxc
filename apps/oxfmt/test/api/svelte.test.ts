@@ -13,8 +13,8 @@ describe("Svelte support", () => {
 
       expect(result.errors).toStrictEqual([]);
       expect(result.code).toContain("let count = $state(0);");
-      expect(result.code).toContain("onclick={()=>count++}");
-      expect(result.code).toContain("<style>button{color:red;}</style>");
+      expect(result.code).toContain("onclick={() => count++}");
+      expect(result.code).toContain("button {\n    color: red;\n  }");
     });
 
     it("keeps `svelte: true` and `svelte: {}` as native-formatting config aliases", async () => {
@@ -115,7 +115,7 @@ let n: number = $state(0);
       expect(result.code).toContain("let n: number = $state(0);");
     });
 
-    it("formats supported syntax and preserves unsupported spans", async () => {
+    it("formats scripts, markup expressions, text, and CSS", async () => {
       const input = `<script context="module">export const answer=40+2</script>
 <script>let items=[{foo:1,bar:2}]</script>
 {#each items as {foo,bar = 2}}
@@ -135,18 +135,23 @@ let n: number = $state(0);
       expect(result.code).toBe(`<script context="module">
   export const answer = 40 + 2;
 </script>
+
 <script>
   let items = [{ foo: 1, bar: 2 }];
 </script>
+
 {#each items as { foo, bar = 2 }}
-  {@const value={foo:1,bar:2}}
-  <p>Hello   world {foo}</p>
+  {@const value = { foo: 1, bar: 2 }}
+  <p>Hello world {foo}</p>
 {/each}
-<style>
-.button {  color: red; }
-</style>
 <pre>  keep
   spacing </pre>
+
+<style>
+  .button {
+    color: red;
+  }
+</style>
 `);
     });
   });

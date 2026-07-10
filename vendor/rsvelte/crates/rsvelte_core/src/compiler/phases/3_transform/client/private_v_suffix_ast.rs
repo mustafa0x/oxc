@@ -39,15 +39,15 @@ use oxc_allocator::Allocator;
 use oxc_ast::ast::*;
 use oxc_ast_visit::Visit;
 use oxc_ast_visit::walk;
-use oxc_parser::{ParseOptions, Parser};
+use oxc_parser::ParseOptions;
 use oxc_span::SourceType;
+
+use super::ast_rewrite::{self, Edit};
 
 thread_local! {
     static MODULE_PRIVATE_V_SUFFIX_ALLOC: RefCell<Allocator> =
         RefCell::new(Allocator::default());
 }
-
-const MAX_FIXED_POINT_ITERS: usize = 16;
 
 /// AST-based rewrite of standalone `qualified` reads to
 /// `qualified.v`. Returns `None` when there's nothing to rewrite
@@ -63,68 +63,48 @@ pub fn transform_private_v_suffix_ast(source: &str, qualified_names: &[String]) 
         return None;
     }
 
-    let mut current = source.to_string();
-    let mut any_changed = false;
-    for _ in 0..MAX_FIXED_POINT_ITERS {
-        match single_pass(&current, qualified_names) {
-            Some(next) => {
-                current = next;
-                any_changed = true;
-            }
-            None => break,
-        }
-    }
-
-    if any_changed { Some(current) } else { None }
-}
-
-fn single_pass(source: &str, qualified_names: &[String]) -> Option<String> {
-    MODULE_PRIVATE_V_SUFFIX_ALLOC.with(|cell| {
-        let allocator = std::mem::take(&mut *cell.borrow_mut());
-        // Constructor bodies often include bare `return`.
-        let parser_ret = Parser::new(&allocator, source, SourceType::mjs())
-            .with_options(ParseOptions {
+    ast_rewrite::fixed_point(source, |src| {
+        ast_rewrite::rewrite_once(
+            &MODULE_PRIVATE_V_SUFFIX_ALLOC,
+            src,
+            SourceType::mjs(),
+            ParseOptions {
                 allow_return_outside_function: true,
                 ..ParseOptions::default()
-            })
-            .parse();
-        if !parser_ret.diagnostics.is_empty() {
-            *cell.borrow_mut() = allocator;
-            return None;
-        }
-
-        let mut collector = PrivateVSuffixCollector {
-            source,
-            qualified_names,
-            replacements: Vec::new(),
-            skip_spans: Vec::new(),
-        };
-        collector.visit_program(&parser_ret.program);
-        let mut replacements = collector.replacements;
-        let skip = collector.skip_spans;
-        replacements.retain(|(s, e, _)| !skip.iter().any(|(s2, e2)| *s2 == *s && *e2 == *e));
-
-        if replacements.is_empty() {
-            *cell.borrow_mut() = allocator;
-            return None;
-        }
-
-        replacements.sort_by_key(|r| std::cmp::Reverse(r.0));
-        let mut out = source.to_string();
-        for (start, end, rewrite) in &replacements {
-            out.replace_range(*start as usize..*end as usize, rewrite);
-        }
-
-        *cell.borrow_mut() = allocator;
-        Some(out)
+            },
+            true,
+            |program| {
+                let mut collector = PrivateVSuffixCollector {
+                    source: src,
+                    qualified_names,
+                    replacements: Vec::new(),
+                    skip_spans: Vec::new(),
+                    fn_depth: 0,
+                };
+                collector.visit_program(program);
+                let skip = collector.skip_spans;
+                let mut replacements = collector.replacements;
+                replacements
+                    .retain(|(s, e, _)| !skip.iter().any(|(s2, e2)| *s2 == *s && *e2 == *e));
+                replacements
+            },
+        )
     })
 }
 
 struct PrivateVSuffixCollector<'a> {
     source: &'a str,
     qualified_names: &'a [String],
-    replacements: Vec<(u32, u32, String)>,
+    replacements: Vec<Edit>,
     skip_spans: Vec<(u32, u32)>,
+    /// Nesting depth of enclosing functions/arrows relative to the constructor
+    /// body root (which is parsed at depth 0). Reads at depth 0 execute
+    /// synchronously during construction and use the direct `.v` source access;
+    /// reads inside a nested function/arrow execute *after* construction, so
+    /// they must read through the signal with `$.get(...)` — mirroring upstream's
+    /// `state.in_constructor` flag, which is cleared when entering a nested
+    /// function in the ClassBody visitor.
+    fn_depth: u32,
 }
 
 impl<'a> PrivateVSuffixCollector<'a> {
@@ -157,10 +137,29 @@ impl<'a, 'ast> Visit<'ast> for PrivateVSuffixCollector<'a> {
         walk::walk_private_field_expression(self, expr);
         let span_text = &self.source[expr.span.start as usize..expr.span.end as usize];
         if self.qualified_names.iter().any(|q| q.as_str() == span_text) {
-            let rewrite = format!("{}.v", span_text);
+            // Direct constructor-body reads (depth 0) use the `.v` source access;
+            // reads inside a nested function/arrow run post-construction and must
+            // go through `$.get(...)`.
+            let rewrite = if self.fn_depth == 0 {
+                format!("{}.v", span_text)
+            } else {
+                format!("$.get({})", span_text)
+            };
             self.replacements
                 .push((expr.span.start, expr.span.end, rewrite));
         }
+    }
+
+    fn visit_function(&mut self, func: &Function<'ast>, flags: oxc_syntax::scope::ScopeFlags) {
+        self.fn_depth += 1;
+        walk::walk_function(self, func, flags);
+        self.fn_depth -= 1;
+    }
+
+    fn visit_arrow_function_expression(&mut self, arrow: &ArrowFunctionExpression<'ast>) {
+        self.fn_depth += 1;
+        walk::walk_arrow_function_expression(self, arrow);
+        self.fn_depth -= 1;
     }
 
     fn visit_assignment_expression(&mut self, expr: &AssignmentExpression<'ast>) {
@@ -214,6 +213,25 @@ mod tests {
         let src = "let x = this.#count;";
         let out = transform_private_v_suffix_ast(src, &ssv(&["this.#count"])).unwrap();
         assert_eq!(out, "let x = this.#count.v;");
+    }
+
+    #[test]
+    fn nested_function_read_uses_get_not_v() {
+        // A read inside a nested arrow (executes post-construction) must read
+        // through the signal with `$.get(...)`, not the direct `.v` access.
+        let src = "rAF(() => { if (!this.#count) {} });";
+        let out = transform_private_v_suffix_ast(src, &ssv(&["this.#count"])).unwrap();
+        assert_eq!(out, "rAF(() => { if (!$.get(this.#count)) {} });");
+    }
+
+    #[test]
+    fn top_level_read_still_v_with_nested_function_present() {
+        let src = "let x = this.#count;\nrAF(() => this.#count);";
+        let out = transform_private_v_suffix_ast(src, &ssv(&["this.#count"])).unwrap();
+        assert_eq!(
+            out,
+            "let x = this.#count.v;\nrAF(() => $.get(this.#count));"
+        );
     }
 
     #[test]

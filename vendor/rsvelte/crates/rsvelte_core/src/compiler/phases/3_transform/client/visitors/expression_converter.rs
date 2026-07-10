@@ -14,6 +14,7 @@ use crate::compiler::phases::phase3_transform::client::types::ComponentContext;
 use crate::compiler::phases::phase3_transform::js_ast::nodes::*;
 use compact_str::CompactString;
 use serde_json::Value;
+use std::fmt::Write as _;
 
 /// Check if a JSON AST node contains an AwaitExpression anywhere in its tree.
 ///
@@ -213,7 +214,10 @@ fn convert_js_node(node: &JsNode, context: &mut ComponentContext) -> JsExpr {
         } => match value {
             LiteralValue::String(s) => {
                 if raw.starts_with('"') {
-                    JsExpr::Raw(raw.to_string().into())
+                    JsExpr::Literal(JsLiteral::RawString {
+                        value: s.to_string().into(),
+                        raw: raw.to_string().into(),
+                    })
                 } else {
                     JsExpr::Literal(JsLiteral::String(s.to_string().into()))
                 }
@@ -233,7 +237,10 @@ fn convert_js_node(node: &JsNode, context: &mut ComponentContext) -> JsExpr {
                 if raw_str == codegen_str {
                     JsExpr::Literal(JsLiteral::Number(*n))
                 } else {
-                    JsExpr::Raw(raw.to_string().into())
+                    JsExpr::Literal(JsLiteral::RawNumber {
+                        value: *n,
+                        raw: raw.to_string().into(),
+                    })
                 }
             }
             LiteralValue::Bool(b) => JsExpr::Literal(JsLiteral::Boolean(*b)),
@@ -247,7 +254,7 @@ fn convert_js_node(node: &JsNode, context: &mut ComponentContext) -> JsExpr {
                 }
                 // Check for BigInt (raw ends with 'n')
                 if raw.ends_with('n') {
-                    return JsExpr::Raw(raw.to_string().into());
+                    return JsExpr::Literal(JsLiteral::BigInt(raw.to_string().into()));
                 }
                 JsExpr::Literal(JsLiteral::Null)
             }
@@ -782,9 +789,21 @@ fn convert_js_node(node: &JsNode, context: &mut ComponentContext) -> JsExpr {
             let saved_transform = context.state.transform.clone();
             let saved_transform_deep_read = context.state.transform_deep_read.clone();
             let param_names = extract_param_names_from_node_refs(&param_nodes);
+            // Track which param names are newly shadowed so a prop name bound by a
+            // (possibly destructured) param — e.g. `({ title }) => title` — is NOT
+            // rewritten to `$$props.title`. The non-source-prop rewrite gates on
+            // `shadowed_prop_names`, which the `transform` removal above misses.
+            let newly_shadowed: Vec<String> = param_names
+                .iter()
+                .filter(|n| !context.state.shadowed_prop_names.contains(n.as_str()))
+                .cloned()
+                .collect();
             for name in &param_names {
                 context.state.transform.remove(name);
                 context.state.transform_deep_read.remove(name);
+            }
+            for name in &newly_shadowed {
+                context.state.shadowed_prop_names.insert(name.clone());
             }
 
             context.state.push_local_scope();
@@ -794,15 +813,7 @@ fn convert_js_node(node: &JsNode, context: &mut ComponentContext) -> JsExpr {
             // set the arrow body level to skip coercive assignment transforms.
             // Reference: AssignmentExpression.js lines 189-209
             let body_node = pa.get_js_node(*body);
-            let body_is_assignment = match body_node {
-                JsNode::Raw(v) => {
-                    v.as_object()
-                        .and_then(|o| o.get("type"))
-                        .and_then(|t| t.as_str())
-                        == Some("AssignmentExpression")
-                }
-                _ => body_node.node_type() == Some("AssignmentExpression"),
-            };
+            let body_is_assignment = body_node.node_type() == Some("AssignmentExpression");
             let saved_arrow_level = context.state.event_handler_arrow_body_level;
             if context.state.in_event_attribute_handler && body_is_assignment {
                 context.state.event_handler_arrow_body_level = 1;
@@ -811,20 +822,6 @@ fn convert_js_node(node: &JsNode, context: &mut ComponentContext) -> JsExpr {
             let conv_body = match body_node {
                 JsNode::BlockStatement { body, .. } => {
                     JsArrowBody::Block(convert_block_statement_from_jsnode(body, context))
-                }
-                JsNode::Raw(v) => {
-                    if let Some(obj) = v.as_object() {
-                        if obj.get("type").and_then(|t| t.as_str()) == Some("BlockStatement") {
-                            JsArrowBody::Block(convert_block_statement(obj, context))
-                        } else {
-                            JsArrowBody::Expression({
-                                let __tmp = convert_json_value(v, context);
-                                context.arena.alloc_expr(__tmp)
-                            })
-                        }
-                    } else {
-                        JsArrowBody::Block(JsBlockStatement::new())
-                    }
                 }
                 _ => JsArrowBody::Expression({
                     let __tmp = convert_js_node(body_node, context);
@@ -835,6 +832,9 @@ fn convert_js_node(node: &JsNode, context: &mut ComponentContext) -> JsExpr {
             context.state.event_handler_arrow_body_level = saved_arrow_level;
 
             context.state.pop_local_scope();
+            for name in &newly_shadowed {
+                context.state.shadowed_prop_names.remove(name);
+            }
             context.state.transform = saved_transform;
             context.state.transform_deep_read = saved_transform_deep_read;
 
@@ -858,13 +858,6 @@ fn convert_js_node(node: &JsNode, context: &mut ComponentContext) -> JsExpr {
                 id.as_ref()
                     .and_then(|id_node| match pa.get_js_node(*id_node) {
                         JsNode::Identifier { name, .. } => Some(name.to_string().into()),
-                        JsNode::Raw(v) => v
-                            .as_object()
-                            .filter(|o| {
-                                o.get("type").and_then(|t| t.as_str()) == Some("Identifier")
-                            })
-                            .and_then(|o| o.get("name").and_then(|n| n.as_str()))
-                            .map(|n| n.into()),
                         _ => None,
                     });
 
@@ -875,9 +868,21 @@ fn convert_js_node(node: &JsNode, context: &mut ComponentContext) -> JsExpr {
             let saved_transform = context.state.transform.clone();
             let saved_transform_deep_read = context.state.transform_deep_read.clone();
             let param_names = extract_param_names_from_node_refs(&param_nodes);
+            // Track which param names are newly shadowed so a prop name bound by a
+            // (possibly destructured) param — e.g. `({ title }) => title` — is NOT
+            // rewritten to `$$props.title`. The non-source-prop rewrite gates on
+            // `shadowed_prop_names`, which the `transform` removal above misses.
+            let newly_shadowed: Vec<String> = param_names
+                .iter()
+                .filter(|n| !context.state.shadowed_prop_names.contains(n.as_str()))
+                .cloned()
+                .collect();
             for name in &param_names {
                 context.state.transform.remove(name);
                 context.state.transform_deep_read.remove(name);
+            }
+            for name in &newly_shadowed {
+                context.state.shadowed_prop_names.insert(name.clone());
             }
 
             context.state.push_local_scope();
@@ -889,13 +894,6 @@ fn convert_js_node(node: &JsNode, context: &mut ComponentContext) -> JsExpr {
                     match b_node {
                         JsNode::BlockStatement { body, .. } => {
                             convert_block_statement_from_jsnode(body, context)
-                        }
-                        JsNode::Raw(v) => {
-                            if let Some(obj) = v.as_object() {
-                                convert_block_statement(obj, context)
-                            } else {
-                                JsBlockStatement::new()
-                            }
                         }
                         _ => {
                             let body_value = b_node.to_value();
@@ -910,6 +908,9 @@ fn convert_js_node(node: &JsNode, context: &mut ComponentContext) -> JsExpr {
                 .unwrap_or_default();
 
             context.state.pop_local_scope();
+            for name in &newly_shadowed {
+                context.state.shadowed_prop_names.remove(name);
+            }
             context.state.transform = saved_transform;
             context.state.transform_deep_read = saved_transform_deep_read;
 
@@ -934,16 +935,12 @@ fn convert_js_node(node: &JsNode, context: &mut ComponentContext) -> JsExpr {
             let right_node = pa.get_js_node(*right);
 
             // Check if the LHS is a destructuring pattern (typed or Raw-wrapped)
-            let left_is_pattern = match left_node {
+            let left_is_pattern = matches!(
+                left_node,
                 JsNode::ArrayPattern { .. }
-                | JsNode::ObjectPattern { .. }
-                | JsNode::RestElement { .. } => true,
-                JsNode::Raw(v) => v
-                    .as_object()
-                    .and_then(|o| o.get("type").and_then(|t| t.as_str()))
-                    .is_some_and(|t| matches!(t, "ArrayPattern" | "ObjectPattern" | "RestElement")),
-                _ => false,
-            };
+                    | JsNode::ObjectPattern { .. }
+                    | JsNode::RestElement { .. }
+            );
 
             if left_is_pattern {
                 let left_val = left_node.to_value();
@@ -991,6 +988,23 @@ fn convert_js_node(node: &JsNode, context: &mut ComponentContext) -> JsExpr {
 
             // Extract root identifier from original JsNode (before transforms)
             let original_root_name = extract_root_identifier_from_jsnode(left_node, pa);
+
+            // Mirror the official EachBlock `assign`/`mutate` transforms: assigning
+            // to / mutating an each-item identifier sets `uses_index = true` on the
+            // owning each block (forcing the `$$index` callback param). The JSON
+            // assignment path (`convert_assignment_expression`) already does this;
+            // the typed path (taken for event-handler bodies) was missing it, so a
+            // nested handler mutating an outer item dropped the outer block's index.
+            if let Some(root) = original_root_name.as_deref()
+                && let Some((_, flag)) = context
+                    .state
+                    .each_item_name_flags
+                    .iter()
+                    .rev()
+                    .find(|(n, _)| n.as_str() == root)
+            {
+                flag.set(true);
+            }
 
             // Pre-compute proxy decision from the JsNode directly (no JSON serialization)
             let should_proxy = Some(should_proxy_jsnode(right_node, pa, context));
@@ -1087,7 +1101,6 @@ fn convert_js_node(node: &JsNode, context: &mut ComponentContext) -> JsExpr {
             }
         }
 
-        JsNode::Raw(value) => convert_json_value(value, context),
         JsNode::Null => JsExpr::Literal(JsLiteral::Null),
 
         // Any other variant - fall back to Value conversion
@@ -1099,6 +1112,10 @@ fn convert_js_node(node: &JsNode, context: &mut ComponentContext) -> JsExpr {
 /// This is a fast check to avoid the expensive `to_value()` conversion for non-rune calls.
 fn is_potential_rune_call(callee: &JsNode, context: &ComponentContext) -> bool {
     let pa = context.state.parse_arena as *const ParseArena;
+    // SAFETY: `parse_arena` is a live `&ParseArena`; reborrowing it through a
+    // raw pointer only decouples the lifetime from `context` so the shared
+    // arena reference can be held alongside other accesses. The referent
+    // outlives this borrow and the dereference is always valid.
     let pa: &ParseArena = unsafe { &*pa };
 
     let check_rune_name = |name: &str| -> bool {
@@ -1121,46 +1138,10 @@ fn is_potential_rune_call(callee: &JsNode, context: &ComponentContext) -> bool {
             return true;
         }
         // Check for $inspect().with() pattern
-        match object_node {
-            JsNode::CallExpression { callee: inner, .. } => {
-                if let Some(n) = get_jsnode_identifier_name(pa.get_js_node(*inner))
-                    && n.starts_with('$')
-                    && context.state.get_binding(&n).is_none()
-                {
-                    return true;
-                }
-            }
-            JsNode::Raw(v) => {
-                if let Some(obj) = v.as_object()
-                    && obj.get("type").and_then(|t| t.as_str()) == Some("CallExpression")
-                    && let Some(name) = obj
-                        .get("callee")
-                        .and_then(|c| c.as_object())
-                        .filter(|o| o.get("type").and_then(|t| t.as_str()) == Some("Identifier"))
-                        .and_then(|o| o.get("name").and_then(|n| n.as_str()))
-                    && name.starts_with('$')
-                    && context.state.get_binding(name).is_none()
-                {
-                    return true;
-                }
-            }
-            _ => {}
-        }
-    }
-
-    // Handle Raw-wrapped callee
-    if let JsNode::Raw(v) = callee
-        && let Some(obj) = v.as_object()
-    {
-        let callee_type = obj.get("type").and_then(|t| t.as_str()).unwrap_or("");
-        if callee_type == "MemberExpression"
-            && let Some(name) = obj
-                .get("object")
-                .and_then(|o| o.as_object())
-                .filter(|o| o.get("type").and_then(|t| t.as_str()) == Some("Identifier"))
-                .and_then(|o| o.get("name").and_then(|n| n.as_str()))
-            && name.starts_with('$')
-            && context.state.get_binding(name).is_none()
+        if let JsNode::CallExpression { callee: inner, .. } = object_node
+            && let Some(n) = get_jsnode_identifier_name(pa.get_js_node(*inner))
+            && n.starts_with('$')
+            && context.state.get_binding(&n).is_none()
         {
             return true;
         }
@@ -1175,6 +1156,9 @@ fn convert_object_member_from_node(
     context: &mut ComponentContext,
 ) -> Option<JsObjectMember> {
     let pa = context.state.parse_arena as *const ParseArena;
+    // SAFETY: `parse_arena` is a live `&ParseArena`; reborrowing it through a
+    // raw pointer only decouples the lifetime from `context`. The referent
+    // outlives this borrow and the dereference is always valid.
     let pa: &ParseArena = unsafe { &*pa };
 
     match node {
@@ -1216,64 +1200,6 @@ fn convert_object_member_from_node(
             };
             Some(JsObjectMember::SpreadElement(conv_argument))
         }
-        // Handle Raw-wrapped property nodes (common from parser)
-        JsNode::Raw(value) => {
-            if let Some(obj) = value.as_object() {
-                let prop_type = obj.get("type").and_then(|t| t.as_str())?;
-                match prop_type {
-                    "Property" => {
-                        let key = convert_property_key(obj, context);
-                        let value = obj
-                            .get("value")
-                            .map(|v| {
-                                let __tmp = convert_json_value(v, context);
-                                context.arena.alloc_expr(__tmp)
-                            })
-                            .unwrap_or_else(|| {
-                                context.arena.alloc_expr(JsExpr::Literal(JsLiteral::Null))
-                            });
-                        let computed = obj
-                            .get("computed")
-                            .and_then(|c| c.as_bool())
-                            .unwrap_or(false);
-                        let shorthand = obj
-                            .get("shorthand")
-                            .and_then(|s| s.as_bool())
-                            .unwrap_or(false);
-                        let kind = match obj.get("kind").and_then(|k| k.as_str()) {
-                            Some("init") => JsPropertyKind::Init,
-                            Some("get") => JsPropertyKind::Get,
-                            Some("set") => JsPropertyKind::Set,
-                            _ => JsPropertyKind::Init,
-                        };
-                        let method = obj.get("method").and_then(|v| v.as_bool()).unwrap_or(false);
-                        Some(JsObjectMember::Property(JsProperty {
-                            key,
-                            value,
-                            kind,
-                            computed,
-                            shorthand,
-                            method,
-                        }))
-                    }
-                    "SpreadElement" => {
-                        let argument = obj
-                            .get("argument")
-                            .map(|a| {
-                                let __tmp = convert_json_value(a, context);
-                                context.arena.alloc_expr(__tmp)
-                            })
-                            .unwrap_or_else(|| {
-                                context.arena.alloc_expr(JsExpr::Literal(JsLiteral::Null))
-                            });
-                        Some(JsObjectMember::SpreadElement(argument))
-                    }
-                    _ => None,
-                }
-            } else {
-                None
-            }
-        }
         _ => None,
     }
 }
@@ -1311,35 +1237,6 @@ fn convert_property_key_from_node(
             };
             JsPropertyKey::Literal(lit)
         }
-        // Handle Raw-wrapped nodes (common from parser)
-        JsNode::Raw(value) => {
-            if let Some(obj) = value.as_object() {
-                let key_type = obj.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                match key_type {
-                    "Identifier" => {
-                        let name = obj
-                            .get("name")
-                            .and_then(|n| n.as_str())
-                            .unwrap_or("unknown");
-                        if computed {
-                            JsPropertyKey::Computed({
-                                let __tmp = convert_json_value(value, context);
-                                context.arena.alloc_expr(__tmp)
-                            })
-                        } else {
-                            JsPropertyKey::Identifier(name.into())
-                        }
-                    }
-                    "Literal" => JsPropertyKey::Literal(convert_literal(obj, context).into()),
-                    _ => JsPropertyKey::Computed({
-                        let __tmp = convert_json_value(value, context);
-                        context.arena.alloc_expr(__tmp)
-                    }),
-                }
-            } else {
-                JsPropertyKey::Identifier("unknown".into())
-            }
-        }
         _ => JsPropertyKey::Identifier("unknown".into()),
     }
 }
@@ -1358,6 +1255,9 @@ fn convert_param_pattern_from_node(
     context: &mut ComponentContext,
 ) -> Option<JsPattern> {
     let pa = context.state.parse_arena as *const ParseArena;
+    // SAFETY: `parse_arena` is a live `&ParseArena`; reborrowing it through a
+    // raw pointer only decouples the lifetime from `context`. The referent
+    // outlives this borrow and the dereference is always valid.
     let pa: &ParseArena = unsafe { &*pa };
 
     match node {
@@ -1400,8 +1300,6 @@ fn convert_param_pattern_from_node(
                 elements: conv_elements,
             }))
         }
-        // Handle Raw-wrapped nodes (common from parser)
-        JsNode::Raw(value) => convert_param_pattern(value, context),
         _ => {
             // Fallback to Value-based conversion
             let value = node.to_value();
@@ -1416,6 +1314,9 @@ fn convert_object_pattern_property_from_node(
     context: &mut ComponentContext,
 ) -> Option<JsObjectPatternProperty> {
     let pa = context.state.parse_arena as *const ParseArena;
+    // SAFETY: `parse_arena` is a live `&ParseArena`; reborrowing it through a
+    // raw pointer only decouples the lifetime from `context`. The referent
+    // outlives this borrow and the dereference is always valid.
     let pa: &ParseArena = unsafe { &*pa };
 
     match node {
@@ -1436,87 +1337,6 @@ fn convert_object_pattern_property_from_node(
             *computed,
             context,
         ),
-        // Handle Raw-wrapped nodes
-        JsNode::Raw(v) => {
-            if let Some(obj) = v.as_object() {
-                let prop_type = obj.get("type").and_then(|t| t.as_str())?;
-                if prop_type == "RestElement" || prop_type == "SpreadElement" {
-                    let arg_val = obj.get("argument")?;
-                    let conv_arg = convert_param_pattern(arg_val, context)?;
-                    Some(JsObjectPatternProperty::Rest(Box::new(conv_arg)))
-                } else if prop_type == "Property" {
-                    // Delegate to Value-based convert_param_pattern path
-                    // by reconstructing what convert_param_pattern expects
-                    let key_val = obj.get("key").and_then(|k| k.as_object())?;
-                    let key_type = key_val.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                    let computed = obj
-                        .get("computed")
-                        .and_then(|c| c.as_bool())
-                        .unwrap_or(false);
-                    let shorthand = obj
-                        .get("shorthand")
-                        .and_then(|s| s.as_bool())
-                        .unwrap_or(false);
-
-                    let (conv_key, fallback_name) = if key_type == "Literal" {
-                        if let Some(val) = key_val.get("value") {
-                            if let Some(s) = val.as_str() {
-                                (JsPropertyKey::Literal(JsLiteral::String(s.into())), None)
-                            } else if let Some(n) = val.as_f64() {
-                                (JsPropertyKey::Literal(JsLiteral::Number(n)), None)
-                            } else {
-                                return None;
-                            }
-                        } else {
-                            return None;
-                        }
-                    } else if key_type == "Identifier" {
-                        let name = key_val.get("name").and_then(|n| n.as_str())?;
-                        if computed {
-                            let key_expr =
-                                convert_json_value(&Value::Object(key_val.clone()), context);
-                            let key_expr = crate::compiler::phases::phase3_transform::client::visitors::shared::utils::apply_transforms_to_expression(&key_expr, context);
-                            (
-                                JsPropertyKey::Computed(context.arena.alloc_expr(key_expr)),
-                                None,
-                            )
-                        } else {
-                            (
-                                JsPropertyKey::Identifier(name.into()),
-                                Some(name.to_string()),
-                            )
-                        }
-                    } else {
-                        let key_expr = convert_json_value(&Value::Object(key_val.clone()), context);
-                        let key_expr = crate::compiler::phases::phase3_transform::client::visitors::shared::utils::apply_transforms_to_expression(&key_expr, context);
-                        (
-                            JsPropertyKey::Computed(context.arena.alloc_expr(key_expr)),
-                            None,
-                        )
-                    };
-
-                    let value_pat = obj
-                        .get("value")
-                        .and_then(|v| convert_param_pattern(v, context))
-                        .or_else(|| {
-                            fallback_name
-                                .as_ref()
-                                .map(|n| JsPattern::Identifier(n.clone().into()))
-                        })?;
-
-                    Some(JsObjectPatternProperty::Property {
-                        key: conv_key,
-                        value: value_pat,
-                        computed,
-                        shorthand,
-                    })
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        }
         _ => None,
     }
 }
@@ -1552,34 +1372,6 @@ fn convert_object_pattern_prop_inner(
                     JsPropertyKey::Identifier(name.to_string().into()),
                     Some(name.to_string()),
                 )
-            }
-        }
-        JsNode::Raw(v) => {
-            // Delegate to Value-based property key conversion
-            if let Some(obj) = v.as_object() {
-                let key_type = obj.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                if key_type == "Identifier" && !computed {
-                    let name = obj
-                        .get("name")
-                        .and_then(|n| n.as_str())
-                        .unwrap_or("unknown");
-                    (
-                        JsPropertyKey::Identifier(name.into()),
-                        Some(name.to_string()),
-                    )
-                } else if key_type == "Literal" {
-                    let lit = convert_literal(obj, context);
-                    (JsPropertyKey::Literal(lit.into()), None)
-                } else {
-                    let key_expr = convert_json_value(v, context);
-                    let key_expr_t = crate::compiler::phases::phase3_transform::client::visitors::shared::utils::apply_transforms_to_expression(&key_expr, context);
-                    (
-                        JsPropertyKey::Computed(context.arena.alloc_expr(key_expr_t)),
-                        None,
-                    )
-                }
-            } else {
-                return None;
             }
         }
         _ => {
@@ -1627,7 +1419,6 @@ fn extract_root_identifier_from_jsnode(node: &JsNode, pa: &ParseArena) -> Option
         JsNode::ChainExpression { expression, .. } => {
             extract_root_identifier_from_jsnode(pa.get_js_node(*expression), pa)
         }
-        JsNode::Raw(v) => extract_root_identifier_from_json(v),
         _ => None,
     }
 }
@@ -1636,11 +1427,6 @@ fn extract_root_identifier_from_jsnode(node: &JsNode, pa: &ParseArena) -> Option
 fn get_jsnode_private_identifier_name(node: &JsNode) -> Option<String> {
     match node {
         JsNode::PrivateIdentifier { name, .. } => Some(name.to_string()),
-        JsNode::Raw(v) => v
-            .as_object()
-            .filter(|o| o.get("type").and_then(|t| t.as_str()) == Some("PrivateIdentifier"))
-            .and_then(|o| o.get("name").and_then(|n| n.as_str()))
-            .map(|s| s.to_string()),
         _ => None,
     }
 }
@@ -1649,11 +1435,6 @@ fn get_jsnode_private_identifier_name(node: &JsNode) -> Option<String> {
 fn get_jsnode_identifier_name(node: &JsNode) -> Option<String> {
     match node {
         JsNode::Identifier { name, .. } => Some(name.to_string()),
-        JsNode::Raw(v) => v
-            .as_object()
-            .filter(|o| o.get("type").and_then(|t| t.as_str()) == Some("Identifier"))
-            .and_then(|o| o.get("name").and_then(|n| n.as_str()))
-            .map(|s| s.to_string()),
         _ => None,
     }
 }
@@ -1664,29 +1445,6 @@ fn get_jsnode_identifier_name(node: &JsNode) -> Option<String> {
 fn get_jsnode_identifier_name_unwrap_ts(node: &JsNode) -> Option<String> {
     match node {
         JsNode::Identifier { name, .. } => Some(name.to_string()),
-        JsNode::Raw(v) => {
-            let mut cur = v.as_object()?;
-            loop {
-                match cur.get("type").and_then(|t| t.as_str()) {
-                    Some("Identifier") => {
-                        return cur
-                            .get("name")
-                            .and_then(|n| n.as_str())
-                            .map(|s| s.to_string());
-                    }
-                    Some(
-                        "TSAsExpression"
-                        | "TSNonNullExpression"
-                        | "TSSatisfiesExpression"
-                        | "TSTypeAssertion"
-                        | "TSInstantiationExpression",
-                    ) => {
-                        cur = cur.get("expression").and_then(|e| e.as_object())?;
-                    }
-                    _ => return None,
-                }
-            }
-        }
         _ => None,
     }
 }
@@ -1703,23 +1461,6 @@ fn is_direct_member_with_identifier(node: &JsNode, pa: &ParseArena) -> bool {
             }
             let obj_node = pa.get_js_node(*object);
             matches!(obj_node, JsNode::Identifier { .. })
-                || matches!(obj_node, JsNode::Raw(v)
-                    if v.as_object()
-                        .and_then(|o| o.get("type").and_then(|t| t.as_str()))
-                        == Some("Identifier"))
-        }
-        JsNode::Raw(v) => {
-            if let Some(obj) = v.as_object()
-                && obj.get("type").and_then(|t| t.as_str()) == Some("MemberExpression")
-                && !obj
-                    .get("computed")
-                    .and_then(|c| c.as_bool())
-                    .unwrap_or(false)
-                && let Some(object_obj) = obj.get("object").and_then(|o| o.as_object())
-            {
-                return object_obj.get("type").and_then(|t| t.as_str()) == Some("Identifier");
-            }
-            false
         }
         _ => false,
     }
@@ -1755,7 +1496,7 @@ fn convert_json_value(value: &Value, context: &mut ComponentContext) -> JsExpr {
                 "UpdateExpression" => convert_update_expression(obj, context),
                 "SequenceExpression" => convert_sequence_expression(obj, context),
                 "ThisExpression" => JsExpr::This,
-                "Super" => JsExpr::Raw("super".into()),
+                "Super" => JsExpr::Super,
                 "ClassExpression" => convert_class_expression(obj, context),
                 "NewExpression" => convert_new_expression(obj, context),
                 "AwaitExpression" => convert_await_expression(obj, context),
@@ -1765,23 +1506,19 @@ fn convert_json_value(value: &Value, context: &mut ComponentContext) -> JsExpr {
                 "TaggedTemplateExpression" => convert_tagged_template_expression(obj, context),
                 "ChainExpression" => convert_chain_expression(obj, context),
                 "ImportExpression" => {
-                    // Dynamic import: import('./module')
-                    // Convert the source argument and render as `import(source)`.
-                    use crate::compiler::phases::phase3_transform::js_ast::codegen::generate_expr;
-                    let source_str = if let Some(source) = obj.get("source") {
-                        let source_expr = convert_json_value(source, context);
-                        generate_expr(&source_expr, &context.arena)
-                    } else {
-                        String::new()
-                    };
-                    // Handle optional options argument (second argument)
-                    if let Some(options) = obj.get("options").filter(|v| !v.is_null()) {
+                    // Dynamic import: import('./module'[, options]). Hold the
+                    // converted source/options as sub-expressions emitted lazily
+                    // by codegen (was: eager generate_expr + Raw stringification).
+                    let source_expr = obj
+                        .get("source")
+                        .map(|source| convert_json_value(source, context))
+                        .unwrap_or(JsExpr::Raw("".into()));
+                    let source = context.arena.alloc_expr(source_expr);
+                    let options = obj.get("options").filter(|v| !v.is_null()).map(|options| {
                         let options_expr = convert_json_value(options, context);
-                        let options_str = generate_expr(&options_expr, &context.arena);
-                        JsExpr::Raw(format!("import({}, {})", source_str, options_str).into())
-                    } else {
-                        JsExpr::Raw(format!("import({})", source_str).into())
-                    }
+                        context.arena.alloc_expr(options_expr)
+                    });
+                    JsExpr::ImportExpression { source, options }
                 }
                 "MetaProperty" => {
                     // ESTree MetaProperty: meta.property (e.g., import.meta, new.target)
@@ -1797,7 +1534,7 @@ fn convert_json_value(value: &Value, context: &mut ComponentContext) -> JsExpr {
                         .and_then(|p| p.get("name"))
                         .and_then(|n| n.as_str())
                         .unwrap_or("meta");
-                    JsExpr::Raw(format!("{}.{}", meta, property).into())
+                    JsExpr::MetaProperty(meta.into(), property.into())
                 }
                 "ObjectPattern" | "ArrayPattern" => {
                     // Destructuring patterns used as LHS in assignment expressions.
@@ -1915,7 +1652,10 @@ fn convert_literal(
             if let Some(Value::String(raw)) = obj.get("raw")
                 && raw.starts_with('"')
             {
-                return JsExpr::Raw(raw.clone().into());
+                return JsExpr::Literal(JsLiteral::RawString {
+                    value: s.clone().into(),
+                    raw: raw.clone().into(),
+                });
             }
             JsExpr::Literal(JsLiteral::String(s.clone().into()))
         }
@@ -3546,7 +3286,8 @@ pub fn convert_param_pattern(value: &Value, context: &mut ComponentContext) -> O
                                 // Handle Identifier keys, Literal keys, and computed keys
                                 let (key, fallback_name) = if key_type == "Literal" {
                                     // Literal key: { 'the-area': area } or { 2: sum }
-                                    if let Some(val) = key_val.get("value") {
+                                    {
+                                        let val = key_val.get("value")?;
                                         if let Some(s) = val.as_str() {
                                             (
                                                 JsPropertyKey::Literal(JsLiteral::String(
@@ -3559,13 +3300,10 @@ pub fn convert_param_pattern(value: &Value, context: &mut ComponentContext) -> O
                                                 JsPropertyKey::Literal(JsLiteral::Number(n as f64)),
                                                 None,
                                             )
-                                        } else if let Some(n) = val.as_f64() {
-                                            (JsPropertyKey::Literal(JsLiteral::Number(n)), None)
                                         } else {
-                                            return None;
+                                            let n = val.as_f64()?;
+                                            (JsPropertyKey::Literal(JsLiteral::Number(n)), None)
                                         }
-                                    } else {
-                                        return None;
                                     }
                                 } else if key_type == "Identifier" {
                                     // Identifier key: { x } or { x: y }
@@ -3690,7 +3428,9 @@ pub fn pattern_to_string(pattern: &JsPattern) -> String {
                                         s.push('"');
                                     }
                                     JsLiteral::Number(n) => s.push_str(&n.to_string()),
-                                    _ => s.push_str(&format!("{:?}", lit)),
+                                    _ => {
+                                        let _ = write!(s, "{:?}", lit);
+                                    }
                                 },
                                 JsPropertyKey::Computed(_e) => {
                                     // Computed keys in destructuring patterns are unusual;
@@ -3728,18 +3468,173 @@ fn convert_block_statement(
     obj: &serde_json::Map<String, Value>,
     context: &mut ComponentContext,
 ) -> JsBlockStatement {
+    // `analysis` is an `&'a ComponentAnalysis` — copying the reference out
+    // releases the borrow of `context`, so the source can be read while
+    // `context` is mutably borrowed in the loop below.
+    let analysis = context.state.analysis;
+    let source = analysis.source.as_str();
+
+    // Save the shadow set at block entry; restore at exit so that names
+    // declared inside this block do not leak into the enclosing scope.
+    let saved_shadowed = context.state.shadowed_prop_names.clone();
+
     let body = obj
         .get("body")
         .and_then(|b| b.as_array())
         .map(|stmts| {
-            stmts
-                .iter()
-                .filter_map(|stmt| convert_statement(stmt, context))
-                .collect()
+            let mut body: Vec<JsStatement> = Vec::with_capacity(stmts.len());
+            let mut prev_end: Option<usize> = None;
+            for stmt in stmts {
+                let stmt_start = stmt
+                    .as_object()
+                    .and_then(|o| o.get("start"))
+                    .and_then(|s| s.as_u64())
+                    .map(|s| s as usize);
+                let stmt_end = stmt
+                    .as_object()
+                    .and_then(|o| o.get("end"))
+                    .and_then(|e| e.as_u64())
+                    .map(|e| e as usize);
+                if let Some(start) = stmt_start {
+                    let gap_start =
+                        prev_end.unwrap_or_else(|| own_line_comment_scan_start(source, start));
+                    push_own_line_comment_raws(source, gap_start, start, &mut body);
+                }
+                if let Some(converted) = convert_statement(stmt, context) {
+                    body.push(converted);
+                }
+                // After each statement is processed, register any variable names
+                // it declares so that subsequent statements see them as shadowed.
+                register_block_decl_names_json(stmt, context);
+                if stmt_end.is_some() {
+                    prev_end = stmt_end;
+                }
+            }
+            body
         })
         .unwrap_or_default();
 
+    // Restore the shadow set to its state before this block was entered.
+    context.state.shadowed_prop_names = saved_shadowed;
+
     JsBlockStatement { body }
+}
+
+/// Add the top-level variable-declaration names from a JSON statement value to
+/// `shadowed_prop_names` so that subsequent statements in the same block do not
+/// rewrite those names as `$$props.name`.
+fn register_block_decl_names_json(stmt: &Value, context: &mut ComponentContext) {
+    let Some(obj) = stmt.as_object() else { return };
+    if obj.get("type").and_then(|t| t.as_str()) != Some("VariableDeclaration") {
+        return;
+    }
+    let Some(decls) = obj.get("declarations").and_then(|d| d.as_array()) else {
+        return;
+    };
+    for decl in decls {
+        if let Some(name) = decl
+            .as_object()
+            .and_then(|d| d.get("id"))
+            .and_then(|id| id.as_object())
+            .filter(|o| o.get("type").and_then(|t| t.as_str()) == Some("Identifier"))
+            .and_then(|o| o.get("name").and_then(|n| n.as_str()))
+        {
+            context.state.shadowed_prop_names.insert(name.to_string());
+        }
+    }
+}
+
+/// Find where to start scanning for own-line leading comments above the FIRST
+/// statement of a block: walk upward over lines that are entirely blank or
+/// single-line comments (`// ...` / `/* ... */`) and return the byte offset of
+/// the topmost such line. Stops at any line containing other content (e.g. the
+/// block opener), so code outside the gap is never rescanned.
+fn own_line_comment_scan_start(source: &str, stmt_start: usize) -> usize {
+    if stmt_start > source.len() || !source.is_char_boundary(stmt_start) {
+        return stmt_start;
+    }
+    let mut line_start = source[..stmt_start].rfind('\n').map(|p| p + 1).unwrap_or(0);
+    loop {
+        if line_start == 0 {
+            return 0;
+        }
+        let prev_line_start = source[..line_start - 1]
+            .rfind('\n')
+            .map(|p| p + 1)
+            .unwrap_or(0);
+        let prev_line = source[prev_line_start..line_start - 1].trim();
+        let is_comment_line = prev_line.starts_with("//")
+            || (prev_line.starts_with("/*") && prev_line.ends_with("*/"));
+        if prev_line.is_empty() || is_comment_line {
+            line_start = prev_line_start;
+        } else {
+            return line_start;
+        }
+    }
+}
+
+/// Scan `source[gap_start..stmt_start]` (the trivia gap before a statement)
+/// for comments that sit on their own line and push them as `JsStatement::Raw`
+/// entries — esrap prints a statement's leading comments as separate lines
+/// above it. Trailing comments on the previous statement's line are skipped
+/// (they are not own-line leading trivia).
+fn push_own_line_comment_raws(
+    source: &str,
+    gap_start: usize,
+    stmt_start: usize,
+    body: &mut Vec<JsStatement>,
+) {
+    if gap_start >= stmt_start
+        || stmt_start > source.len()
+        || !source.is_char_boundary(gap_start)
+        || !source.is_char_boundary(stmt_start)
+    {
+        return;
+    }
+    let gap = &source[gap_start..stmt_start];
+    let bytes = gap.as_bytes();
+    // `clean` = only whitespace seen on the current line so far
+    let mut clean = gap_start == 0 || source.as_bytes()[gap_start - 1] == b'\n';
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\n' => {
+                clean = true;
+                i += 1;
+            }
+            b' ' | b'\t' | b'\r' => i += 1,
+            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'/' => {
+                let s = i;
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                if clean {
+                    body.push(JsStatement::Raw(gap[s..i].trim_end().into()));
+                }
+            }
+            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
+                let s = i;
+                i += 2;
+                let mut closed = false;
+                while i < bytes.len() {
+                    if bytes[i] == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                        i += 2;
+                        closed = true;
+                        break;
+                    }
+                    i += 1;
+                }
+                if clean && closed {
+                    body.push(JsStatement::Raw(gap[s..i].into()));
+                }
+                clean = false;
+            }
+            _ => {
+                clean = false;
+                i += 1;
+            }
+        }
+    }
 }
 
 /// Convert a statement node to JsStatement.
@@ -3803,7 +3698,10 @@ fn convert_statement(stmt: &Value, context: &mut ComponentContext) -> Option<JsS
             }))
         }
         "ReturnStatement" => {
-            let argument = obj.get("argument").map(|a| {
+            // Filter out JSON null: `{ "argument": null }` means `return;` (no value),
+            // not `return null;`. Without this filter, convert_json_value(Null) produces
+            // a null literal, turning bare `return;` into `return null;`.
+            let argument = obj.get("argument").filter(|a| !a.is_null()).map(|a| {
                 let __tmp = convert_json_value(a, context);
                 context.arena.alloc_expr(__tmp)
             });
@@ -4377,6 +4275,23 @@ fn convert_assignment_expression(
     // `rows` into `rows()`, making it impossible to identify the root identifier later.
     let original_root_name = obj.get("left").and_then(extract_root_identifier_from_json);
 
+    // Mirror the official EachBlock `assign`/`mutate` transforms (EachBlock.js
+    // lines 229-243): assigning to or mutating an each-block item identifier sets
+    // `uses_index = true` on the OWNING each block, forcing the `$$index` callback
+    // parameter to be emitted even when the produced code does not reference it.
+    // We look the name up in `each_item_name_flags` (most-recent first) so a nested
+    // each body that mutates an outer item still sets the outer block's flag.
+    if let Some(root) = original_root_name.as_deref()
+        && let Some((_, flag)) = context
+            .state
+            .each_item_name_flags
+            .iter()
+            .rev()
+            .find(|(n, _)| n.as_str() == root)
+    {
+        flag.set(true);
+    }
+
     // Check if this assignment needs ownership mutation validation (dev mode only).
     // We need to check the ORIGINAL JSON left-hand side because transforms may have
     // already altered the LHS (e.g., `object.count` -> `object().count`).
@@ -4546,7 +4461,6 @@ fn comment_has_svelte_ignore(text: &str, code: &str) -> bool {
 /// Check if an assignment expression's LHS is a member expression targeting a prop,
 /// and if so, return the ownership validation info (prop_alias, path array, optional source location).
 /// This works on the original JSON AST before transforms are applied.
-#[allow(clippy::type_complexity)]
 fn check_ownership_validation(
     left_json: Option<&Value>,
     context: &ComponentContext,
@@ -4799,10 +4713,70 @@ fn try_transform_assignment(
 
         let result = mutate_fn(&context.arena, b::id(&root_name), mutation_expr);
         let result = apply_store_ref_transform(result, &root_name, context);
+        // If the mutated prop carries `legacy_indirect_bindings` (a legacy
+        // `<select bind:value={prop…}>` whose subtree references other scope
+        // variables), wrap the mutation in a sequence with
+        // `$.invalidate_inner_signals(() => { … })` so those signals re-read.
+        // Mirrors the instance-script prop-member-mutation path
+        // (`prop_member_mutate_ast`) and upstream `AssignmentExpression.js`.
+        let result = wrap_with_legacy_invalidate(result, &root_name, context);
         return Some(result);
     }
 
     None
+}
+
+/// Wrap a prop-member-mutation expression in
+/// `(<mutation>, $.invalidate_inner_signals(() => { <reads> }))` when the
+/// mutated prop binding has `legacy_indirect_bindings`. Returns the input
+/// unchanged otherwise. The read form of each indirect binding mirrors
+/// `build_getter` / the `prop_invalidate_bodies` precompute: prop source →
+/// `name()`, store sub → `name()`, reactive state/derived → `$.get(name)`,
+/// everything else → bare `name`.
+pub(crate) fn wrap_with_legacy_invalidate(
+    result: JsExpr,
+    root_name: &str,
+    context: &ComponentContext,
+) -> JsExpr {
+    use crate::compiler::phases::phase2_analyze::scope::BindingKind as BK;
+    use crate::compiler::phases::phase3_transform::client::utils::is_prop_source;
+    use crate::compiler::phases::phase3_transform::js_ast::builders as b;
+
+    let indirect = match context.state.get_binding(root_name) {
+        Some(binding) if !binding.legacy_indirect_bindings.is_empty() => {
+            binding.legacy_indirect_bindings.clone()
+        }
+        _ => return result,
+    };
+
+    let analysis = context.state.analysis;
+    let read_form = |n: &str| -> String {
+        match context.state.get_binding(n) {
+            Some(b)
+                if matches!(b.kind, BK::Prop | BK::BindableProp) && is_prop_source(b, analysis) =>
+            {
+                format!("{n}()")
+            }
+            Some(b) if matches!(b.kind, BK::StoreSub) => format!("{n}()"),
+            Some(b)
+                if matches!(
+                    b.kind,
+                    BK::State | BK::RawState | BK::Derived | BK::LegacyReactive
+                ) =>
+            {
+                format!("$.get({n})")
+            }
+            _ => n.to_string(),
+        }
+    };
+
+    let body = indirect
+        .iter()
+        .map(|n| format!("{};", read_form(n)))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let invalidate = b::raw(format!("$.invalidate_inner_signals(() => {{ {body} }})"));
+    b::sequence(vec![result, invalidate])
 }
 
 /// Get the appropriate $.assign* function name for an operator.
@@ -5641,7 +5615,6 @@ fn should_proxy_jsnode(node: &JsNode, _pa: &ParseArena, context: &ComponentConte
             true
         }
         JsNode::ObjectExpression { .. } | JsNode::ArrayExpression { .. } => true,
-        JsNode::Raw(v) => should_proxy_value(Some(v), context),
         _ => !matches!(
             node.node_type(),
             Some(
@@ -5712,13 +5685,70 @@ fn convert_block_statement_from_jsnode(
     context: &mut ComponentContext,
 ) -> JsBlockStatement {
     let pa = context.state.parse_arena as *const ParseArena;
+    // SAFETY: `parse_arena` is a live `&ParseArena`; reborrowing it through a
+    // raw pointer only decouples the lifetime from `context`. The referent
+    // outlives this borrow and the dereference is always valid.
     let pa: &ParseArena = unsafe { &*pa };
+    let analysis = context.state.analysis;
+    let source = analysis.source.as_str();
     let children: Vec<&JsNode> = pa.get_js_children(*body_range).iter().collect();
-    let body: Vec<JsStatement> = children
-        .iter()
-        .filter_map(|child| convert_statement_from_jsnode(child, context))
-        .collect();
+
+    // Save the current set of shadowed prop names at block entry so we can
+    // restore it at block exit. As we encounter variable declarations inside
+    // the block we add their declared names progressively so that subsequent
+    // statements (and nested blocks) don't rewrite them as `$$props.name`.
+    let saved_shadowed = context.state.shadowed_prop_names.clone();
+
+    let mut body: Vec<JsStatement> = Vec::with_capacity(children.len());
+    let mut prev_end: Option<usize> = None;
+    for child in &children {
+        if let Some(start) = child.start().map(|s| s as usize) {
+            let gap_start = prev_end.unwrap_or_else(|| own_line_comment_scan_start(source, start));
+            push_own_line_comment_raws(source, gap_start, start, &mut body);
+        }
+        if let Some(converted) = convert_statement_from_jsnode(child, context) {
+            body.push(converted);
+        }
+        // After processing each statement, add any newly-declared variable names
+        // to the shadow set so they are visible to subsequent statements.
+        register_block_decl_names_jsnode(child, pa, context);
+        if let Some(end) = child.end().map(|e| e as usize) {
+            prev_end = Some(end);
+        }
+    }
+
+    // Restore the shadow set to its state before this block was entered.
+    context.state.shadowed_prop_names = saved_shadowed;
+
     JsBlockStatement { body }
+}
+
+/// Add the top-level variable-declaration names from a JsNode statement to
+/// `shadowed_prop_names`.  Only simple `Identifier` lhs patterns are handled;
+/// destructuring patterns are ignored (they rarely shadow a prop name and the
+/// code is cleaner without the extra complexity).
+fn register_block_decl_names_jsnode(
+    node: &JsNode,
+    pa: &ParseArena,
+    context: &mut ComponentContext,
+) {
+    let names: Vec<String> = match node {
+        JsNode::VariableDeclaration { declarations, .. } => pa
+            .get_js_children(*declarations)
+            .iter()
+            .filter_map(|d| match d {
+                JsNode::VariableDeclarator { id, .. } => match pa.get_js_node(*id) {
+                    JsNode::Identifier { name, .. } => Some(name.to_string()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect(),
+        _ => vec![],
+    };
+    for name in names {
+        context.state.shadowed_prop_names.insert(name);
+    }
 }
 
 /// Convert a single statement from a JsNode.
@@ -5728,6 +5758,9 @@ fn convert_statement_from_jsnode(
     context: &mut ComponentContext,
 ) -> Option<JsStatement> {
     let pa = context.state.parse_arena as *const ParseArena;
+    // SAFETY: `parse_arena` is a live `&ParseArena`; reborrowing it through a
+    // raw pointer only decouples the lifetime from `context`. The referent
+    // outlives this borrow and the dereference is always valid.
     let pa: &ParseArena = unsafe { &*pa };
     match node {
         JsNode::ExpressionStatement { expression, .. } => {
@@ -5778,28 +5811,6 @@ fn convert_statement_from_jsnode(
                             init: init_expr,
                         })
                     }
-                    JsNode::Raw(v) => {
-                        let obj = v.as_object()?;
-                        let id_val = obj.get("id")?;
-                        let pattern = convert_param_pattern(id_val, context)?;
-                        if !context.state.local_var_init_types.is_empty()
-                            && let Some(init_json) = obj.get("init")
-                            && let Some(t) = unwrap_ts_expression_type(init_json)
-                            && let JsPattern::Identifier(ref name) = pattern
-                        {
-                            context
-                                .state
-                                .register_local_var_init_type(name.to_string(), t.to_string());
-                        }
-                        let init_expr = obj.get("init").filter(|i| !i.is_null()).map(|i| {
-                            let __tmp = convert_json_value(i, context);
-                            context.arena.alloc_expr(__tmp)
-                        });
-                        Some(JsVariableDeclarator {
-                            id: pattern,
-                            init: init_expr,
-                        })
-                    }
                     _ => None,
                 })
                 .collect();
@@ -5841,7 +5852,6 @@ fn convert_statement_from_jsnode(
             Some(JsStatement::Throw(context.arena.alloc_expr(expr)))
         }
         JsNode::EmptyStatement { .. } => Some(JsStatement::Empty),
-        JsNode::Raw(v) => convert_statement(v, context),
         _ => {
             let value = node.to_value();
             convert_statement(&value, context)
@@ -5854,9 +5864,6 @@ fn collect_param_names_from_jsnode(node: &JsNode, names: &mut Vec<String>) {
     match node {
         JsNode::Identifier { name, .. } => {
             names.push(name.to_string());
-        }
-        JsNode::Raw(v) => {
-            collect_param_names(v, names);
         }
         _ => {
             collect_param_names(&node.to_value(), names);
@@ -6125,6 +6132,37 @@ fn apply_store_ref_transform(
         {
             *first_arg = transformed_ref;
         }
+        return result;
+    }
+
+    // Non-source props (`const { store } = $props()`) don't register a read
+    // transform — their reads are emitted as `$$props.store` by the default
+    // identifier path. The store-mutation builders, however, emit the bare
+    // store name as the first argument, so resolve it here directly from the
+    // binding: a non-source prop store object must be `$$props.store`
+    // (or `$$props['alias']`). Mirrors the store-getter declaration.
+    if let Some(binding) = context.state.get_binding(store_name)
+        && matches!(binding.kind, BindingKind::Prop | BindingKind::BindableProp)
+        && !crate::compiler::phases::phase3_transform::client::utils::is_prop_source(
+            binding,
+            context.state.analysis,
+        )
+        && let JsExpr::Call(ref mut call) = result
+        && let Some(first_arg) = call.arguments.first_mut()
+        && matches!(first_arg, JsExpr::Identifier(n) if n.as_str() == store_name)
+    {
+        use crate::compiler::phases::phase3_transform::js_ast::builders as b;
+        let alias = binding.prop_alias.as_deref().filter(|a| *a != store_name);
+        *first_arg = if let Some(a) = alias {
+            JsExpr::Member(JsMemberExpression {
+                object: context.arena.alloc_expr(b::id("$$props")),
+                property: JsMemberProperty::Expression(context.arena.alloc_expr(b::string(a))),
+                computed: true,
+                optional: false,
+            })
+        } else {
+            b::member_path(&context.arena, &format!("$$props.{}", store_name))
+        };
     }
 
     result

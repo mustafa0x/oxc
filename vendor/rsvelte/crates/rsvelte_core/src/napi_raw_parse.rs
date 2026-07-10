@@ -222,10 +222,11 @@ pub const JS_TS_TYPE_ANNOTATION: u8 = 0xC6;
 pub const JS_TS_ENUM_DECLARATION: u8 = 0xC7;
 pub const JS_TS_MODULE_DECLARATION: u8 = 0xC8;
 pub const JS_COMMENT: u8 = 0xC9;
-// Special sentinels for the JsNode null/raw fallback variants — they
-// don't fit the normal preamble-with-positions shape.
+// Special sentinel for the JsNode null fallback variant — it doesn't fit the
+// normal preamble-with-positions shape. (0xCB was the former whole-node
+// `JS_RAW_JSON` escape; type annotations now ride a per-node trailer instead.)
 pub const JS_NULL: u8 = 0xCA;
-pub const JS_RAW_JSON: u8 = 0xCB;
+pub const JS_TS_PARAMETER_PROPERTY: u8 = 0xCC;
 
 // LiteralValue inner tag (within a JS_LITERAL payload).
 const LV_NULL: u8 = 0;
@@ -294,8 +295,8 @@ fn write_opt_str<W: Writer>(w: &mut W, s: Option<&str>) {
 #[inline]
 fn write_preamble<W: Writer>(w: &mut W, tag: u8, start: u32, end: u32) {
     write_u8(w, tag);
-    write_u32(w, start);
-    write_u32(w, end);
+    write_u32(w, conv_off(start));
+    write_u32(w, conv_off(end));
 }
 
 /// Serialize a `SourceLocation` as 24 bytes — flattens the nested
@@ -303,11 +304,11 @@ fn write_preamble<W: Writer>(w: &mut W, tag: u8, start: u32, end: u32) {
 /// six u32s. The decoder rebuilds the object form.
 fn write_source_location<W: Writer>(w: &mut W, loc: &crate::ast::span::SourceLocation) {
     write_u32(w, loc.start.line);
-    write_u32(w, loc.start.column);
-    write_u32(w, loc.start.character);
+    write_u32(w, conv_col(loc.start.line, loc.start.column));
+    write_u32(w, conv_off(loc.start.character));
     write_u32(w, loc.end.line);
-    write_u32(w, loc.end.column);
-    write_u32(w, loc.end.character);
+    write_u32(w, conv_col(loc.end.line, loc.end.column));
+    write_u32(w, conv_off(loc.end.character));
 }
 fn write_opt_source_location<W: Writer>(w: &mut W, loc: Option<&crate::ast::span::SourceLocation>) {
     match loc {
@@ -357,7 +358,20 @@ fn write_json_node<W: Writer, T: Serialize + ?Sized>(
         }
     }
     let mut shim = WriterAdapter(w);
-    serde_json::to_writer(&mut shim, value).map_err(std::io::Error::other)?;
+    if offset_remap_active() {
+        // The embedded JSON sub-tree carries byte offsets too; remap them to
+        // UTF-16 so the whole envelope is consistent (#793). Only pay the
+        // serialize-to-Value round-trip when a remap is actually active.
+        let mut json_value = serde_json::to_value(value).map_err(std::io::Error::other)?;
+        OFFSET_CONV.with(|c| {
+            if let Some(conv) = &*c.borrow() {
+                crate::compiler::legacy::convert_positions_to_utf16(&mut json_value, conv);
+            }
+        });
+        serde_json::to_writer(&mut shim, &json_value).map_err(std::io::Error::other)?;
+    } else {
+        serde_json::to_writer(&mut shim, value).map_err(std::io::Error::other)?;
+    }
     let payload_end = shim.0.position();
     w.patch_u32(len_slot, (payload_end - payload_start) as u32);
     Ok(())
@@ -375,7 +389,6 @@ fn write_expression<W: Writer>(
             write_js_node(w, &te.node, arena)
         }),
         Expression::Lazy { start, end, .. } => write_json_node(w, *start, *end, expr),
-        Expression::Value(_) => write_json_node(w, u32::MAX, u32::MAX, expr),
     }
 }
 fn write_opt_expression<W: Writer>(
@@ -416,6 +429,44 @@ fn css_stub_only() -> bool {
     SKIP_CSS_AST.with(|c| c.get())
 }
 
+thread_local! {
+    // Byte -> UTF-16 offset converter for the current encode. `Some` only when
+    // the source contains non-ASCII; for ASCII source byte == UTF-16 so it is
+    // left `None` and every conversion below is a zero-cost identity (#793).
+    static OFFSET_CONV: std::cell::RefCell<Option<crate::compiler::legacy::Utf8ToUtf16>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Convert an absolute byte offset to a UTF-16 code-unit offset (identity when
+/// no converter is installed, i.e. ASCII source).
+#[inline]
+fn conv_off(v: u32) -> u32 {
+    // `u32::MAX` is the "no span" sentinel (e.g. legacy `Value` expressions);
+    // never remap it.
+    if v == u32::MAX {
+        return v;
+    }
+    OFFSET_CONV.with(|c| match &*c.borrow() {
+        Some(conv) => conv.convert(v as usize) as u32,
+        None => v,
+    })
+}
+
+/// Convert a byte column (0-based, within `line`) to a UTF-16 column.
+#[inline]
+fn conv_col(line: u32, col: u32) -> u32 {
+    OFFSET_CONV.with(|c| match &*c.borrow() {
+        Some(conv) => conv.convert_column(line as usize, col as usize) as u32,
+        None => col,
+    })
+}
+
+/// Whether an offset remap is active for the current encode.
+#[inline]
+fn offset_remap_active() -> bool {
+    OFFSET_CONV.with(|c| c.borrow().is_some())
+}
+
 /// `typed_expr::Loc` — emits a flag byte + 6 u32s (with optional
 /// `character`) when `loc.is_some()`. When the envelope-level
 /// `FLAG_JSNODE_NO_LOC` flag is set the encoder skips this call
@@ -428,20 +479,20 @@ fn write_typed_loc<W: Writer>(w: &mut W, loc: Option<&Loc>) {
         Some(l) => {
             write_u8(w, 1);
             write_u32(w, l.start.line);
-            write_u32(w, l.start.column);
+            write_u32(w, conv_col(l.start.line, l.start.column));
             match l.start.character {
                 Some(c) => {
                     write_u8(w, 1);
-                    write_u32(w, c);
+                    write_u32(w, conv_off(c));
                 }
                 None => write_u8(w, 0),
             }
             write_u32(w, l.end.line);
-            write_u32(w, l.end.column);
+            write_u32(w, conv_col(l.end.line, l.end.column));
             match l.end.character {
                 Some(c) => {
                     write_u8(w, 1);
-                    write_u32(w, c);
+                    write_u32(w, conv_off(c));
                 }
                 None => write_u8(w, 0),
             }
@@ -1084,6 +1135,50 @@ fn write_root<W: Writer>(w: &mut W, root: &Root) -> std::io::Result<()> {
 // JsNode (estree) — 74-variant dispatcher
 // ---------------------------------------------------------------------------
 
+/// Write an optional TS `typeAnnotation` trailer: a flag byte, then (when
+/// present) a u32-length-prefixed JSON blob with byte offsets remapped to UTF-16
+/// (like every other span). The open-ended TS type grammar is the one place a
+/// JSON escape is kept — the node's own stable fields (start/end/loc/name/…) use
+/// the binary encoding, so there is no whole-node `JS_RAW_JSON` re-materialization.
+fn write_opt_type_annotation<W: Writer>(
+    w: &mut W,
+    ta: Option<&serde_json::Value>,
+) -> std::io::Result<()> {
+    let Some(value) = ta else {
+        write_u8(w, 0);
+        return Ok(());
+    };
+    write_u8(w, 1);
+    let len_slot = w.position();
+    write_u32(w, 0);
+    let p0 = w.position();
+    struct A<'a, W2: Writer>(&'a mut W2);
+    impl<W2: Writer> std::io::Write for A<'_, W2> {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.write_bytes(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut shim = A(w);
+    if offset_remap_active() {
+        let mut json_value = value.clone();
+        OFFSET_CONV.with(|c| {
+            if let Some(conv) = &*c.borrow() {
+                crate::compiler::legacy::convert_positions_to_utf16(&mut json_value, conv);
+            }
+        });
+        serde_json::to_writer(&mut shim, &json_value).map_err(std::io::Error::other)?;
+    } else {
+        serde_json::to_writer(&mut shim, value).map_err(std::io::Error::other)?;
+    }
+    let p1 = shim.0.position();
+    w.patch_u32(len_slot, (p1 - p0) as u32);
+    Ok(())
+}
+
 fn write_js_node<W: Writer>(w: &mut W, node: &JsNode, arena: &ParseArena) -> std::io::Result<()> {
     match node {
         JsNode::Identifier {
@@ -1091,10 +1186,12 @@ fn write_js_node<W: Writer>(w: &mut W, node: &JsNode, arena: &ParseArena) -> std
             end,
             loc,
             name,
+            type_annotation,
         } => {
             write_preamble(w, JS_IDENTIFIER, *start, *end);
             write_typed_loc(w, loc.as_deref());
             write_str(w, name.as_str());
+            write_opt_type_annotation(w, type_annotation.as_deref())?;
         }
         JsNode::PrivateIdentifier {
             start,
@@ -1443,20 +1540,24 @@ fn write_js_node<W: Writer>(w: &mut W, node: &JsNode, arena: &ParseArena) -> std
             end,
             loc,
             properties,
+            type_annotation,
         } => {
             write_preamble(w, JS_OBJECT_PATTERN, *start, *end);
             write_typed_loc(w, loc.as_deref());
             write_id_range(w, *properties, arena)?;
+            write_opt_type_annotation(w, type_annotation.as_deref())?;
         }
         JsNode::ArrayPattern {
             start,
             end,
             loc,
             elements,
+            type_annotation,
         } => {
             write_preamble(w, JS_ARRAY_PATTERN, *start, *end);
             write_typed_loc(w, loc.as_deref());
             write_node_array(w, elements, arena)?;
+            write_opt_type_annotation(w, type_annotation.as_deref())?;
         }
         JsNode::AssignmentPattern {
             start,
@@ -1508,6 +1609,8 @@ fn write_js_node<W: Writer>(w: &mut W, node: &JsNode, arena: &ParseArena) -> std
             source_type,
             leading_comments,
             trailing_comments,
+            // Internal analyze-only metadata; not part of the serialized AST.
+            ignore_comment_map: _,
         } => {
             write_preamble(w, JS_PROGRAM, *start, *end);
             write_typed_loc(w, loc.as_deref());
@@ -1924,6 +2027,7 @@ fn write_js_node<W: Writer>(w: &mut W, node: &JsNode, arena: &ParseArena) -> std
             value,
             r#static,
             computed,
+            accessor: _,
         } => {
             write_preamble(w, JS_PROPERTY_DEFINITION, *start, *end);
             write_typed_loc(w, loc.as_deref());
@@ -1960,6 +2064,10 @@ fn write_js_node<W: Writer>(w: &mut W, node: &JsNode, arena: &ParseArena) -> std
             write_preamble(w, JS_TS_ENUM_DECLARATION, *start, *end);
             write_typed_loc(w, loc.as_deref());
         }
+        JsNode::TSParameterProperty { start, end, loc } => {
+            write_preamble(w, JS_TS_PARAMETER_PROPERTY, *start, *end);
+            write_typed_loc(w, loc.as_deref());
+        }
         JsNode::TSModuleDeclaration {
             start,
             end,
@@ -1980,28 +2088,8 @@ fn write_js_node<W: Writer>(w: &mut W, node: &JsNode, arena: &ParseArena) -> std
             write_str(w, comment_type.as_str());
             write_str(w, value.as_str());
         }
-        // `Raw(Value)` and `Null` don't carry positions, so they use
-        // dedicated sentinel tags without the usual preamble pair.
-        JsNode::Raw(value) => {
-            write_preamble(w, JS_RAW_JSON, u32::MAX, u32::MAX);
-            let len_slot = w.position();
-            write_u32(w, 0);
-            let p0 = w.position();
-            struct A<'a, W2: Writer>(&'a mut W2);
-            impl<W2: Writer> std::io::Write for A<'_, W2> {
-                fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-                    self.0.write_bytes(b);
-                    Ok(b.len())
-                }
-                fn flush(&mut self) -> std::io::Result<()> {
-                    Ok(())
-                }
-            }
-            let mut shim = A(w);
-            serde_json::to_writer(&mut shim, value).map_err(std::io::Error::other)?;
-            let p1 = shim.0.position();
-            w.patch_u32(len_slot, (p1 - p0) as u32);
-        }
+        // `Null` doesn't carry positions, so it uses a dedicated sentinel tag
+        // without the usual preamble pair.
         JsNode::Null => {
             write_preamble(w, JS_NULL, u32::MAX, u32::MAX);
         }
@@ -2078,16 +2166,29 @@ pub fn encode_root_into<W: Writer>(
     struct Guard {
         prev_loc: bool,
         prev_css: bool,
+        prev_conv: Option<crate::compiler::legacy::Utf8ToUtf16>,
     }
     impl Drop for Guard {
         fn drop(&mut self) {
             SKIP_JSNODE_LOC.with(|c| c.set(self.prev_loc));
             SKIP_CSS_AST.with(|c| c.set(self.prev_css));
+            OFFSET_CONV.with(|c| *c.borrow_mut() = self.prev_conv.take());
         }
     }
     let prev_loc = SKIP_JSNODE_LOC.with(|c| c.replace(skip_jsnode_loc));
     let prev_css = SKIP_CSS_AST.with(|c| c.replace(skip_css_ast));
-    let _guard = Guard { prev_loc, prev_css };
+    // Install a byte->UTF-16 converter only for non-ASCII source (#793).
+    let new_conv = if source.is_ascii() {
+        None
+    } else {
+        Some(crate::compiler::legacy::Utf8ToUtf16::new(source))
+    };
+    let prev_conv = OFFSET_CONV.with(|c| c.replace(new_conv));
+    let _guard = Guard {
+        prev_loc,
+        prev_css,
+        prev_conv,
+    };
 
     let _ = crate::ast::arena::with_serialize_arena(&root.arena, || write_root(writer, root));
 
@@ -2121,6 +2222,97 @@ mod tests {
         let root_off = u32::from_le_bytes(buf[12..16].try_into().unwrap()) as usize;
         // Root must be the binary TAG_ROOT, not the JSON fallback.
         assert_eq!(buf[root_off], TAG_ROOT);
+    }
+
+    /// #908: a genuinely-TS construct lowered to a `JsNode::Raw` JSON sub-tree
+    /// (here a constructor parameter property) carries byte offsets, which must
+    /// be remapped to UTF-16 like every other span when the source contains
+    /// non-ASCII characters — otherwise the whole sub-tree drifts past the
+    /// preceding multibyte text and `source.slice(start, end)` breaks.
+    #[test]
+    fn raw_json_offsets_are_utf16() {
+        use std::collections::HashSet;
+
+        // A type-annotated declaration (`let n: number`) still emits its
+        // `Identifier` (with `typeAnnotation`) as a `JS_RAW_JSON` envelope blob —
+        // the Raw-eradication campaign typed the previously-`JsNode::Raw` TS
+        // arrow / parameter-property nodes, but `parse()` output keeps type
+        // annotations and re-materializes type-annotated nodes as raw JSON for
+        // byte-identical encoding. That JSON carries byte offsets, which must be
+        // remapped to UTF-16 like every other span when the source contains
+        // non-ASCII characters — otherwise the node drifts past the preceding
+        // multibyte text and `source.slice(start, end)` breaks (#908).
+        //
+        // 4 multibyte chars precede the declaration, so a leaked byte offset
+        // would be shifted by +8 (4 chars × 2 extra bytes) versus UTF-16.
+        let src = concat!(
+            "<script lang=\"ts\">\n",
+            "  const \u{30E9}\u{30D9}\u{30EB} = \"\u{3042}\";\n",
+            "  let n: number = 1;\n",
+            "</script>\n",
+            "<p>{\u{30E9}\u{30D9}\u{30EB}}</p>",
+        );
+        let ast = parse(src, ParseOptions::default()).unwrap();
+
+        // Canonical UTF-16 offsets — exactly what the JSON `parse` path emits.
+        let valid: HashSet<i64> = crate::ast::arena::with_serialize_arena(&ast.arena, || {
+            let mut value = serde_json::to_value(&ast).unwrap();
+            let conv = crate::compiler::legacy::Utf8ToUtf16::new(src);
+            crate::compiler::legacy::convert_positions_to_utf16(&mut value, &conv);
+            let mut set = HashSet::new();
+            collect_offsets(&value, &mut set);
+            set
+        });
+
+        let buf = encode_root_to_vec(&ast, src);
+        // Raw-JSON sub-trees are the only place `"start":`/`"end":` appears as
+        // text in the binary envelope (typed nodes store offsets as raw u32).
+        let text = String::from_utf8_lossy(&buf);
+        let mut checked = 0usize;
+        for key in ["\"start\":", "\"end\":"] {
+            let mut from = 0;
+            while let Some(rel) = text[from..].find(key) {
+                let num_start = from + rel + key.len();
+                let digits: String = text[num_start..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect();
+                from = num_start;
+                if let Ok(n) = digits.parse::<i64>() {
+                    assert!(
+                        valid.contains(&n),
+                        "envelope raw-JSON offset {n} is not a UTF-16 node offset \
+                         (byte offsets leaked — #908)"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(
+            checked > 0,
+            "expected the typed arrow to produce raw-JSON offsets to check"
+        );
+    }
+
+    fn collect_offsets(value: &serde_json::Value, out: &mut std::collections::HashSet<i64>) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (k, v) in map {
+                    if (k == "start" || k == "end")
+                        && let Some(n) = v.as_i64()
+                    {
+                        out.insert(n);
+                    }
+                    collect_offsets(v, out);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for it in items {
+                    collect_offsets(it, out);
+                }
+            }
+            _ => {}
+        }
     }
 
     #[test]

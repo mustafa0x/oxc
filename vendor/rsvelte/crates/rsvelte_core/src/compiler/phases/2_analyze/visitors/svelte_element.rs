@@ -67,14 +67,24 @@ pub fn visit(
                     _ => {}
                 }
             }
-            Attribute::Attribute(attr_node) if attr_node.name == "id" => {
-                if let AttributeValue::Sequence(parts) = &attr_node.value
-                    && parts.len() == 1
-                    && let Some(AttributeValuePart::Text(text)) = parts.first()
-                {
-                    element_id = Some(text.data.to_string());
+            Attribute::Attribute(attr_node) if attr_node.name == "id" => match &attr_node.value {
+                AttributeValue::Sequence(parts) => {
+                    let has_dynamic_part = parts
+                        .iter()
+                        .any(|p| matches!(p, AttributeValuePart::ExpressionTag(_)));
+                    if has_dynamic_part {
+                        context.analysis.css.has_dynamic_ids = true;
+                    } else if parts.len() == 1
+                        && let Some(AttributeValuePart::Text(text)) = parts.first()
+                    {
+                        element_id = Some(text.data.to_string());
+                    }
                 }
-            }
+                AttributeValue::Expression(_) => {
+                    context.analysis.css.has_dynamic_ids = true;
+                }
+                _ => {}
+            },
             Attribute::ClassDirective(cd) => {
                 context
                     .analysis
@@ -98,6 +108,7 @@ pub fn visit(
         dynamic_attribute_names: FxHashSet::default(),
         has_spread: false,
         has_class_directive: false,
+        class_directive_names: FxHashSet::default(),
         has_style_directive: false,
         parent_idx,
         children_idx: Vec::new(),
@@ -134,8 +145,34 @@ pub fn visit(
     }
 
     // Analyze the 'this' expression to track template references
-    // This is crucial for legacy state promotion to work correctly
-    super::script::walk_expression(&element.tag, context)?;
+    // This is crucial for legacy state promotion to work correctly.
+    //
+    // Mirror upstream SvelteElement.js `context.visit(node.tag, { ...state,
+    // expression: node.metadata.expression })`: the tag is a reactive template
+    // expression, so it is walked with the element's ExpressionMetadata (the
+    // same pattern as `expression_tag.rs`). This makes an `await` inside
+    // `this={await …}` set has_await and trip the `experimental_async` gate
+    // under default options, while keeping the pickled-await detection
+    // root-relative (a bare `this={await p}` IS the last evaluated expression
+    // and must not get a `$.save(...)` wrap).
+    {
+        let saved_in_expression_tag = context.in_expression_tag;
+        context.in_expression_tag = true;
+        let node = element.tag.as_node();
+        let result = super::shared::utils::walk_js_expression_node(
+            &node,
+            context,
+            &mut element.metadata.expression,
+        );
+        context.in_expression_tag = saved_in_expression_tag;
+        result?;
+
+        super::await_block::collect_pickled_awaits_node(
+            &node,
+            &mut context.analysis.pickled_awaits,
+            context.parse_arena,
+        );
+    }
 
     // Determine SVG/MathML metadata based on xmlns attribute or ancestor context.
     // This follows the official Svelte compiler's SvelteElement.js analysis logic.
@@ -231,7 +268,9 @@ pub fn visit(
     // so children with slot attributes should be allowed (they may be valid at runtime).
     // This matches how <svelte:component> allows slot attributes on its children.
     let was_direct_child = context.is_direct_child_of_component;
+    let was_direct_snippet = context.is_direct_child_of_snippet;
     context.is_direct_child_of_component = true;
+    context.is_direct_child_of_snippet = false;
     context
         .slot_owner_ancestors
         .push(super::SlotOwnerType::Component);
@@ -299,6 +338,7 @@ pub fn visit(
     context.fragment_owner_stack.pop();
     context.slot_owner_ancestors.pop();
     context.is_direct_child_of_component = was_direct_child;
+    context.is_direct_child_of_snippet = was_direct_snippet;
 
     Ok(())
 }

@@ -26,6 +26,22 @@ use super::super::parser::{ElementType, Parser, StackEntry};
 use super::super::utils::decode_html_entities;
 use super::super::utils::is_void_element;
 
+/// Whether the attribute list contains a non-empty `lang="…"` attribute. Used
+/// (in lenient/lint mode) to treat `<template lang="pug">` and similar as raw
+/// text rather than Svelte markup.
+fn template_has_lang(attributes: &[crate::ast::Attribute]) -> bool {
+    for attr in attributes {
+        if let crate::ast::Attribute::Attribute(node) = attr
+            && node.name.as_str() == "lang"
+            && let AttributeValue::Sequence(parts) = &node.value
+            && let Some(AttributeValuePart::Text(t)) = parts.first()
+        {
+            return !t.data.trim().is_empty();
+        }
+    }
+    false
+}
+
 impl Parser<'_> {
     /// Parse an element or comment.
     pub fn parse_element_or_comment(&mut self) -> ParseResult<Option<TemplateNode>> {
@@ -162,37 +178,74 @@ impl Parser<'_> {
         let pos_after_name = self.index;
         self.skip_whitespace();
 
-        // Parse attributes
-        let attributes = self.parse_attributes()?;
+        // Parse attributes. Top-level `<script>` / `<style>` attributes are
+        // static upstream (`read_static_attribute`, element.js
+        // `is_top_level_script_or_style`), so `{...}` chunks in their quoted
+        // values must not be parsed as JS expressions.
+        let is_top_level_script_or_style =
+            (name == "script" || name == "style") && self.stack.len() == 1;
+        let prev_in_root_script_or_style = self.in_root_script_or_style;
+        self.in_root_script_or_style = is_top_level_script_or_style;
+        let attributes_result = self.parse_attributes();
+        self.in_root_script_or_style = prev_in_root_script_or_style;
+        let attributes = attributes_result?;
 
         // Track position after attributes for unclosed elements at EOF
         let pos_after_attrs = self.index;
         self.skip_whitespace();
 
-        // Check for self-closing or void element
-        let self_closing = self.eat_optional("/");
+        // Check for self-closing or void element. A top-level `<script>` /
+        // `<style>` cannot be self-closed: upstream's
+        // `is_top_level_script_or_style` branch runs `parser.eat('>', true)`
+        // directly (the `/` is never consumed), so `<script foo="bar"/>` is an
+        // `expected_token` error at the `/`.
+        //
+        // In lenient (lint) mode we mirror svelte-eslint-parser, which DOES
+        // tolerate a self-closed `<style />` / `<script />` (it produces a
+        // self-closing node so layout/style lint rules can still fire). Allow
+        // the `/` to be consumed so the template parse does not abort — the
+        // compiler keeps `lenient_script: false`, so its output is unchanged.
+        let self_closing = if is_top_level_script_or_style
+            && !self.options.loose
+            && !self.options.lenient_script
+        {
+            false
+        } else {
+            self.eat_optional("/")
+        };
         let has_closing_bracket = self.eat_optional(">"); // consume '>'
 
-        // For unclosed elements at EOF, report unexpected_eof error (unless in loose mode)
-        if !has_closing_bracket && self.is_eof() && !self.options.loose {
-            return Err(crate::error::ParseError::svelte(
-                "unexpected_eof",
-                "Unexpected end of input",
-                (self.index, self.index),
-            ));
+        // A missing `>` after the attributes is a strict-mode error.
+        //
+        // - At EOF, upstream's next `read_attribute` → `read_until` call
+        //   throws `unexpected_eof` (parser.read_until errors when invoked at
+        //   the end of input), e.g. `<d` ⊣.
+        // - Mid-template the attribute loop ends on a non-name character and
+        //   `parser.eat('>', true, false)` throws `expected_token`, e.g.
+        //   `<Comp foo={bar}\n</div>` or a top-level `<script …/>`.
+        if !has_closing_bracket && !self.options.loose {
+            self.skip_whitespace();
+            if self.is_eof() {
+                return Err(crate::error::ParseError::svelte(
+                    "unexpected_eof",
+                    "Unexpected end of input",
+                    (self.source.len(), self.source.len()),
+                ));
+            }
+            return Err(crate::error::ParseError::expected_token(">", self.index));
         }
         // In loose mode, treat as an unclosed element and continue
 
         // Handle script and style tags specially
         // Only treat as Svelte script if at root level (not inside another element)
         if name == "script" && !self.is_inside_element() {
-            return self.parse_script_tag(start, attributes);
+            return self.parse_script_tag(start, attributes, self_closing);
         }
 
         // Only treat as Svelte style (component CSS) if at root level (not inside another element)
         // When inside any element (including svelte:head), style should remain as a child element
         if name == "style" && !self.is_inside_element() {
-            return self.parse_style_tag(start, attributes);
+            return self.parse_style_tag(start, attributes, self_closing);
         }
 
         // Handle svelte:options specially - extract and store options
@@ -209,8 +262,17 @@ impl Parser<'_> {
         // Check if this is a raw text element (textarea, or non-top-level script/style).
         // Non-top-level <script> and <style> tags have their content parsed as raw text,
         // matching the official Svelte compiler behavior (element.js L400-417).
+        //
+        // In lenient (lint) mode a `<template lang="…">` (e.g. `lang="pug"`) holds
+        // a preprocessor language, NOT Svelte markup — parsing its body as Svelte
+        // would spuriously fail and suppress every lint on the file. Treat it as a
+        // raw-text element so the body is opaque (svelte-eslint-parser likewise
+        // does not parse it as Svelte). The compiler keeps `lenient_script: false`.
         let is_raw_text_element = name == "textarea"
-            || ((name == "script" || name == "style") && self.is_inside_element());
+            || ((name == "script" || name == "style") && self.is_inside_element())
+            || (self.options.lenient_script
+                && name == "template"
+                && template_has_lang(&attributes));
 
         // Create fragment for children
         let mut fragment = Fragment {
@@ -260,25 +322,89 @@ impl Parser<'_> {
                         }
                     }
                     self.eat_optional(">"); // consume '>'
+
+                    // Upstream clears `last_auto_closed_tag` once a closing tag
+                    // pops the stack below the depth recorded when the tag was
+                    // auto-closed (element.js L133-135). The pop for this
+                    // element happens just below, so compare against
+                    // `stack.len() - 1`.
+                    if let Some(ref last_auto) = self.last_auto_closed_tag
+                        && self.stack.len().saturating_sub(1) < last_auto.depth
+                    {
+                        self.last_auto_closed_tag = None;
+                    }
                 } else {
-                    // Mismatched close tag - implicitly close the current element.
-                    // Emit element_implicitly_closed warning.
-                    // Corresponds to element.js L97-104:
-                    //   w.element_implicitly_closed({ start: parent.start, end }, `</${name}>`, `</${parent.name}>`);
-                    self.parse_warnings.push(crate::ast::template::ParseWarning {
-                        code: "element_implicitly_closed".to_string(),
-                        message: format!(
-                            "This element is implicitly closed by the following `</{}>`, which can cause an unexpected DOM structure. Add an explicit `</{}>` to avoid surprises.\nhttps://svelte.dev/e/element_implicitly_closed",
-                            closing_name, name
-                        ),
-                    });
+                    // Mismatched close tag. Upstream's close() while-loop:
+                    // a *RegularElement* parent is implicitly closed with an
+                    // `element_implicitly_closed` warning (suppressed when the
+                    // tag was just auto-closed); any other parent (Component,
+                    // SvelteElement, TitleElement, …) is a strict-mode error —
+                    // `element_invalid_closing_tag` or its `…_autoclosed`
+                    // variant (element.js L107-122).
+                    let is_regular_element = matches!(
+                        element_type,
+                        ElementType::Regular | ElementType::ShadowrootTemplate
+                    );
+                    if is_regular_element {
+                        if self
+                            .last_auto_closed_tag
+                            .as_ref()
+                            .is_none_or(|t| t.tag.as_str() != closing_name)
+                        {
+                            self.parse_warnings.push(crate::ast::template::ParseWarning {
+                                code: "element_implicitly_closed".to_string(),
+                                message: format!(
+                                    "This element is implicitly closed by the following `</{}>`, which can cause an unexpected DOM structure. Add an explicit `</{}>` to avoid surprises.\nhttps://svelte.dev/e/element_implicitly_closed",
+                                    closing_name, name
+                                ),
+                            });
+                        }
+                    } else if !self.options.loose {
+                        if let Some(ref last_auto) = self.last_auto_closed_tag
+                            && last_auto.tag.as_str() == closing_name
+                        {
+                            let reason = last_auto.reason.clone();
+                            return Err(crate::error::ParseError::svelte(
+                                "element_invalid_closing_tag_autoclosed",
+                                format!(
+                                    "`</{}>` attempted to close element that was already automatically closed by `<{}>` (cannot nest `<{}>` inside `</{}>`)",
+                                    closing_name, reason, reason, closing_name
+                                ),
+                                (close_start, close_start),
+                            ));
+                        }
+                        return Err(crate::error::ParseError::svelte(
+                            "element_invalid_closing_tag",
+                            format!(
+                                "`</{}>` attempted to close an element that was not open",
+                                closing_name
+                            ),
+                            (close_start, close_start),
+                        ));
+                    }
                     self.index = close_start; // Reset to before '</...'
                     // Still mark as found for backwards compatibility (auto-close behavior)
                     found_closing_tag = true;
                 }
-            } else if self.match_str("{/") || self.match_str("{:") {
-                // If we encounter a block closing tag {/ or continuation {:
-                // while inside an element, auto-close the element
+            } else if let Some(slash_pos) = self.match_block_close_marker() {
+                // `{/...}` while this element is still open. Upstream `close()`
+                // hits the `RegularElement` / default case: strict mode errors
+                // `block_unexpected_close` (e.g. the open `<li>b` in
+                // `{#if true}<li>b{/if}`), loose mode pops the element so the
+                // enclosing block consumes the marker (auto-close recovery).
+                if !self.options.loose {
+                    return Err(crate::error::ParseError::svelte(
+                        "block_unexpected_close",
+                        "Unexpected block closing tag",
+                        (slash_pos, slash_pos),
+                    ));
+                }
+                found_closing_tag = true;
+            } else if self.match_block_continuation_marker().is_some() {
+                // A `{:...}` continuation while inside an element: loose-mode
+                // recovery auto-closes the element. (In strict mode
+                // `parse_fragment` already errored with
+                // `block_invalid_continuation_placement` before reaching here.)
                 found_closing_tag = true;
             } else if let Some(reason) = self.should_implicitly_close() {
                 // Element was implicitly closed by the next element (sibling).
@@ -574,8 +700,11 @@ impl Parser<'_> {
                         return expr_tag.expression.clone();
                     }
                     AttributeValue::Sequence(parts)
-                        // Handle single-item sequences
-                        if parts.len() == 1 => {
+                        // A non-expression `this` uses the FIRST chunk only,
+                        // mirroring upstream element.js L298-315: `this="h{n}"`
+                        // (buggy Svelte 4 behaviour, preserved upstream) becomes
+                        // the Literal `'h'` rather than an error.
+                        if !parts.is_empty() => {
                             match &parts[0] {
                                 AttributeValuePart::Text(text) => {
                                     // For quoted string values like this="div"
@@ -584,7 +713,7 @@ impl Parser<'_> {
                                     return Expression::from_json(serde_json::json!({
                                         "type": "Literal",
                                         "value": text.data.as_str(),
-                                        "raw": format!("'{}'", text.data.as_str()),
+                                        "raw": format!("'{}'", text.raw.as_str()),
                                         "start": text.start,
                                         "end": text.end
                                     }));
@@ -1085,7 +1214,7 @@ impl Parser<'_> {
 
                 // Create an empty ExpressionTag value
                 let expression = if self.options.skip_expression_loc {
-                    Expression::Value(serde_json::json!({
+                    Expression::from_json(serde_json::json!({
                         "type": "Identifier",
                         "name": "",
                         "start": expr_start,
@@ -1094,7 +1223,7 @@ impl Parser<'_> {
                     }))
                 } else {
                     let loc = self.get_location(expr_start);
-                    Expression::Value(serde_json::json!({
+                    Expression::from_json(serde_json::json!({
                         "type": "Identifier",
                         "name": "",
                         "start": expr_start,
@@ -1559,7 +1688,8 @@ impl Parser<'_> {
 
         let name_loc = self.create_name_loc_optional(name_start, name_end);
 
-        let expression = if self.eat_optional("=") {
+        let had_value = self.eat_optional("=");
+        let expression = if had_value {
             self.skip_whitespace();
             // Handle both bare {expr} and quoted "{expr}" / '{expr}'
             let quote =
@@ -1602,10 +1732,12 @@ impl Parser<'_> {
             )
         };
 
+        // Shorthand `class:name` (no value) ends at the name (see animate).
+        let end = if had_value { self.index } else { name_end };
         Ok(Some(crate::ast::Attribute::ClassDirective(
             crate::ast::template::ClassDirective {
                 start: start as u32,
-                end: self.index as u32,
+                end: end as u32,
                 name: CompactString::from(class_name),
                 name_loc,
                 expression,
@@ -1636,7 +1768,8 @@ impl Parser<'_> {
 
         let name_loc = self.create_name_loc_optional(name_start, name_end);
 
-        let value = if self.eat_optional("=") {
+        let has_value = self.eat_optional("=");
+        let value = if has_value {
             self.skip_whitespace();
             if self.eat_optional("{") {
                 let expr_start = self.index;
@@ -1668,7 +1801,10 @@ impl Parser<'_> {
                                 start: text_start as u32,
                                 end: self.index as u32,
                                 raw: CompactString::from(&self.source[text_start..self.index]),
-                                data: CompactString::from(&self.source[text_start..self.index]),
+                                data: CompactString::from(decode_html_entities(
+                                    &self.source[text_start..self.index],
+                                    true,
+                                )),
                             }));
                         }
                         let expr_start = self.index;
@@ -1680,10 +1816,10 @@ impl Parser<'_> {
                         parts.push(AttributeValuePart::ExpressionTag(ExpressionTag {
                             start: expr_start as u32,
                             end: self.index as u32,
-                            expression: self.parse_js_expression(
+                            expression: self.parse_js_expression_strict_eager(
                                 &self.source[inner_start..inner_end],
                                 inner_start,
-                            ),
+                            )?,
                             metadata: Default::default(),
                         }));
                         text_start = self.index;
@@ -1698,7 +1834,10 @@ impl Parser<'_> {
                         start: text_start as u32,
                         end: self.index as u32,
                         raw: CompactString::from(&self.source[text_start..self.index]),
-                        data: CompactString::from(&self.source[text_start..self.index]),
+                        data: CompactString::from(decode_html_entities(
+                            &self.source[text_start..self.index],
+                            true,
+                        )),
                     }));
                 }
 
@@ -1723,7 +1862,10 @@ impl Parser<'_> {
                                 start: text_start as u32,
                                 end: self.index as u32,
                                 raw: CompactString::from(&self.source[text_start..self.index]),
-                                data: CompactString::from(&self.source[text_start..self.index]),
+                                data: CompactString::from(decode_html_entities(
+                                    &self.source[text_start..self.index],
+                                    true,
+                                )),
                             }));
                         }
                         let expr_start = self.index;
@@ -1735,10 +1877,10 @@ impl Parser<'_> {
                         parts.push(AttributeValuePart::ExpressionTag(ExpressionTag {
                             start: expr_start as u32,
                             end: self.index as u32,
-                            expression: self.parse_js_expression(
+                            expression: self.parse_js_expression_strict_eager(
                                 &self.source[inner_start..inner_end],
                                 inner_start,
-                            ),
+                            )?,
                             metadata: Default::default(),
                         }));
                         text_start = self.index;
@@ -1753,7 +1895,10 @@ impl Parser<'_> {
                         start: text_start as u32,
                         end: self.index as u32,
                         raw: CompactString::from(&self.source[text_start..self.index]),
-                        data: CompactString::from(&self.source[text_start..self.index]),
+                        data: CompactString::from(decode_html_entities(
+                            &self.source[text_start..self.index],
+                            true,
+                        )),
                     }));
                 }
 
@@ -1769,10 +1914,17 @@ impl Parser<'_> {
             AttributeValue::True(true)
         };
 
+        // For the shorthand form (`style:color`) the directive ends at the
+        // property name. `self.index` was advanced past any trailing whitespace
+        // by the `skip_whitespace()` before directive dispatch (needed to look
+        // for `=`), so using it here would wrongly extend the node onto the next
+        // line — upstream ends a shorthand directive at the name. With a value,
+        // `self.index` already sits at the end of the parsed value.
+        let end = if has_value { self.index } else { name_end };
         Ok(Some(crate::ast::Attribute::StyleDirective(
             crate::ast::template::StyleDirective {
                 start: start as u32,
-                end: self.index as u32,
+                end: end as u32,
                 name: CompactString::from(prop_name),
                 name_loc,
                 value,
@@ -1903,7 +2055,8 @@ impl Parser<'_> {
         let animate_name = &full_name[8..]; // Skip "animate:"
         let name_loc = self.create_name_loc_optional(name_start, name_end);
 
-        let expression = if self.eat_optional("=") {
+        let had_value = self.eat_optional("=");
+        let expression = if had_value {
             self.skip_whitespace();
             // Handle both bare {expr} and quoted "{expr}" / '{expr}'
             let quote =
@@ -1934,10 +2087,14 @@ impl Parser<'_> {
             None
         };
 
+        // A shorthand `animate:name` (no value) ends at the name — `self.index`
+        // was advanced past trailing whitespace by the pre-dispatch
+        // `skip_whitespace()`, so use `name_end` (matches upstream spans).
+        let end = if had_value { self.index } else { name_end };
         Ok(Some(crate::ast::Attribute::AnimateDirective(
             crate::ast::template::AnimateDirective {
                 start: start as u32,
-                end: self.index as u32,
+                end: end as u32,
                 name: CompactString::from(animate_name),
                 name_loc,
                 expression,
@@ -1957,7 +2114,8 @@ impl Parser<'_> {
         let let_name = &full_name[4..]; // Skip "let:"
         let name_loc = self.create_name_loc_optional(name_start, name_end);
 
-        let expression = if self.eat_optional("=") {
+        let had_value = self.eat_optional("=");
+        let expression = if had_value {
             self.skip_whitespace();
             // Handle both bare {expr} and quoted "{expr}" / '{expr}'
             let quote =
@@ -1988,10 +2146,12 @@ impl Parser<'_> {
             None
         };
 
+        // Shorthand `let:name` (no value) ends at the name (see animate).
+        let end = if had_value { self.index } else { name_end };
         Ok(Some(crate::ast::Attribute::LetDirective(
             crate::ast::template::LetDirective {
                 start: start as u32,
-                end: self.index as u32,
+                end: end as u32,
                 name: CompactString::from(let_name),
                 name_loc,
                 expression,
@@ -2167,12 +2327,28 @@ impl Parser<'_> {
 
                 let expr_end = self.index;
 
-                // Create expression tag
+                // Create expression tag. Use the strict parser so that an
+                // invalid expression (`a={...}`, `a={1 ? 2 : }`, TS syntax in
+                // a non-TS file) surfaces as `js_parse_error`, mirroring
+                // upstream's `read_expression` inside `read_attribute_value`.
+                // In deferred mode this creates a Lazy expression whose error
+                // is raised by `resolve_lazy_expressions`; in loose mode the
+                // underlying parser still recovers with a placeholder.
                 let expr_content = &self.source[expr_start + 1..expr_end - 1];
+                let expression = if self.in_root_script_or_style {
+                    // Top-level <script>/<style> attributes are static
+                    // upstream (`read_static_attribute`): `{...}` chunks in
+                    // quoted values are plain text. The parts get merged back
+                    // into a Text node (`merge_attribute_parts_to_text`), so
+                    // parse leniently and never raise `js_parse_error`.
+                    self.parse_js_expression(expr_content, expr_start + 1)
+                } else {
+                    self.parse_js_expression_strict_eager(expr_content, expr_start + 1)?
+                };
                 parts.push(AttributeValuePart::ExpressionTag(ExpressionTag {
                     start: expr_start as u32,
                     end: expr_end as u32,
-                    expression: self.parse_js_expression(expr_content, expr_start + 1),
+                    expression,
                     metadata: Default::default(),
                 }));
             } else {
@@ -2283,7 +2459,11 @@ impl Parser<'_> {
     /// - For textarea: parses {expressions} but treats HTML as text
     pub fn parse_raw_text_content(&mut self, tag_name: &str) -> ParseResult<Fragment> {
         let closing_tag = format!("</{}", tag_name);
-        let is_raw_content = tag_name == "style" || tag_name == "script";
+        // `template` only reaches here via the lenient-mode `<template lang="…">`
+        // raw-text gate (a normal `<template>` is parsed as markup), so its body
+        // is a non-Svelte preprocessor language and must be fully opaque — no
+        // expression handling — exactly like `style`/`script`.
+        let is_raw_content = tag_name == "style" || tag_name == "script" || tag_name == "template";
 
         // For style and script elements, just get raw content (no expression handling)
         if is_raw_content {
@@ -2336,6 +2516,24 @@ impl Parser<'_> {
                             "{{@{} ...}} tag cannot be inside a <textarea>",
                             tag_name_str
                         ),
+                        (mustache_start, mustache_start),
+                    ));
+                }
+                // A logic block (`{#each}`, `{#if}`, …) cannot appear inside a
+                // <textarea>. Svelte raises `block_invalid_placement` at PARSE
+                // (read_sequence's `'inside <textarea>'` location); rsvelte
+                // mirrored it only in the analyze EachBlock visitor, which
+                // svelte2tsx (parse-only) never runs. Raise it here too so the
+                // error surfaces consistently.
+                if trimmed_peek.starts_with('#') {
+                    let after_hash = trimmed_peek.get(1..).unwrap_or("");
+                    let block_name: String = after_hash
+                        .chars()
+                        .take_while(|c| c.is_ascii_lowercase())
+                        .collect();
+                    return Err(crate::error::ParseError::svelte(
+                        "block_invalid_placement",
+                        format!("{{#{} ...}} block cannot be inside <textarea>", block_name),
                         (mustache_start, mustache_start),
                     ));
                 }

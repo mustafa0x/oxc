@@ -12,65 +12,6 @@ use crate::ast::typed_expr::JsNode;
 use crate::compiler::phases::phase2_analyze::BindingKind;
 use serde_json::Value;
 
-/// Visit a variable declarator.
-///
-/// Corresponds to `VariableDeclarator` in VariableDeclarator.js.
-pub fn visit(node: &Value, context: &mut VisitorContext) -> Result<(), AnalysisError> {
-    // Ensure no conflict with module imports
-    utils::ensure_no_module_import_conflict(node, context)?;
-
-    // Collect svelte-ignore codes from the parent VariableDeclaration's leading comments.
-    // This is needed to suppress warnings like `non_reactive_update` when the declaration
-    // has a `// svelte-ignore non_reactive_update` comment.
-    let ignore_codes = collect_ignore_codes_from_parent(context);
-    if !ignore_codes.is_empty() {
-        // Store ignore codes on all bindings declared in this declarator
-        if let Some(id) = node.get("id") {
-            store_ignore_codes_on_bindings(id, &ignore_codes, context);
-        }
-    }
-
-    if context.analysis.runes {
-        // Runes mode path
-        visit_runes_mode(node, context)?;
-    } else {
-        // Non-runes mode - check for invalid rune usage
-        visit_non_runes_mode(node, context)?;
-    }
-
-    // Handle visitation order
-    if let Some(init) = node.get("init") {
-        let rune = get_rune(init, context);
-
-        if rune.as_deref() == Some("$props") {
-            // For $props(), visit the id with incremented function_depth
-            // to prevent erroneous `state_referenced_locally` warnings
-            if let Some(id) = node.get("id") {
-                let original_depth = context.function_depth;
-                context.function_depth += 1;
-                super::script::walk_js_node(id, context)?;
-                context.function_depth = original_depth;
-            }
-
-            // Visit init normally
-            super::script::walk_js_node(init, context)?;
-        } else {
-            // Normal visitation - visit both id and init
-            if let Some(id) = node.get("id") {
-                super::script::walk_js_node(id, context)?;
-            }
-            super::script::walk_js_node(init, context)?;
-        }
-    } else {
-        // No init - just visit the id
-        if let Some(id) = node.get("id") {
-            super::script::walk_js_node(id, context)?;
-        }
-    }
-
-    Ok(())
-}
-
 /// Process variable declarator in runes mode.
 fn visit_runes_mode(node: &Value, context: &mut VisitorContext) -> Result<(), AnalysisError> {
     let init = node.get("init");
@@ -115,8 +56,19 @@ fn visit_runes_mode(node: &Value, context: &mut VisitorContext) -> Result<(), An
                 .and_then(|a| a.first());
             if let Some(arg) = rune_arg {
                 for path in &paths {
+                    // Prefer position-based lookup so a `$state` declared inside a
+                    // function body doesn't contaminate a same-named root binding
+                    // (e.g. `let value = $derived.by(() => { const value = $state(0); ... })`).
+                    let id_start = path.get("start").and_then(|s| s.as_u64()).map(|s| s as u32);
                     if let Some(name) = path.get("name").and_then(|n| n.as_str())
-                        && let Some(bi) = context.analysis.root.find_binding_any_scope(name)
+                        && let Some(bi) = id_start
+                            .and_then(|pos| {
+                                context.analysis.root.bindings.iter().position(|b| {
+                                    b.name == name && b.declaration_start == Some(pos)
+                                })
+                            })
+                            .or_else(|| context.analysis.root.get_binding(name, context.scope))
+                            .or_else(|| context.analysis.root.find_binding_any_scope(name))
                     {
                         let b = &mut context.analysis.root.bindings[bi];
                         // For $derived, always store the argument expression (even non-literals)
@@ -143,6 +95,17 @@ fn visit_runes_mode(node: &Value, context: &mut VisitorContext) -> Result<(), An
         }
     } else if let Some(init) = init {
         // Non-rune variable declaration - set initial value for constant folding
+        if std::env::var("RSV_DBG4").is_ok() {
+            for path in &paths {
+                if let Some(nm) = path.get("name").and_then(|n| n.as_str()) {
+                    eprintln!(
+                        "DBG4 nonrune name={} init.type={:?}",
+                        nm,
+                        init.get("type").and_then(|t| t.as_str())
+                    );
+                }
+            }
+        }
         for path in &paths {
             if let Some(name) = path.get("name").and_then(|n| n.as_str()) {
                 // Prefer a position-based lookup so that identical names in
@@ -164,6 +127,14 @@ fn visit_runes_mode(node: &Value, context: &mut VisitorContext) -> Result<(), An
                 if let Some(binding_idx) = binding_idx {
                     let binding = &mut context.analysis.root.bindings[binding_idx];
                     binding.initial = extract_literal_string(init);
+                    if init.get("type").and_then(|t| t.as_str()) == Some("TemplateLiteral")
+                        && init
+                            .get("expressions")
+                            .and_then(|e| e.as_array())
+                            .is_some_and(|a| !a.is_empty())
+                    {
+                        binding.init_expr_json = Some(init.to_string());
+                    }
                     binding.initial_is_defined = is_expression_defined(init);
                     // Store the AST node type of the initial value for should_proxy()
                     binding.initial_node_type =
@@ -601,7 +572,18 @@ fn visit_non_runes_mode(node: &Value, context: &mut VisitorContext) -> Result<()
         }
     }
 
-    // Set initial value for constant folding
+    // Set initial value for constant folding.
+    // For destructured patterns (`const { i } = obj`, `const [x] = arr`), each
+    // binding's *actual* value is a property/element access on the RHS — not the
+    // RHS itself.  The upstream `scope.evaluate` resolves `binding.initial`
+    // (which is the whole RHS) via ObjectExpression → UNKNOWN, so `is_defined`
+    // ends up false.  We mirror that: only mark `initial_is_defined` for the
+    // binding when the declarator id is a plain Identifier (no destructuring).
+    let id_is_plain_identifier = node
+        .get("id")
+        .and_then(|id| id.get("type"))
+        .and_then(|t| t.as_str())
+        == Some("Identifier");
     if let Some(init) = init {
         for path in &paths {
             if let Some(name) = path.get("name").and_then(|n| n.as_str())
@@ -609,7 +591,11 @@ fn visit_non_runes_mode(node: &Value, context: &mut VisitorContext) -> Result<()
             {
                 let binding = &mut context.analysis.root.bindings[binding_idx];
                 binding.initial = extract_literal_string(init);
-                binding.initial_is_defined = is_expression_defined(init);
+                // Only propagate `is_defined` when this is a simple binding
+                // (`const x = expr`).  For destructured bindings the runtime
+                // value comes from a property/index access on the RHS, so we
+                // cannot confirm it is defined without full evaluation.
+                binding.initial_is_defined = id_is_plain_identifier && is_expression_defined(init);
                 binding.initial_node_type =
                     init.get("type").and_then(|t| t.as_str()).map(String::from);
             }
@@ -815,8 +801,55 @@ fn is_expression_defined(node: &Value) -> bool {
             .and_then(|arr| arr.last())
             .map(is_expression_defined)
             .unwrap_or(false),
+        // Upstream `scope.evaluate` knows the global `Math.*` / `Number` /
+        // `Number.*` / `String` / `String.from*` / `BigInt` functions return a
+        // NUMBER or STRING — never null/undefined. A `const x = Math.round(...)`
+        // binding is therefore `is_defined`, so a template `${x}` reads bare
+        // (no `?? ''`). Mirrors `is_known_defined_global_call` in
+        // `3_transform/.../shared/utils.rs`.
+        "CallExpression" => node
+            .get("callee")
+            .and_then(json_member_keypath)
+            .map(|kp| is_known_defined_global_call(&kp))
+            .unwrap_or(false),
         _ => false,
     }
+}
+
+/// Build a dotted keypath for a non-computed identifier member chain
+/// (`Math.round` → `"Math.round"`, `Number` → `"Number"`). Returns `None` for
+/// any computed access / non-identifier link. Mirrors `js_expr_keypath`.
+fn json_member_keypath(node: &Value) -> Option<String> {
+    match node.get("type").and_then(|t| t.as_str())? {
+        "Identifier" => node.get("name").and_then(|n| n.as_str()).map(String::from),
+        "MemberExpression"
+            if !node
+                .get("computed")
+                .and_then(|c| c.as_bool())
+                .unwrap_or(false) =>
+        {
+            let object = json_member_keypath(node.get("object")?)?;
+            let prop = node
+                .get("property")
+                .filter(|p| p.get("type").and_then(|t| t.as_str()) == Some("Identifier"))
+                .and_then(|p| p.get("name"))
+                .and_then(|n| n.as_str())?;
+            Some(format!("{object}.{prop}"))
+        }
+        _ => None,
+    }
+}
+
+/// The global functions whose return value is always a defined number/string —
+/// mirrors `is_known_defined_global_call` in the client transform.
+fn is_known_defined_global_call(keypath: &str) -> bool {
+    keypath.starts_with("Math.")
+        || keypath == "Number"
+        || keypath.starts_with("Number.")
+        || keypath == "String"
+        || keypath == "String.fromCharCode"
+        || keypath == "String.fromCodePoint"
+        || keypath == "BigInt"
 }
 
 /// Extract a literal string representation from an AST node.
@@ -890,10 +923,33 @@ fn collect_ignore_codes_from_parent(context: &VisitorContext) -> Vec<String> {
         return codes;
     }
     for node in context.js_path[..path_len - 1].iter().rev() {
-        let node_type = node.get("type").and_then(|t| t.as_str());
+        let node_type = node.get_type_str();
         match node_type {
             Some("VariableDeclaration") | Some("ExportNamedDeclaration") => {
-                if let Some(comments) = node.get("leadingComments").and_then(|c| c.as_array()) {
+                // Prefer the parser-harvested svelte-ignore map (keyed by the parent's
+                // absolute start). This covers both typed parents and Value-entry parents
+                // that live inside a genuinely-`JsNode::Raw` subtree, without materializing
+                // a typed node into a Value.
+                let before = codes.len();
+                if let Some(start) = node.get_field_u64("start")
+                    && let Some(values) = context.script_ignore_comments.get(&(start as u32))
+                {
+                    for value in values {
+                        codes.extend(
+                            crate::compiler::phases::phase2_analyze::utils::extract_svelte_ignore(
+                                value,
+                                context.analysis.runes,
+                            ),
+                        );
+                    }
+                }
+                // Legacy Value-path fallback: read the materialized `leadingComments`
+                // directly when the map yielded nothing (e.g. pure Value-path analysis,
+                // where `script_ignore_comments` is empty).
+                if codes.len() == before
+                    && node.as_js_node().is_none()
+                    && let Some(comments) = node.get("leadingComments").and_then(|c| c.as_array())
+                {
                     for comment in comments {
                         if let Some(value) = comment.get("value").and_then(|v| v.as_str()) {
                             let extracted =
@@ -1168,8 +1224,42 @@ fn is_expression_defined_typed(node: &JsNode, arena: &crate::ast::arena::ParseAr
                 .map(|last| is_expression_defined_typed(last, arena))
                 .unwrap_or(false)
         }
-        JsNode::Raw(value) => is_expression_defined(value),
+        // Mirror the Value-path `CallExpression` arm: upstream `scope.evaluate`
+        // knows the global `Math.*` / `Number` / `String` / `BigInt` functions
+        // return a defined number/string, so a `const x = Math.round(...)`
+        // binding is `is_defined` and a template `${x}` reads bare (no `?? ''`).
+        // Without this arm the typed path falls through to `_ => false`, which
+        // spuriously adds `?? ''` for TS scripts now walked typed.
+        JsNode::CallExpression { callee, .. } => {
+            js_node_member_keypath(arena.get_js_node(*callee), arena)
+                .map(|kp| is_known_defined_global_call(&kp))
+                .unwrap_or(false)
+        }
         _ => false,
+    }
+}
+
+/// Build a dotted keypath for a non-computed identifier member chain on a typed
+/// `JsNode` (`Math.round` → `"Math.round"`, `Number` → `"Number"`). Returns
+/// `None` for any computed access / non-identifier link. Typed mirror of
+/// `json_member_keypath`; falls back to it for genuinely-`Raw` subtrees.
+fn js_node_member_keypath(node: &JsNode, arena: &crate::ast::arena::ParseArena) -> Option<String> {
+    match node {
+        JsNode::Identifier { name, .. } => Some(name.to_string()),
+        JsNode::MemberExpression {
+            object,
+            property,
+            computed: false,
+            ..
+        } => {
+            let object = js_node_member_keypath(arena.get_js_node(*object), arena)?;
+            let prop = match arena.get_js_node(*property) {
+                JsNode::Identifier { name, .. } => name.to_string(),
+                _ => return None,
+            };
+            Some(format!("{object}.{prop}"))
+        }
+        _ => None,
     }
 }
 
@@ -1223,7 +1313,20 @@ fn visit_runes_mode_typed(
             };
             if let Some(arg) = rune_arg {
                 for path in &paths {
-                    if let Some(bi) = context.analysis.root.find_binding_any_scope(&path.name) {
+                    // Prefer position-based lookup so a `$state` declared inside a
+                    // function body doesn't contaminate a same-named root binding
+                    // (e.g. `let value = $derived.by(() => { const value = $state(0); ... })`).
+                    let bi = context
+                        .analysis
+                        .root
+                        .bindings
+                        .iter()
+                        .position(|b| {
+                            b.name == path.name && b.declaration_start == Some(path.start)
+                        })
+                        .or_else(|| context.analysis.root.get_binding(&path.name, context.scope))
+                        .or_else(|| context.analysis.root.find_binding_any_scope(&path.name));
+                    if let Some(bi) = bi {
                         let b = &mut context.analysis.root.bindings[bi];
                         b.initial = extract_literal_string_typed(arg).or_else(|| {
                             if rune_name == "$derived" {
@@ -1257,8 +1360,32 @@ fn visit_runes_mode_typed(
                 .or_else(|| context.analysis.root.get_binding(&path.name, context.scope))
                 .or_else(|| context.analysis.root.find_binding_any_scope(&path.name));
             if let Some(binding_idx) = binding_idx {
+                // Guard: a plain (non-rune) `const`/`let`/`var` declarator must
+                // never write `initial` onto a prop binding. In runes mode props
+                // derive `initial` solely from the `$props()` destructuring, so a
+                // same-named binding reached here is always a *different* (e.g.
+                // block-scoped) variable. Without this guard, the typed-path
+                // position lookup — whose `path.start` (global) cannot match the
+                // binding's `declaration_start` (global + script offset, see
+                // scope_builder) — falls back to a scope-insensitive lookup that
+                // resolves to the prop and erases its default (initial → None),
+                // which then mis-emits `$$props.x` instead of the `x()` accessor.
+                if matches!(
+                    context.analysis.root.bindings[binding_idx].kind,
+                    BindingKind::Prop | BindingKind::BindableProp | BindingKind::RestProp
+                ) {
+                    continue;
+                }
                 let binding = &mut context.analysis.root.bindings[binding_idx];
                 binding.initial = extract_literal_string_typed(init);
+                // Keep the init AST for an interpolated template literal so
+                // reactive-state evaluation can see through `const url =
+                // `…${KNOWN}…``. Stored separately from `initial` (which feeds
+                // `is_prop_source`).
+                if matches!(init, JsNode::TemplateLiteral { expressions, .. } if !expressions.is_empty())
+                {
+                    binding.init_expr_json = Some(init.to_json_string());
+                }
                 binding.initial_is_defined = is_expression_defined_typed(init, arena);
                 binding.initial_node_type = Some(init.type_str().to_string());
                 if binding.initial_node_type.as_deref() == Some("Identifier")
@@ -1646,7 +1773,14 @@ fn visit_non_runes_mode_typed(
         }
     }
 
-    // Set initial value for constant folding
+    // Set initial value for constant folding.
+    // For destructured patterns (`const { i } = obj`, `const [x] = arr`), each
+    // binding's *actual* value is a property/element access on the RHS — not the
+    // RHS itself.  The upstream `scope.evaluate` resolves `binding.initial`
+    // (which is the whole RHS) via ObjectExpression → UNKNOWN, so `is_defined`
+    // ends up false.  We mirror that: only mark `initial_is_defined` for the
+    // binding when the declarator id is a plain Identifier (no destructuring).
+    let id_is_plain_identifier_typed = matches!(id_node, JsNode::Identifier { .. });
     if let Some(init) = init_node {
         for path in &paths {
             if let Some(&binding_idx) = context
@@ -1658,7 +1792,12 @@ fn visit_non_runes_mode_typed(
             {
                 let binding = &mut context.analysis.root.bindings[binding_idx];
                 binding.initial = extract_literal_string_typed(init);
-                binding.initial_is_defined = is_expression_defined_typed(init, arena);
+                // Only propagate `is_defined` when this is a simple binding
+                // (`const x = expr`).  For destructured bindings the runtime
+                // value comes from a property/index access on the RHS, so we
+                // cannot confirm it is defined without full evaluation.
+                binding.initial_is_defined =
+                    id_is_plain_identifier_typed && is_expression_defined_typed(init, arena);
                 binding.initial_node_type = Some(init.type_str().to_string());
                 if binding.initial_node_type.as_deref() == Some("Identifier")
                     && let JsNode::Identifier { name, .. } = init

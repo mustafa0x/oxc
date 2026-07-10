@@ -3,19 +3,19 @@
 //! This binary is called by the Node.js benchmark script to measure
 //! the Rust compiler's performance in single-threaded and multi-threaded modes.
 
-// Use jemalloc as the global allocator for better multi-threaded
+// Use mimalloc as the global allocator (A/B-measured faster than jemalloc;
 // performance. Defined per-bin rather than once in the lib because the lib
 // is built as both rlib and cdylib, and a lib-level `#[global_allocator]`
 // is duplicated across both outputs at link time — cargo issue
 // rust-lang/cargo#6313.
 #[cfg(all(
-    feature = "jemalloc",
+    feature = "mimalloc-alloc",
     not(feature = "napi"),
     not(target_arch = "wasm32"),
     not(target_os = "windows")
 ))]
 #[global_allocator]
-static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use std::env;
 use std::fs;
@@ -25,10 +25,10 @@ use std::time::Instant;
 #[cfg(feature = "native")]
 use rayon::prelude::*;
 
-use svelte_compiler_rust::svelte2tsx::{
+use rsvelte_core::svelte2tsx::{
     Svelte2TsxMode, Svelte2TsxNamespace, Svelte2TsxOptions, SvelteVersion, svelte2tsx,
 };
-use svelte_compiler_rust::{CompileOptions, GenerateMode, ParseOptions, compile, parse};
+use rsvelte_core::{CompileOptions, GenerateMode, ParseOptions, compile, parse};
 
 #[derive(Debug, Clone, PartialEq)]
 enum Task {
@@ -193,7 +193,7 @@ fn run_single_threaded(files: &[(String, String)], task: &Task) {
         Task::Parse => {
             // Reuse parser instance across files for reduced per-file overhead
             let dummy_source = "";
-            let mut parser = svelte_compiler_rust::compiler::phases::phase1_parse::Parser::new(
+            let mut parser = rsvelte_core::compiler::phases::phase1_parse::Parser::new(
                 dummy_source,
                 ParseOptions {
                     modern: true,
@@ -209,7 +209,7 @@ fn run_single_threaded(files: &[(String, String)], task: &Task) {
                 ..Default::default()
             };
             for (_path, content) in files {
-                let _ = svelte_compiler_rust::compiler::phases::phase1_parse::parse_reuse(
+                let _ = rsvelte_core::compiler::phases::phase1_parse::parse_reuse(
                     &mut parser,
                     content,
                     options,

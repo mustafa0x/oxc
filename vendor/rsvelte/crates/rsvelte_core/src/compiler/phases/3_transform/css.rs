@@ -4,6 +4,7 @@
 //! Preserves original whitespace from source using AST positions.
 
 use memchr::{memchr, memmem};
+use std::fmt::Write as _;
 
 use super::super::phase1_parse::parse_css;
 use super::{CssOutput, TransformError};
@@ -26,6 +27,9 @@ struct CssContext<'a> {
     has_dynamic_elements: bool,
     /// Whether there are dynamic class expressions
     has_dynamic_classes: bool,
+    /// Whether any element has a dynamically-valued `id` (so `#id` selectors
+    /// cannot be pruned — a dynamic id can resolve to any value at runtime)
+    has_dynamic_ids: bool,
     /// Whether template has control flow (if/each/await/snippet/slot)
     has_control_flow: bool,
     /// Whether template has opaque elements (slots/snippets/render tags) or
@@ -63,6 +67,7 @@ pub struct CssUnusedWarning {
 /// Corresponds to `warn_unused()` in Svelte's `css-warn.js`.
 pub fn collect_css_unused_warnings(
     analysis: &ComponentAnalysis,
+    ast: Option<&crate::ast::css::StyleSheet>,
     source: &str,
 ) -> Vec<CssUnusedWarning> {
     let mut warnings = Vec::new();
@@ -77,6 +82,7 @@ pub fn collect_css_unused_warnings(
         used_ids: &analysis.css.used_ids,
         has_dynamic_elements: analysis.css.has_dynamic_elements,
         has_dynamic_classes: analysis.css.has_dynamic_classes,
+        has_dynamic_ids: analysis.css.has_dynamic_ids,
         has_control_flow: analysis.css.has_control_flow,
         has_opaque_sibling_boundaries: analysis.css.has_opaque_elements,
         dom_structure: &analysis.css.dom_structure,
@@ -85,11 +91,38 @@ pub fn collect_css_unused_warnings(
         minify: false,
     };
 
-    if let Some((css_content, css_start)) = extract_css_content(source) {
-        let children = parse_css(&css_content, css_start);
+    // Prefer the phase-1-parsed stylesheet's recorded content span over a
+    // textual scan: a `<style>` substring inside a `<script>` string literal
+    // would otherwise be mistaken for the real stylesheet (see
+    // `render_stylesheet_internal`).
+    let extracted;
+    let resolved: Option<(&str, usize, Option<&[Value]>)> = match ast {
+        Some(ss) => Some((
+            ss.content.styles.as_str(),
+            ss.content.start as usize,
+            (!ss.children.is_empty()).then_some(ss.children.as_slice()),
+        )),
+        None => match extract_css_content(source) {
+            Some((c, s)) => {
+                extracted = c;
+                Some((extracted.as_str(), s, None))
+            }
+            None => None,
+        },
+    };
+
+    if let Some((css_content, css_start, ast_children)) = resolved {
+        let reparsed;
+        let children: &[Value] = match ast_children {
+            Some(c) => c,
+            None => {
+                reparsed = parse_css(css_content, css_start);
+                &reparsed
+            }
+        };
         collect_unused_warnings_from_nodes(
-            &children,
-            &css_content,
+            children,
+            css_content,
             css_start,
             &ctx,
             &mut warnings,
@@ -105,6 +138,29 @@ pub fn collect_css_unused_warnings(
 ///
 /// For example, `x :is(y, .unused)` - if the overall selector is used but `.unused`
 /// inside :is() doesn't match any DOM element, report it.
+/// Clone `complex` and replace the simple selector at `children[ri].selectors[si]`
+/// (a `:is()` / `:where()` pseudo-class) with `branch_selectors` — the simple
+/// selectors of one of its single-compound argument branches. The rest of the
+/// compound (combinators, sibling/descendant relations, other simple selectors)
+/// is preserved, so the result can be reachability-checked as if that branch
+/// had been written in place of the `:is()`.
+fn substitute_is_branch(
+    complex: &Value,
+    ri: usize,
+    si: usize,
+    branch_selectors: &[Value],
+) -> Value {
+    let mut synth = complex.clone();
+    if let Some(children) = synth.get_mut("children").and_then(|c| c.as_array_mut())
+        && let Some(rel) = children.get_mut(ri)
+        && let Some(sels) = rel.get_mut("selectors").and_then(|s| s.as_array_mut())
+        && si < sels.len()
+    {
+        sels.splice(si..si + 1, branch_selectors.iter().cloned());
+    }
+    synth
+}
+
 fn collect_is_where_unused_warnings(
     complex_selector: &Value,
     css_source: &str,
@@ -117,13 +173,13 @@ fn collect_is_where_unused_warnings(
         None => return,
     };
 
-    for rel in rel_selectors {
+    for (ri, rel) in rel_selectors.iter().enumerate() {
         let selectors = match rel.get("selectors").and_then(|s| s.as_array()) {
             Some(s) => s,
             None => continue,
         };
 
-        for sel in selectors {
+        for (si, sel) in selectors.iter().enumerate() {
             let sel_type = sel.get("type").and_then(|t| t.as_str()).unwrap_or("");
             let sel_name = sel.get("name").and_then(|n| n.as_str()).unwrap_or("");
 
@@ -147,7 +203,34 @@ fn collect_is_where_unused_warnings(
                         continue;
                     }
 
-                    if is_complex_selector_unused(inner_complex, ctx) {
+                    // Evaluate the branch IN THE CONTEXT of the surrounding
+                    // compound, not in isolation: substitute the branch's
+                    // simple selectors in place of the `:is()` / `:where()` in
+                    // the parent complex selector and check whether the whole
+                    // substituted selector is reachable. This catches branches
+                    // that are unreachable only because of a combinator — e.g.
+                    // for `:is(.a, .b) + .c` where `.c` never immediately
+                    // follows `.a`, the `.a` branch is unused even though a
+                    // bare `.a` element exists. Mirrors upstream marking each
+                    // `:is` argument's `metadata.used` during the real walk.
+                    let branch_selectors = inner_complex
+                        .get("children")
+                        .and_then(|c| c.as_array())
+                        .and_then(|a| a.first())
+                        .and_then(|r| r.get("selectors"))
+                        .and_then(|s| s.as_array());
+
+                    let unused = match branch_selectors {
+                        Some(bs) => {
+                            let synth = substitute_is_branch(complex_selector, ri, si, bs);
+                            is_complex_selector_unused(&synth, ctx)
+                        }
+                        // Empty branch (e.g. `:is()`) — fall back to the
+                        // isolated check.
+                        None => is_complex_selector_unused(inner_complex, ctx),
+                    };
+
+                    if unused {
                         let start = inner_complex
                             .get("start")
                             .and_then(|s| s.as_u64())
@@ -291,27 +374,34 @@ fn collect_unused_warnings_from_nodes<'a>(
 }
 
 /// Render the stylesheet for a component.
+///
+/// `preparsed` is the phase-1-parsed `<style>` AST (`Root.css`). When present
+/// and its content offset matches, its `children` are reused directly, avoiding
+/// a full re-parse of the stylesheet here.
 pub fn render_stylesheet(
     analysis: &ComponentAnalysis,
+    ast: Option<&crate::ast::css::StyleSheet>,
     source: &str,
     options: &CompileOptions,
 ) -> Result<CssOutput, TransformError> {
-    render_stylesheet_internal(analysis, source, options, false)
+    render_stylesheet_internal(analysis, ast, source, options, false)
 }
 
 /// Render the stylesheet for a component with optional minification.
 /// Used for injected CSS in SSR which should be minified.
 pub fn render_stylesheet_minified(
     analysis: &ComponentAnalysis,
+    ast: Option<&crate::ast::css::StyleSheet>,
     source: &str,
     options: &CompileOptions,
 ) -> Result<CssOutput, TransformError> {
-    render_stylesheet_internal(analysis, source, options, true)
+    render_stylesheet_internal(analysis, ast, source, options, true)
 }
 
 /// Internal implementation of render_stylesheet with minification option.
 fn render_stylesheet_internal(
     analysis: &ComponentAnalysis,
+    ast: Option<&crate::ast::css::StyleSheet>,
     source: &str,
     options: &CompileOptions,
     minify: bool,
@@ -333,6 +423,7 @@ fn render_stylesheet_internal(
         used_ids: &analysis.css.used_ids,
         has_dynamic_elements: analysis.css.has_dynamic_elements,
         has_dynamic_classes: analysis.css.has_dynamic_classes,
+        has_dynamic_ids: analysis.css.has_dynamic_ids,
         has_control_flow: analysis.css.has_control_flow,
         has_opaque_sibling_boundaries: analysis.css.has_opaque_elements,
         dom_structure: &analysis.css.dom_structure,
@@ -341,16 +432,51 @@ fn render_stylesheet_internal(
         minify,
     };
 
-    // Extract CSS content and its start position
-    if let Some((css_content, css_start)) = extract_css_content(source) {
-        // Parse the CSS with proper start offset
-        let children = parse_css(&css_content, css_start);
+    // Determine the CSS content and its start offset. Prefer the phase-1-parsed
+    // stylesheet's recorded content span: the AST captured the *real* `<style>`
+    // block from a structural parse, where the script body is opaque raw text.
+    // The textual `extract_css_content` scan must NOT be used when an AST exists
+    // because a `<style>` substring can legitimately appear inside a `<script>`
+    // string literal (e.g. a docs page rendering a Svelte code sample), which
+    // the scan would wrongly latch onto instead of the actual stylesheet.
+    let extracted;
+    let (css_content, css_start): (&str, usize) = match ast {
+        Some(ss) => (ss.content.styles.as_str(), ss.content.start as usize),
+        None => match extract_css_content(source) {
+            Some((c, s)) => {
+                extracted = c;
+                (extracted.as_str(), s)
+            }
+            None => {
+                return Ok(CssOutput {
+                    code: String::new(),
+                    map: None,
+                });
+            }
+        },
+    };
+
+    {
+        // Reuse the phase-1-parsed stylesheet's children when present, avoiding a
+        // redundant full re-parse (the transform profile showed this re-parse at
+        // ~60% inclusive on CSS-heavy input). `parse_css` here is the *same*
+        // function phase 1 used, so the trees are byte-identical; fall back to a
+        // re-parse only when no AST children are available (e.g. a deferred parse
+        // or comment-only `<style>` block).
+        let reparsed;
+        let children: &[Value] = match ast {
+            Some(ss) if !ss.children.is_empty() => &ss.children,
+            _ => {
+                reparsed = parse_css(css_content, css_start);
+                &reparsed
+            }
+        };
 
         // Collect keyframe names for animation value replacement
-        let keyframes = collect_keyframe_names(&children);
+        let keyframes = collect_keyframe_names(children);
 
         // Transform the CSS
-        let mut code = transform_css(&children, &selector, hash, &css_content, css_start, &ctx);
+        let mut code = transform_css(children, &selector, hash, css_content, css_start, &ctx);
 
         // Post-process: replace animation keyframe references
         if !keyframes.is_empty() {
@@ -361,11 +487,6 @@ fn render_stylesheet_internal(
         let map = generate_css_sourcemap(source, &code, css_start, options);
 
         Ok(CssOutput { code, map })
-    } else {
-        Ok(CssOutput {
-            code: String::new(),
-            map: None,
-        })
     }
 }
 
@@ -716,6 +837,27 @@ fn replace_animation_keyframes(css: &str, hash: &str, keyframes: &FxHashSet<Stri
     let mut i = 0;
 
     while i < chars.len() {
+        // Skip comments entirely: the official compiler only renames keyframe
+        // references inside real Declaration nodes, so declarations that ended up
+        // inside `/* (unused) ... */` / `/* (empty) ... */` comments (or ordinary
+        // source comments) must keep their original animation names.
+        if chars[i] == '/' && i + 1 < chars.len() && chars[i + 1] == '*' {
+            result.push(chars[i]);
+            result.push(chars[i + 1]);
+            i += 2;
+            while i < chars.len() {
+                if chars[i] == '*' && i + 1 < chars.len() && chars[i + 1] == '/' {
+                    result.push(chars[i]);
+                    result.push(chars[i + 1]);
+                    i += 2;
+                    break;
+                }
+                result.push(chars[i]);
+                i += 1;
+            }
+            continue;
+        }
+
         // Look for animation or animation-name property
         let remaining: String = chars[i..].iter().collect();
         let lower = remaining.to_lowercase();
@@ -805,9 +947,42 @@ fn replace_animation_keyframes(css: &str, hash: &str, keyframes: &FxHashSet<Stri
 /// Extract CSS content from source (finds the <style> block)
 /// Returns (css_content, start_position_in_source)
 fn extract_css_content(source: &str) -> Option<(String, usize)> {
-    let style_start = memmem::find(source.as_bytes(), b"<style")?;
-    let content_start = memchr(b'>', &source.as_bytes()[style_start..])? + style_start + 1;
-    let style_end = memmem::find(source.as_bytes(), b"</style>")?;
+    let bytes = source.as_bytes();
+    // A `<style`/`</style` prefix is only the real stylesheet tag when the next
+    // byte terminates the tag name — otherwise `<style-foo>` (a custom element)
+    // would be misread as the stylesheet.
+    let is_term = |b: Option<&u8>| {
+        matches!(
+            b,
+            None | Some(b'>')
+                | Some(b'/')
+                | Some(b' ')
+                | Some(b'\t')
+                | Some(b'\n')
+                | Some(b'\r')
+                | Some(0x0c)
+        )
+    };
+    // Exact `<style` open tag (reject `<style-foo`, `<styles`, …).
+    let mut at = 0;
+    let style_start = loop {
+        let p = at + memmem::find(&bytes[at..], b"<style")?;
+        if is_term(bytes.get(p + 6)) {
+            break p;
+        }
+        at = p + 6;
+    };
+    let content_start = memchr(b'>', &bytes[style_start..])? + style_start + 1;
+    // Exact `</style` close tag, searched from the content start (the tag may
+    // have whitespace before its `>`, e.g. `</style   >`).
+    let mut at = content_start;
+    let style_end = loop {
+        let p = at + memmem::find(&bytes[at..], b"</style")?;
+        if is_term(bytes.get(p + 7)) {
+            break p;
+        }
+        at = p + 7;
+    };
 
     if content_start >= style_end {
         return None;
@@ -845,11 +1020,17 @@ fn transform_css<'a>(
         );
     }
 
-    // Add any trailing content (skip when minifying)
-    if !ctx.minify && last_end > css_start {
+    // Add any trailing content. This also covers stylesheets without any
+    // rules (e.g. a comment-only <style> block), which the official compiler
+    // preserves verbatim: it only removes the content outside
+    // `ast.content.start..ast.content.end`. In minify mode upstream applies
+    // `remove_preceding_whitespace(ast.content.end)`, so trailing comments
+    // survive with only the final whitespace run dropped.
+    {
         let trailing_start = last_end - css_start;
         if trailing_start < css_source.len() {
-            output.push_str(&css_source[trailing_start..]);
+            let gap = &css_source[trailing_start..];
+            output.push_str(if ctx.minify { gap.trim_end() } else { gap });
         }
     }
 
@@ -857,7 +1038,6 @@ fn transform_css<'a>(
 }
 
 /// Transform a CSS node while preserving whitespace
-#[allow(clippy::too_many_arguments)]
 fn transform_node_preserving<'a>(
     node: &'a Value,
     selector: &str,
@@ -954,17 +1134,17 @@ fn is_rule_empty<'a>(rule: &'a Value, ctx: &CssContext<'a>, is_in_global_block: 
                 }
             }
             "Atrule" => {
-                // At-rules with blocks that have children are not empty
-                if let Some(atrule_block) = child.get("block") {
-                    if atrule_block
-                        .get("children")
+                // Mirrors upstream: `if (child.block === null || child.block.children.length > 0) return false;`
+                // i.e. a blockless at-rule (like @import) or an at-rule with
+                // block content makes the rule non-empty.
+                let block_is_null = child.get("block").is_none_or(|b| b.is_null());
+                if block_is_null
+                    || child
+                        .get("block")
+                        .and_then(|b| b.get("children"))
                         .and_then(|c| c.as_array())
                         .is_some_and(|atrule_children| !atrule_children.is_empty())
-                    {
-                        return false;
-                    }
-                } else {
-                    // At-rule without block (like @import) is not empty
+                {
                     return false;
                 }
             }
@@ -1047,12 +1227,18 @@ fn selector_contains_global_block(node: &Value) -> bool {
     false
 }
 
-/// Check if a block contains nested rules (not just declarations)
+/// Check if a block contains nested rules or at-rules (not just declarations).
+/// At-rules count too: an `@media` nested inside a rule can contain rules whose
+/// selectors need transformation, and a nested `@keyframes` prelude needs hash
+/// prefixing, so the block cannot simply be copied verbatim from source.
 fn has_nested_rules(block: &Value) -> bool {
     if let Some(children) = block.get("children").and_then(|c| c.as_array()) {
-        children
-            .iter()
-            .any(|child| child.get("type").and_then(|t| t.as_str()) == Some("Rule"))
+        children.iter().any(|child| {
+            matches!(
+                child.get("type").and_then(|t| t.as_str()),
+                Some("Rule") | Some("Atrule")
+            )
+        })
     } else {
         false
     }
@@ -1223,6 +1409,17 @@ fn is_complex_selector_unused(complex: &Value, ctx: &CssContext) -> bool {
 
 /// Implementation of complex selector unused check
 fn is_complex_selector_unused_impl(complex: &Value, ctx: &CssContext) -> bool {
+    // A non-global selector can never match when the component renders no
+    // scopeable elements. Mirrors upstream `prune()`, which only sets
+    // `metadata.used` while iterating over `elements`; with zero elements every
+    // non-global-like selector is reported unused (e.g. a `<style>`-only file).
+    if !ctx.has_dynamic_elements
+        && ctx.dom_structure.elements.is_empty()
+        && !is_complex_selector_global_like(complex)
+    {
+        return true;
+    }
+
     // Get the relative selectors (like "div > span" has multiple relative selectors)
     if let Some(rel_selectors) = complex.get("children").and_then(|c| c.as_array()) {
         // Check for :host > element pattern FIRST (before the global-like check)
@@ -1605,10 +1802,14 @@ fn is_nesting_compound_unused(rel_selectors: &[Value], ctx: &CssContext) -> bool
 
             // Check if any DOM element satisfies ALL the combined constraints
             let any_element_matches = ctx.dom_structure.elements.iter().any(|elem| {
-                // Check all required classes are present on the element
-                let classes_match = all_required_classes
-                    .iter()
-                    .all(|c| elem.classes.contains(*c));
+                // Check all required classes are present on the element. A class may
+                // be carried statically (`class="..."`), via a `class:NAME` directive,
+                // or potentially via a spread (`{...rest}`), which could set anything.
+                let classes_match = all_required_classes.iter().all(|c| {
+                    elem.has_spread
+                        || elem.classes.contains(*c)
+                        || elem.class_directive_names.contains(*c)
+                });
 
                 // Check all required ids match
                 let ids_match = all_required_ids
@@ -1967,9 +2168,61 @@ fn is_sibling_combinator_no_match_impl(rel_selectors: &[Value], ctx: &CssContext
     false
 }
 
+/// True if a relative selector is an "outer global" tail per upstream `truncate`
+/// (css-prune.js:207-231): global-like (`:host`/`:root`/view-transition), a bare
+/// `:global` (no args), or a `:global(...)` whose compound stays global (every
+/// simple selector is a pseudo-class/element).
+fn relative_selector_is_outer_global(rel: &Value) -> bool {
+    if is_global_like(rel) {
+        return true;
+    }
+    let Some(selectors) = rel.get("selectors").and_then(|s| s.as_array()) else {
+        return false;
+    };
+    let Some(first) = selectors.first() else {
+        return false;
+    };
+    let first_is_global = first.get("type").and_then(|t| t.as_str()) == Some("PseudoClassSelector")
+        && first.get("name").and_then(|n| n.as_str()) == Some("global");
+    if !first_is_global {
+        return false;
+    }
+    if first.get("args").is_none() {
+        return true; // bare :global
+    }
+    // `:global(...)` stays global only if every simple selector is pseudo.
+    selectors.iter().all(|s| {
+        matches!(
+            s.get("type").and_then(|t| t.as_str()),
+            Some("PseudoClassSelector") | Some("PseudoElementSelector")
+        )
+    })
+}
+
+/// Discard trailing global relative selectors (mirrors css-prune.js `truncate`).
+/// Returns the prefix up to and including the last non-global relative selector;
+/// if every selector is global, returns the input unchanged.
+fn truncate_trailing_globals(rel_selectors: &[Value]) -> &[Value] {
+    let mut last_kept = None;
+    for (i, rel) in rel_selectors.iter().enumerate() {
+        if !relative_selector_is_outer_global(rel) {
+            last_kept = Some(i);
+        }
+    }
+    match last_kept {
+        Some(i) => &rel_selectors[..=i],
+        None => rel_selectors,
+    }
+}
+
 /// Check if a sibling combinator selector is unused
 /// A + B or A ~ B is unused if no parent element has children that satisfy the relationship
 fn is_sibling_combinator_unused(rel_selectors: &[Value], ctx: &CssContext) -> bool {
+    // Upstream prunes via `get_relative_selectors` → `truncate`, which drops
+    // trailing `:global(...)` selectors before matching. `& + :global(&)`
+    // reduces to `[&]`, which resolves to the (used) parent prelude — the `+` is
+    // never tested.
+    let rel_selectors = truncate_trailing_globals(rel_selectors);
     if rel_selectors.len() < 2 || ctx.dom_structure.elements.is_empty() {
         return false;
     }
@@ -2290,45 +2543,83 @@ struct SelectorInfo {
     classes: Vec<String>,
     id: Option<String>,
     is_universal: bool,
+    /// `:is(...)` / `:where(...)` argument groups present in this compound. Each
+    /// group is the set of branch selectors; the group is satisfied when **any**
+    /// branch matches the element (an OR set), mirroring CSS `:is()` semantics.
+    /// A multi-part branch (one containing combinators) is recorded as a
+    /// universal branch so it conservatively matches, matching upstream's
+    /// treatment of complex `:is()` arguments as used.
+    is_groups: Vec<Vec<SelectorInfo>>,
 }
 
 fn extract_selector_info(rel_selector: &Value) -> SelectorInfo {
-    let mut info = SelectorInfo {
-        tag_name: None,
-        classes: Vec::new(),
-        id: None,
-        is_universal: false,
-    };
-
     if let Some(selectors) = rel_selector.get("selectors").and_then(|s| s.as_array()) {
-        for sel in selectors {
-            let sel_type = sel.get("type").and_then(|t| t.as_str());
-            match sel_type {
-                Some("TypeSelector") => {
-                    if let Some(name) = sel.get("name").and_then(|n| n.as_str()) {
-                        if name == "*" {
-                            info.is_universal = true;
-                        } else {
-                            info.tag_name = Some(name.to_string());
-                        }
-                    }
-                }
-                Some("ClassSelector") => {
-                    if let Some(name) = sel.get("name").and_then(|n| n.as_str()) {
-                        info.classes.push(name.to_string());
-                    }
-                }
-                Some("IdSelector") => {
-                    if let Some(name) = sel.get("name").and_then(|n| n.as_str()) {
-                        info.id = Some(name.to_string());
-                    }
-                }
-                _ => {}
-            }
+        extract_selector_info_from_selectors(selectors)
+    } else {
+        SelectorInfo {
+            tag_name: None,
+            classes: Vec::new(),
+            id: None,
+            is_universal: false,
+            is_groups: Vec::new(),
         }
     }
+}
 
-    info
+/// Build `:is(...)` / `:where(...)` OR-groups from a compound's simple selectors.
+/// Each returned group is the set of branch [`SelectorInfo`]s; the group is
+/// satisfied when any branch matches (see [`selector_matches_element`]).
+fn extract_is_groups(selectors: &[Value]) -> Vec<Vec<SelectorInfo>> {
+    let mut groups = Vec::new();
+    for sel in selectors {
+        if sel.get("type").and_then(|t| t.as_str()) != Some("PseudoClassSelector") {
+            continue;
+        }
+        let name = sel.get("name").and_then(|n| n.as_str()).unwrap_or("");
+        if name != "is" && name != "where" {
+            continue;
+        }
+        let Some(children) = sel
+            .get("args")
+            .and_then(|a| a.get("children"))
+            .and_then(|c| c.as_array())
+        else {
+            continue;
+        };
+        let mut branches: Vec<SelectorInfo> = Vec::new();
+        for branch in children {
+            let rels = branch.get("children").and_then(|c| c.as_array());
+            match rels {
+                // Single compound (no combinator): match against its constraints.
+                Some(rs) if rs.len() == 1 => {
+                    if let Some(inner) = rs[0].get("selectors").and_then(|s| s.as_array()) {
+                        branches.push(extract_selector_info_from_selectors(inner));
+                    }
+                }
+                // Multi-part or empty branch: conservatively treat as matching,
+                // mirroring upstream marking complex `:is()` args as used.
+                _ => branches.push(SelectorInfo {
+                    tag_name: None,
+                    classes: Vec::new(),
+                    id: None,
+                    is_universal: true,
+                    is_groups: Vec::new(),
+                }),
+            }
+        }
+        if !branches.is_empty() {
+            groups.push(branches);
+        }
+    }
+    groups
+}
+
+/// `true` when the extracted selector info carries at least one concrete
+/// constraint (tag/class/id/universal). Selectors made up purely of
+/// pseudo-classes / pseudo-elements (e.g. `:focus-visible`) have no constraints
+/// and can potentially match any element.
+fn selector_info_has_constraints(info: &SelectorInfo) -> bool {
+    info.tag_name.is_some() || !info.classes.is_empty() || info.id.is_some() || info.is_universal
 }
 
 fn selector_matches_element(
@@ -2348,10 +2639,19 @@ fn selector_matches_element(
         return false;
     }
 
-    // Check classes
-    for class in &info.classes {
-        if !el.classes.contains(class) {
-            return false;
+    // Check classes. An element whose `class` value can't be fully resolved at
+    // compile time — an interpolated expression we couldn't enumerate (so the
+    // attribute name lands in `dynamic_attribute_names`) or a spread that may
+    // inject arbitrary classes — matches *any* class selector. This mirrors
+    // upstream `attribute_matches`, which returns `true` as soon as a class
+    // chunk's possible values are indeterminate (css-prune.js), so e.g.
+    // `class="wx-icon {expr}"` still satisfies a `.wx-icon` sibling selector.
+    let class_is_indeterminate = el.has_spread || el.dynamic_attribute_names.contains("class");
+    if !class_is_indeterminate {
+        for class in &info.classes {
+            if !el.classes.contains(class) {
+                return false;
+            }
         }
     }
 
@@ -2362,8 +2662,23 @@ fn selector_matches_element(
         return false;
     }
 
+    // Check `:is()` / `:where()` groups: each group must have at least one
+    // branch that matches the element (OR within a group, AND across groups).
+    for group in &info.is_groups {
+        if !group
+            .iter()
+            .any(|branch| selector_matches_element(branch, el))
+        {
+            return false;
+        }
+    }
+
     // If no selector specified, it matches nothing specific
-    info.tag_name.is_some() || !info.classes.is_empty() || info.id.is_some() || info.is_universal
+    info.tag_name.is_some()
+        || !info.classes.is_empty()
+        || info.id.is_some()
+        || info.is_universal
+        || !info.is_groups.is_empty()
 }
 
 fn has_sibling_match(
@@ -2946,6 +3261,13 @@ fn is_has_argument_unused_globally(has_complex: &Value, ctx: &CssContext) -> boo
         }
     }
 
+    // Arguments without any concrete constraint (e.g. `:has(:focus-visible)`)
+    // can match any element; the official matcher skips plain pseudo-classes and
+    // treats the selector as a possible match.
+    if !selector_info_has_constraints(&first_info) {
+        return false;
+    }
+
     // For descendant/child selectors from :root/:global context,
     // the element just needs to exist anywhere in the template
     match combinator {
@@ -3026,6 +3348,13 @@ fn is_has_argument_unused(
         if is_global {
             return false; // :global() is always potentially used
         }
+    }
+
+    // Arguments without any concrete constraint (e.g. `:has(:focus-visible)`)
+    // can match any element; the official matcher skips plain pseudo-classes and
+    // treats the selector as a possible match.
+    if !selector_info_has_constraints(&first_info) {
+        return false;
     }
 
     // If there are multiple relative selectors (like > h > i), handle that too
@@ -3247,6 +3576,7 @@ fn extract_selector_info_from_selectors(selectors: &[Value]) -> SelectorInfo {
         classes: Vec::new(),
         id: None,
         is_universal: false,
+        is_groups: extract_is_groups(selectors),
     };
 
     for sel in selectors {
@@ -3271,7 +3601,8 @@ fn extract_selector_info_from_selectors(selectors: &[Value]) -> SelectorInfo {
                     info.id = Some(decode_css_escape(name));
                 }
             }
-            // Skip pseudo-classes like :has(), :not(), etc.
+            // `:is()` / `:where()` handled via is_groups; skip other pseudo-classes
+            // (`:has()`, `:not()`, etc.).
             _ => {}
         }
     }
@@ -3314,6 +3645,11 @@ fn is_simple_selector_unused(sel: &Value, ctx: &CssContext) -> bool {
         }
         Some("IdSelector") => {
             if let Some(name) = sel.get("name").and_then(|n| n.as_str()) {
+                // If any element has a dynamically-valued id, it could resolve to
+                // any value at runtime, so any #id selector is potentially used.
+                if ctx.has_dynamic_ids {
+                    return false;
+                }
                 // Decode CSS escape sequences for comparison
                 let decoded = decode_css_escape(name);
                 return !ctx.used_ids.contains(&decoded);
@@ -3713,6 +4049,9 @@ fn is_is_inner_selector_unused(complex: &Value, ctx: &CssContext) -> bool {
                         }
                     }
                     Some("IdSelector") => {
+                        if ctx.has_dynamic_ids {
+                            return false;
+                        }
                         if let Some(name) = sel.get("name").and_then(|n| n.as_str()) {
                             let decoded = decode_css_escape(name);
                             if !ctx.used_ids.contains(&decoded) {
@@ -3732,7 +4071,6 @@ fn is_is_inner_selector_unused(complex: &Value, ctx: &CssContext) -> bool {
 }
 
 /// Transform a CSS rule while preserving whitespace from source
-#[allow(clippy::too_many_arguments)]
 fn transform_rule_preserving<'a>(
     node: &'a Value,
     selector: &str,
@@ -3750,12 +4088,16 @@ fn transform_rule_preserving<'a>(
     let node_start = node.get("start").and_then(|s| s.as_u64()).unwrap_or(0) as usize;
     let node_end = node.get("end").and_then(|e| e.as_u64()).unwrap_or(0) as usize;
 
-    // Copy leading whitespace from source (skip when minifying)
-    if !ctx.minify && node_start > *last_end {
+    // Copy leading content from source. In minify mode, mirror upstream's
+    // `remove_preceding_whitespace(node.start)`: only the whitespace run
+    // immediately before the node is dropped, so comments (and their own
+    // leading whitespace) survive minification.
+    if node_start > *last_end {
         let ws_start = (*last_end).saturating_sub(css_start);
         let ws_end = node_start.saturating_sub(css_start);
         if ws_end <= css_source.len() && ws_start < ws_end {
-            output.push_str(&css_source[ws_start..ws_end]);
+            let gap = &css_source[ws_start..ws_end];
+            output.push_str(if ctx.minify { gap.trim_end() } else { gap });
         }
     }
 
@@ -3776,9 +4118,39 @@ fn transform_rule_preserving<'a>(
         return;
     }
 
+    // Check if the rule is empty (no declarations, or all nested rules are unused/empty)
+    // In dev mode, keep empty rules (convenient to add styles via devtools).
+    // NOTE: The empty check runs BEFORE the unused check, mirroring the official
+    // Rule visitor in 3-transform/css/index.js (empty wins over unused).
+    if !ctx.dev && is_rule_empty(node, ctx, is_in_global_block) {
+        if ctx.minify {
+            // In minify mode, just skip the rule entirely
+            *last_end = node_end;
+            return;
+        }
+        // Comment out empty rules
+        output.push_str("/* (empty) ");
+
+        // Get the original rule text
+        let rule_start = node_start.saturating_sub(css_start);
+        let rule_end = node_end.saturating_sub(css_start);
+        if rule_end <= css_source.len() && rule_start < rule_end {
+            let original = &css_source[rule_start..rule_end];
+            // Escape any */ in the content
+            if memchr::memmem::find(original.as_bytes(), b"*/").is_some() {
+                let escaped = original.replace("*/", "*\\/");
+                output.push_str(&escaped);
+            } else {
+                output.push_str(original);
+            }
+        }
+
+        output.push_str("*/");
+        *last_end = node_end;
+        return;
+    }
+
     // Check if the rule is unused (selector doesn't match any template elements)
-    // NOTE: Must check unused BEFORE empty, because an unused selector with nested
-    // content (like @media rules) should be marked (unused) not (empty)
     // Skip unused check when inside a bare :global {} block (all selectors are global)
     if !is_in_bare_global_block && let Some(prelude) = node.get("prelude") {
         let unused_status = check_selector_unused(prelude, ctx);
@@ -3810,36 +4182,6 @@ fn transform_rule_preserving<'a>(
             *last_end = node_end;
             return;
         }
-    }
-
-    // Check if the rule is empty (no declarations, or all nested rules are unused/empty)
-    // In dev mode, keep empty rules (convenient to add styles via devtools)
-    if !ctx.dev && is_rule_empty(node, ctx, is_in_global_block) {
-        if ctx.minify {
-            // In minify mode, just skip the rule entirely
-            *last_end = node_end;
-            return;
-        }
-        // Comment out empty rules
-        output.push_str("/* (empty) ");
-
-        // Get the original rule text
-        let rule_start = node_start.saturating_sub(css_start);
-        let rule_end = node_end.saturating_sub(css_start);
-        if rule_end <= css_source.len() && rule_start < rule_end {
-            let original = &css_source[rule_start..rule_end];
-            // Escape any */ in the content
-            if memchr::memmem::find(original.as_bytes(), b"*/").is_some() {
-                let escaped = original.replace("*/", "*\\/");
-                output.push_str(&escaped);
-            } else {
-                output.push_str(original);
-            }
-        }
-
-        output.push_str("*/");
-        *last_end = node_end;
-        return;
     }
 
     // Get the prelude (selector list)
@@ -3971,7 +4313,6 @@ fn transform_rule_preserving<'a>(
 }
 
 /// Transform a block that contains nested rules
-#[allow(clippy::too_many_arguments)]
 fn transform_block_with_nested_rules<'a>(
     block: &'a Value,
     selector: &str,
@@ -3999,12 +4340,15 @@ fn transform_block_with_nested_rules<'a>(
             let child_start = child.get("start").and_then(|s| s.as_u64()).unwrap_or(0) as usize;
             let child_end = child.get("end").and_then(|e| e.as_u64()).unwrap_or(0) as usize;
 
-            // Copy whitespace before this child (skip when minifying)
-            if !ctx.minify && child_start > last_end {
+            // Copy content before this child. In minify mode only the
+            // whitespace run immediately before the child is dropped
+            // (upstream `remove_preceding_whitespace`), keeping comments.
+            if child_start > last_end {
                 let ws_start = last_end.saturating_sub(css_start);
                 let ws_end = child_start.saturating_sub(css_start);
                 if ws_end <= css_source.len() && ws_start < ws_end {
-                    output.push_str(&css_source[ws_start..ws_end]);
+                    let gap = &css_source[ws_start..ws_end];
+                    output.push_str(if ctx.minify { gap.trim_end() } else { gap });
                 }
             }
 
@@ -4042,41 +4386,47 @@ fn transform_block_with_nested_rules<'a>(
                         );
                     }
                 }
-                Some("Declaration") | Some("Atrule") => {
+                Some("Atrule") => {
+                    transform_nested_atrule(
+                        child,
+                        selector,
+                        hash,
+                        css_source,
+                        css_start,
+                        output,
+                        specificity_bumped,
+                        ctx,
+                        is_in_global_block,
+                        parent_has_local_selectors,
+                        is_in_bare_global_block,
+                    );
+                }
+                Some("Declaration") => {
                     if ctx.minify {
                         // Minified: output declaration without leading whitespace
                         // and remove whitespace after colon
-                        if child_type == Some("Declaration") {
-                            let prop = child.get("property").and_then(|p| p.as_str()).unwrap_or("");
-                            let decl_start = child_start.saturating_sub(css_start);
-                            let decl_end = child_end.saturating_sub(css_start);
-                            if decl_end <= css_source.len() && decl_start < decl_end {
-                                let decl_text = &css_source[decl_start..decl_end];
-                                if !prop.starts_with("--") {
-                                    if let Some(colon_pos) = decl_text.find(':') {
-                                        let before_colon = &decl_text[..=colon_pos];
-                                        let after_colon = decl_text[colon_pos + 1..].trim_start();
-                                        output.push_str(before_colon);
-                                        output.push_str(after_colon);
-                                    } else {
-                                        output.push_str(decl_text);
-                                    }
+                        let prop = child.get("property").and_then(|p| p.as_str()).unwrap_or("");
+                        let decl_start = child_start.saturating_sub(css_start);
+                        let decl_end = child_end.saturating_sub(css_start);
+                        if decl_end <= css_source.len() && decl_start < decl_end {
+                            let decl_text = &css_source[decl_start..decl_end];
+                            if !prop.starts_with("--") {
+                                if let Some(colon_pos) = decl_text.find(':') {
+                                    let before_colon = &decl_text[..=colon_pos];
+                                    let after_colon = decl_text[colon_pos + 1..].trim_start();
+                                    output.push_str(before_colon);
+                                    output.push_str(after_colon);
                                 } else {
                                     output.push_str(decl_text);
                                 }
-                                // Declaration end position is before the semicolon in our AST
-                                output.push(';');
+                            } else {
+                                output.push_str(decl_text);
                             }
-                        } else {
-                            // Atrule inside nested block
-                            let decl_start = child_start.saturating_sub(css_start);
-                            let decl_end = child_end.saturating_sub(css_start);
-                            if decl_end <= css_source.len() && decl_start < decl_end {
-                                output.push_str(&css_source[decl_start..decl_end]);
-                            }
+                            // Declaration end position is before the semicolon in our AST
+                            output.push(';');
                         }
                     } else {
-                        // Copy the declaration/atrule from source
+                        // Copy the declaration from source
                         let decl_start = child_start.saturating_sub(css_start);
                         let decl_end = child_end.saturating_sub(css_start);
                         if decl_end <= css_source.len() && decl_start < decl_end {
@@ -4091,20 +4441,200 @@ fn transform_block_with_nested_rules<'a>(
         }
     }
 
-    // Copy whitespace/content before closing brace (skip when minifying)
-    if !ctx.minify && block_end > last_end {
+    // Copy content before the closing brace. In minify mode mirror upstream's
+    // `remove_preceding_whitespace(node.block.end - 1)`.
+    if block_end > last_end {
         let ws_start = last_end.saturating_sub(css_start);
         let ws_end = (block_end - 1).saturating_sub(css_start); // -1 to exclude the '}'
         if ws_end <= css_source.len() && ws_start < ws_end {
-            output.push_str(&css_source[ws_start..ws_end]);
+            let gap = &css_source[ws_start..ws_end];
+            output.push_str(if ctx.minify { gap.trim_end() } else { gap });
         }
     }
 
     output.push('}');
 }
 
-/// Transform a :global { ... } block by commenting out the :global wrapper
+/// Transform an at-rule that is nested inside a rule's block (e.g. `@media`
+/// inside `.foo { ... }`). Nested rules inside the at-rule body still need
+/// selector transformation (scoping / unused pruning), and `@keyframes`
+/// preludes still need hash prefixing — in the official compiler the css
+/// visitors run irrespective of nesting depth.
 #[allow(clippy::too_many_arguments)]
+fn transform_nested_atrule<'a>(
+    node: &'a Value,
+    selector: &str,
+    hash: &str,
+    css_source: &str,
+    css_start: usize,
+    output: &mut String,
+    specificity_bumped: &mut bool,
+    ctx: &CssContext<'a>,
+    is_in_global_block: bool,
+    parent_has_local_selectors: bool,
+    is_in_bare_global_block: bool,
+) {
+    let node_start = node.get("start").and_then(|s| s.as_u64()).unwrap_or(0) as usize;
+    let node_end = node.get("end").and_then(|e| e.as_u64()).unwrap_or(0) as usize;
+    let name = node.get("name").and_then(|n| n.as_str()).unwrap_or("");
+
+    let src = |from: usize, to: usize| -> &str {
+        let s = from.saturating_sub(css_start);
+        let e = to.saturating_sub(css_start);
+        if e <= css_source.len() && s < e {
+            &css_source[s..e]
+        } else {
+            ""
+        }
+    };
+
+    // @keyframes: prefix the keyframe name with the hash (or strip `-global-`),
+    // then copy the body verbatim — upstream returns early without transforming
+    // anything within a keyframes block.
+    if matches!(
+        name,
+        "keyframes" | "-webkit-keyframes" | "-moz-keyframes" | "-o-keyframes"
+    ) {
+        // Mirror the official Atrule visitor: skip the `@name` + 1, then spaces,
+        // to find the prelude start in the source.
+        let bytes = css_source.as_bytes();
+        let mut p_start = node_start + name.len() + 1;
+        while p_start.saturating_sub(css_start) < css_source.len()
+            && bytes.get(p_start - css_start) == Some(&b' ')
+        {
+            p_start += 1;
+        }
+
+        output.push_str(src(node_start, p_start));
+
+        let prelude = node.get("prelude").and_then(|p| p.as_str()).unwrap_or("");
+        if prelude.starts_with("-global-") {
+            // Remove the `-global-` prefix
+            output.push_str(src(p_start + 8, node_end));
+        } else {
+            if !is_in_bare_global_block {
+                output.push_str(hash);
+                output.push('-');
+            }
+            output.push_str(src(p_start, node_end));
+        }
+        return;
+    }
+
+    // Blockless at-rules (e.g. @import) — copy verbatim.
+    let block = node.get("block").filter(|b| !b.is_null());
+    let Some(block) = block else {
+        output.push_str(src(node_start, node_end));
+        return;
+    };
+
+    let block_start = block.get("start").and_then(|s| s.as_u64()).unwrap_or(0) as usize;
+    let block_end = block.get("end").and_then(|e| e.as_u64()).unwrap_or(0) as usize;
+
+    // `@media (...) {` — copied verbatim from source.
+    output.push_str(src(node_start, block_start + 1));
+
+    let mut last_end = block_start + 1;
+
+    if let Some(children) = block.get("children").and_then(|c| c.as_array()) {
+        for child in children {
+            let child_type = child.get("type").and_then(|t| t.as_str());
+            let child_start = child.get("start").and_then(|s| s.as_u64()).unwrap_or(0) as usize;
+            let child_end = child.get("end").and_then(|e| e.as_u64()).unwrap_or(0) as usize;
+
+            // Copy content before this child (minify keeps comments, dropping
+            // only the whitespace run immediately before the child).
+            if child_start > last_end {
+                let gap = src(last_end, child_start);
+                output.push_str(if ctx.minify { gap.trim_end() } else { gap });
+            }
+
+            match child_type {
+                Some("Rule") => {
+                    if is_global_block(child) {
+                        transform_global_block(
+                            child,
+                            selector,
+                            hash,
+                            css_source,
+                            css_start,
+                            output,
+                            specificity_bumped,
+                            ctx,
+                        );
+                    } else {
+                        let mut local_last_end = child_start;
+                        transform_rule_preserving(
+                            child,
+                            selector,
+                            hash,
+                            css_source,
+                            css_start,
+                            output,
+                            specificity_bumped,
+                            &mut local_last_end,
+                            ctx,
+                            parent_has_local_selectors,
+                            is_in_global_block,
+                            is_in_bare_global_block,
+                        );
+                    }
+                }
+                Some("Atrule") => {
+                    transform_nested_atrule(
+                        child,
+                        selector,
+                        hash,
+                        css_source,
+                        css_start,
+                        output,
+                        specificity_bumped,
+                        ctx,
+                        is_in_global_block,
+                        parent_has_local_selectors,
+                        is_in_bare_global_block,
+                    );
+                }
+                Some("Declaration") => {
+                    if ctx.minify {
+                        let prop = child.get("property").and_then(|p| p.as_str()).unwrap_or("");
+                        let decl_text = src(child_start, child_end);
+                        if !prop.starts_with("--") {
+                            if let Some(colon_pos) = decl_text.find(':') {
+                                let before_colon = &decl_text[..=colon_pos];
+                                let after_colon = decl_text[colon_pos + 1..].trim_start();
+                                output.push_str(before_colon);
+                                output.push_str(after_colon);
+                            } else {
+                                output.push_str(decl_text);
+                            }
+                        } else {
+                            output.push_str(decl_text);
+                        }
+                        // Declaration end position is before the semicolon in our AST
+                        output.push(';');
+                    } else {
+                        output.push_str(src(child_start, child_end));
+                    }
+                }
+                _ => {}
+            }
+
+            last_end = child_end;
+        }
+    }
+
+    // Copy trailing content before the closing brace (minify drops only the
+    // final whitespace run).
+    if block_end > last_end + 1 {
+        let gap = src(last_end, block_end - 1);
+        output.push_str(if ctx.minify { gap.trim_end() } else { gap });
+    }
+
+    output.push('}');
+}
+
+/// Transform a :global { ... } block by commenting out the :global wrapper
 fn transform_global_block(
     node: &Value,
     _selector: &str,
@@ -4182,7 +4712,6 @@ fn transform_global_block(
 }
 
 /// Transform an at-rule while preserving whitespace
-#[allow(clippy::too_many_arguments)]
 fn transform_atrule_preserving<'a>(
     node: &'a Value,
     selector: &str,
@@ -4218,9 +4747,9 @@ fn transform_atrule_preserving<'a>(
 
         // Check if it's a global keyframe
         if let Some(keyframe_name) = prelude.strip_prefix("-global-") {
-            output.push_str(&format!("@{} {}", name, keyframe_name));
+            let _ = write!(output, "@{} {}", name, keyframe_name);
         } else {
-            output.push_str(&format!("@{} {}-{}", name, hash, prelude));
+            let _ = write!(output, "@{} {}-{}", name, hash, prelude);
         }
 
         // Copy block from source, preserving original whitespace between prelude and block
@@ -4324,7 +4853,6 @@ fn transform_atrule_preserving<'a>(
 
 /// Transform a selector list
 /// Marks unused selectors inline with /* (unused) SELECTOR*/ comments.
-#[allow(clippy::too_many_arguments)]
 fn transform_selector_list(
     prelude: &Value,
     selector: &str,
@@ -4510,7 +5038,6 @@ fn transform_selector_list(
 /// Minified version of selector list transformation.
 /// Removes unused selectors entirely (no comments), matching the official Svelte
 /// MagicString-based pruning algorithm.
-#[allow(clippy::too_many_arguments)]
 fn transform_selector_list_minified(
     children: &[Value],
     selector: &str,
@@ -4713,7 +5240,43 @@ fn is_global_like(relative_selector: &Value) -> bool {
 }
 
 /// Transform a complex selector (sequence of relative selectors)
-#[allow(clippy::too_many_arguments)]
+/// Append the verbatim source text *inside* a `:global(...)` pseudo-class to
+/// `out`, i.e. everything between the opening `(` and the closing `)`.
+///
+/// This mirrors upstream `remove_global_pseudo_class` (css/index.js), which
+/// `code.remove(selector.start, selector.start + ':global('.length)` and
+/// `code.remove(selector.end - 1, selector.end)` — keeping every byte of the
+/// argument span untouched, including any whitespace/newlines that sit between
+/// the parentheses and the inner selector list. Slicing the `args` SelectorList
+/// node's own `start..end` instead would drop that inner padding (the AST span
+/// is tight around the selectors), so a multi-line
+/// `:global(\n    .a,\n    .b\n)` would lose its indentation.
+fn push_global_args_text(
+    out: &mut String,
+    global_sel: &Value,
+    args: &Value,
+    css_source: &str,
+    css_start: usize,
+) {
+    let sel_start = global_sel
+        .get("start")
+        .and_then(|s| s.as_u64())
+        .unwrap_or(0) as usize;
+    let sel_end = global_sel.get("end").and_then(|e| e.as_u64()).unwrap_or(0) as usize;
+    // Inner content spans `:global(`.end ..= the byte before the closing `)`.
+    let inner_start = sel_start + ":global(".len();
+    let inner_end = sel_end.saturating_sub(1); // drop the trailing ')'
+    let src_start = inner_start.saturating_sub(css_start);
+    let src_end = inner_end.saturating_sub(css_start);
+    if inner_start < inner_end && src_end <= css_source.len() && src_start < src_end {
+        out.push_str(&css_source[src_start..src_end]);
+    } else {
+        // Fallback to the reconstructed args text (e.g. synthetic nodes without
+        // a reliable source span).
+        out.push_str(&get_selector_text(args));
+    }
+}
+
 fn transform_complex_selector(
     node: &Value,
     selector: &str,
@@ -4789,7 +5352,18 @@ fn transform_complex_selector(
             let is_global_modifier = starts_with_bare_global && selectors_count > 1;
 
             if is_bare_global_only {
-                // Skip this selector entirely - mark that next selector is global
+                // Upstream (css/index.js:286-310): a standalone bare `:global`
+                // (args === null) at the start of a *nested* rule (combinator
+                // === null) becomes `&` — `div { :global x { … } }` →
+                // `div { & x { … } }`. The trailing parts stay unscoped (latched
+                // via `next_is_global`). Non-empty `parent_preludes` ⇒ nested.
+                if result.is_empty() && ctx.is_some_and(|c| !c.parent_preludes.borrow().is_empty())
+                {
+                    result.push('&');
+                }
+                // Mark that this AND every subsequent relative selector in this
+                // complex selector is global/unscoped (css-analyze.js:208-211
+                // sets `is_global_like` on all selectors after the bare `:global`).
                 next_is_global = true;
                 continue;
             }
@@ -4851,7 +5425,7 @@ fn transform_complex_selector(
                     if name == " " {
                         result.push(' ');
                     } else {
-                        result.push_str(&format!(" {} ", name));
+                        let _ = write!(result, " {} ", name);
                     }
                 }
                 // Output selectors without scoping
@@ -4873,7 +5447,12 @@ fn transform_complex_selector(
                     }
                 }
                 _previous_was_scoped = false;
-                next_is_global = false;
+                // Do NOT reset `next_is_global` here: once a standalone bare
+                // `:global` is seen, EVERY following relative selector in this
+                // complex selector is global/unscoped (upstream marks them all
+                // `is_global_like`). The comma operator splits selector lists
+                // into separate `transform_complex_selector` calls, so the latch
+                // correctly resets per complex selector.
                 continue;
             }
 
@@ -4889,9 +5468,9 @@ fn transform_complex_selector(
                 } else if result.is_empty() {
                     // First combinator at start (e.g., "> nav" as a nested selector)
                     // Don't add leading space
-                    result.push_str(&format!("{} ", name));
+                    let _ = write!(result, "{} ", name);
                 } else {
-                    result.push_str(&format!(" {} ", name));
+                    let _ = write!(result, " {} ", name);
                 }
                 // After any combinator, subsequent selectors should use :where() for specificity preservation
                 // UNLESS the previous selector was global-like (like :host) or a :global() selector,
@@ -4951,19 +5530,13 @@ fn transform_complex_selector(
                         {
                             // Extract the content inside :global() from source
                             if let Some(args) = sel.get("args") {
-                                let args_start =
-                                    args.get("start").and_then(|s| s.as_u64()).unwrap_or(0)
-                                        as usize;
-                                let args_end =
-                                    args.get("end").and_then(|e| e.as_u64()).unwrap_or(0) as usize;
-                                let src_start = args_start.saturating_sub(css_start);
-                                let src_end = args_end.saturating_sub(css_start);
-                                if src_end <= css_source.len() && src_start < src_end {
-                                    result.push_str(&css_source[src_start..src_end]);
-                                } else {
-                                    // Fallback to reconstructed text
-                                    result.push_str(&get_selector_text(args));
-                                }
+                                push_global_args_text(
+                                    &mut result,
+                                    sel,
+                                    args,
+                                    css_source,
+                                    css_start,
+                                );
                             }
                         } else {
                             // For non-:global() selectors like :is(x) following :global(.foo),
@@ -5022,18 +5595,13 @@ fn transform_complex_selector(
                         {
                             // Extract the content inside :global() from source
                             if let Some(args) = sel.get("args") {
-                                let args_start =
-                                    args.get("start").and_then(|s| s.as_u64()).unwrap_or(0)
-                                        as usize;
-                                let args_end =
-                                    args.get("end").and_then(|e| e.as_u64()).unwrap_or(0) as usize;
-                                let src_start = args_start.saturating_sub(css_start);
-                                let src_end = args_end.saturating_sub(css_start);
-                                if src_end <= css_source.len() && src_start < src_end {
-                                    selector_parts.push_str(&css_source[src_start..src_end]);
-                                } else {
-                                    selector_parts.push_str(&get_selector_text(args));
-                                }
+                                push_global_args_text(
+                                    &mut selector_parts,
+                                    sel,
+                                    args,
+                                    css_source,
+                                    css_start,
+                                );
                             }
                         } else {
                             selector_parts.push_str(&format_simple_selector_with_scope(
@@ -5295,7 +5863,6 @@ fn format_simple_selector(sel: &Value) -> String {
 /// `use_direct_class` - When true, use direct class (e.g., .svelte-xyz) instead of :where() inside :is()/:not()/:has()
 /// `outer_specificity_bumped` - When true, the outer selector has already been scoped (specificity bumped),
 ///   so inner :has()/:is()/:not() selectors should use :where() for scoping
-#[allow(clippy::too_many_arguments)]
 fn format_simple_selector_with_scope(
     sel: &Value,
     selector: &str,
@@ -5622,7 +6189,7 @@ fn transform_is_not_complex_selector(
                         result.push_str(name);
                     }
                 } else {
-                    result.push_str(&format!(" {} ", name));
+                    let _ = write!(result, " {} ", name);
                 }
             }
 
@@ -5675,6 +6242,30 @@ fn transform_is_not_complex_selector(
                         }
                     }
 
+                    // Pure-pseudo relative selectors (e.g. `:focus-visible` inside
+                    // `:has(...)`) get the scoping modifier PREPENDED, mirroring the
+                    // upstream printer which calls `prependRight(selector.start,
+                    // modifier)` when it reaches `i === 0` and every selector was a
+                    // pseudo. `:root` / `:host` are exempt, as are standalone
+                    // `:is(...)` / `:where(...)` which scope their content internally.
+                    if last_non_pseudo_idx.is_none() && !selector.is_empty() {
+                        let skip = selectors.first().is_some_and(|s| {
+                            let t = s.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                            let n = s.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                            t == "PseudoClassSelector"
+                                && (n == "root"
+                                    || n == "host"
+                                    || ((n == "is" || n == "where") && selectors.len() == 1))
+                        });
+                        if !skip {
+                            if inner_use_direct_class {
+                                selector_parts.push_str(selector);
+                            } else {
+                                let _ = write!(selector_parts, ":where({})", selector);
+                            }
+                        }
+                    }
+
                     for (idx, sel) in selectors.iter().enumerate() {
                         let sel_type = sel.get("type").and_then(|t| t.as_str()).unwrap_or("");
                         let is_universal = sel_type == "TypeSelector"
@@ -5688,7 +6279,7 @@ fn transform_is_not_complex_selector(
                             if inner_use_direct_class {
                                 selector_parts.push_str(selector);
                             } else {
-                                selector_parts.push_str(&format!(":where({})", selector));
+                                let _ = write!(selector_parts, ":where({})", selector);
                             }
                             continue;
                         }
@@ -5710,7 +6301,7 @@ fn transform_is_not_complex_selector(
                             if inner_use_direct_class {
                                 selector_parts.push_str(selector);
                             } else {
-                                selector_parts.push_str(&format!(":where({})", selector));
+                                let _ = write!(selector_parts, ":where({})", selector);
                             }
                         }
                     }
@@ -5802,13 +6393,20 @@ fn get_selector_text(node: &Value) -> String {
             // Check if this is a RelativeSelector with a combinator
             if let Some(combinator) = child.get("combinator")
                 && let Some(name) = combinator.get("name").and_then(|n| n.as_str())
-                && !result.is_empty()
             {
-                // Add combinator (space for descendant, or the actual combinator)
-                if name == " " {
+                if result.is_empty() {
+                    // Leading combinator in a relative selector list (e.g.
+                    // `:has(> [open])`): the `>` / `+` / `~` is significant and
+                    // must be preserved. A leading descendant combinator (" ")
+                    // is implicit and emitted as nothing.
+                    if name != " " {
+                        let _ = write!(result, "{} ", name);
+                    }
+                } else if name == " " {
+                    // Add combinator (space for descendant, or the actual combinator)
                     result.push(' ');
                 } else {
-                    result.push_str(&format!(" {} ", name));
+                    let _ = write!(result, " {} ", name);
                 }
             }
 
@@ -5903,6 +6501,7 @@ mod tests {
                 used_ids: &used_ids,
                 has_dynamic_elements: false,
                 has_dynamic_classes: false,
+                has_dynamic_ids: false,
                 has_control_flow: false,
                 has_opaque_sibling_boundaries: false,
                 dom_structure: &dom_structure,
@@ -5945,6 +6544,7 @@ mod tests {
                 used_ids: &used_ids,
                 has_dynamic_elements: false,
                 has_dynamic_classes: false,
+                has_dynamic_ids: false,
                 has_control_flow: false,
                 has_opaque_sibling_boundaries: false,
                 dom_structure: &dom_structure,

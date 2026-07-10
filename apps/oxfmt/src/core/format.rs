@@ -423,14 +423,14 @@ impl SourceFormatter {
             FormatStrategy::RsvelteFormatter {
                 path,
                 format_options,
-                indent_script_and_style,
+                svelte_options,
                 insert_final_newline,
             } => (
                 Self::format_by_rsvelte_formatter(
                     source_text,
                     &path,
                     &format_options,
-                    indent_script_and_style,
+                    &svelte_options,
                 ),
                 insert_final_newline,
             ),
@@ -678,12 +678,12 @@ impl SourceFormatter {
         source_text: &str,
         path: &Path,
         format_options: &JsFormatOptions,
-        indent_script_and_style: bool,
+        svelte_options: &oxc_svelte_backend::SvelteFormatOptions,
     ) -> Result<String, OxcDiagnostic> {
-        oxc_svelte_backend::format_svelte_with_options_and_indent(
+        oxc_svelte_backend::format_svelte_with_config(
             source_text,
             format_options.clone(),
-            indent_script_and_style,
+            svelte_options,
         )
         .map_err(|err| {
             OxcDiagnostic::error(format!(

@@ -1,6 +1,7 @@
-//! `svelte-check` CLI binary — Wave 2 of the ecosystem port. v0.1
-//! covers Svelte-side diagnostics only (compile errors + compiler
-//! warnings). tsgo integration is the next milestone.
+//! `svelte-check` CLI binary — Wave 2 of the ecosystem port. Reports
+//! Svelte-side diagnostics (compile errors + compiler warnings) plus
+//! TypeScript type errors. Type-checking runs by default via `tsc`
+//! (or `tsgo` with `--tsgo`); pass `--no-type-check` for Svelte-only.
 
 // Use jemalloc as the global allocator for better multi-threaded
 // performance. Defined per-bin rather than once in the lib because the lib
@@ -8,7 +9,17 @@
 // is duplicated across both outputs at link time — cargo issue
 // rust-lang/cargo#6313.
 #[cfg(all(
+    feature = "mimalloc-alloc",
+    not(feature = "napi"),
+    not(target_arch = "wasm32"),
+    not(target_os = "windows")
+))]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+#[cfg(all(
     feature = "jemalloc",
+    not(feature = "mimalloc-alloc"),
     not(feature = "napi"),
     not(target_arch = "wasm32"),
     not(target_os = "windows")
@@ -22,7 +33,7 @@ use std::process::ExitCode;
 use std::collections::{HashMap, HashSet};
 
 use clap::Parser;
-use svelte_compiler_rust::svelte_check::{
+use rsvelte_core::svelte_check::{
     OutputFormat, RunOptions, run,
     runner::{DiagnosticSource, WarningOverride},
     watch::{WatchOptions, run_watch},
@@ -32,7 +43,8 @@ use svelte_compiler_rust::svelte_check::{
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "svelte-check",
+    name = "rsvelte-check",
+    bin_name = "rsvelte-check",
     about = "Type-check & diagnose Svelte projects (Rust port of @sveltejs/svelte-check)",
     long_about = None
 )]
@@ -54,10 +66,10 @@ struct Cli {
     #[arg(long = "fail-on-warnings", default_value_t = false)]
     fail_on_warnings: bool,
 
-    /// Materialise `.tsx` shadow files + an overlay tsconfig under
-    /// `<workspace>/.svelte-check/`. The directory layout matches the
-    /// JS reference's `--tsgo` cache, so a follow-up step can hand it
-    /// straight to a TypeScript compiler.
+    /// Keep the materialised `.tsx` shadow files + overlay tsconfig under
+    /// `<workspace>/.svelte-check/` on disk (they are written internally
+    /// for type-checking regardless). Useful for inspecting the overlay,
+    /// or combined with `--no-type-check` to emit without compiling.
     #[arg(long = "emit-overlay", default_value_t = false)]
     emit_overlay: bool,
 
@@ -66,11 +78,18 @@ struct Cli {
     #[arg(long = "tsconfig")]
     tsconfig: Option<PathBuf>,
 
-    /// Run `tsgo` (or `tsc`) against the overlay tsconfig and report
-    /// the resulting TypeScript diagnostics mapped back to the
-    /// original `.svelte` source. Implies `--emit-overlay`.
+    /// Prefer Microsoft's native `tsgo` over the stock `tsc` when
+    /// type-checking the overlay. Without this flag type-checking still
+    /// runs, using `tsc`. (`tsgo` falls back to `tsc` and vice-versa if
+    /// the preferred binary isn't installed.)
     #[arg(long = "tsgo", default_value_t = false)]
     tsgo: bool,
+
+    /// Skip the TypeScript type-checking pass entirely and report only
+    /// Svelte-side diagnostics (compile errors + compiler warnings).
+    /// Type-checking is on by default.
+    #[arg(long = "no-type-check", default_value_t = false)]
+    no_type_check: bool,
 
     /// Comma-separated `code:error|ignore` overrides for compiler
     /// warnings. Example: `css-unused-selector:ignore,a11y-no-noninteractive-element-to-interactive-role:error`.
@@ -134,13 +153,17 @@ fn main() -> ExitCode {
     let compiler_warnings = parse_compiler_warnings(cli.compiler_warnings.as_deref());
     let diagnostic_sources = parse_diagnostic_sources(cli.diagnostic_sources.as_deref());
 
+    // Type-checking is on by default; `--no-type-check` opts out. `--tsgo`
+    // only selects which compiler backend is preferred (tsgo vs tsc).
+    let type_check = !cli.no_type_check;
     let options = RunOptions {
         workspace: workspace.clone(),
         ignore,
         fail_on_warnings: cli.fail_on_warnings,
-        emit_overlay: cli.emit_overlay || cli.tsgo,
+        emit_overlay: cli.emit_overlay,
         tsconfig: cli.tsconfig,
-        use_tsgo: cli.tsgo,
+        type_check,
+        prefer_tsgo: cli.tsgo,
         compiler_warnings,
         diagnostic_sources,
         incremental: cli.incremental,
@@ -158,19 +181,30 @@ fn main() -> ExitCode {
         if let Err(err) = run_watch(options, watch_opts, |run_result| {
             print_run(run_result, &workspace_for_print, format);
         }) {
-            eprintln!("svelte-check: watch mode failed to start: {err}");
+            eprintln!("rsvelte-check: watch mode failed to start: {err}");
             return ExitCode::from(2);
         }
         ExitCode::SUCCESS
     } else {
         let result = run(&options);
+        // Finding nothing is almost always a misconfigured workspace path, not
+        // a clean project. Surface it on stderr (never stdout, so machine
+        // formats stay parseable) so "checked nothing" can't masquerade as
+        // "passed" (issue #718).
+        if result.files_checked == 0 {
+            eprintln!(
+                "rsvelte-check: warning: no .svelte files found under {} — nothing was checked. \
+                 Is the --workspace path correct?",
+                workspace.display()
+            );
+        }
         print_run(&result, &workspace, format);
         ExitCode::from(result.exit_code(cli.fail_on_warnings) as u8)
     }
 }
 
 fn print_run(
-    result: &svelte_compiler_rust::svelte_check::runner::RunResult,
+    result: &rsvelte_core::svelte_check::runner::RunResult,
     workspace: &Path,
     format: OutputFormat,
 ) {

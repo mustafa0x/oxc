@@ -235,6 +235,27 @@ pub(super) fn is_tag_valid_with_parent(child_tag: &str, parent_tag: &str) -> Opt
             "`<{}>` cannot be a child of `<{}>`. `<{}>` only allows these children: `<caption>`, `<colgroup>`, `<tbody>`, `<thead>`, `<tfoot>`, `<style>`, `<script>`, `<template>`",
             child_tag, parent_tag, parent_tag
         )),
+        // https://html.spec.whatwg.org/multipage/syntax.html#parsing-main-inhead
+        (
+            "head",
+            "base" | "basefont" | "bgsound" | "link" | "meta" | "title" | "noscript" | "noframes"
+            | "style" | "script" | "template",
+        ) => None,
+        ("head", _) => Some(format!(
+            "`<{}>` cannot be a child of `<{}>`. `<{}>` only allows these children: `<base>`, `<basefont>`, `<bgsound>`, `<link>`, `<meta>`, `<title>`, `<noscript>`, `<noframes>`, `<style>`, `<script>`, `<template>`",
+            child_tag, parent_tag, parent_tag
+        )),
+        // https://html.spec.whatwg.org/multipage/semantics.html#the-html-element
+        ("html", "head" | "body" | "frameset") => None,
+        ("html", _) => Some(format!(
+            "`<{}>` cannot be a child of `<{}>`. `<{}>` only allows these children: `<head>`, `<body>`, `<frameset>`",
+            child_tag, parent_tag, parent_tag
+        )),
+        ("frameset", "frame") => None,
+        ("frameset", _) => Some(format!(
+            "`<{}>` cannot be a child of `<{}>`. `<{}>` only allows these children: `<frame>`",
+            child_tag, parent_tag, parent_tag
+        )),
         // Note: <select> is not restricted here because HTML5 customizable select elements
         // allow <button> and other elements inside <select>. The official Svelte compiler
         // does not have <select> in the disallowed_children map.
@@ -323,6 +344,19 @@ fn is_direct_only_disallowed(ancestor_tag: &str) -> bool {
         ancestor_tag,
         "li" | "thead" | "tbody" | "tfoot" | "tr" | "td" | "th"
     )
+}
+
+/// Tags that "reset" a disallowed-descendant rule for `ancestor_tag`, mirroring
+/// upstream `autoclosing_children[tag].reset_by` in `html-tree-validation.js`.
+///
+/// `<dt>`/`<dd>` may not be descendants of `<dt>`/`<dd>`, *but* a nested `<dl>`
+/// between them resets the rule (a `<dl>` re-opens a valid description-list
+/// context). So a valid nested `<dl>` inside a `<dd>` must not error (#721).
+fn get_descendant_reset_by(ancestor_tag: &str) -> Option<&'static [&'static str]> {
+    match ancestor_tag {
+        "dt" | "dd" => Some(&["dl"]),
+        _ => None,
+    }
 }
 
 /// Check if a tag is valid with an ancestor.
@@ -439,6 +473,7 @@ pub fn visit(
     let mut dynamic_attribute_names: FxHashSet<String> = FxHashSet::default();
     let mut has_spread = false;
     let mut has_class_directive = false;
+    let mut class_directive_names: FxHashSet<String> = FxHashSet::default();
     let mut has_style_directive = false;
 
     // Track class names and IDs from attributes
@@ -686,17 +721,32 @@ pub fn visit(
                     }
                 }
                 "id" => {
-                    // Extract ID from attribute value
-                    if let AttributeValue::Sequence(parts) = &attr_node.value {
-                        for part in parts {
-                            if let AttributeValuePart::Text(text) = part {
-                                let id = text.data.trim();
-                                if !id.is_empty() {
-                                    context.analysis.css.used_ids.insert(id.to_string());
-                                    element_id = Some(id.to_string());
+                    match &attr_node.value {
+                        AttributeValue::Sequence(parts) => {
+                            // An interpolated id (`id="a{x}"`) has an unknown runtime
+                            // value, so it could match any #id selector.
+                            let has_dynamic_part = parts
+                                .iter()
+                                .any(|p| matches!(p, AttributeValuePart::ExpressionTag(_)));
+                            if has_dynamic_part {
+                                context.analysis.css.has_dynamic_ids = true;
+                            } else {
+                                for part in parts {
+                                    if let AttributeValuePart::Text(text) = part {
+                                        let id = text.data.trim();
+                                        if !id.is_empty() {
+                                            context.analysis.css.used_ids.insert(id.to_string());
+                                            element_id = Some(id.to_string());
+                                        }
+                                    }
                                 }
                             }
                         }
+                        // `id={expr}` or the `{id}` shorthand: dynamic, unknown value.
+                        AttributeValue::Expression(_) => {
+                            context.analysis.css.has_dynamic_ids = true;
+                        }
+                        _ => {}
                     }
                 }
                 _ => {}
@@ -708,8 +758,13 @@ pub fn visit(
         } else if let Attribute::BindDirective(bind) = attr {
             // bind:name is a dynamic attribute
             dynamic_attribute_names.insert(bind.name.to_string());
-        } else if let Attribute::ClassDirective(_) = attr {
+        } else if let Attribute::ClassDirective(class_dir) = attr {
             has_class_directive = true;
+            class_directive_names.insert(class_dir.name.to_string());
+            // `class:name` matches a `.name` class selector exactly (the official
+            // `attribute_matches` returns true for ClassDirective with `~=`), so
+            // track the directive name as a class on this element.
+            element_classes.insert(class_dir.name.to_string());
         } else if let Attribute::StyleDirective(_) = attr {
             has_style_directive = true;
         }
@@ -891,6 +946,19 @@ pub fn visit(
                     continue;
                 }
 
+                // `reset_by` rules: if any element between this ancestor and the
+                // current element re-opens the context (e.g. a nested `<dl>`
+                // between an outer `<dd>` and an inner `<dt>`), the descendant
+                // restriction no longer applies. Mirrors upstream's `reset_by`
+                // walk in `is_tag_valid_with_ancestor` (#721).
+                if let Some(reset_by) = get_descendant_reset_by(ancestor_name)
+                    && context.element_ancestors[i + 1..]
+                        .iter()
+                        .any(|a| reset_by.contains(&a.as_str()))
+                {
+                    continue;
+                }
+
                 let message = format!(
                     "`<{}>` cannot be a descendant of `<{}>`",
                     element.name, ancestor_name
@@ -958,6 +1026,7 @@ pub fn visit(
         dynamic_attribute_names,
         has_spread,
         has_class_directive,
+        class_directive_names,
         has_style_directive,
         parent_idx,
         children_idx: Vec::new(),
@@ -1123,7 +1192,9 @@ pub fn visit(
 
     // Clear is_direct_child_of_component since we're now inside an element
     let was_direct_child = context.is_direct_child_of_component;
+    let was_direct_snippet = context.is_direct_child_of_snippet;
     context.is_direct_child_of_component = false;
+    context.is_direct_child_of_snippet = false;
 
     // Push fragment owner type for const_tag placement validation
     // Elements with a slot attribute allow {@const} tags (like components)
@@ -1184,35 +1255,127 @@ pub fn visit(
                         // We collect indirect_names first (read-only access to declarations
                         // and bindings), then mutate the target binding separately to avoid
                         // cloning the entire declarations HashMap.
-                        let mut indirect_names: Vec<String> = Vec::new();
+                        // Collect only bindings referenced WITHIN this `<select>`
+                        // element's own source span (its attributes + descendant
+                        // options), mirroring the official compiler which iterates
+                        // the select's scope references — NOT every template
+                        // reference in the component (which would wrongly pull in
+                        // unrelated ids used on sibling elements). Order by the
+                        // first in-span reference position so the emitted
+                        // `$.invalidate_inner_signals` body matches source order.
+                        // The set of scope indices that are `scope_idx` or an
+                        // ancestor of it — used by both the identifier group
+                        // (below) and the component group (further down).
+                        let mut ancestor_scopes: FxHashSet<usize> = FxHashSet::default();
                         {
-                            let scope_declarations =
-                                if context.analysis.root.all_scopes.len() > scope_idx {
-                                    &context.analysis.root.all_scopes[scope_idx].declarations
-                                } else {
-                                    &context.analysis.root.scope.declarations
-                                };
-
-                            for (name, &other_idx) in scope_declarations {
+                            let mut cur = Some(scope_idx);
+                            while let Some(si) = cur {
+                                ancestor_scopes.insert(si);
+                                cur = context
+                                    .analysis
+                                    .root
+                                    .all_scopes
+                                    .get(si)
+                                    .and_then(|s| s.parent);
+                            }
+                        }
+                        let mut indirect_with_pos: Vec<(u32, String)> = Vec::new();
+                        {
+                            // Mirror the official `scope.references.keys()`: the
+                            // bindings visible in the select's ENCLOSING scope that
+                            // are referenced within the select. The select's own
+                            // local scope (`scope_idx`) is too narrow — an indirect
+                            // binding usually lives in an OUTER scope (e.g. a prop
+                            // `guid` read in the select's `id=` attribute when the
+                            // select is nested in `{#if}`). So we walk `scope_idx`
+                            // and all its ANCESTOR scopes, collecting their
+                            // declarations. Crucially this EXCLUDES descendant
+                            // (child) scopes — e.g. a `{#each tasks as task}` inside
+                            // the select declares `task` in a child scope, which the
+                            // official's enclosing-scope references never contain, so
+                            // mutating the bound value must not invalidate `task`.
+                            // The in-span template-reference filter keeps this to the
+                            // select element (not unrelated sibling elements).
+                            // A binding is in the select's ENCLOSING scope iff its own
+                            // `scope_index` is in `ancestor_scopes`; a binding declared
+                            // in a descendant scope (e.g. an each-block item inside the
+                            // select) is NOT. We use `binding.scope_index` rather than
+                            // `scope.declarations` because the latter is polluted with
+                            // child-scope declarations for backward compat (see scope.rs).
+                            for other_binding in context.analysis.root.bindings.iter() {
+                                let name = &other_binding.name;
                                 if name == root_name {
                                     continue;
                                 }
-                                if let Some(other_binding) =
-                                    context.analysis.root.bindings.get(other_idx)
+                                if !ancestor_scopes.contains(&other_binding.scope_index) {
+                                    continue;
+                                }
+                                // A store auto-subscription (`$label`) is not a real
+                                // scope binding upstream — `scope.get('$label')`
+                                // returns null (the binding is `label`), so the
+                                // official never adds it as an indirect binding.
+                                // rsvelte synthesizes a `$label` StoreSub binding, so
+                                // skip it explicitly to match.
+                                if matches!(
+                                    other_binding.kind,
+                                    crate::compiler::phases::phase2_analyze::scope::BindingKind::StoreSub
+                                ) {
+                                    continue;
+                                }
+                                if let Some(min_pos) = other_binding
+                                    .references
+                                    .iter()
+                                    .filter(|r| {
+                                        r.is_template_reference
+                                            && r.start >= element.start
+                                            && r.end <= element.end
+                                    })
+                                    .map(|r| r.start)
+                                    .min()
                                 {
-                                    let has_template_ref = other_binding
-                                        .references
-                                        .iter()
-                                        .any(|r| r.is_template_reference);
-                                    if has_template_ref {
-                                        indirect_names.push(name.clone());
+                                    indirect_with_pos.push((min_pos, name.clone()));
+                                }
+                            }
+                        }
+                        indirect_with_pos.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+                        let indirect_names: Vec<String> =
+                            indirect_with_pos.into_iter().map(|(_, n)| n).collect();
+
+                        // Component group (immediate references). In the official
+                        // compiler these are inserted into the select scope's
+                        // `references` map BEFORE the deferred identifier references,
+                        // so they must come first in `legacy_indirect_bindings`.
+                        let mut comp_names: Vec<String> = Vec::new();
+                        {
+                            let mut comp_with_pos: Vec<(u32, String)> = Vec::new();
+                            collect_subtree_component_refs(&element.fragment, &mut comp_with_pos);
+                            comp_with_pos.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+                            let mut seen: FxHashSet<String> = FxHashSet::default();
+                            for (_, name) in comp_with_pos {
+                                if &name == root_name || !seen.insert(name.clone()) {
+                                    continue;
+                                }
+                                // Resolve like the official `scope.get(name)`: only
+                                // add when it maps to an enclosing-scope binding that
+                                // is not a synthesized store-subscription alias.
+                                if let Some(bi) =
+                                    context.analysis.root.get_binding(&name, scope_idx)
+                                {
+                                    let b = &context.analysis.root.bindings[bi];
+                                    if ancestor_scopes.contains(&b.scope_index)
+                                        && !matches!(
+                                            b.kind,
+                                            crate::compiler::phases::phase2_analyze::scope::BindingKind::StoreSub
+                                        )
+                                    {
+                                        comp_names.push(name);
                                     }
                                 }
                             }
                         }
 
                         let binding = &mut context.analysis.root.bindings[binding_idx];
-                        for name in indirect_names {
+                        for name in comp_names.into_iter().chain(indirect_names) {
                             if !binding.legacy_indirect_bindings.contains(&name) {
                                 binding.legacy_indirect_bindings.push(name);
                             }
@@ -1229,6 +1392,7 @@ pub fn visit(
 
     // Restore is_direct_child_of_component
     context.is_direct_child_of_component = was_direct_child;
+    context.is_direct_child_of_snippet = was_direct_snippet;
 
     // Pop from each_block_stack
     context.each_block_stack.pop();
@@ -1303,9 +1467,78 @@ fn extract_binding_root_identifier_node(
             // whole MemberExpression chain into a Value.
             extract_binding_root_identifier_node(arena.get_js_node(*object), arena)
         }
-        JsNode::Raw(v) => extract_binding_root_identifier_json(v),
         _ => None,
     }
+}
+
+/// Recursively collect component-tag references within a fragment subtree, in
+/// source order, as `(start, root_name)` pairs.
+///
+/// Mirrors the official compiler's `Component` create-scopes visitor
+/// (`context.state.scope.reference(b.id(node.name.split('.')[0]), …)`), whose
+/// references are applied IMMEDIATELY during the walk — unlike plain identifier
+/// references, which are buffered and applied afterwards. As a result component
+/// names occupy the FIRST slots of a scope's `references` map, ahead of every
+/// deferred identifier reference. The `<select bind:value>` legacy-indirect
+/// population relies on this ordering, so we gather component refs separately
+/// and emit them before the identifier group.
+fn collect_subtree_component_refs(
+    fragment: &crate::ast::template::Fragment,
+    out: &mut Vec<(u32, String)>,
+) {
+    fn root_name(name: &str) -> String {
+        name.split('.').next().unwrap_or(name).to_string()
+    }
+    fn walk(nodes: &[TemplateNode], out: &mut Vec<(u32, String)>) {
+        for node in nodes {
+            match node {
+                TemplateNode::Component(c) => {
+                    out.push((c.start, root_name(&c.name)));
+                    walk(&c.fragment.nodes, out);
+                }
+                TemplateNode::SvelteSelf(e) => walk(&e.fragment.nodes, out),
+                TemplateNode::SvelteComponent(c) => walk(&c.fragment.nodes, out),
+                TemplateNode::RegularElement(e) => walk(&e.fragment.nodes, out),
+                TemplateNode::SvelteElement(e) => walk(&e.fragment.nodes, out),
+                TemplateNode::TitleElement(e) => walk(&e.fragment.nodes, out),
+                TemplateNode::SlotElement(e) => walk(&e.fragment.nodes, out),
+                TemplateNode::SvelteBody(e)
+                | TemplateNode::SvelteDocument(e)
+                | TemplateNode::SvelteFragment(e)
+                | TemplateNode::SvelteBoundary(e)
+                | TemplateNode::SvelteHead(e)
+                | TemplateNode::SvelteOptions(e)
+                | TemplateNode::SvelteWindow(e) => walk(&e.fragment.nodes, out),
+                TemplateNode::IfBlock(b) => {
+                    walk(&b.consequent.nodes, out);
+                    if let Some(alt) = &b.alternate {
+                        walk(&alt.nodes, out);
+                    }
+                }
+                TemplateNode::EachBlock(b) => {
+                    walk(&b.body.nodes, out);
+                    if let Some(fallback) = &b.fallback {
+                        walk(&fallback.nodes, out);
+                    }
+                }
+                TemplateNode::KeyBlock(b) => walk(&b.fragment.nodes, out),
+                TemplateNode::AwaitBlock(b) => {
+                    if let Some(p) = &b.pending {
+                        walk(&p.nodes, out);
+                    }
+                    if let Some(t) = &b.then {
+                        walk(&t.nodes, out);
+                    }
+                    if let Some(c) = &b.catch {
+                        walk(&c.nodes, out);
+                    }
+                }
+                TemplateNode::SnippetBlock(b) => walk(&b.body.nodes, out),
+                _ => {}
+            }
+        }
+    }
+    walk(&fragment.nodes, out);
 }
 
 fn extract_binding_root_identifier_json(value: &serde_json::Value) -> Option<String> {

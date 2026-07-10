@@ -375,6 +375,13 @@ fn walk_metadata_flags(
             if let Some(t) = obj.get("type").and_then(|t| t.as_str()) {
                 match t {
                     "CallExpression" => *has_call = true,
+                    // A spread `...x` is treated like `...x.values()` — it may
+                    // invoke a getter/iterator — so it counts as a call. Mirrors
+                    // upstream `2-analyze/visitors/SpreadElement.js`, which sets
+                    // `has_call = true`. This makes a legacy attribute value with a
+                    // spread (`{ ...props }`) get the `(deps, $.untrack(...))`
+                    // dependency wrapping from `build_expression`.
+                    "SpreadElement" => *has_call = true,
                     "MemberExpression" => *has_member = true,
                     "AssignmentExpression" | "UpdateExpression" => *has_assignment = true,
                     "AwaitExpression" => *has_await = true,
@@ -720,7 +727,6 @@ fn attr_has_await_expr(attr_value: &AttributeValue) -> bool {
 /// * `is_html` - Whether this is an HTML element (vs SVG)
 /// * `css_hash` - The CSS scoping hash (empty string if no CSS)
 /// * `is_scoped` - Whether the element needs CSS scoping
-#[allow(clippy::too_many_arguments)]
 pub fn build_set_class(
     _element: &RegularElementNode,
     node_id: &str,
@@ -748,6 +754,10 @@ pub fn build_set_class(
         let mut memoizer = std::mem::take(&mut context.state.memoizer);
         let mut any_has_call = false;
         let mut any_has_await = false;
+        // SAFETY: `JsArena` allocates via interior mutability (`UnsafeCell`)
+        // with nodes behind stable `Box`es, so a shared `&JsArena` stays valid
+        // while `context` is reborrowed mutably by `build_attribute_value`. The
+        // arena outlives this borrow; traversal is single-threaded (no aliasing).
         let arena_ref_elem = unsafe { &*(&context.arena as *const _) };
         let result = build_attribute_value(attr_value, context, |expr, metadata| {
             let has_call = metadata.has_call();
@@ -834,6 +844,22 @@ pub fn build_set_class(
                     class_value = b::string(format!("{} {}", s, css_hash));
                 }
             }
+            // A quote-preserving string literal (`class={"draggable"}`) is just as
+            // static — fold the hash into the string rather than passing it as a
+            // separate `$.set_class` argument (matches upstream, which sees a plain
+            // string `Literal`).
+            JsExpr::Literal(
+                crate::compiler::phases::phase3_transform::js_ast::nodes::JsLiteral::RawString {
+                    value,
+                    ..
+                },
+            ) => {
+                if value.is_empty() {
+                    class_value = b::string(css_hash);
+                } else {
+                    class_value = b::string(format!("{} {}", value, css_hash));
+                }
+            }
             _ => {
                 // Dynamic class value - use css_hash as separate argument
                 css_hash_expr = Some(b::string(css_hash));
@@ -892,7 +918,6 @@ pub fn build_set_class(
 }
 
 /// Legacy function for backwards compatibility - use build_set_class instead.
-#[allow(clippy::too_many_arguments)]
 pub fn build_set_class_call(
     _element: &RegularElementNode,
     node_expr: JsExpr,
@@ -1054,6 +1079,29 @@ pub fn build_set_style(
                 .push(b::let_decl(&context.arena, &id, None));
             prev = b::id(&id);
             previous_id = Some(id);
+        }
+
+        // Upstream `StyleDirective.js` (analyze) adds a SHORTHAND directive's
+        // binding to `metadata.expression.dependencies` rather than `references`,
+        // and the client `Memoizer.check_blockers` only walks `references`. As a
+        // result a `$.set_style` whose directives are ALL shorthand never
+        // contributes a `$$promises[N]` blocker to its `$.template_effect`. Record
+        // the shorthand directive names so the Rust blocker scan (which works off
+        // the literal update-statement identifiers) can exclude them. If ANY
+        // directive in this set is non-shorthand, upstream merges its references
+        // into the shared metadata and the whole `set_style` blocks, so we record
+        // nothing.
+        if has_state
+            && style_directives
+                .iter()
+                .all(|d| matches!(&d.value, AttributeValue::True(true)))
+        {
+            for d in style_directives {
+                let name = d.name.to_string();
+                if !context.state.style_shorthand_blocker_names.contains(&name) {
+                    context.state.style_shorthand_blocker_names.push(name);
+                }
+            }
         }
     }
 
@@ -1293,7 +1341,7 @@ fn get_directive_expression(directive: &StyleDirective) -> crate::ast::js::Expre
         AttributeValue::Expression(expr_tag) => expr_tag.expression.clone(),
         AttributeValue::True(_) => {
             // For style:color shorthand, create an identifier expression
-            Expression::Value(serde_json::json!({
+            Expression::from_json(serde_json::json!({
                 "type": "Identifier",
                 "name": directive.name.to_string()
             }))
@@ -1306,7 +1354,7 @@ fn get_directive_expression(directive: &StyleDirective) -> crate::ast::js::Expre
                 }
             }
             // Static text - return a literal
-            Expression::Value(serde_json::Value::Null)
+            Expression::from_json(serde_json::Value::Null)
         }
     }
 }
@@ -1335,7 +1383,6 @@ fn get_directive_expression(directive: &StyleDirective) -> crate::ast::js::Expre
 /// var event_handler = () => $.set(changed, 'a');
 /// $.attribute_effect(div, ($0) => ({ ...$0, ona: event_handler }), [() => get_rest()]);
 /// ```
-#[allow(clippy::too_many_arguments)]
 pub fn build_attribute_effect(
     attributes: &[&crate::ast::template::Attribute],
     class_directives: &[&ClassDirective],

@@ -87,6 +87,11 @@ pub fn fragment(
             parent,
             &node.nodes,
             context.state.analysis,
+            // Only the root component fragment is a namespace-reset boundary in
+            // this code path; nested block fragments inherit from their element
+            // ancestor (snippet bodies are handled by snippet_block.rs, which
+            // pre-sets the namespace and calls this with is_root_fragment=true).
+            is_root_fragment,
         )
         .to_string()
     };
@@ -145,6 +150,7 @@ pub fn fragment(
         update: Vec::new(),
         after_update: Vec::new(),
         consts: Vec::new(),
+        snippet_body_prepend: Vec::new(),
         async_consts: None,
         let_directives: Vec::new(),
         node: context.state.node.clone(),
@@ -176,15 +182,24 @@ pub fn fragment(
         is_controlled_each: false,
         is_controlled_html: false,
         snippets: Vec::new(),
-        // Root fragment starts at level 0; non-root fragments (e.g., inside {#if}/{#each})
-        // start at level 1 so that snippets inside blocks are not hoisted to the root.
-        // This matches the official compiler's `context.path.length === 1` check.
-        template_nesting_level: if is_root_fragment { 0 } else { 1 },
+        // Root fragment inherits the caller's nesting level; non-root fragments (e.g.,
+        // inside {#if}/{#each}) start at level 1 so that snippets inside blocks are not
+        // hoisted to the root. This matches the official compiler's
+        // `context.path.length === 1` check: the component's own root fragment is entered
+        // with template_nesting_level==0 and is_root_fragment==true, so it stays at 0.
+        // A snippet body bumps template_nesting_level before calling fragment_visitor with
+        // is_root_fragment=true, so nested snippets correctly see level >= 1 here.
+        template_nesting_level: if is_root_fragment {
+            context.state.template_nesting_level
+        } else {
+            1
+        },
         in_control_flow_block: context.state.in_control_flow_block,
         each_index_used: context.state.each_index_used.clone(),
         each_index_name: context.state.each_index_name.clone(),
         ancestor_each_index_names: context.state.ancestor_each_index_names.clone(),
         each_item_assign_or_mutate: context.state.each_item_assign_or_mutate.clone(),
+        each_item_name_flags: context.state.each_item_name_flags.clone(),
         each_item_names: context.state.each_item_names.clone(),
         each_binding_context: context.state.each_binding_context.clone(),
         local_var_init_types: Vec::new(),
@@ -195,10 +210,12 @@ pub fn fragment(
         blocker_map: context.state.blocker_map.clone(),
         blocker_map_primary_names: context.state.blocker_map_primary_names.clone(),
         extra_blocker_indices: Vec::new(),
+        style_shorthand_blocker_names: Vec::new(),
         is_standalone: false,
         const_blocker_map: context.state.const_blocker_map.clone(),
         needs_mutation_validation: context.state.needs_mutation_validation.clone(),
         templates: Rc::clone(&context.state.templates),
+        pending_error: None,
     };
 
     // Swap context.state with our local state so that process_children uses it
@@ -445,6 +462,11 @@ pub fn fragment(
     // Swap the state back and get the modified state
     let state = std::mem::replace(&mut context.state, saved_state);
 
+    // Propagate any pending error from the fragment state to the parent state.
+    if state.pending_error.is_some() {
+        context.state.pending_error = state.pending_error.clone();
+    }
+
     // Build the final body
     // Add snippets, let_directives, and consts (matches official Fragment.js line 154)
     body.extend(state.snippets);
@@ -512,9 +534,33 @@ pub fn fragment(
                 }
                 // Also scan memoized expressions for blocked identifiers.
                 // Memoized values like `[() => checkedFactory()()]` are not in
-                // state.update but still reference blocked variables.
+                // state.update but still reference blocked variables. These are
+                // render-time thunks (no event handlers), so descend into
+                // nested closures too — a blocker referenced from inside an IIFE
+                // such as `{(() => host)()}` must still be collected (Svelte
+                // 5.56.0 #18309). The blocker set is deduped, so re-collecting a
+                // name already found in `state.update` is a no-op.
                 for memo_expr in state.memoizer.all_expressions() {
-                    collect_ids_from_expr(&memo_expr, &context.arena, &mut all_names);
+                    collect_ids_from_expr_props(&memo_expr, &context.arena, &mut all_names);
+                }
+
+                // Exclude names that are referenced ONLY by shorthand `style:x`
+                // directives. Upstream's `StyleDirective.js` analyze visitor adds a
+                // shorthand directive's binding to `metadata.expression.dependencies`
+                // (not `references`), and the client `Memoizer.check_blockers` only
+                // walks `references`, so a shorthand-only `$.set_style` never emits a
+                // `$$promises[N]` blocker on its `$.template_effect`. `build_set_style`
+                // records such names in `style_shorthand_blocker_names` only when ALL
+                // of that element's style directives are shorthand (if any is a normal
+                // `style:x={expr}`, upstream merges its references and the whole
+                // set_style blocks, so the name is not recorded).
+                if !state.style_shorthand_blocker_names.is_empty() {
+                    all_names.retain(|n| {
+                        !state
+                            .style_shorthand_blocker_names
+                            .iter()
+                            .any(|s| s.as_str() == n.as_str())
+                    });
                 }
 
                 // Collect instance-level blocker indices from blocker_map.
@@ -603,13 +649,33 @@ pub fn fragment(
                 // Use pointer identity to deduplicate (same source pointer = same expression).
                 let mut const_blocker_exprs: Vec<JsExpr> = Vec::new();
                 let mut seen_ptrs: Vec<*const JsExpr> = Vec::new();
+                // Also dedup by VALUE: a destructured async declaration
+                // (`{const { length, 0: first } = await …}`) registers the
+                // SAME `promises[N]` slot for EVERY declared name, but each name
+                // is a separate `const_blocker_map` entry (distinct storage =
+                // distinct pointer). Upstream shares ONE blocker Expression for
+                // the whole pattern (`Memoizer.#blockers = new Set<Expression>`
+                // keyed on identity), so the pattern contributes a SINGLE array
+                // entry. Mirror that by also collapsing structurally-equal
+                // blocker expressions.
+                let mut seen_values: rustc_hash::FxHashSet<String> =
+                    rustc_hash::FxHashSet::default();
                 for name in &all_names {
                     if let Some(blocker_expr) = const_map.get(name.as_str()) {
                         let ptr = blocker_expr as *const JsExpr;
-                        if !seen_ptrs.contains(&ptr) {
-                            seen_ptrs.push(ptr);
-                            const_blocker_exprs.push(blocker_expr.clone());
+                        if seen_ptrs.contains(&ptr) {
+                            continue;
                         }
+                        let value_key =
+                            crate::compiler::phases::phase3_transform::js_ast::codegen::generate_expr(
+                                blocker_expr,
+                                &context.arena,
+                            );
+                        if !seen_values.insert(value_key) {
+                            continue;
+                        }
+                        seen_ptrs.push(ptr);
+                        const_blocker_exprs.push(blocker_expr.clone());
                     }
                 }
 
@@ -918,7 +984,7 @@ pub fn collect_identifiers_from_statement_props(
 /// but skips arrow functions that are the value of `children` or `$$slots` properties.
 /// This mirrors the official Svelte compiler's memoizer which tracks blockers from
 /// direct prop expressions but not from children callbacks.
-fn collect_ids_from_expr_props(
+pub(crate) fn collect_ids_from_expr_props(
     expr: &JsExpr,
     arena: &crate::compiler::phases::phase3_transform::js_ast::arena::JsArena,
     names: &mut Vec<compact_str::CompactString>,

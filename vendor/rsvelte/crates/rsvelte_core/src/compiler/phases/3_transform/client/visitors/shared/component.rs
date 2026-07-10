@@ -969,6 +969,10 @@ fn process_on_directive(
     // This is handled via build_event_handler which sets needs_props_from_events
 
     // Build base event handler
+    // SAFETY: `JsArena` allocates via interior mutability (`UnsafeCell`) with
+    // nodes behind stable `Box`es, so a shared `&JsArena` stays valid while
+    // `context` is reborrowed mutably by `build_event_handler`. The arena
+    // outlives this borrow and traversal is single-threaded (no aliasing).
     let arena_local = unsafe { &*(&context.arena as *const _) };
     let mut handler = build_event_handler(
         arena_local,
@@ -1066,9 +1070,6 @@ fn process_regular_attribute(
     custom_css_props: &mut Vec<JsObjectMember>,
     memoizer: &mut crate::compiler::phases::phase3_transform::client::types::Memoizer,
 ) {
-    #[allow(unused_imports)]
-    use crate::compiler::phases::phase3_transform::client::types::ExpressionMetadata;
-
     // Handle custom CSS properties (--var)
     if attr.name.starts_with("--") {
         // Build the attribute value with potential memoization
@@ -1159,8 +1160,32 @@ fn process_regular_attribute(
     // because their initial type is SnippetBlock, not FunctionExpression)
     let is_snippet_reference = is_snippet_identifier(&attr.value, context);
 
+    // A prop whose value reads an async-blocked binding (e.g.
+    // `onclick={() => foo}` where `const foo = $derived(await …)`) must be
+    // emitted as a getter so the child re-reads it once the promise resolves
+    // (Svelte 5.56.1 #18352). Collect the value's identifiers — descending into
+    // closures, since the read is inside the `() => foo` arrow — and check them
+    // against the instance/`{@const}` blocker maps.
+    let prop_references_blocked_binding = {
+        let blocker_map = context.state.blocker_map.borrow();
+        let const_blocker_map = context.state.const_blocker_map.borrow();
+        if blocker_map.is_empty() && const_blocker_map.is_empty() {
+            false
+        } else {
+            let mut names: Vec<compact_str::CompactString> = Vec::new();
+            super::super::fragment::collect_ids_from_expr_props(
+                &final_value,
+                &context.arena,
+                &mut names,
+            );
+            names.iter().any(|n| {
+                blocker_map.contains_key(n.as_str()) || const_blocker_map.contains_key(n.as_str())
+            })
+        }
+    };
+
     // Add to props
-    if result.has_state || is_snippet_reference {
+    if result.has_state || is_snippet_reference || prop_references_blocked_binding {
         // Use getter for reactive values and snippet references
         push_prop_immediate(
             props_and_spreads,
@@ -1188,7 +1213,7 @@ fn get_original_expression(value: &AttributeValue) -> crate::ast::js::Expression
                 expr_tag.expression.clone()
             } else {
                 // Text - create a dummy literal expression
-                crate::ast::js::Expression::Value(serde_json::json!({
+                crate::ast::js::Expression::from_json(serde_json::json!({
                     "type": "Literal",
                     "value": ""
                 }))
@@ -1196,7 +1221,7 @@ fn get_original_expression(value: &AttributeValue) -> crate::ast::js::Expression
         }
         _ => {
             // Other cases - create a dummy literal expression
-            crate::ast::js::Expression::Value(serde_json::json!({
+            crate::ast::js::Expression::from_json(serde_json::json!({
                 "type": "Literal",
                 "value": ""
             }))
@@ -1263,11 +1288,10 @@ fn is_snippet_identifier(value: &AttributeValue, context: &ComponentContext) -> 
 }
 
 /// Process a bind directive.
-#[allow(clippy::too_many_arguments)]
 fn process_bind_directive(
     bind: &BindDirective,
     context: &mut ComponentContext,
-    _props_and_spreads: &mut Vec<PropsEntry>,
+    props_and_spreads: &mut Vec<PropsEntry>,
     delayed_props: &mut Vec<DelayedProp>,
     bind_this: &mut Option<Expression>,
     binding_initializers: &mut Vec<JsStatement>,
@@ -1423,9 +1447,15 @@ fn process_bind_directive(
             .init
             .push(b::var_decl(&context.arena, set_name.clone(), Some(set)));
 
-        // Add getter
-        delayed_props.push(DelayedProp {
-            prop: b::getter(
+        // An explicit get/set bind (`bind:x={() => a, b => …}` — a SequenceExpression)
+        // is pushed in SOURCE position, NOT delayed. Upstream only delays the
+        // simple `bind:x={var}` form so a later spread can't overwrite it; the
+        // explicit-accessor form keeps its place so e.g.
+        // `<C bind:checked={…} {...rest} />` emits `spread_props({ get/set }, () => rest)`
+        // in attribute order (component.js lines 232-245 push WITHOUT delay).
+        push_prop_immediate(
+            props_and_spreads,
+            b::getter(
                 &context.arena,
                 bind.name.as_str(),
                 vec![b::return_value(
@@ -1433,11 +1463,10 @@ fn process_bind_directive(
                     b::call(&context.arena, b::id(get_name), vec![]),
                 )],
             ),
-        });
-
-        // Add setter
-        delayed_props.push(DelayedProp {
-            prop: b::setter(
+        );
+        push_prop_immediate(
+            props_and_spreads,
+            b::setter(
                 &context.arena,
                 bind.name.as_str(),
                 "$$value",
@@ -1446,7 +1475,7 @@ fn process_bind_directive(
                     b::call(&context.arena, b::id(set_name), vec![b::id("$$value")]),
                 )],
             ),
-        });
+        );
 
         return;
     }
@@ -1457,17 +1486,22 @@ fn process_bind_directive(
     // Check if this is a store member expression (e.g., $store.value)
     let is_store_member = is_store_member_expression(&bind.expression, context);
 
-    // Check if this is a state source or derived binding that needs $.get/$.set
-    // In the official compiler, the transform.assign for both State and Derived
-    // generates $.set(node, value), so both need the same treatment.
+    // Check if this is a state source or derived binding that needs $.get/$.set.
+    // In the official compiler, the transform.assign for state, derived AND legacy
+    // reactive (`$:`-declared) bindings all generate $.set(node, value) — this is
+    // exactly the set `add_state_transformers` registers a `$.set` assign for
+    // (is_state_source || Derived || LegacyReactive). Without LegacyReactive here,
+    // a plain `bind:x={path}` whose `path` comes from `$: path = …` falls through
+    // to a plain `path = $$value` assignment and loses reactivity (issue #1228).
     let is_state_binding = if let JsExpr::Identifier(name) = &raw_expression {
         if let Some(binding) = context.state.get_binding(name) {
+            use crate::compiler::phases::phase2_analyze::scope::BindingKind;
             crate::compiler::phases::phase3_transform::client::utils::is_state_source(
                 binding,
                 context.state.analysis,
             ) || matches!(
                 binding.kind,
-                crate::compiler::phases::phase2_analyze::scope::BindingKind::Derived
+                BindingKind::Derived | BindingKind::LegacyReactive
             )
         } else {
             false
@@ -1560,14 +1594,27 @@ fn process_bind_directive(
         if needs_proxy {
             set_args.push(b::boolean(true));
         }
-        vec![b::stmt(
+        let set_call = b::call(
             &context.arena,
-            b::call(
+            b::member_path(&context.arena, "$.set"),
+            set_args,
+        );
+        // If the bound state variable is ALSO store-subscribed (`$store` is
+        // referenced elsewhere), writing a new value to it must unsubscribe the
+        // old store so subsequent `$store` reads re-subscribe. Upstream gets
+        // this for free because its setter visits the `store = $$value`
+        // assignment, whose AssignmentExpression visitor wraps it in
+        // `$.store_unsub($.set(...), '$store', $$stores)`. We build the `$.set`
+        // directly, so apply the same wrap here.
+        let setter_expr = match &raw_expression {
+            JsExpr::Identifier(name) if is_var_store_subscribed(name, context) => b::call(
                 &context.arena,
-                b::member_path(&context.arena, "$.set"),
-                set_args,
+                b::member_path(&context.arena, "$.store_unsub"),
+                vec![set_call, b::string(format!("${}", name)), b::id("$$stores")],
             ),
-        )]
+            _ => set_call,
+        };
+        vec![b::stmt(&context.arena, setter_expr)]
     } else if is_store_sub {
         // For direct store subscriptions, use $.store_set(store, $$value)
         // $store = value -> $.store_set(store, value)
@@ -1612,12 +1659,24 @@ fn process_bind_directive(
                 &store_prefix,
                 b::id("$$value"),
             );
+            // The store *source* (first arg) is read like any other reference to
+            // its binding: a prop reads as the getter call `store()`, a state /
+            // mutable_source reads as `$.get(store)`, and a plain store keeps the
+            // bare name. Apply the registered read transform (mirrors upstream's
+            // `context.state.transform[name].read`).
+            let store_source = match context.state.transform.get(&store_name) {
+                Some(transform) => match transform.read {
+                    Some(read_fn) => read_fn(&context.arena, b::id(&store_name)),
+                    None => b::id(&store_name),
+                },
+                None => b::id(&store_name),
+            };
             vec![b::stmt(
                 &context.arena,
                 b::call(
                     &context.arena,
                     b::member_path(&context.arena, "$.store_mutate"),
-                    vec![b::id(&store_name), assignment_expr, untrack_call],
+                    vec![store_source, assignment_expr, untrack_call],
                 ),
             )]
         } else {
@@ -1700,14 +1759,19 @@ fn process_bind_directive(
                     transformed_expression.clone(),
                     b::id("$$value"),
                 );
-                vec![b::stmt(
+                let call = b::call(
                     &context.arena,
-                    b::call(
-                        &context.arena,
-                        b::id(root_name.clone()),
-                        vec![assignment, b::boolean(true)],
-                    ),
-                )]
+                    b::id(root_name.clone()),
+                    vec![assignment, b::boolean(true)],
+                );
+                // Wrap in `(call, $.invalidate_inner_signals(…))` when the prop
+                // carries legacy indirect bindings (a `<select bind:value>`
+                // referencing other scope variables), mirroring the text /
+                // instance-script prop-member-mutation paths.
+                let wrapped = crate::compiler::phases::phase3_transform::client::visitors::expression_converter::wrap_with_legacy_invalidate(
+                    call, &root_name, context,
+                );
+                vec![b::stmt(&context.arena, wrapped)]
             } else if is_state {
                 if context.state.analysis.runes {
                     // In runes mode, replace the root with $.get(root) in the assignment:
@@ -2158,18 +2222,39 @@ fn visit_slot_children(
     use crate::compiler::phases::phase3_transform::client::transform_template::Namespace;
     use crate::compiler::phases::phase3_transform::utils::clean_nodes;
 
+    // SAFETY: `JsArena` allocates via interior mutability (`UnsafeCell`) with
+    // nodes behind stable `Box`es, so a shared `&JsArena` stays valid while
+    // `context` is reborrowed mutably below. The arena outlives this borrow
+    // and traversal is single-threaded (no aliasing).
     let arena_local2: &crate::compiler::phases::phase3_transform::js_ast::arena::JsArena =
         unsafe { &*(&context.arena as *const _) };
 
     // Convert &[&TemplateNode] to Vec<TemplateNode> for clean_nodes
     let nodes: Vec<TemplateNode> = children.iter().map(|n| (*n).clone()).collect();
 
+    // Slot content is its own fragment, so its namespace is RE-INFERRED from the
+    // children (a component is a namespace-reset boundary), NOT inherited from
+    // the component's position. e.g. `<Svg><Group><circle/><Text/></Group></Svg>`
+    // — `Svg`/`Group` are components, so the inherited namespace is still `html`,
+    // but the `<circle>` makes the slot fragment `svg`. `clean_nodes` needs this
+    // namespace so the SVG `can_remove_entirely` whitespace rule fires (drop the
+    // whitespace between `<circle/>` and `<Text/>` rather than collapsing it to a
+    // space) — matching the `$.from_svg` template built below from the same
+    // inferred namespace.
+    let inferred_ns = crate::compiler::phases::phase3_transform::utils::infer_namespace(
+        &context.state.metadata.namespace,
+        crate::compiler::phases::phase3_transform::utils::ParentRef::None,
+        &nodes,
+        context.state.analysis,
+        true,
+    );
+
     // Clean the nodes (trim whitespace, etc.)
     let cleaned = clean_nodes(
         crate::compiler::phases::phase3_transform::utils::ParentRef::None, // No parent in slot context
         &nodes,
         &context.path,
-        &context.state.metadata.namespace,
+        inferred_ns,
         context.state.scope,
         context.state.analysis,
         context.state.preserve_whitespace,
@@ -2186,6 +2271,12 @@ fn visit_slot_children(
     let saved_init = std::mem::take(&mut context.state.init);
     let saved_update = std::mem::take(&mut context.state.update);
     let saved_after_update = std::mem::take(&mut context.state.after_update);
+    // The slot content is its own fragment: upstream's Fragment visitor clones
+    // the transform map (`transform: { ...state.transform }`), so transforms
+    // registered while visiting slot content (e.g. a slot-level `{@const}`)
+    // must not leak to sibling slots / later components.
+    let saved_transform = context.state.transform.clone();
+    let saved_transform_deep_read = context.state.transform_deep_read.clone();
     let saved_template = context.state.template.clone();
     let saved_node = context.state.node.clone();
     let saved_hoisted = std::mem::take(&mut context.state.hoisted);
@@ -2199,6 +2290,18 @@ fn visit_slot_children(
             &context.state.memoizer,
         );
     let saved_memoizer = std::mem::replace(&mut context.state.memoizer, new_memoizer);
+
+    // Propagate the slot fragment's inferred namespace to the child state so a
+    // NESTED component slot (whose own children are namespace-inconclusive, e.g.
+    // only text + components) inherits it via `infer_namespace`'s
+    // `new_namespace ?? namespace` fallback. Mirrors upstream `Fragment.js`,
+    // which puts the inferred `namespace` on the new child `state.metadata`.
+    // Without this an `<svg>` sibling deep inside one component's slot never
+    // cascades down to a nested component's slot (e.g. `<Card>…<svg/></Card>`
+    // making a `<CardDescription>` fragment `svg`), so it wrongly built a
+    // `$.from_html` template with untrimmed SVG whitespace.
+    let saved_namespace = context.state.metadata.namespace.clone();
+    context.state.metadata.namespace = inferred_ns.to_string();
 
     // Reset template for slot content
     context.state.template =
@@ -2256,6 +2359,17 @@ fn visit_slot_children(
                 }
             };
 
+            // A single-element slot whose root is a custom element / `<video>`
+            // (visited just above) sets `needs_import_node`; the template must
+            // carry the `USE_IMPORT_NODE` flag (`2`) so cloning upgrades the
+            // custom element — mirrors the top-level single-element fragment
+            // path. This branch previously hardcoded `flags = None`.
+            let flags = if context.state.template.needs_import_node {
+                Some(2u32) // TEMPLATE_USE_IMPORT_NODE
+            } else {
+                None
+            };
+
             // Build the template expression using transform_template
             // which handles dev mode $.add_locations wrapping, lazy id naming
             // and template dedup (Svelte 5.56.0 #18320).
@@ -2264,7 +2378,7 @@ fn visit_slot_children(
                 &mut context.state,
                 "root",
                 namespace,
-                None,
+                flags,
                 None,
             );
 
@@ -2341,8 +2455,10 @@ fn visit_slot_children(
                 ),
             ));
         }
-    } else {
-        // For non-standalone cases, follow Fragment.js pattern:
+    } else if !cleaned.trimmed.is_empty() {
+        // For non-standalone cases, follow Fragment.js pattern (upstream gates
+        // this branch on `trimmed.length > 0` — a slot whose content is ONLY
+        // hoisted nodes like `{@const}` emits no template / fragment / append):
         // 1. Create fragment variable
         // 2. Use process_children with $.first_child(fragment) as initial expression
         // 3. Check if template is single comment -> use $.comment()
@@ -2497,14 +2613,10 @@ fn visit_slot_children(
             } else {
                 // Standard template case (template_name was reserved at the start of this function)
 
-                // Infer namespace from the slot children themselves.
-                // For example, if all children are SVG elements, use "svg".
-                let inferred_ns = crate::compiler::phases::phase3_transform::utils::infer_namespace(
-                    &context.state.metadata.namespace,
-                    crate::compiler::phases::phase3_transform::utils::ParentRef::None,
-                    &cleaned.trimmed,
-                    context.state.analysis,
-                );
+                // Reuse the namespace inferred from the raw slot children above
+                // (the same value `clean_nodes` was given), so the emitted
+                // `$.from_svg` / `$.from_html` template and the whitespace
+                // trimming agree.
                 let namespace = match inferred_ns {
                     "svg" => Namespace::Svg,
                     "mathml" => Namespace::Mathml,
@@ -2603,6 +2715,10 @@ fn visit_slot_children(
         ));
     }
 
+    // Restore the transform maps (slot-local transforms end here)
+    context.state.transform = saved_transform;
+    context.state.transform_deep_read = saved_transform_deep_read;
+
     // Add init statements
     let init_stmts = std::mem::replace(&mut context.state.init, saved_init);
     result.extend(init_stmts);
@@ -2679,6 +2795,7 @@ fn visit_slot_children(
     context.state.template = saved_template;
     context.state.node = saved_node;
     context.state.is_standalone = saved_is_standalone;
+    context.state.metadata.namespace = saved_namespace;
 
     result
 }
@@ -2819,7 +2936,6 @@ fn build_bind_this_call(
 }
 
 /// Build component with CSS props wrapper.
-#[allow(clippy::too_many_arguments)]
 fn build_with_css_props(
     statements: &mut Vec<JsStatement>,
     context: &mut ComponentContext,
@@ -3037,6 +3153,19 @@ fn is_store_subscription(expr: &Expression, context: &ComponentContext) -> bool 
             == crate::compiler::phases::phase2_analyze::scope::BindingKind::StoreSub;
     }
     false
+}
+
+/// Whether the local variable `name` is also auto-subscribed as a store — i.e.
+/// `$<name>` is referenced somewhere, creating a `StoreSub` binding named
+/// `$<name>`. Used to decide whether a `bind:` write to a store-holding state
+/// variable needs a `$.store_unsub(...)` wrap.
+fn is_var_store_subscribed(name: &str, context: &ComponentContext) -> bool {
+    context
+        .state
+        .get_binding(&format!("${}", name))
+        .is_some_and(|b| {
+            b.kind == crate::compiler::phases::phase2_analyze::scope::BindingKind::StoreSub
+        })
 }
 
 #[cfg(test)]

@@ -27,7 +27,7 @@
 //! ## Usage
 //!
 //! ```rust,ignore
-//! use svelte_compiler_rust::{compile, CompileOptions, GenerateMode};
+//! use rsvelte_core::{compile, CompileOptions, GenerateMode};
 //!
 //! let source = "<h1>Hello World</h1>";
 //! let options = CompileOptions {
@@ -198,7 +198,6 @@ pub struct CompileOptions {
     /// Root directory for relative path resolution.
     pub root_dir: Option<String>,
     /// Warning filter function.
-    #[allow(clippy::type_complexity)]
     pub warning_filter: Option<WarningFilterFn>,
     /// Experimental options.
     pub experimental: ExperimentalOptions,
@@ -528,6 +527,10 @@ pub fn compile(source: &str, options: CompileOptions) -> Result<CompileResult, C
         loose: false,
         skip_expression_loc: true,
         defer_script_parse: true,
+        force_typescript: false,
+        lenient_script: false,
+        skip_non_css_lang_style: false,
+        capture_comments: false,
     };
     let mut ast = phases::phase1_parse::parse(source, parse_options)?;
 
@@ -556,21 +559,25 @@ pub fn compile(source: &str, options: CompileOptions) -> Result<CompileResult, C
     // We need to parse it first so remove_typescript_nodes can inspect the AST.
     {
         let line_offsets = phases::phase1_parse::compute_line_offsets(source, false);
-        if let Some(ref mut instance) = ast.instance {
-            phases::phase1_parse::read::script::ensure_script_parsed(
+        if let Some(ref mut instance) = ast.instance
+            && let Some(parse_err) = phases::phase1_parse::read::script::ensure_script_parsed(
                 &ast.arena,
                 instance,
                 source,
                 &line_offsets,
-            );
+            )
+        {
+            return Err(parse_err.into());
         }
-        if let Some(ref mut module) = ast.module {
-            phases::phase1_parse::read::script::ensure_script_parsed(
+        if let Some(ref mut module) = ast.module
+            && let Some(parse_err) = phases::phase1_parse::read::script::ensure_script_parsed(
                 &ast.arena,
                 module,
                 source,
                 &line_offsets,
-            );
+            )
+        {
+            return Err(parse_err.into());
         }
     }
 
@@ -598,9 +605,123 @@ pub fn compile(source: &str, options: CompileOptions) -> Result<CompileResult, C
     let runes_mode = options.runes.unwrap_or(analysis.runes);
 
     // Phase 3: Transform (pass AST to avoid re-parsing)
-    let mut transform_result =
+    let transform_result =
         phases::phase3_transform::transform_component(&analysis, &ast, source, &options)?;
 
+    Ok(finalize_compile_result(
+        transform_result,
+        &analysis,
+        source,
+        &options,
+        runes_mode,
+    ))
+}
+
+/// Compile a single component to **both** client (CSR) and server (SSR) output in
+/// one call, sharing one parse + analyze pass between the two transforms.
+///
+/// This is the mold-linker P5 principle ("never reprocess data you already hold")
+/// applied structurally. A dual-output build (e.g. Vite/SvelteKit SSR) otherwise
+/// calls [`compile`] twice and re-parses + re-analyzes the same source each time —
+/// and analyze alone is ~half of a compile. `analyze_component` is deterministic
+/// and does not depend on `generate` mode, and `transform_component` borrows the
+/// AST + analysis immutably, so running both transforms over a single shared
+/// analysis yields byte-identical output to two separate [`compile`] calls while
+/// doing the parse + analyze work only once.
+///
+/// `options.generate` is ignored; the returned tuple is `(client, server)`.
+pub fn compile_both(
+    source: &str,
+    options: CompileOptions,
+) -> Result<(CompileResult, CompileResult), CompileError> {
+    // Phase 1: Parse (identical to `compile`).
+    let parse_options = crate::ParseOptions {
+        modern: true,
+        loose: false,
+        skip_expression_loc: true,
+        defer_script_parse: true,
+        force_typescript: false,
+        lenient_script: false,
+        skip_non_css_lang_style: false,
+        capture_comments: false,
+    };
+    let mut ast = phases::phase1_parse::parse(source, parse_options)?;
+
+    // SAFETY: `ast.arena` lives until the end of this function (see `compile`).
+    let _arena_guard = unsafe { SerializeArenaGuard::new(&ast.arena as *const _) };
+
+    if let Some(parse_err) =
+        phases::phase1_parse::resolve_lazy::resolve_lazy_expressions(&mut ast, source)
+    {
+        return Err(parse_err.into());
+    }
+
+    {
+        let line_offsets = phases::phase1_parse::compute_line_offsets(source, false);
+        if let Some(ref mut instance) = ast.instance
+            && let Some(parse_err) = phases::phase1_parse::read::script::ensure_script_parsed(
+                &ast.arena,
+                instance,
+                source,
+                &line_offsets,
+            )
+        {
+            return Err(parse_err.into());
+        }
+        if let Some(ref mut module) = ast.module
+            && let Some(parse_err) = phases::phase1_parse::read::script::ensure_script_parsed(
+                &ast.arena,
+                module,
+                source,
+                &line_offsets,
+            )
+        {
+            return Err(parse_err.into());
+        }
+    }
+
+    remove_typescript_from_ast(&mut ast)?;
+
+    let mut options = options;
+    if let Some(ref parsed_options) = ast.options {
+        if let Some(pw) = parsed_options.preserve_whitespace {
+            options.preserve_whitespace = pw;
+        }
+        if parsed_options.css == Some(crate::ast::template::CssOption::Injected) {
+            options.css = CssMode::Injected;
+        }
+    }
+
+    // Phase 2: Analyze — ONCE, shared by both transforms (mode-independent).
+    let analysis = phases::phase2_analyze::analyze_component(&mut ast, source, &options)?;
+    let runes_mode = options.runes.unwrap_or(analysis.runes);
+
+    // Phase 3: Transform twice over the shared (ast, analysis).
+    let mut client_options = options.clone();
+    client_options.generate = GenerateMode::Client;
+    let client_tr =
+        phases::phase3_transform::transform_component(&analysis, &ast, source, &client_options)?;
+    let client = finalize_compile_result(client_tr, &analysis, source, &client_options, runes_mode);
+
+    let mut server_options = options;
+    server_options.generate = GenerateMode::Server;
+    let server_tr =
+        phases::phase3_transform::transform_component(&analysis, &ast, source, &server_options)?;
+    let server = finalize_compile_result(server_tr, &analysis, source, &server_options, runes_mode);
+
+    Ok((client, server))
+}
+
+/// Build a [`CompileResult`] from a finished transform — accessors-deprecation
+/// warning, source-position resolution, frame generation, and warning filtering.
+/// Shared by [`compile`] and [`compile_both`] so the two paths are identical.
+fn finalize_compile_result(
+    mut transform_result: TransformResult,
+    analysis: &ComponentAnalysis,
+    source: &str,
+    options: &CompileOptions,
+    runes_mode: bool,
+) -> CompileResult {
     // Emit options_deprecated_accessors warning when accessors option is used in runes mode.
     // Reference: svelte/packages/svelte/src/compiler/validate-options.js line 52
     if options.accessors && runes_mode {
@@ -616,7 +737,7 @@ pub fn compile(source: &str, options: CompileOptions) -> Result<CompileResult, C
     }
 
     // Convert to CompileResult
-    Ok(CompileResult {
+    CompileResult {
         js: CompileOutput {
             code: transform_result.js,
             map: transform_result.js_map,
@@ -691,7 +812,7 @@ pub fn compile(source: &str, options: CompileOptions) -> Result<CompileResult, C
         },
         metadata: CompileMetadata { runes: runes_mode },
         ast: None, // TODO: Return AST if options.modern_ast is true
-    })
+    }
 }
 
 /// Module compile options (subset of CompileOptions for module files).
@@ -759,53 +880,44 @@ pub fn compile_module(
     source: &str,
     options: ModuleCompileOptions,
 ) -> Result<CompileResult, CompileError> {
-    // Detect TypeScript from filename
-    let is_typescript = options
-        .filename
-        .as_ref()
-        .map(|f| f.ends_with(".ts") || f.ends_with(".svelte.ts"))
-        .unwrap_or(false);
-
-    // Parse JS source into an AST using the same infrastructure as component scripts
+    // Parse JS source into an AST using the same infrastructure as component scripts.
+    // Upstream `compileModule` → `analyze_module` always parses with
+    // `typescript: false` (2-analyze/index.js `parse(source, comments, false,
+    // false)`), so TypeScript syntax in a module is a `js_parse_error` — even
+    // for `.svelte.ts` filenames (callers like Vite strip TS first).
     // Pass empty line_offsets to skip loc object creation (not needed during compilation)
     let arena = crate::ast::arena::ParseArena::new();
     // RAII install of the serialize arena. We install it *twice* across
-    // this function — once for the parse_program / TypeScript-strip step
-    // here, then again below after `arena` is moved into `ast` — because
-    // the second guard refers to the moved arena. Each guard restores
-    // the prior pointer on drop, so the outer scope's arena (if any) is
-    // preserved.
+    // this function — once for the parse_program step here, then again
+    // below after `arena` is moved into `ast` — because the second guard
+    // refers to the moved arena. Each guard restores the prior pointer on
+    // drop, so the outer scope's arena (if any) is preserved.
     //
     // SAFETY: `arena` lives until it is moved into `ast` below, which
     // outlives `_pre_move_guard`. The `?`/early-return paths only fire
     // after the program is built, so the guard always covers the parser.
     let program = {
+        // SAFETY: `arena` outlives `_pre_move_guard` — it is moved into `ast` only after
+        // the program is built, and the guard restores the prior pointer on drop.
         let _pre_move_guard = unsafe { SerializeArenaGuard::new(&arena as *const _) };
-        let program = phases::phase1_parse::read::expression::parse_program(
-            &arena,
-            source,
-            0, // offset = 0 (source is the entire file)
-            &[],
-            is_typescript,
-            &[],          // no leading comments
-            0,            // script_tag_start
-            source.len(), // script_tag_end
-        );
-
-        // Remove TypeScript nodes if needed. Propagate any error (e.g. an
-        // unsupported `@decorator`, which `remove_typescript_nodes` rejects)
-        // instead of silently dropping it — the component compile path already
-        // does this with `?`. (issue #450, H-085)
-        if is_typescript {
-            let mut val_clone = program.as_json().clone();
-            phases::phase1_parse::remove_typescript_nodes::remove_typescript_nodes(
-                &mut val_clone,
+        let (program, parse_error) =
+            phases::phase1_parse::read::expression::parse_program_with_error(
+                &arena,
+                source,
+                0, // offset = 0 (source is the entire file)
                 &[],
-            )?;
-            crate::ast::js::Expression::Value(val_clone)
-        } else {
-            program
+                false,        // upstream analyze_module always parses plain JS
+                &[],          // no leading comments
+                0,            // script_tag_start
+                source.len(), // script_tag_end
+            );
+
+        // Mirror upstream acorn's throw-on-error behaviour (js_parse_error).
+        if let Some(parse_err) = parse_error {
+            return Err(parse_err.into());
         }
+
+        program
     };
 
     // Build a synthetic Root AST that treats the JS source as a module script.
@@ -879,27 +991,11 @@ pub fn compile_module(
 
     // Phase 3: Generate module output using the module-specific transform.
     // Unlike transform_component, this does NOT generate a component wrapper.
-    //
-    // The text-based rune rewrites inside `transform_module` work on the raw
-    // source string, not the AST. If the file is TypeScript, those rewrites
-    // would otherwise run against TS annotations (`(x: T) => …`, return-type
-    // `: T`, optional parameter `?`, etc.), corrupting the output and leaking
-    // TS into the emitted JS. Feed the TS-stripped source to the transform so
-    // every downstream string operation sees pure JS — matching what the
-    // analyzer has already stripped from the AST.
-    let stripped_source: String;
-    let source_for_transform: &str = if is_typescript {
-        stripped_source = phases::phase2_analyze::types::strip_typescript(source);
-        &stripped_source
-    } else {
-        source
-    };
-
-    let transform_result = phases::phase3_transform::transform_module(
-        &analysis,
-        source_for_transform,
-        &compile_options,
-    );
+    // Modules are always plain JS (upstream `analyze_module` parses with
+    // `typescript: false`; TS input is rejected above as `js_parse_error`),
+    // so the transform operates on the raw source directly.
+    let transform_result =
+        phases::phase3_transform::transform_module(&analysis, source, &compile_options);
 
     // Propagate transform errors — the previous code swallowed every error,
     // emitting the raw source with a header comment instead, which silently
@@ -1007,19 +1103,24 @@ fn remove_typescript_from_ast(ast: &mut crate::ast::Root) -> Result<(), crate::e
     fn strip_ts_from_script(
         script: &mut crate::ast::Script,
     ) -> Result<(), crate::error::ParseError> {
-        let val = match &mut script.content {
-            crate::ast::js::Expression::Value(v) => v,
-            crate::ast::js::Expression::Typed(_) | crate::ast::js::Expression::Lazy { .. } => {
-                // Convert Typed/Lazy to Value for mutation
-                let json = script.content.as_json().clone();
-                script.content = crate::ast::js::Expression::Value(json);
-                match &mut script.content {
-                    crate::ast::js::Expression::Value(v) => v,
-                    _ => unreachable!(),
-                }
+        use crate::ast::js::Expression;
+        match &mut script.content {
+            // Typed path: mutate the arena-backed typed tree in place, keeping
+            // the script `Expression::Typed` (no expensive `as_json()` round
+            // trip). The serialize arena is installed by the caller's
+            // `SerializeArenaGuard`, so it backs this Program's children.
+            Expression::Typed(te) => crate::ast::arena::with_current_serialize_arena(|arena| {
+                phases::phase1_parse::remove_typescript_nodes::remove_typescript_nodes_typed(
+                    &mut te.node,
+                    arena,
+                )
+            }),
+            // Lazy expressions are resolved before strip_ts (the pipeline is
+            // resolve_lazy -> strip_ts), so this is never reached.
+            Expression::Lazy { .. } => {
+                unreachable!("Expression::Lazy must be resolved before strip_ts")
             }
-        };
-        phases::phase1_parse::remove_typescript_nodes::remove_typescript_nodes(val, &[])
+        }
     }
 
     // In Svelte, if ANY script has lang="ts", ALL scripts are treated as TypeScript.
@@ -1046,20 +1147,23 @@ fn remove_typescript_from_ast(ast: &mut crate::ast::Root) -> Result<(), crate::e
     Ok(())
 }
 
-/// Strip TypeScript annotations from a single Expression::Value.
+/// Strip TypeScript annotations from a single Expression.
 fn strip_ts_from_expression(
     expr: &mut crate::ast::js::Expression,
 ) -> Result<(), crate::error::ParseError> {
-    // Ensure we have a Value variant for mutation
-    if matches!(expr, crate::ast::js::Expression::Typed(_)) {
-        let json = expr.as_json().clone();
-        *expr = crate::ast::js::Expression::Value(json);
-    }
+    use crate::ast::js::Expression;
     match expr {
-        crate::ast::js::Expression::Value(val) => {
-            phases::phase1_parse::remove_typescript_nodes::remove_typescript_nodes(val, &[])
+        // Typed path: mutate the arena-backed typed tree in place (no `as_json()`).
+        Expression::Typed(te) => crate::ast::arena::with_current_serialize_arena(|arena| {
+            phases::phase1_parse::remove_typescript_nodes::remove_typescript_nodes_typed(
+                &mut te.node,
+                arena,
+            )
+        }),
+        // Lazy expressions are resolved before strip_ts, so this is never reached.
+        Expression::Lazy { .. } => {
+            unreachable!("Expression::Lazy must be resolved before strip_ts")
         }
-        _ => unreachable!(),
     }
 }
 
@@ -1283,7 +1387,7 @@ fn strip_ts_from_attribute_value(
 /// # Example
 ///
 /// ```rust,ignore
-/// use svelte_compiler_rust::{compile_batch, CompileOptions, GenerateMode};
+/// use rsvelte_core::{compile_batch, CompileOptions, GenerateMode};
 ///
 /// let sources = vec![
 ///     ("<h1>Hello</h1>", CompileOptions { generate: GenerateMode::Client, ..Default::default() }),
@@ -1696,5 +1800,58 @@ export function greet(name) {
             code.contains("greet") && code.contains("$.bind_props"),
             "Should have greet in bind_props"
         );
+    }
+
+    #[test]
+    fn test_server_module_jsdoc_not_mangled() {
+        // Regression test for JSDoc block comments being mangled in server modules:
+        // each line inside /** ... */ should NOT get a `;` appended, and the
+        // newline after `*/` should NOT be consumed.
+        //
+        // IMPORTANT: the class must contain a `$state(…)` field so that
+        // `transform_class_fields_server` actually runs (it short-circuits when
+        // there are no rune fields).  The bug was only triggered on classes that
+        // have at least one `$state`/`$derived` field alongside JSDoc comments.
+        let source = r#"export class Foo {
+  #fieldNode = $state(null);
+
+  /**
+   * Sets the field node.
+   * Keep #fieldNode private.
+   */
+  setFieldNode(node) {
+    this.#fieldNode = node;
+  }
+}"#;
+        let options = ModuleCompileOptions {
+            generate: GenerateMode::Server,
+            dev: false,
+            filename: Some("test.svelte.ts".to_string()),
+            ..Default::default()
+        };
+        let result = compile_module(source, options).unwrap();
+        let code = &result.js.code;
+        // The JSDoc lines must NOT have ';' appended
+        assert!(
+            !code.contains("/**;"),
+            "/**; found — block comment corrupted"
+        );
+        assert!(
+            !code.contains(" * Sets the field node.;"),
+            "comment line has ; appended"
+        );
+        // `*/` must be followed by a newline and then the method, not joined inline
+        let lines: Vec<&str> = code.lines().collect();
+        let star_close = lines.iter().position(|l| l.trim() == "*/");
+        let set_field = lines
+            .iter()
+            .position(|l| l.trim().starts_with("setFieldNode("));
+        assert!(
+            star_close.is_some() && set_field.is_some(),
+            "both */ and setFieldNode must appear in server output; got:\n{code}"
+        );
+        if let (Some(a), Some(b)) = (star_close, set_field) {
+            assert_eq!(b, a + 1, "*/ and setFieldNode must be on consecutive lines");
+        }
     }
 }

@@ -35,7 +35,8 @@ file://<fixture>/format/test.svelte
 <script>
   let count = $state(0);
 </script>
-<button onclick={()=>count++}>{count}</button>
+
+<button onclick={() => count++}>{count}</button>
 
 --------------------"
 `;
@@ -216,7 +217,8 @@ file://<fixture>/config-svelte/test.svelte
 <script>
   let count = $state(0);
 </script>
-<button onclick={()=>count++}>{count}</button>
+
+<button onclick={() => count++}>{count}</button>
 
 --------------------"
 `;
@@ -434,7 +436,8 @@ untitled://Untitled-7
 <script>
   let count = $state(0);
 </script>
-<button onclick={()=>count++}>{count}</button>
+
+<button onclick={() => count++}>{count}</button>
 
 --------------------"
 `;

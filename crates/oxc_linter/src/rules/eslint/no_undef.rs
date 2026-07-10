@@ -3,6 +3,7 @@ use oxc_diagnostics::OxcDiagnostic;
 use oxc_macros::declare_oxc_lint;
 use oxc_span::{GetSpan, Span};
 use oxc_syntax::operator::UnaryOperator;
+use rustc_hash::FxHashSet;
 use schemars::JsonSchema;
 use serde::Deserialize;
 
@@ -63,7 +64,14 @@ impl Rule for NoUndef {
     }
 
     fn run_once(&self, ctx: &LintContext) {
+        // Svelte module and instance scripts share bindings, and `$store` subscriptions are
+        // synthesized by the Svelte compiler. Partial script scopes cannot model either safely.
+        if ctx.file_extension().is_some_and(|ext| ext == "svelte") {
+            return;
+        }
+
         let symbol_table = ctx.scoping();
+        let inline_globals = inline_global_names(ctx);
 
         for reference_id_list in ctx.scoping().root_unresolved_references_ids() {
             for reference_id in reference_id_list {
@@ -75,7 +83,7 @@ impl Rule for NoUndef {
 
                 let name = ctx.semantic().reference_name(reference);
 
-                if ctx.is_global_defined(name) {
+                if ctx.is_global_defined(name) || inline_globals.contains(name) {
                     continue;
                 }
 
@@ -101,6 +109,28 @@ impl Rule for NoUndef {
     }
 }
 
+fn inline_global_names<'a>(ctx: &LintContext<'a>) -> FxHashSet<&'a str> {
+    let mut names = FxHashSet::default();
+
+    for comment in ctx.comments() {
+        let text = ctx.source_range(comment.content_span()).trim();
+        let rest = text
+            .strip_prefix("globals")
+            .or_else(|| text.strip_prefix("global"))
+            .filter(|rest| rest.chars().next().is_some_and(char::is_whitespace));
+        let Some(rest) = rest else { continue };
+
+        for entry in rest.split([',', ' ', '\t', '\r', '\n']) {
+            let name = entry.split_once(':').map_or(entry, |(name, _)| name).trim();
+            if !name.is_empty() {
+                names.insert(name);
+            }
+        }
+    }
+
+    names
+}
+
 fn has_typeof_operator(node: &AstNode<'_>, ctx: &LintContext<'_>) -> bool {
     let parent = ctx.nodes().parent_node(node.id());
     match parent.kind() {
@@ -112,6 +142,8 @@ fn has_typeof_operator(node: &AstNode<'_>, ctx: &LintContext<'_>) -> bool {
 
 #[test]
 fn test() {
+    use std::path::PathBuf;
+
     use crate::tester::Tester;
 
     let pass = vec![
@@ -209,6 +241,8 @@ fn test() {
         // ("AsyncDisposableStack; DisposableStack; SuppressedError", None, None), / es2026
         ("function resolve<T>(path: string): T { return { path } as T; }", None, None),
         ("let xyz: NodeListOf<HTMLElement>", None, None),
+        ("/* global $, argv */ $; argv;", None, None),
+        ("/* globals foo:readonly, bar:writable */ foo; bar;", None, None),
         ("type Foo = Record<string, unknown>;", None, None),
         (
             "export interface StoreImpl { onOutputBlobs: (callback: (blobs: MediaSetBlobs) => void) => import('rxjs').Subscription; }",
@@ -255,6 +289,11 @@ fn test() {
     ];
 
     Tester::new(NoUndef::NAME, NoUndef::PLUGIN, pass, fail).test_and_snapshot();
+
+    let pass =
+        vec![("$store; module_binding;", None, None, Some(PathBuf::from("Component.svelte")))];
+    let fail = vec![("missing;", None, None, Some(PathBuf::from("file.js")))];
+    Tester::new(NoUndef::NAME, NoUndef::PLUGIN, pass, fail).test();
 
     let pass = vec![(
         "if (typeof anUndefinedVar === 'string') {}",
