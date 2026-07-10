@@ -189,4 +189,5 @@ jobs:
           pnpm napi pre-publish --no-gh-release -t npm \
             --package-json-path .fork-publish/${{ matrix.package }}/package/package.json \
             --npm-dir .fork-publish/${{ matrix.package }}/npm
-          bash .github/scripts/publish-if-needed.sh .fork-publish/${{ matrix.package }}/package --provenance --access public --no-git-checks
+          bash .github/scripts/publish-if-needed.sh .fork-publish/${{ matrix.package }}/package \
+            --tag "${{ steps.publish_tag.outputs.value }}" --provenance --access public --no-git-checks
