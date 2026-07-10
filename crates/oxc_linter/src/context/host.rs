@@ -194,9 +194,7 @@ impl std::fmt::Debug for ContextHost<'_> {
 }
 
 impl<'a> ContextHost<'a> {
-    /// # Panics
-    /// If `sub_hosts` is empty.
-    pub fn new<P: AsRef<Path>>(
+    fn new_inner<P: AsRef<Path>>(
         file_path: P,
         sub_hosts: Vec<ContextSubHost<'a>>,
         allocator: &'a Allocator,
@@ -204,11 +202,6 @@ impl<'a> ContextHost<'a> {
         config: Arc<LintConfig>,
     ) -> Self {
         const DIAGNOSTICS_INITIAL_CAPACITY: usize = 16;
-
-        assert!(
-            !sub_hosts.is_empty(),
-            "ContextHost requires at least one ContextSubHost to be analyzed"
-        );
 
         let file_path = file_path.as_ref().to_path_buf().into_boxed_path();
         let file_extension = file_path.extension().map(|ext| ext.to_owned().into_boxed_os_str());
@@ -226,7 +219,37 @@ impl<'a> ContextHost<'a> {
             with_ignore_fixes: options.with_ignore_fixes,
             react_compiler_results: OnceCell::new(),
         }
-        .sniff_for_frameworks()
+    }
+
+    /// # Panics
+    /// If `sub_hosts` is empty.
+    pub fn new<P: AsRef<Path>>(
+        file_path: P,
+        sub_hosts: Vec<ContextSubHost<'a>>,
+        allocator: &'a Allocator,
+        options: LintOptions,
+        config: Arc<LintConfig>,
+    ) -> Self {
+        assert!(
+            !sub_hosts.is_empty(),
+            "ContextHost requires at least one ContextSubHost to be analyzed"
+        );
+
+        Self::new_inner(file_path, sub_hosts, allocator, options, config).sniff_for_frameworks()
+    }
+
+    /// Construct a host for files that are only linted through a whole-file custom parser.
+    ///
+    /// This host intentionally contains no native script sections, so native Rust rules will not run.
+    /// It exists so JS plugin rules can still receive resolved settings, globals, and diagnostics
+    /// collection for files such as `.svelte` components that contain no `<script>` blocks.
+    pub fn new_external_only<P: AsRef<Path>>(
+        file_path: P,
+        allocator: &'a Allocator,
+        options: LintOptions,
+        config: Arc<LintConfig>,
+    ) -> Self {
+        Self::new_inner(file_path, Vec::new(), allocator, options, config)
     }
 
     /// The current [`ContextSubHost`]
@@ -342,6 +365,31 @@ impl<'a> ContextHost<'a> {
             diagnostic.move_offset(self.current_sub_host().source_text_offset);
         }
         self.diagnostics.borrow_mut().push(diagnostic);
+    }
+
+    #[inline]
+    pub(crate) fn push_diagnostic_without_offset(&self, diagnostic: Message) {
+        self.diagnostics.borrow_mut().push(diagnostic);
+    }
+
+    pub(crate) fn contains_disable_directive_for_full_file_span(
+        &self,
+        rule_name: &str,
+        span: Span,
+    ) -> bool {
+        self.sub_hosts.iter().any(|sub_host| {
+            let offset = sub_host.source_text_offset;
+            let len = u32::try_from(sub_host.semantic.source_text().len()).unwrap_or(u32::MAX);
+            let section_end = offset.saturating_add(len);
+
+            if span.end < offset || span.start > section_end {
+                return false;
+            }
+
+            let local_start = span.start.max(offset).saturating_sub(offset);
+            let local_end = span.end.min(section_end).saturating_sub(offset);
+            sub_host.disable_directives.contains(rule_name, Span::new(local_start, local_end))
+        })
     }
 
     // Append a list of diagnostics. Only used in report_unused_directives.

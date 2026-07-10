@@ -1,9 +1,13 @@
+#[cfg(not(feature = "svelte-rsvelte-backend"))]
 use memchr::memmem::{Finder, FinderRev};
 
 use oxc_span::SourceType;
+#[cfg(feature = "svelte-rsvelte-backend")]
+use oxc_svelte_backend::{SvelteParseResult, parse_svelte};
 
 use crate::loader::JavaScriptSource;
 
+#[cfg(not(feature = "svelte-rsvelte-backend"))]
 use super::{
     AttributeValue, COMMENT_END, COMMENT_START, SCRIPT_END, SCRIPT_START, find_attribute,
     find_script_closing_angle, find_script_start,
@@ -22,10 +26,45 @@ impl<'a> SveltePartialLoader<'a> {
         self.parse_scripts()
     }
 
+    #[cfg(feature = "svelte-rsvelte-backend")]
+    fn parse_scripts(&self) -> Vec<JavaScriptSource<'a>> {
+        let Ok(parsed) = parse_svelte(self.source_text) else {
+            return vec![];
+        };
+
+        Self::parse_scripts_from_result(self.source_text, &parsed)
+    }
+
+    #[cfg(feature = "svelte-rsvelte-backend")]
+    pub fn parse_scripts_from_result(
+        source_text: &'a str,
+        parsed: &SvelteParseResult,
+    ) -> Vec<JavaScriptSource<'a>> {
+        parsed
+            .scripts
+            .iter()
+            .filter_map(|script| {
+                let start = usize::try_from(script.body_range.span.start).ok()?;
+                let end = usize::try_from(script.body_range.span.end).ok()?;
+                let source_text = source_text.get(start..end)?;
+                let source_type =
+                    if script.is_typescript { SourceType::ts() } else { SourceType::mjs() }
+                        .with_module(true);
+
+                Some(JavaScriptSource::partial(
+                    source_text,
+                    source_type,
+                    script.body_range.span.start,
+                ))
+            })
+            .collect()
+    }
+
     /// Each *.svelte file can contain at most
     ///  * one `<script>` block
     ///  * one `<script context="module">` or `<script module>` block
     ///    <https://github.com/sveltejs/svelte.dev/blob/ba7ad256f786aa5bc67eac3a58608f3f50b59e91/apps/svelte.dev/content/tutorial/02-advanced-svelte/08-script-module/02-module-exports/index.md>
+    #[cfg(not(feature = "svelte-rsvelte-backend"))]
     fn parse_scripts(&self) -> Vec<JavaScriptSource<'a>> {
         let mut pointer = 0;
         let Some(result1) = self.parse_script(&mut pointer) else {
@@ -37,6 +76,7 @@ impl<'a> SveltePartialLoader<'a> {
         vec![result1, result2]
     }
 
+    #[cfg(not(feature = "svelte-rsvelte-backend"))]
     fn parse_script(&self, pointer: &mut usize) -> Option<JavaScriptSource<'a>> {
         let script_start_finder = Finder::new(SCRIPT_START);
         let script_end_finder = Finder::new(SCRIPT_END);
@@ -91,6 +131,7 @@ impl<'a> SveltePartialLoader<'a> {
         }
     }
 
+    #[cfg(not(feature = "svelte-rsvelte-backend"))]
     fn extract_lang_attribute(content: &str) -> &str {
         match find_attribute(content, "lang") {
             Some(AttributeValue::Value(lang)) if !lang.is_empty() => lang,
@@ -98,6 +139,7 @@ impl<'a> SveltePartialLoader<'a> {
         }
     }
 
+    #[cfg(not(feature = "svelte-rsvelte-backend"))]
     fn is_module_script(content: &str) -> bool {
         find_attribute(content, "module").is_some()
             || matches!(find_attribute(content, "context"), Some(AttributeValue::Value("module")))
@@ -127,6 +169,7 @@ mod test {
         assert!(result.source_type.is_module());
     }
 
+    #[cfg(not(feature = "svelte-rsvelte-backend"))]
     #[test]
     fn test_script_inside_code_comment() {
         let source_text = r"
@@ -324,6 +367,7 @@ mod test {
         assert!(result.source_type.is_module());
     }
 
+    #[cfg(not(feature = "svelte-rsvelte-backend"))]
     #[test]
     fn test_parse_svelte_script_with_callback_attribute() {
         let source_text = r#"<script>
@@ -339,6 +383,7 @@ let browser = true;
         assert_eq!(sources[1].source_text, "");
     }
 
+    #[cfg(not(feature = "svelte-rsvelte-backend"))]
     #[test]
     fn test_parse_svelte_script_with_callback_attribute_no_component_script() {
         let source_text = r#"{#if browser}
@@ -348,5 +393,29 @@ let browser = true;
         let sources = SveltePartialLoader::new(source_text).parse();
         assert_eq!(sources.len(), 1);
         assert_eq!(sources[0].source_text, "");
+    }
+
+    #[cfg(feature = "svelte-rsvelte-backend")]
+    #[test]
+    fn test_rsvelte_loader_uses_component_scripts_only() {
+        let source_text = r#"<script>
+let browser = true;
+</script>
+{#if browser}
+  <script src="/" onload={() => {}}></script>
+{/if}"#;
+
+        let sources = SveltePartialLoader::new(source_text).parse();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].source_text.trim(), "let browser = true;");
+    }
+
+    #[cfg(feature = "svelte-rsvelte-backend")]
+    #[test]
+    fn test_rsvelte_loader_returns_no_scripts_for_parse_errors() {
+        let source_text = r#"<script context="not-module"></script>"#;
+
+        let sources = SveltePartialLoader::new(source_text).parse();
+        assert!(sources.is_empty());
     }
 }

@@ -3,7 +3,7 @@ use std::{
     sync::Arc,
 };
 
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 
 use crate::{
     AllowWarnDeny,
@@ -12,7 +12,8 @@ use crate::{
 };
 
 use super::{
-    GlobSet, LintConfig, LintPlugins, OxlintEnv, OxlintGlobals, categories::OxlintCategories,
+    GlobSet, LintConfig, LintPlugins, OxlintEnv, OxlintGlobals, OxlintSettings,
+    categories::OxlintCategories,
 };
 
 // TODO: support `categories` et. al. in overrides.
@@ -48,7 +49,10 @@ pub struct ResolvedOxlintOverride {
     pub exclude_files: GlobSet,
     pub env: Option<OxlintEnv>,
     pub globals: Option<OxlintGlobals>,
+    pub settings: Option<OxlintSettings>,
     pub plugins: Option<LintPlugins>,
+    pub language_options_id: Option<u32>,
+    pub language_options_has_parser: Option<bool>,
     pub rules: ResolvedOxlintOverrideRules,
 }
 
@@ -78,7 +82,10 @@ pub struct Config {
 }
 
 impl Config {
-    fn builtin_rule_plugins(plugins: LintPlugins) -> LintPlugins {
+    fn builtin_rule_plugins(mut plugins: LintPlugins) -> LintPlugins {
+        if plugins.contains(LintPlugins::VITEST) {
+            plugins |= LintPlugins::JEST;
+        }
         plugins
     }
 
@@ -154,7 +161,9 @@ impl Config {
         let mut env = self.base.config.env.clone();
         let mut globals = self.base.config.globals.clone();
         let mut plugins = self.base.config.plugins;
-        let settings = self.base.config.settings.clone();
+        let mut settings = self.base.config.settings.clone();
+        let mut js_language_options_ids = self.base.config.js_language_options_ids.clone();
+        let mut js_has_custom_parser = self.base.config.js_has_custom_parser;
 
         for override_config in overrides_to_apply.clone() {
             if let Some(override_plugins) = override_config.plugins {
@@ -214,13 +223,13 @@ impl Config {
                         // Only apply categories to rules from unconfigured plugins
                         if !rule_plugin.is_empty() && unconfigured_plugins.contains(rule_plugin) {
                             self.categories
-                                .get(&rule.category())
+                                .severity_for_rule(rule)
                                 .map(|severity| (rule.clone(), severity))
                         } else {
                             None
                         }
                     }) {
-                        rules.entry(rule).or_insert(*severity);
+                        rules.entry(rule).or_insert(severity);
                     }
                     // Mark these plugins as configured
                     configured_plugins |= unconfigured_plugins;
@@ -247,12 +256,25 @@ impl Config {
             if let Some(override_globals) = &override_config.globals {
                 override_globals.override_globals(&mut globals);
             }
+
+            if let Some(override_settings) = &override_config.settings {
+                override_settings.override_settings(&mut settings);
+            }
+
+            if let Some(language_options_id) = override_config.language_options_id {
+                js_language_options_ids.push(language_options_id);
+            }
+            if let Some(language_options_has_parser) = override_config.language_options_has_parser {
+                js_has_custom_parser = language_options_has_parser;
+            }
         }
 
         let config: Arc<LintConfig> = if plugins == self.base.config.plugins
             && env == self.base.config.env
             && globals == self.base.config.globals
             && settings == self.base.config.settings
+            && js_language_options_ids == self.base.config.js_language_options_ids
+            && js_has_custom_parser == self.base.config.js_has_custom_parser
         {
             Arc::clone(&self.base.config)
         } else {
@@ -262,6 +284,8 @@ impl Config {
             config.env = env;
             config.globals = globals;
             config.settings = settings;
+            config.js_language_options_ids = js_language_options_ids;
+            config.js_has_custom_parser = js_has_custom_parser;
             Arc::new(config)
         };
 
@@ -307,52 +331,22 @@ impl ConfigStore {
         }
     }
 
-    /// Returns the total number of rules, inclusive of JS Plugin rules and overrides, optionally filtering out tsgolint rules if type_aware_enabled is false.
+    /// Returns the total number of rules, inclusive of JS Plugin rules, optionally filtering out
+    /// tsgolint rules if type_aware_enabled is false.
     pub fn number_of_rules(&self, type_aware_enabled: bool) -> Option<usize> {
-        // If there are nested configs the number of rules may vary per-file, so return `None`.
-        if !self.nested_configs.is_empty() {
+        // If there are nested configs or any overrides, the number of rules may vary per-file,
+        // so return `None` instead of reporting a misleading single global count.
+        if !self.nested_configs.is_empty() || !self.base.overrides.is_empty() {
             return None;
         }
 
-        let mut builtin_rules = if type_aware_enabled {
-            self.base.base.rules.iter().map(|(rule, _)| rule.clone()).collect::<FxHashSet<_>>()
+        let builtin_count = if type_aware_enabled {
+            self.base.base.rules.len()
         } else {
-            self.base
-                .base
-                .rules
-                .iter()
-                .filter(|(rule, _)| !rule.is_tsgolint_rule())
-                .map(|(rule, _)| rule.clone())
-                .collect::<FxHashSet<_>>()
+            self.base.base.rules.iter().filter(|(rule, _)| !rule.is_tsgolint_rule()).count()
         };
 
-        let mut external_rules = self
-            .base
-            .base
-            .external_rules
-            .iter()
-            .map(|(rule_id, _, _)| *rule_id)
-            .collect::<FxHashSet<_>>();
-
-        for override_config in self.base.overrides.iter() {
-            for (rule, severity) in &override_config.rules.builtin_rules {
-                if !severity.is_warn_deny() {
-                    continue;
-                }
-                if !type_aware_enabled && rule.is_tsgolint_rule() {
-                    continue;
-                }
-                builtin_rules.insert(rule.clone());
-            }
-
-            for (rule_id, _, severity) in &override_config.rules.external_rules {
-                if severity.is_warn_deny() {
-                    external_rules.insert(*rule_id);
-                }
-            }
-        }
-
-        Some(builtin_rules.len() + external_rules.len())
+        Some(builtin_count + self.base.base.external_rules.len())
     }
 
     pub fn rules(&self) -> &Arc<[(RuleEnum, AllowWarnDeny)]> {
@@ -449,17 +443,18 @@ mod test {
     use crate::{
         AllowWarnDeny, ExternalOptionsId, ExternalPluginStore, LintPlugins, RuleCategory, RuleEnum,
         config::{
-            ConfigStoreBuilder, GlobSet, LintConfig, OxlintEnv, OxlintGlobals, OxlintSettings,
-            categories::OxlintCategories,
+            ConfigStoreBuilder, LintConfig, OxlintEnv, OxlintGlobals, OxlintSettings,
+            categories::{CategoryConfig, OxlintCategories, is_category_default_rule},
             config_store::{Config, ResolvedOxlintOverride, ResolvedOxlintOverrideRules},
             oxlintrc::{OxlintOptions, Oxlintrc},
         },
         rule::Rule,
         rules::{
-            EslintAccessorPairs, EslintCurly, EslintNoUnusedVars, ReactJsxFilenameExtension,
+            EslintAccessorPairs, EslintCurly, EslintNoUnusedVars, RULES, ReactJsxFilenameExtension,
             TypescriptNoExplicitAny, TypescriptNoMisusedPromises,
         },
     };
+    use oxc_config::GlobSet;
 
     macro_rules! from_json {
         ($json:tt) => {
@@ -482,6 +477,9 @@ mod test {
             exclude_files: GlobSet::default(),
             plugins: None,
             globals: None,
+            settings: None,
+            language_options_id: None,
+            language_options_has_parser: None,
             rules: ResolvedOxlintOverrideRules { builtin_rules: vec![], external_rules: vec![] },
         }]);
         let store = ConfigStore::new(
@@ -504,6 +502,228 @@ mod test {
         assert_eq!(rules_for_test_file.rules[0].0.id(), rules_for_source_file.rules[0].0.id());
     }
 
+    #[test]
+    fn test_override_language_options_ids_accumulate_in_order() {
+        let base_config = LintConfig {
+            js_language_options_ids: vec![1],
+            js_has_custom_parser: false,
+            ..LintConfig::default()
+        };
+
+        let overrides = ResolvedOxlintOverrides::new(vec![
+            ResolvedOxlintOverride {
+                env: None,
+                files: GlobSet::new(vec!["*.svelte"]),
+                exclude_files: GlobSet::default(),
+                plugins: None,
+                globals: None,
+                settings: None,
+                language_options_id: Some(2),
+                language_options_has_parser: None,
+                rules: ResolvedOxlintOverrideRules {
+                    builtin_rules: vec![],
+                    external_rules: vec![],
+                },
+            },
+            ResolvedOxlintOverride {
+                env: None,
+                files: GlobSet::new(vec!["src/*.svelte"]),
+                exclude_files: GlobSet::default(),
+                plugins: None,
+                globals: None,
+                settings: None,
+                language_options_id: Some(3),
+                language_options_has_parser: None,
+                rules: ResolvedOxlintOverrideRules {
+                    builtin_rules: vec![],
+                    external_rules: vec![],
+                },
+            },
+        ]);
+
+        let store = ConfigStore::new(
+            Config::new(vec![], vec![], OxlintCategories::default(), base_config, overrides),
+            FxHashMap::default(),
+            ExternalPluginStore::default(),
+        );
+
+        let nested_match = store.resolve("src/App.svelte".as_ref());
+        assert_eq!(nested_match.config.js_language_options_ids, vec![1, 2, 3]);
+
+        let root_match = store.resolve("App.svelte".as_ref());
+        assert_eq!(root_match.config.js_language_options_ids, vec![1, 2]);
+    }
+
+    #[test]
+    fn test_override_custom_parser_flag_applies_per_matching_file() {
+        let base_config = LintConfig { js_has_custom_parser: false, ..LintConfig::default() };
+
+        let overrides = ResolvedOxlintOverrides::new(vec![
+            ResolvedOxlintOverride {
+                env: None,
+                files: GlobSet::new(vec!["*.svelte"]),
+                exclude_files: GlobSet::default(),
+                plugins: None,
+                globals: None,
+                settings: None,
+                language_options_id: None,
+                language_options_has_parser: Some(true),
+                rules: ResolvedOxlintOverrideRules {
+                    builtin_rules: vec![],
+                    external_rules: vec![],
+                },
+            },
+            ResolvedOxlintOverride {
+                env: None,
+                files: GlobSet::new(vec!["src/*.svelte"]),
+                exclude_files: GlobSet::default(),
+                plugins: None,
+                globals: None,
+                settings: None,
+                language_options_id: None,
+                language_options_has_parser: Some(false),
+                rules: ResolvedOxlintOverrideRules {
+                    builtin_rules: vec![],
+                    external_rules: vec![],
+                },
+            },
+        ]);
+
+        let store = ConfigStore::new(
+            Config::new(vec![], vec![], OxlintCategories::default(), base_config, overrides),
+            FxHashMap::default(),
+            ExternalPluginStore::default(),
+        );
+
+        assert!(store.resolve("App.svelte".as_ref()).config.js_has_custom_parser);
+        assert!(!store.resolve("src/App.svelte".as_ref()).config.js_has_custom_parser);
+        assert!(!store.resolve("App.ts".as_ref()).config.js_has_custom_parser);
+    }
+
+    #[test]
+    fn test_override_settings_apply_per_matching_file() {
+        let base_config = LintConfig {
+            settings: serde_json::from_value(serde_json::json!({
+                "svelte": {
+                    "ignoreWarnings": false,
+                    "nested": {
+                        "rootOnly": true
+                    }
+                }
+            }))
+            .unwrap(),
+            ..LintConfig::default()
+        };
+
+        let overrides = ResolvedOxlintOverrides::new(vec![
+            ResolvedOxlintOverride {
+                env: None,
+                files: GlobSet::new(vec!["*.svelte"]),
+                exclude_files: GlobSet::default(),
+                plugins: None,
+                globals: None,
+                settings: Some(
+                    serde_json::from_value(serde_json::json!({
+                        "svelte": {
+                            "compilerWarnings": ["a11y"]
+                        }
+                    }))
+                    .unwrap(),
+                ),
+                language_options_id: None,
+                language_options_has_parser: None,
+                rules: ResolvedOxlintOverrideRules {
+                    builtin_rules: vec![],
+                    external_rules: vec![],
+                },
+            },
+            ResolvedOxlintOverride {
+                env: None,
+                files: GlobSet::new(vec!["src/*.svelte"]),
+                exclude_files: GlobSet::default(),
+                plugins: None,
+                globals: None,
+                settings: Some(
+                    serde_json::from_value(serde_json::json!({
+                        "svelte": {
+                            "ignoreWarnings": true
+                        }
+                    }))
+                    .unwrap(),
+                ),
+                language_options_id: None,
+                language_options_has_parser: None,
+                rules: ResolvedOxlintOverrideRules {
+                    builtin_rules: vec![],
+                    external_rules: vec![],
+                },
+            },
+        ]);
+
+        let store = ConfigStore::new(
+            Config::new(vec![], vec![], OxlintCategories::default(), base_config, overrides),
+            FxHashMap::default(),
+            ExternalPluginStore::default(),
+        );
+
+        let root_match = store.resolve("App.svelte".as_ref());
+        let nested_match = store.resolve("src/App.svelte".as_ref());
+        let non_match = store.resolve("App.ts".as_ref());
+
+        assert_eq!(
+            root_match.config.settings.json,
+            Some(
+                serde_json::json!({
+                    "svelte": {
+                        "ignoreWarnings": false,
+                        "nested": {
+                            "rootOnly": true
+                        },
+                        "compilerWarnings": ["a11y"]
+                    }
+                })
+                .as_object()
+                .unwrap()
+                .clone()
+            )
+        );
+
+        assert_eq!(
+            nested_match.config.settings.json,
+            Some(
+                serde_json::json!({
+                    "svelte": {
+                        "ignoreWarnings": true,
+                        "nested": {
+                            "rootOnly": true
+                        },
+                        "compilerWarnings": ["a11y"]
+                    }
+                })
+                .as_object()
+                .unwrap()
+                .clone()
+            )
+        );
+
+        assert_eq!(
+            non_match.config.settings.json,
+            Some(
+                serde_json::json!({
+                    "svelte": {
+                        "ignoreWarnings": false,
+                        "nested": {
+                            "rootOnly": true
+                        }
+                    }
+                })
+                .as_object()
+                .unwrap()
+                .clone()
+            )
+        );
+    }
+
     /// adding plugins but no rules is a no-op
     #[test]
     fn test_no_rules_and_new_plugins() {
@@ -520,6 +740,9 @@ mod test {
                     | LintPlugins::JSX_A11Y,
             ),
             globals: None,
+            settings: None,
+            language_options_id: None,
+            language_options_has_parser: None,
             rules: ResolvedOxlintOverrideRules { builtin_rules: vec![], external_rules: vec![] },
         }]);
         let store = ConfigStore::new(
@@ -551,6 +774,9 @@ mod test {
             exclude_files: GlobSet::default(),
             plugins: None,
             globals: None,
+            settings: None,
+            language_options_id: None,
+            language_options_has_parser: None,
             rules: ResolvedOxlintOverrideRules {
                 builtin_rules: vec![(
                     RuleEnum::TypescriptNoExplicitAny(TypescriptNoExplicitAny::default()),
@@ -571,7 +797,7 @@ mod test {
             FxHashMap::default(),
             ExternalPluginStore::default(),
         );
-        assert_eq!(store.number_of_rules(false), Some(1));
+        assert_eq!(store.number_of_rules(false), None);
 
         let rules_for_source_file = store.resolve("App.tsx".as_ref());
         assert_eq!(rules_for_source_file.rules.len(), 1);
@@ -589,6 +815,9 @@ mod test {
             exclude_files: GlobSet::default(),
             plugins: None,
             globals: None,
+            settings: None,
+            language_options_id: None,
+            language_options_has_parser: None,
             rules: ResolvedOxlintOverrideRules {
                 builtin_rules: vec![(
                     RuleEnum::EslintNoUnusedVars(EslintNoUnusedVars::default()),
@@ -609,7 +838,7 @@ mod test {
             FxHashMap::default(),
             ExternalPluginStore::default(),
         );
-        assert_eq!(store.number_of_rules(false), Some(2));
+        assert_eq!(store.number_of_rules(false), None);
 
         assert_eq!(store.resolve("App.tsx".as_ref()).rules.len(), 1);
         assert_eq!(store.resolve("src/App.tsx".as_ref()).rules.len(), 2);
@@ -625,6 +854,9 @@ mod test {
             files: GlobSet::new(vec!["src/**/*.{ts,tsx}"]),
             plugins: None,
             globals: None,
+            settings: None,
+            language_options_id: None,
+            language_options_has_parser: None,
             rules: ResolvedOxlintOverrideRules {
                 builtin_rules: vec![
                     (
@@ -656,8 +888,8 @@ mod test {
             ExternalPluginStore::default(),
         );
 
-        assert_eq!(store.number_of_rules(false), Some(3));
-        assert_eq!(store.number_of_rules(true), Some(3));
+        assert_eq!(store.number_of_rules(false), None);
+        assert_eq!(store.number_of_rules(true), None);
     }
 
     #[test]
@@ -668,6 +900,9 @@ mod test {
                 files: GlobSet::new(vec!["*.ts"]),
                 plugins: None,
                 globals: None,
+                settings: None,
+                language_options_id: None,
+                language_options_has_parser: None,
                 rules: ResolvedOxlintOverrideRules {
                     builtin_rules: vec![
                         (RuleEnum::EslintCurly(EslintCurly::default()), AllowWarnDeny::Warn),
@@ -685,6 +920,9 @@ mod test {
                 files: GlobSet::new(vec!["*.tsx"]),
                 plugins: None,
                 globals: None,
+                settings: None,
+                language_options_id: None,
+                language_options_has_parser: None,
                 rules: ResolvedOxlintOverrideRules {
                     builtin_rules: vec![(
                         RuleEnum::EslintNoUnusedVars(EslintNoUnusedVars::default()),
@@ -708,7 +946,7 @@ mod test {
             ExternalPluginStore::default(),
         );
 
-        assert_eq!(store.number_of_rules(false), Some(2));
+        assert_eq!(store.number_of_rules(false), None);
     }
 
     #[test]
@@ -718,6 +956,9 @@ mod test {
             files: GlobSet::new(vec!["*.ts"]),
             plugins: None,
             globals: None,
+            settings: None,
+            language_options_id: None,
+            language_options_has_parser: None,
             rules: ResolvedOxlintOverrideRules {
                 builtin_rules: vec![(
                     RuleEnum::TypescriptNoExplicitAny(TypescriptNoExplicitAny::default()),
@@ -740,8 +981,8 @@ mod test {
             ExternalPluginStore::default(),
         );
 
-        assert_eq!(store.number_of_rules(false), Some(1));
-        assert_eq!(store.number_of_rules(true), Some(1));
+        assert_eq!(store.number_of_rules(false), None);
+        assert_eq!(store.number_of_rules(true), None);
     }
 
     #[test]
@@ -753,6 +994,9 @@ mod test {
             exclude_files: GlobSet::default(),
             plugins: None,
             globals: None,
+            settings: None,
+            language_options_id: None,
+            language_options_has_parser: None,
             rules: ResolvedOxlintOverrideRules {
                 builtin_rules: vec![(
                     RuleEnum::TypescriptNoExplicitAny(TypescriptNoExplicitAny::default()),
@@ -773,7 +1017,7 @@ mod test {
             FxHashMap::default(),
             ExternalPluginStore::default(),
         );
-        assert_eq!(store.number_of_rules(false), Some(1));
+        assert_eq!(store.number_of_rules(false), None);
 
         let app = store.resolve("App.tsx".as_ref()).rules;
         assert_eq!(app.len(), 1);
@@ -794,6 +1038,9 @@ mod test {
                 exclude_files: GlobSet::default(),
                 plugins: Some(LintPlugins::REACT),
                 globals: None,
+                settings: None,
+                language_options_id: None,
+                language_options_has_parser: None,
                 rules: ResolvedOxlintOverrideRules {
                     builtin_rules: vec![],
                     external_rules: vec![],
@@ -805,6 +1052,9 @@ mod test {
                 exclude_files: GlobSet::default(),
                 plugins: Some(LintPlugins::TYPESCRIPT),
                 globals: None,
+                settings: None,
+                language_options_id: None,
+                language_options_has_parser: None,
                 rules: ResolvedOxlintOverrideRules {
                     builtin_rules: vec![],
                     external_rules: vec![],
@@ -842,6 +1092,9 @@ mod test {
             exclude_files: GlobSet::default(),
             plugins: None,
             globals: None,
+            settings: None,
+            language_options_id: None,
+            language_options_has_parser: None,
             rules: ResolvedOxlintOverrideRules { builtin_rules: vec![], external_rules: vec![] },
         }]);
 
@@ -866,6 +1119,9 @@ mod test {
             env: Some(from_json!({ "es2024": false })),
             plugins: None,
             globals: None,
+            settings: None,
+            language_options_id: None,
+            language_options_has_parser: None,
             rules: ResolvedOxlintOverrideRules { builtin_rules: vec![], external_rules: vec![] },
         }]);
 
@@ -890,6 +1146,9 @@ mod test {
             env: None,
             plugins: None,
             globals: Some(from_json!({ "React": "readonly", "Secret": "writable" })),
+            settings: None,
+            language_options_id: None,
+            language_options_has_parser: None,
             rules: ResolvedOxlintOverrideRules { builtin_rules: vec![], external_rules: vec![] },
         }]);
 
@@ -929,6 +1188,9 @@ mod test {
             env: None,
             plugins: None,
             globals: None,
+            settings: None,
+            language_options_id: None,
+            language_options_has_parser: None,
             rules: ResolvedOxlintOverrideRules { builtin_rules: vec![], external_rules: vec![] },
         }]);
 
@@ -967,6 +1229,9 @@ mod test {
             env: None,
             plugins: None,
             globals: Some(from_json!({ "React": "off", "Secret": "off" })),
+            settings: None,
+            language_options_id: None,
+            language_options_has_parser: None,
             rules: ResolvedOxlintOverrideRules { builtin_rules: vec![], external_rules: vec![] },
         }]);
 
@@ -997,6 +1262,8 @@ mod test {
             globals: OxlintGlobals::default(),
             path: None,
             options: OxlintOptions::default(),
+            js_language_options_ids: Vec::new(),
+            js_has_custom_parser: false,
         };
 
         // Set up categories to enable restriction rules
@@ -1012,6 +1279,9 @@ mod test {
                 exclude_files: GlobSet::default(),
                 plugins: Some(LintPlugins::TYPESCRIPT),
                 globals: None,
+                settings: None,
+                language_options_id: None,
+                language_options_has_parser: None,
                 rules: ResolvedOxlintOverrideRules {
                     builtin_rules: vec![],
                     external_rules: vec![],
@@ -1024,6 +1294,9 @@ mod test {
                 exclude_files: GlobSet::default(),
                 plugins: Some(LintPlugins::REACT),
                 globals: None,
+                settings: None,
+                language_options_id: None,
+                language_options_has_parser: None,
                 rules: ResolvedOxlintOverrideRules {
                     builtin_rules: vec![(
                         RuleEnum::ReactJsxFilenameExtension(ReactJsxFilenameExtension::default()),
@@ -1039,6 +1312,9 @@ mod test {
                 exclude_files: GlobSet::default(),
                 plugins: Some(LintPlugins::UNICORN),
                 globals: None,
+                settings: None,
+                language_options_id: None,
+                language_options_has_parser: None,
                 rules: ResolvedOxlintOverrideRules {
                     builtin_rules: vec![],
                     external_rules: vec![],
@@ -1088,6 +1364,8 @@ mod test {
             globals: OxlintGlobals::default(),
             path: None,
             options: OxlintOptions::default(),
+            js_language_options_ids: Vec::new(),
+            js_has_custom_parser: false,
         };
 
         // Set up categories
@@ -1101,6 +1379,9 @@ mod test {
             exclude_files: GlobSet::default(),
             plugins: Some(LintPlugins::REACT),
             globals: None,
+            settings: None,
+            language_options_id: None,
+            language_options_has_parser: None,
             rules: ResolvedOxlintOverrideRules { builtin_rules: vec![], external_rules: vec![] },
         }]);
 
@@ -1121,6 +1402,67 @@ mod test {
     }
 
     #[test]
+    fn test_categories_recommended_only_apply_builtin_subset_for_new_plugins() {
+        let base_config = LintConfig {
+            plugins: LintPlugins::REACT,
+            env: OxlintEnv::default(),
+            settings: OxlintSettings::default(),
+            globals: OxlintGlobals::default(),
+            path: None,
+            options: OxlintOptions::default(),
+            js_language_options_ids: Vec::new(),
+            js_has_custom_parser: false,
+        };
+
+        let mut categories = OxlintCategories::default();
+        categories.insert(RuleCategory::Suspicious, CategoryConfig::Recommended);
+
+        let overrides = ResolvedOxlintOverrides::new(vec![ResolvedOxlintOverride {
+            env: None,
+            files: GlobSet::new(vec!["*.tsx"]),
+            exclude_files: GlobSet::default(),
+            plugins: Some(LintPlugins::TYPESCRIPT),
+            globals: None,
+            settings: None,
+            language_options_id: None,
+            language_options_has_parser: None,
+            rules: ResolvedOxlintOverrideRules { builtin_rules: vec![], external_rules: vec![] },
+        }]);
+
+        let store = ConfigStore::new(
+            Config::new(vec![], vec![], categories, base_config, overrides),
+            FxHashMap::default(),
+            ExternalPluginStore::default(),
+        );
+
+        let rules_for_tsx = store.resolve("App.tsx".as_ref());
+        let expected_typescript_rules = RULES
+            .iter()
+            .filter(|rule| {
+                rule.category() == RuleCategory::Suspicious
+                    && rule.plugin_name() == "typescript"
+                    && is_category_default_rule(rule)
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !expected_typescript_rules.is_empty(),
+            "expected at least one recommended suspicious TypeScript rule"
+        );
+
+        for rule in expected_typescript_rules {
+            assert!(rules_for_tsx.rules.iter().any(|(configured_rule, severity)| {
+                configured_rule.plugin_name() == rule.plugin_name()
+                    && configured_rule.name() == rule.name()
+                    && *severity == AllowWarnDeny::Warn
+            }));
+        }
+
+        assert!(!rules_for_tsx.rules.iter().any(|(rule, _)| {
+            rule.category() == RuleCategory::Suspicious && rule.plugin_name() == "react"
+        }));
+    }
+
+    #[test]
     fn test_rule_config_override_replaces_properly() {
         let base_rules = vec![(
             RuleEnum::EslintNoUnusedVars(EslintNoUnusedVars::default()),
@@ -1135,6 +1477,9 @@ mod test {
             exclude_files: GlobSet::default(),
             plugins: None,
             globals: None,
+            settings: None,
+            language_options_id: None,
+            language_options_has_parser: None,
             rules: ResolvedOxlintOverrideRules {
                 builtin_rules: vec![(
                     RuleEnum::EslintNoUnusedVars(override_rule),
@@ -1196,6 +1541,8 @@ mod test {
             globals: OxlintGlobals::default(),
             path: None,
             options: OxlintOptions::default(),
+            js_language_options_ids: Vec::new(),
+            js_has_custom_parser: false,
         };
 
         // Set up categories
@@ -1215,6 +1562,9 @@ mod test {
             exclude_files: GlobSet::default(),
             plugins: Some(LintPlugins::TYPESCRIPT),
             globals: None,
+            settings: None,
+            language_options_id: None,
+            language_options_has_parser: None,
             rules: ResolvedOxlintOverrideRules { builtin_rules: vec![], external_rules: vec![] },
         }]);
 
@@ -1306,6 +1656,38 @@ mod test {
     }
 
     #[test]
+    fn test_number_of_rules_is_unknown_when_overrides_exist() {
+        let base = Config::new(
+            vec![(RuleEnum::EslintCurly(EslintCurly::default()), AllowWarnDeny::Deny)],
+            vec![],
+            OxlintCategories::default(),
+            LintConfig::default(),
+            ResolvedOxlintOverrides::new(vec![ResolvedOxlintOverride {
+                files: GlobSet::new(vec!["*.svelte"]),
+                exclude_files: GlobSet::default(),
+                env: None,
+                globals: None,
+                settings: None,
+                plugins: None,
+                language_options_id: None,
+                language_options_has_parser: None,
+                rules: ResolvedOxlintOverrideRules {
+                    builtin_rules: vec![(
+                        RuleEnum::ReactJsxFilenameExtension(ReactJsxFilenameExtension::default()),
+                        AllowWarnDeny::Warn,
+                    )],
+                    external_rules: vec![],
+                },
+            }]),
+        );
+
+        let store = ConfigStore::new(base, FxHashMap::default(), ExternalPluginStore::default());
+
+        assert_eq!(store.number_of_rules(false), None);
+        assert_eq!(store.number_of_rules(true), None);
+    }
+
+    #[test]
     fn test_external_rule_options_override_precedence() {
         // Prepare external plugin store with a custom plugin and rule
         let mut store = ExternalPluginStore::new(true);
@@ -1331,7 +1713,10 @@ mod test {
                 exclude_files: GlobSet::default(),
                 env: None,
                 globals: None,
+                settings: None,
                 plugins: None,
+                language_options_id: None,
+                language_options_has_parser: None,
                 // Override redefines the same rule with options B and severity error
                 rules: ResolvedOxlintOverrideRules {
                     builtin_rules: vec![],
@@ -1583,6 +1968,9 @@ mod test {
             exclude_files: GlobSet::default(),
             plugins: Some(LintPlugins::IMPORT),
             globals: None,
+            settings: None,
+            language_options_id: None,
+            language_options_has_parser: None,
             rules: ResolvedOxlintOverrideRules { builtin_rules: vec![], external_rules: vec![] },
         }]);
 

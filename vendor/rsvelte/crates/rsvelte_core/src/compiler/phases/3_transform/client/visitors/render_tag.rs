@@ -1,0 +1,459 @@
+//! RenderTag visitor for client-side transformation.
+//!
+//! Corresponds to `RenderTag.js` in
+//! `svelte/packages/svelte/src/compiler/phases/3-transform/client/visitors/RenderTag.js`.
+//!
+//! This visitor handles the transformation of `{@render snippet(...)}` tags
+//! into client-side JavaScript code.
+
+use crate::ast::js::Expression;
+use crate::ast::template::RenderTag;
+use crate::compiler::phases::phase3_transform::client::types::*;
+use crate::compiler::phases::phase3_transform::client::visitors::expression_converter::convert_expression;
+use crate::compiler::phases::phase3_transform::client::visitors::shared::utils::build_expression;
+use crate::compiler::phases::phase3_transform::js_ast::builders as b;
+use crate::compiler::phases::phase3_transform::js_ast::nodes::*;
+
+/// Visit a RenderTag node and generate client-side code.
+///
+/// This function corresponds to the `RenderTag` visitor in the JavaScript compiler.
+/// It generates the necessary JavaScript to render a snippet.
+///
+/// # Arguments
+///
+/// * `node` - The RenderTag AST node
+/// * `context` - The component transformation context
+///
+/// # Returns
+///
+/// Returns a statement that renders the snippet.
+///
+/// # Example
+///
+/// Given this Svelte code:
+/// ```svelte
+/// {@render snip()}
+/// ```
+///
+/// This visitor generates code like:
+/// ```javascript
+/// snip(node);
+/// ```
+///
+/// For dynamic snippets, it generates:
+/// ```javascript
+/// $.snippet(node, () => snippet_function, ...args);
+/// ```
+pub fn render_tag(node: &RenderTag, context: &mut ComponentContext) -> JsStatement {
+    // Push a comment placeholder for the render tag
+    context.state.template.push_comment(None);
+
+    // Get the call expression from the render tag
+    // The expression should be a CallExpression like `snip()` or `snip(arg1, arg2)`
+    let call_expr = unwrap_optional(&node.expression, context.state.parse_arena);
+    // Extract arguments and wrap them in thunks
+    // Reference: RenderTag.js lines 22-33
+    let raw_args = extract_call_arguments(&call_expr, context.state.parse_arena);
+
+    // Track async values for $.async() wrapping
+    let mut async_values: Vec<JsExpr> = Vec::new();
+    let mut async_ids: Vec<compact_str::CompactString> = Vec::new();
+    let mut any_has_await = false;
+
+    let mut derived_decls: Vec<JsStatement> = Vec::new();
+    // Async placeholders (callback params `$0`, `$1`, …) and memoised-call
+    // placeholders (`let $0 = $.derived(…)`) share one `$N` namespace inside the
+    // generated render block, so they must draw from a SINGLE counter. Two
+    // independent counters (one per kind) would both start at 0 and emit a
+    // duplicate `$0` when a render tag has both an awaited arg and a call arg —
+    // the `let $0` would shadow the async callback param `$0` (H-099).
+    let mut placeholder_index: usize = 0;
+    let args: Vec<JsExpr> = raw_args
+        .iter()
+        .enumerate()
+        .map(|(i, arg)| {
+            let converted = convert_expression(arg, context);
+            // Get metadata from analysis for this argument, or compute from expression
+            let template_metadata = node.metadata.arguments.get(i).cloned().unwrap_or_default();
+            let metadata = ExpressionMetadata::from_template_metadata(&template_metadata);
+            // Apply transforms ($.get() wrapping for reactive state variables)
+            let built = build_expression(context, &converted, &metadata);
+
+            // Check if this argument has await
+            let arg_has_await =
+                template_metadata.has_await() || super::shared::utils::expression_has_await(arg);
+
+            if arg_has_await {
+                any_has_await = true;
+                // Generate async value id like $0, $1, etc. (shared counter)
+                let id_name = format!("${}", placeholder_index);
+                placeholder_index += 1;
+                // Strip the top-level await since $.async handles the awaiting
+                let stripped = b::strip_await(&context.arena, built);
+                // If the stripped expression still contains awaits, use async thunk
+                let thunked = if b::js_expr_has_await(&context.arena, &stripped) {
+                    b::async_thunk(&context.arena, stripped)
+                } else {
+                    b::thunk(&context.arena, stripped)
+                };
+                async_values.push(thunked);
+                async_ids.push(id_name.clone().into());
+                // Return: () => $.get($N)
+                b::thunk(
+                    &context.arena,
+                    b::call(
+                        &context.arena,
+                        b::member_path(&context.arena, "$.get"),
+                        vec![b::id(&id_name)],
+                    ),
+                )
+            } else {
+                // If the argument expression has a call, we need to memoize it with $.derived()
+                let has_call_from_expr = render_tag_has_call(arg);
+                if template_metadata.has_call() || has_call_from_expr {
+                    // Draw from the same `$N` counter as async placeholders so a
+                    // memoised-call arg never collides with an async callback
+                    // param in the same render block (H-099).
+                    let id_name = format!("${}", placeholder_index);
+                    placeholder_index += 1;
+                    derived_decls.push(b::let_decl(
+                        &context.arena,
+                        &id_name,
+                        Some(b::call(
+                            &context.arena,
+                            b::member_path(&context.arena, "$.derived"),
+                            vec![b::thunk(&context.arena, built)],
+                        )),
+                    ));
+                    b::thunk(
+                        &context.arena,
+                        b::call(
+                            &context.arena,
+                            b::member_path(&context.arena, "$.get"),
+                            vec![b::id(&id_name)],
+                        ),
+                    )
+                } else {
+                    b::thunk(&context.arena, built)
+                }
+            }
+        })
+        .collect();
+
+    // Get the snippet function (callee)
+    // Reference: RenderTag.js lines 40-44
+    let snippet_function =
+        if let Some(callee) = extract_call_callee(&call_expr, context.state.parse_arena) {
+            let converted = convert_expression(&callee, context);
+            // Apply transforms to the callee too (e.g., for derived snippet variables)
+            let metadata = ExpressionMetadata::from_template_metadata(&node.metadata.expression);
+            build_expression(context, &converted, &metadata)
+        } else {
+            // Fallback - shouldn't normally happen
+            b::id("$$snippet")
+        };
+
+    // If we have a chain expression then ensure a nullish snippet function gets turned into an empty one
+    let is_chain_expression = node.expression.node_type() == Some("ChainExpression");
+
+    // Build the call based on whether the snippet is dynamic
+    let call = if node.metadata.dynamic {
+        // Dynamic snippet: use $.snippet() helper
+        let snippet_fn = if is_chain_expression {
+            b::logical_str(
+                &context.arena,
+                "??",
+                snippet_function,
+                b::member_path(&context.arena, "$.noop"),
+            )
+        } else {
+            snippet_function
+        };
+        let mut call_args = vec![
+            context.state.node.clone(),
+            b::thunk(&context.arena, snippet_fn),
+        ];
+        call_args.extend(args);
+        b::call(
+            &context.arena,
+            b::member_path(&context.arena, "$.snippet"),
+            call_args,
+        )
+    } else {
+        // Static snippet: direct call (optional if original was a ChainExpression)
+        let mut call_args = vec![context.state.node.clone()];
+        call_args.extend(args);
+        if is_chain_expression {
+            b::optional_call(&context.arena, snippet_function, call_args)
+        } else {
+            b::call(&context.arena, snippet_function, call_args)
+        }
+    };
+
+    // Build the statements list (derived decls + call)
+    let mut statements: Vec<JsStatement> = derived_decls;
+    // In dev mode, wrap with $.add_svelte_meta() for render tags
+    if context.state.dev {
+        use crate::compiler::phases::phase3_transform::client::visitors::attribute::locate_in_source;
+        let (line, col) = locate_in_source(&context.state.analysis.source, node.start as usize);
+        statements.push(super::shared::utils::add_svelte_meta_dev(
+            &context.arena,
+            call,
+            "render",
+            &context.state.analysis.name,
+            line,
+            col,
+            None,
+            true,
+        ));
+    } else {
+        statements.push(b::stmt(&context.arena, call));
+    }
+
+    // Check for blockers from the blocker_map by scanning the call for identifiers.
+    // We use collect_identifiers_from_statement (which recurses into arrow functions)
+    // rather than collect_get_arg_identifiers_from_statement (which doesn't),
+    // because render tag arguments are often thunked: `child($$anchor, () => $.get(n))`.
+    // The $.get(n) inside the arrow contains the blocker reference.
+    let mut all_blocker_exprs: Vec<JsExpr> = Vec::new();
+    let mut seen_indices: Vec<usize> = Vec::new();
+    for stmt in &statements {
+        let mut names = Vec::new();
+        super::fragment::collect_identifiers_from_statement_deep(stmt, &context.arena, &mut names);
+        let map = context.state.blocker_map.borrow();
+        for name in &names {
+            if let Some(&idx) = map.get(name.as_str())
+                && !seen_indices.contains(&idx)
+            {
+                seen_indices.push(idx);
+                let blocker =
+                    b::member_computed(&context.arena, b::id("$$promises"), b::number(idx as f64));
+                all_blocker_exprs.push(blocker);
+            }
+        }
+    }
+    let has_blockers = !all_blocker_exprs.is_empty();
+
+    // If any arguments have await or blockers, wrap in $.async()
+    if any_has_await || has_blockers {
+        let node_name = match &context.state.node {
+            JsExpr::Identifier(name) => name.clone(),
+            _ => "$$anchor".into(),
+        };
+
+        let mut callback_params: Vec<
+            crate::compiler::phases::phase3_transform::js_ast::nodes::JsPattern,
+        > = vec![b::id_pattern(node_name.clone())];
+        for id in &async_ids {
+            callback_params.push(b::id_pattern(id.clone()));
+        }
+
+        let callback = b::arrow_block(callback_params, statements);
+
+        // Build blockers argument
+        let blockers_arg = if has_blockers {
+            b::array(all_blocker_exprs)
+        } else {
+            b::undefined(&context.arena)
+        };
+
+        // Build async_values argument
+        let async_values_arg = if any_has_await {
+            b::array(async_values)
+        } else {
+            b::undefined(&context.arena)
+        };
+
+        let result = b::stmt(
+            &context.arena,
+            b::call(
+                &context.arena,
+                b::member_path(&context.arena, "$.async"),
+                vec![
+                    context.state.node.clone(),
+                    blockers_arg,
+                    async_values_arg,
+                    callback,
+                ],
+            ),
+        );
+
+        // If standalone, push $.async() to init and add $.next() after
+        if context.state.is_standalone {
+            context.state.init.push(result);
+            return b::stmt(
+                &context.arena,
+                b::call(
+                    &context.arena,
+                    b::member_path(&context.arena, "$.next"),
+                    vec![],
+                ),
+            );
+        }
+
+        result
+    } else if statements.len() == 1 {
+        statements.pop().unwrap()
+    } else {
+        b::block(statements)
+    }
+}
+
+/// Unwrap optional chain expression if present.
+///
+/// Corresponds to `unwrap_optional` in Svelte's utils.
+fn unwrap_optional(expr: &Expression, arena: &crate::ast::arena::ParseArena) -> Expression {
+    use crate::ast::typed_expr::JsNode;
+    if expr.node_type() == Some("ChainExpression") {
+        let node = expr.as_node();
+        match &*node {
+            JsNode::ChainExpression { expression, .. } => {
+                return Expression::from_node(arena.get_js_node(*expression).clone());
+            }
+            JsNode::Raw(val) => {
+                if let Some(inner) = val.get("expression") {
+                    return Expression::Value(inner.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    expr.clone()
+}
+
+/// Extract arguments from a call expression.
+fn extract_call_arguments(
+    expr: &Expression,
+    arena: &crate::ast::arena::ParseArena,
+) -> Vec<Expression> {
+    use crate::ast::typed_expr::JsNode;
+    if expr.node_type() != Some("CallExpression") {
+        return Vec::new();
+    }
+    // Fast path for Expression::Value: extract directly from JSON to avoid
+    // JsNode conversion that allocates into a different (DESER) arena.
+    if let Expression::Value(val) = expr {
+        if let Some(args) = val.get("arguments").and_then(|a| a.as_array()) {
+            return args
+                .iter()
+                .map(|arg| Expression::Value(arg.clone()))
+                .collect();
+        }
+        return Vec::new();
+    }
+    let node = expr.as_node();
+    match &*node {
+        JsNode::CallExpression { arguments, .. } => arena
+            .get_js_children(*arguments)
+            .iter()
+            .map(|arg| Expression::from_node(arg.clone()))
+            .collect(),
+        JsNode::Raw(val) => {
+            if let Some(args) = val.get("arguments").and_then(|a| a.as_array()) {
+                args.iter()
+                    .map(|arg| Expression::Value(arg.clone()))
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Extract callee from a call expression.
+fn extract_call_callee(
+    expr: &Expression,
+    arena: &crate::ast::arena::ParseArena,
+) -> Option<Expression> {
+    use crate::ast::typed_expr::JsNode;
+    if expr.node_type() != Some("CallExpression") {
+        return None;
+    }
+    // Fast path for Expression::Value: extract directly from JSON to avoid
+    // JsNode conversion that allocates into a different (DESER) arena.
+    if let Expression::Value(val) = expr {
+        return val.get("callee").map(|c| Expression::Value(c.clone()));
+    }
+    let node = expr.as_node();
+    match &*node {
+        JsNode::CallExpression { callee, .. } => {
+            Some(Expression::from_node(arena.get_js_node(*callee).clone()))
+        }
+        JsNode::Raw(val) => val.get("callee").map(|c| Expression::Value(c.clone())),
+        _ => None,
+    }
+}
+
+/// Wrapper to check if an Expression has a call.
+fn render_tag_has_call(expr: &Expression) -> bool {
+    json_value_has_call(expr.as_json())
+}
+
+/// Recursively check if a JSON value (ESTree node) contains a CallExpression.
+/// Stops recursion at function boundaries (ArrowFunctionExpression, FunctionExpression)
+/// since calls inside those don't affect the outer expression's reactivity.
+fn json_value_has_call(val: &serde_json::Value) -> bool {
+    match val {
+        serde_json::Value::Object(obj) => {
+            if let Some(expr_type) = obj.get("type").and_then(|v| v.as_str()) {
+                if expr_type == "CallExpression" {
+                    return true;
+                }
+                if expr_type == "ArrowFunctionExpression"
+                    || expr_type == "FunctionExpression"
+                    || expr_type == "FunctionDeclaration"
+                {
+                    return false;
+                }
+            }
+            obj.values().any(json_value_has_call)
+        }
+        serde_json::Value::Array(arr) => arr.iter().any(json_value_has_call),
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_call_callee() {
+        let call_expr = Expression::Value(serde_json::json!({
+            "type": "CallExpression",
+            "callee": {
+                "type": "Identifier",
+                "name": "snip"
+            },
+            "arguments": []
+        }));
+
+        let arena = crate::ast::arena::ParseArena::new();
+        let callee = extract_call_callee(&call_expr, &arena);
+        assert!(callee.is_some());
+
+        if let Some(callee_expr) = callee {
+            assert_eq!(callee_expr.node_type(), Some("Identifier"));
+            assert_eq!(callee_expr.name(), Some("snip"));
+        }
+    }
+
+    #[test]
+    fn test_extract_call_arguments() {
+        let call_expr = Expression::Value(serde_json::json!({
+            "type": "CallExpression",
+            "callee": {
+                "type": "Identifier",
+                "name": "snip"
+            },
+            "arguments": [
+                { "type": "Literal", "value": 42 }
+            ]
+        }));
+
+        let arena = crate::ast::arena::ParseArena::new();
+        let args = extract_call_arguments(&call_expr, &arena);
+        assert_eq!(args.len(), 1);
+    }
+}

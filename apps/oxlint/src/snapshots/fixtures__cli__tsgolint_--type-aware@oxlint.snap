@@ -5,6 +5,7 @@ source: apps/oxlint/src/tester.rs
 arguments: --type-aware
 working directory: fixtures/cli/tsgolint
 ----------
+Type-aware Svelte linting is not supported yet; `.svelte` files are excluded from TypeScript type-aware checks and use rsvelte syntax diagnostics plus non-type-aware linting.
 
   x typescript(await-thenable): Unexpected `await` of a non-Promise (non-"Thenable") value.
    ,-[await-thenable.ts:1:1]

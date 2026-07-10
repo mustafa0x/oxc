@@ -1,0 +1,21 @@
+[package]
+name = "rsvelte_formatter"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+description = "Fast Svelte 5 formatter built on rsvelte + oxc_formatter"
+license = "MIT"
+publish = false
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+svelte-compiler-rust = { path = "../rsvelte_core", default-features = false, features = ["native"] }
+oxc_allocator = { path = "../../../../crates/oxc_allocator" }
+oxc_ast = { path = "../../../../crates/oxc_ast" }
+oxc_parser = { path = "../../../../crates/oxc_parser" }
+oxc_span = { path = "../../../../crates/oxc_span" }
+oxc_formatter = { path = "../../../../crates/oxc_formatter" }
+oxc_formatter_core = { path = "../../../../crates/oxc_formatter_core" }
+thiserror = "2.0"

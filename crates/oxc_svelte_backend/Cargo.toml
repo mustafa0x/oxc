@@ -1,0 +1,25 @@
+[package]
+name = "oxc_svelte_backend"
+version = "0.0.0"
+authors.workspace = true
+categories.workspace = true
+edition.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+license.workspace = true
+publish = false
+repository.workspace = true
+rust-version.workspace = true
+description = "rsvelte-backed Svelte parser and formatter adapter for Oxc"
+
+[features]
+default = []
+rsvelte = ["dep:svelte-compiler-rust", "dep:rsvelte_formatter"]
+
+[lints]
+workspace = true
+
+[dependencies]
+oxc_span = { workspace = true }
+svelte-compiler-rust = { workspace = true, optional = true }
+rsvelte_formatter = { workspace = true, optional = true }

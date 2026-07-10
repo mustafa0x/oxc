@@ -440,6 +440,18 @@ impl DisableDirectives {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct RawDirectiveComment<'a> {
+    /// Span of the full comment, including delimiters.
+    pub span: Span,
+    /// Span of the comment content, without delimiters.
+    ///
+    /// When `None`, `span` is treated as the content span for backward-compatible callers.
+    pub content_span: Option<Span>,
+    /// Raw comment content text, without delimiters.
+    pub text: &'a str,
+}
+
 pub struct DisableDirectivesBuilder {
     /// Which directive prefixes should be recognized.
     respect_eslint_disable_directives: bool,
@@ -477,6 +489,32 @@ impl DisableDirectivesBuilder {
     }
 
     pub fn build(mut self, source_text: &str, comments: &[Comment]) -> DisableDirectives {
+        let raw_comments = comments
+            .iter()
+            .map(|comment| {
+                let content_span = comment.content_span();
+                RawDirectiveComment {
+                    span: comment.span,
+                    content_span: Some(content_span),
+                    text: content_span.source_text(source_text),
+                }
+            })
+            .collect::<Vec<_>>();
+        self.build_impl(source_text, &raw_comments);
+
+        DisableDirectives {
+            intervals: self.intervals,
+            disable_rule_comments: self.disable_rule_comments.into_boxed_slice(),
+            unused_enable_comments: self.unused_enable_comments.into_boxed_slice(),
+            used_disable_comments: RefCell::new(Vec::new()),
+        }
+    }
+
+    pub fn build_raw_comments(
+        mut self,
+        source_text: &str,
+        comments: &[RawDirectiveComment<'_>],
+    ) -> DisableDirectives {
         self.build_impl(source_text, comments);
 
         DisableDirectives {
@@ -501,9 +539,9 @@ impl DisableDirectivesBuilder {
     /// This span is stored in [`DisabledRule`] so that `Fix::delete(span)`
     /// produces the correct edit without any extra post-processing in callers.
     #[expect(clippy::cast_possible_truncation)]
-    pub(crate) fn compute_comment_fix_span(comment: &Comment, source_text: &str) -> Span {
-        let outer_start = comment.span.start as usize;
-        let outer_end = comment.span.end as usize;
+    fn compute_comment_fix_span_from_span(comment_span: Span, source_text: &str) -> Span {
+        let outer_start = comment_span.start as usize;
+        let outer_end = comment_span.end as usize;
 
         // Find the start of the current line (character after the preceding `\n`, or 0).
         let line_start = source_text[..outer_start].rfind('\n').map_or(0, |i| i + 1);
@@ -522,12 +560,17 @@ impl DisableDirectivesBuilder {
         } else {
             // There is other content on the same line – only delete the comment
             // itself (including its delimiters).
-            comment.span
+            comment_span
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn compute_comment_fix_span(comment: &Comment, source_text: &str) -> Span {
+        Self::compute_comment_fix_span_from_span(comment.span, source_text)
+    }
+
     #[expect(clippy::cast_possible_truncation)] // for `as u32`
-    fn build_impl(&mut self, source_text: &str, comments: &[Comment]) {
+    fn build_impl(&mut self, source_text: &str, comments: &[RawDirectiveComment<'_>]) {
         let source_len = source_text.len() as u32;
         // This algorithm iterates through the comments and builds all intervals
         // for matching disable and enable pairs.
@@ -542,7 +585,6 @@ impl DisableDirectivesBuilder {
         let mut unused_enable_directives: Vec<(DirectivePrefix, Option<String>, Span)> = vec![];
 
         for comment in comments {
-            let comment_span = comment.content_span();
             // `comment.span` is the full outer span (including `//` or `/* */` delimiters).
             // It is used as the diagnostic span.
             let outer_span = comment.span;
@@ -1419,7 +1461,7 @@ mod tests {
         DirectivePrefix, DisabledRule, RuleCommentRule, RuleCommentType,
     };
 
-    use super::{DisableDirectives, DisableDirectivesBuilder};
+    use super::{DisableDirectives, DisableDirectivesBuilder, RawDirectiveComment};
 
     fn process_source<'a>(allocator: &'a Allocator, source_text: &'a str) -> Semantic<'a> {
         let source_type = SourceType::default();
@@ -1834,6 +1876,48 @@ mod tests {
             apply_delete(source_text, fix.span),
             concat!("// eslint-disable-next-line no-bitwise - intentional\n", "const x = 1;\n",)
         );
+    }
+
+    #[test]
+    fn next_line_span_of_html_comment() {
+        let source_text = "<!-- eslint-disable-next-line no-console -->
+<h1>Hello</h1>
+";
+        let comment_start = 4;
+        let comment_end = u32::try_from(source_text.find("-->").unwrap()).unwrap();
+        let comment = RawDirectiveComment {
+            span: Span::new(0, comment_end + 3),
+            content_span: Some(Span::new(comment_start, comment_end)),
+            text: &source_text[comment_start as usize..comment_end as usize],
+        };
+        let directives =
+            DisableDirectivesBuilder::new().build_raw_comments(source_text, &[comment]);
+
+        let h1_start = u32::try_from(source_text.find("<h1>").unwrap()).unwrap();
+        let h1_span = Span::new(h1_start, h1_start + 4);
+        assert!(
+            directives.contains("no-console", h1_span),
+            "HTML-comment disable-next-line should suppress diagnostics on the next line"
+        );
+    }
+
+    #[test]
+    fn unused_html_disable_comment_keeps_outer_span() {
+        let source_text = "<!-- eslint-disable-next-line -->
+<h1>Hello</h1>
+";
+        let comment_end = u32::try_from(source_text.find("-->").unwrap()).unwrap() + 3;
+        let comment = RawDirectiveComment {
+            span: Span::new(0, comment_end),
+            content_span: Some(Span::new(4, comment_end - 3)),
+            text: &source_text[4..(comment_end - 3) as usize],
+        };
+        let directives =
+            DisableDirectivesBuilder::new().build_raw_comments(source_text, &[comment]);
+
+        let unused = directives.collect_unused_disable_comments();
+        assert_eq!(unused.len(), 1);
+        assert_eq!(unused[0].span, Span::new(0, comment_end));
     }
 
     #[test]

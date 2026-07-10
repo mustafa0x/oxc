@@ -90,6 +90,7 @@ describe("LSP formatting", () => {
       ["untitled://Untitled-4", "format/test.toml", "toml"],
       ["untitled://Untitled-5", "format/formatted.ts", "typescript"],
       ["untitled://Untitled-6", "format/test.txt", "plaintext"],
+      ["untitled://Untitled-7", "format/test.svelte", "svelte"],
       // with path
       ["vscode-userdata:/c%3A/Users/User/settings.json", "format/test.tsx", "typescriptreact"],
     ])("should format uri %s", async (uri, path, languageId) => {

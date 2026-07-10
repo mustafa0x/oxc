@@ -24,11 +24,27 @@ import type {
   TextEdit,
 } from "vscode-languageserver-protocol/node";
 
-const CLI_PATH = join(import.meta.dirname, "..", "..", "dist", "cli.js");
+const PACKAGE_ROOT_PATH = join(import.meta.dirname, "..", "..");
+const BUILT_CLI_PATH = join(PACKAGE_ROOT_PATH, "dist", "cli.js");
+const RAW_CLI_PATH = join(PACKAGE_ROOT_PATH, "src-js", "cli.ts");
+const TSX_CLI_PATH = join(PACKAGE_ROOT_PATH, "node_modules", "tsx", "dist", "cli.mjs");
 
-export function createLspConnection(env: Record<string, string> = {}) {
-  const proc = spawn("node", [CLI_PATH, "--lsp"], {
-    env: { ...process.env, ...env },
+export type OxfmtLspLaunchMode = "built" | "raw";
+
+function getLspLaunchArgs(launchMode: OxfmtLspLaunchMode): string[] {
+  return launchMode === "built"
+    ? [BUILT_CLI_PATH, "--lsp"]
+    : [TSX_CLI_PATH, RAW_CLI_PATH, "--lsp"];
+}
+
+export function createLspConnection(
+  launchModeOrEnv: OxfmtLspLaunchMode | Record<string, string> = "built",
+  env: Record<string, string> = {},
+) {
+  const launchMode = typeof launchModeOrEnv === "string" ? launchModeOrEnv : "built";
+  const mergedEnv = typeof launchModeOrEnv === "string" ? env : launchModeOrEnv;
+  const proc = spawn(process.execPath, getLspLaunchArgs(launchMode), {
+    env: { ...process.env, ...mergedEnv },
   });
 
   const connection = createMessageConnection(
@@ -107,23 +123,25 @@ export async function formatFixture(
   fixturePath: string,
   languageId: string,
   clientOrConfig?: OxfmtLSPConfig | ReturnType<typeof createLspConnection>,
+  launchMode: OxfmtLspLaunchMode = "built",
 ): Promise<string> {
   const filePath = join(fixturesDir, fixturePath);
   const fileUri = pathToFileURL(filePath).href;
 
-  return await formatFixtureContent(fixturesDir, fixturePath, fileUri, languageId, clientOrConfig);
+  return await formatFixtureContent(fixturesDir, fixturePath, fileUri, languageId, clientOrConfig, launchMode);
 }
 
 export async function formatSingleFileFixture(
   fixturesDir: string,
   fixturePath: string,
   languageId: string,
+  launchMode: OxfmtLspLaunchMode = "built",
 ): Promise<string> {
   const filePath = join(fixturesDir, fixturePath);
   const fileUri = pathToFileURL(filePath).href;
   const content = await fs.readFile(filePath, "utf-8");
 
-  const client = createLspConnection();
+  const client = createLspConnection(launchMode);
   await client.initialize(null);
   await client.didOpen(fileUri, languageId, content);
   const edits = await client.format(fileUri);
@@ -143,6 +161,7 @@ export async function formatFixtureContent(
   fileUri: string,
   languageId: string,
   clientOrConfig?: OxfmtLSPConfig | ReturnType<typeof createLspConnection>,
+  launchMode: OxfmtLspLaunchMode = "built",
 ): Promise<string> {
   const filePath = join(fixturesDir, fixturePath);
   const dirPath = dirname(filePath);
@@ -151,7 +170,7 @@ export async function formatFixtureContent(
   let innerClient: ReturnType<typeof createLspConnection> | undefined;
 
   if (clientOrConfig === undefined || !("initialize" in clientOrConfig)) {
-    innerClient = createLspConnection();
+    innerClient = createLspConnection(launchMode);
 
     await innerClient.initialize([{ uri: pathToFileURL(dirPath).href, name: "test" }], {}, [
       {
@@ -231,13 +250,14 @@ export async function formatFixtureAfterConfigChange(
   languageId: string,
   initializationOptions: OxfmtLSPConfig,
   configurationChangeOptions: OxfmtLSPConfig,
+  launchMode: OxfmtLspLaunchMode = "built",
 ): Promise<string> {
   const filePath = join(fixturesDir, fixturePath);
   const dirPath = dirname(filePath);
   const fileUri = pathToFileURL(filePath).href;
   const content = await fs.readFile(filePath, "utf-8");
 
-  await using client = createLspConnection();
+  await using client = createLspConnection(launchMode);
 
   // Initial format with first config
   await client.initialize([{ uri: pathToFileURL(dirPath).href, name: "test" }], {}, [

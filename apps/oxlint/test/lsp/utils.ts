@@ -37,7 +37,10 @@ import {
 import { TextDocument } from "vscode-languageserver-textdocument";
 import { codeFrameColumns } from "@babel/code-frame";
 
-const CLI_PATH = join(import.meta.dirname, "..", "..", "dist", "cli.js");
+const PACKAGE_ROOT_PATH = join(import.meta.dirname, "..", "..");
+const BUILT_CLI_PATH = join(PACKAGE_ROOT_PATH, "dist", "cli.js");
+const RAW_CLI_PATH = join(PACKAGE_ROOT_PATH, "src-js", "cli.ts");
+const TSX_CLI_PATH = join(PACKAGE_ROOT_PATH, "node_modules", "tsx", "dist", "cli.mjs");
 
 const PULL_DIAGNOSTICS_CAPABILITY = {
   textDocument: {
@@ -50,12 +53,25 @@ const PULL_DIAGNOSTICS_CAPABILITY = {
   },
 };
 
-export function createLspConnection(env: Record<string, string> = {}) {
-  const proc = spawn(process.execPath, [CLI_PATH, "--lsp"], {
+export type LspLaunchMode = "built" | "raw";
+
+function getLspLaunchArgs(launchMode: LspLaunchMode): string[] {
+  return launchMode === "raw"
+    ? [TSX_CLI_PATH, "--conditions=code", RAW_CLI_PATH, "--lsp"]
+    : [BUILT_CLI_PATH, "--lsp"];
+}
+
+export function createLspConnection(
+  launchModeOrEnv: LspLaunchMode | Record<string, string> = "built",
+  env: Record<string, string> = {},
+) {
+  const launchMode = typeof launchModeOrEnv === "string" ? launchModeOrEnv : "built";
+  const mergedEnv = typeof launchModeOrEnv === "string" ? env : launchModeOrEnv;
+  const proc = spawn(process.execPath, getLspLaunchArgs(launchMode), {
     env: {
       ...process.env,
       OXC_LOG: "debug",
-      ...env,
+      ...mergedEnv,
     },
   });
 
@@ -162,11 +178,13 @@ export async function lintFixture(
   fixturePath: string,
   languageId: string,
   initializationOptions?: OxlintLSPConfig,
+  launchMode: LspLaunchMode = "built",
 ): Promise<string> {
   return lintMultiWorkspaceFixture(
     fixturesDir,
     [{ path: fixturePath, languageId }],
     initializationOptions ? [initializationOptions] : undefined,
+    launchMode,
   );
 }
 
@@ -174,8 +192,9 @@ export async function lintSingleFileFixture(
   fixtureDir: string,
   fixturePath: string,
   languageId: string,
+  launchMode: LspLaunchMode = "built",
 ): Promise<string> {
-  await using client = createLspConnection();
+  await using client = createLspConnection(launchMode);
   await client.initialize(null, PULL_DIAGNOSTICS_CAPABILITY);
   return await getDiagnosticSnapshot(
     fixturePath,
@@ -219,11 +238,12 @@ export async function lintMultiWorkspaceFixture(
     languageId: string;
   }[],
   initializationOptions?: OxlintLSPConfig[],
+  launchMode: LspLaunchMode = "built",
 ): Promise<string> {
   const workspaceUris = fixturePaths.map(
     ({ path }) => pathToFileURL(dirname(join(fixturesDir, path))).href,
   );
-  await using client = createLspConnection();
+  await using client = createLspConnection(launchMode);
 
   await client.initialize(
     workspaceUris.map((uri, index) => ({ uri, name: `workspace-${index}` })),
@@ -257,6 +277,7 @@ export async function lintFixtureWithFileContentChange(
   oldConfigPath: string,
   newConfigPath: string,
   initializationOptions?: OxlintLSPConfig,
+  launchMode: LspLaunchMode = "built",
 ): Promise<string> {
   return lintMultiWorkspaceFixtureWithFileContentChange(
     fixturesDir,
@@ -264,23 +285,49 @@ export async function lintFixtureWithFileContentChange(
     oldConfigPath,
     newConfigPath,
     initializationOptions ? [initializationOptions] : undefined,
+    launchMode,
   );
 }
 
+export async function lintFixtureWithWorkspaceFileContentChange(
+  fixturesDir: string,
+  workspacePath: string,
+  fixturePath: string,
+  languageId: string,
+  oldConfigPath: string,
+  newConfigPath: string,
+  initializationOptions?: OxlintLSPConfig,
+  launchMode: LspLaunchMode = "built",
+): Promise<string> {
+  return lintMultiWorkspaceFixtureWithFileContentChange(
+    fixturesDir,
+    [{ path: fixturePath, languageId, workspacePath }],
+    oldConfigPath,
+    newConfigPath,
+    initializationOptions ? [initializationOptions] : undefined,
+    launchMode,
+  );
+}
+
+type MultiWorkspaceFixtureInput = {
+  path: string;
+  languageId: string;
+  workspacePath?: string;
+};
+
 export async function lintMultiWorkspaceFixtureWithFileContentChange(
   fixturesDir: string,
-  fixturePaths: {
-    path: string;
-    languageId: string;
-  }[],
+  fixturePaths: MultiWorkspaceFixtureInput[],
   oldConfigPath: string,
   newConfigPath: string,
   initializationOptions?: OxlintLSPConfig[],
+  launchMode: LspLaunchMode = "built",
 ): Promise<string> {
   const workspaceUris = fixturePaths.map(
-    ({ path }) => pathToFileURL(dirname(join(fixturesDir, path))).href,
+    ({ path, workspacePath }) =>
+      pathToFileURL(join(fixturesDir, workspacePath ?? dirname(path))).href,
   );
-  await using client = createLspConnection();
+  await using client = createLspConnection(launchMode);
 
   // in theory we should support dynamic registration for the watcher
   // but the server does not care if you request `workspace/didChangeWatchedFiles` without the capability.
@@ -309,8 +356,8 @@ export async function lintMultiWorkspaceFixtureWithFileContentChange(
   }
 
   const oldContent = await Promise.all(
-    fixturePaths.map(({ path }) => {
-      const dir = dirname(join(fixturesDir, path));
+    fixturePaths.map(({ path, workspacePath }) => {
+      const dir = join(fixturesDir, workspacePath ?? dirname(path));
       const oldFilePath = join(dir, oldConfigPath);
       return fs.readFile(oldFilePath, "utf-8");
     }),
@@ -318,8 +365,8 @@ export async function lintMultiWorkspaceFixtureWithFileContentChange(
 
   try {
     const refreshedUris = await Promise.all(
-      fixturePaths.map(async ({ path }) => {
-        const dir = dirname(join(fixturesDir, path));
+      fixturePaths.map(async ({ path, workspacePath }) => {
+        const dir = join(fixturesDir, workspacePath ?? dirname(path));
         const filePath = join(dir, newConfigPath);
         const oldFilePath = join(dir, oldConfigPath);
         const newContent = await fs.readFile(filePath, "utf-8");
@@ -339,8 +386,8 @@ export async function lintMultiWorkspaceFixtureWithFileContentChange(
     snapshots.push("=== After Config Change ===");
   } finally {
     await Promise.all(
-      fixturePaths.map(({ path }, index) => {
-        const dir = dirname(join(fixturesDir, path));
+      fixturePaths.map(({ path, workspacePath }, index) => {
+        const dir = join(fixturesDir, workspacePath ?? dirname(path));
         const oldFilePath = join(dir, oldConfigPath);
         return fs.writeFile(oldFilePath, oldContent[index]);
       }),
@@ -368,12 +415,14 @@ export async function fixFixture(
   languageId: string,
   initializationOptions?: OxlintLSPConfig,
   context?: CodeActionContext,
+  launchMode: LspLaunchMode = "built",
 ): Promise<string> {
   return fixMultiWorkspaceFixture(
     fixturesDir,
     [{ path: fixturePath, languageId }],
     initializationOptions ? [initializationOptions] : undefined,
     context,
+    launchMode,
   );
 }
 
@@ -385,11 +434,12 @@ export async function fixMultiWorkspaceFixture(
   }[],
   initializationOptions?: OxlintLSPConfig[],
   context?: CodeActionContext,
+  launchMode: LspLaunchMode = "built",
 ): Promise<string> {
   const workspaceUris = fixturePaths.map(
     ({ path }) => pathToFileURL(dirname(join(fixturesDir, path))).href,
   );
-  await using client = createLspConnection();
+  await using client = createLspConnection(launchMode);
 
   await client.initialize(
     workspaceUris.map((uri, index) => ({ uri, name: `workspace-${index}` })),

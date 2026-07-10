@@ -45,6 +45,15 @@ pub struct CliRunner {
     js_config_loader: Option<JsConfigLoaderCb>,
 }
 
+fn has_svelte_file(paths: &[Arc<OsStr>]) -> bool {
+    paths.iter().any(|path| {
+        Path::new(path.as_ref())
+            .extension()
+            .and_then(OsStr::to_str)
+            .is_some_and(|ext| ext == "svelte")
+    })
+}
+
 impl Debug for CliRunner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut s = f.debug_struct("CliRunner");
@@ -343,7 +352,12 @@ impl CliRunner {
         .with_filters(&filters);
 
         if misc_options.print_config {
-            return crate::mode::run_print_config(&config_builder, root_config, stdout);
+            return crate::mode::run_print_config(
+                &config_builder,
+                &external_plugin_store,
+                root_config,
+                stdout,
+            );
         }
 
         let lint_config = match config_builder.build(&mut external_plugin_store) {
@@ -1215,6 +1229,94 @@ mod test {
         assert!(output.contains("fixtures/cli/svelte/context-module-script-ts.svelte:7:2"));
     }
 
+    #[cfg(feature = "svelte-rsvelte-backend")]
+    #[test]
+    fn lint_invalid_svelte_with_rsvelte_backend() {
+        let output =
+            Tester::new().test_output_verbose(&["fixtures/cli/svelte/invalid-context.svelte"]);
+
+        assert!(output.contains("svelte(script_invalid_context)"));
+        assert!(output.contains("fixtures/cli/svelte/invalid-context.svelte:1:9"));
+    }
+
+    #[cfg(feature = "svelte-rsvelte-backend")]
+    #[test]
+    fn lint_svelte_compiler_warning_with_rsvelte_backend() {
+        let output =
+            Tester::new().test_output_verbose(&["fixtures/cli/svelte/a11y-warning.svelte"]);
+
+        assert!(output.contains("svelte(a11y_invalid_attribute)"));
+        assert!(output.contains("'javascript:void(0)' is not a valid href attribute"));
+    }
+
+    #[cfg(feature = "svelte-rsvelte-backend")]
+    #[test]
+    fn lint_svelte_compiler_warning_respects_html_disable_directive() {
+        let output = Tester::new()
+            .test_output_verbose(&["fixtures/cli/svelte/a11y-warning-disabled.svelte"]);
+
+        assert!(!output.contains("svelte(a11y_invalid_attribute)"));
+    }
+
+    #[cfg(feature = "svelte-rsvelte-backend")]
+    #[test]
+    fn lint_svelte_analysis_error_with_rsvelte_backend() {
+        let output =
+            Tester::new().test_output_verbose(&["fixtures/cli/svelte/analysis-error.svelte"]);
+
+        assert!(output.contains("svelte(svelte_component_missing_this)"));
+        assert!(output.contains("must have a 'this' attribute"));
+    }
+
+    #[cfg(feature = "svelte-rsvelte-backend")]
+    #[test]
+    fn lint_invalid_svelte_html_disable_directive_with_rsvelte_backend() {
+        let output = Tester::new()
+            .test_output_verbose(&["fixtures/cli/svelte/invalid-context-disabled.svelte"]);
+
+        assert!(!output.contains("svelte(script_invalid_context)"));
+    }
+
+    #[cfg(feature = "svelte-rsvelte-backend")]
+    #[test]
+    fn lint_svelte_html_disable_directive_filters_script_diagnostics() {
+        let output =
+            Tester::new().test_output_verbose(&["fixtures/cli/svelte/script-html-disable.svelte"]);
+
+        assert!(!output.contains("eslint(no-debugger)"));
+    }
+
+    #[cfg(feature = "svelte-rsvelte-backend")]
+    #[test]
+    fn lint_svelte_reports_unused_html_disable_directive() {
+        let output = Tester::new().test_output_verbose(&[
+            "--report-unused-disable-directives",
+            "fixtures/cli/svelte/unused-html-disable.svelte",
+        ]);
+
+        assert!(output.contains("Unused oxlint-disable directive (no problems were reported)."));
+    }
+
+    #[test]
+    fn test_category_recommended_uses_builtin_subset() {
+        let output = Tester::new()
+            .with_cwd("fixtures/cli/category_recommended".into())
+            .test_output_verbose(&["app.jsx"]);
+
+        assert_eq!(output.matches("eslint(no-debugger)").count(), 1);
+        assert!(!output.contains("react(react-in-jsx-scope)"));
+    }
+
+    #[test]
+    fn test_category_recommended_respects_explicit_rule_overrides() {
+        let output = Tester::new()
+            .with_cwd("fixtures/cli/category_recommended".into())
+            .test_output_verbose(&["-c", "explicit-react.json", "app.jsx"]);
+
+        assert_eq!(output.matches("eslint(no-debugger)").count(), 1);
+        assert_eq!(output.matches("react(react-in-jsx-scope)").count(), 1);
+    }
+
     #[test]
     fn test_tsconfig_option() {
         // passed
@@ -1301,6 +1403,26 @@ mod test {
             "--print-config",
         ];
         Tester::new().test_and_snapshot(args);
+    }
+
+    #[test]
+    fn test_categories_recommended_skips_plugin_only_suspicious_rules() {
+        let output = Tester::new()
+            .with_cwd("fixtures/cli/categories_recommended".into())
+            .test_output_verbose(&["-c", ".oxlintrc.json", "test.jsx"]);
+
+        assert!(output.contains("'done' is not modified in this loop."));
+        assert!(!output.contains("`React` must be in scope when using JSX."));
+    }
+
+    #[test]
+    fn test_correctness_categories_recommended_skips_plugin_only_correctness_rules() {
+        let output = Tester::new()
+            .with_cwd("fixtures/cli/categories_recommended_correctness".into())
+            .test_output_verbose(&["-c", ".oxlintrc.json", "test.jsx"]);
+
+        assert!(output.contains("Unexpected re-assignment of `const` variable value."));
+        assert!(!output.contains("Avoid passing children using a prop."));
     }
 
     #[test]
@@ -1545,6 +1667,26 @@ mod test {
         // Check that using a config that extends a config which extends a config works
         let args = &["--config", "relative_paths/extends_extends_config.json", "console.js"];
         Tester::new().with_cwd("fixtures/cli/extends_config".into()).test_and_snapshot(args);
+    }
+
+    #[test]
+    fn test_extends_package_config_from_node_modules() {
+        let output =
+            Tester::new().with_cwd("fixtures/cli/extends_config".into()).test_output_verbose(&[
+                "--config",
+                "packages/app/oxlintrc.json",
+                "packages/app/console.js",
+                "packages/app/list.jsx",
+            ]);
+
+        assert_eq!(output.matches("eslint(no-console)").count(), 1);
+        assert_eq!(output.matches("eslint(no-debugger)").count(), 1);
+        assert_eq!(output.matches("eslint(no-alert)").count(), 1);
+        assert_eq!(output.matches("jsx-key").count(), 1);
+        assert!(output.contains("packages/app/console.js:1:1"));
+        assert!(output.contains("packages/app/console.js:2:1"));
+        assert!(output.contains("packages/app/console.js:3:1"));
+        assert!(output.contains("packages/app/list.jsx:2:"));
     }
 
     #[test]

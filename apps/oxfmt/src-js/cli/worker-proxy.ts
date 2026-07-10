@@ -1,6 +1,7 @@
 import Tinypool from "tinypool";
 import { toFormatFileResult, toNullable } from "../libs/napi-callbacks";
 import type { FormatFileResult } from "../libs/napi-callbacks";
+import { resolvePlugins } from "../libs/apis";
 import type {
   FormatFileParam,
   FormatEmbeddedCodeParam,

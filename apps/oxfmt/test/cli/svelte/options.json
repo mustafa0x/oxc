@@ -1,8 +1,15 @@
 [
-  { "args": ["--check", "--config", "./fmt-simple.json"] },
-  { "args": ["--check", "--config", "./fmt-no-svelte.json"] },
-  { "args": ["--check", "--config", "./fmt-root-overrides.json"] },
-  { "args": ["--check", "--config", "./fmt-overrides-only.json"] },
-  { "args": ["--check", "--config", "./fmt-md-only.json"] },
-  { "args": ["--check", "--config", "./fmt-bool-disable.json"] }
+  { "args": ["--check", "App.svelte", "legacy/Old.svelte", "--config", "./fmt-simple.json"] },
+  { "args": ["--check", "App.svelte", "legacy/Old.svelte", "--config", "./fmt-no-svelte.json"] },
+  { "args": ["--check", "App.svelte", "legacy/Old.svelte", "--config", "./fmt-root-overrides.json"] },
+  { "args": ["--check", "App.svelte", "legacy/Old.svelte", "--config", "./fmt-overrides-only.json"] },
+  { "args": ["--check", "App.svelte", "legacy/Old.svelte", "--config", "./fmt-bool-disable.json"] },
+  {
+    "args": [
+      "--check",
+      "App.svelte",
+      "--config",
+      "./fmt-missing-svelte-plugin.json"
+    ]
+  }
 ]

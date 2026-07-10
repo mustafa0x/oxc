@@ -1,0 +1,101 @@
+---
+source: apps/oxlint/src/lsp/tester.rs
+---
+########## 
+Linted file: fixtures/lsp/invalid_syntax/debugger.ts
+----------
+########## Diagnostic Reports
+File URI: file://<variable>/fixtures/lsp/invalid_syntax/debugger.ts
+
+code: ""
+code_description.href: "None"
+message: "Unexpected token"
+range: Range { start: Position { line: 0, character: 9 }, end: Position { line: 0, character: 10 } }
+related_information[0].message: ""
+related_information[0].location.uri: "file://<variable>/fixtures/lsp/invalid_syntax/debugger.ts"
+related_information[0].location.range: Range { start: Position { line: 0, character: 9 }, end: Position { line: 0, character: 10 } }
+severity: Some(Error)
+source: Some("oxc")
+tags: None
+
+########### Code Actions/Commands
+
+########### Fix All Action
+None
+########## 
+Linted file: fixtures/lsp/invalid_syntax/invalid.vue
+----------
+########## Diagnostic Reports
+File URI: file://<variable>/fixtures/lsp/invalid_syntax/invalid.vue
+
+code: ""
+code_description.href: "None"
+message: "Missing initializer in const declaration\nhelp: Add an initializer (e.g. ` = undefined`) here"
+range: Range { start: Position { line: 2, character: 6 }, end: Position { line: 2, character: 13 } }
+related_information[0].message: ""
+related_information[0].location.uri: "file://<variable>/fixtures/lsp/invalid_syntax/invalid.vue"
+related_information[0].location.range: Range { start: Position { line: 2, character: 6 }, end: Position { line: 2, character: 13 } }
+severity: Some(Error)
+source: Some("oxc")
+tags: None
+
+########### Code Actions/Commands
+
+########### Fix All Action
+None
+########## 
+Linted file: fixtures/lsp/invalid_syntax/invalid.svelte
+----------
+########## Diagnostic Reports
+File URI: file://<variable>/fixtures/lsp/invalid_syntax/invalid.svelte
+
+code: "svelte(script_invalid_context)"
+code_description.href: "None"
+message: "script_invalid_context: If the context attribute is supplied, its value must be \"module\"\nhttps://svelte.dev/e/script_invalid_context"
+range: Range { start: Position { line: 0, character: 8 }, end: Position { line: 0, character: 28 } }
+related_information[0].message: "Svelte compiler error"
+related_information[0].location.uri: "file://<variable>/fixtures/lsp/invalid_syntax/invalid.svelte"
+related_information[0].location.range: Range { start: Position { line: 0, character: 8 }, end: Position { line: 0, character: 28 } }
+severity: Some(Error)
+source: Some("oxc")
+tags: None
+
+########### Code Actions/Commands
+CodeAction: 
+Title: Disable svelte/script_invalid_context for this line
+Is Preferred: Some(false)
+TextEdit: TextEdit {
+    range: Range {
+        start: Position {
+            line: 0,
+            character: 0,
+        },
+        end: Position {
+            line: 0,
+            character: 0,
+        },
+    },
+    new_text: "<!-- oxlint-disable-next-line svelte/script_invalid_context -->\n",
+}
+
+
+CodeAction: 
+Title: Disable svelte/script_invalid_context for this whole file
+Is Preferred: Some(false)
+TextEdit: TextEdit {
+    range: Range {
+        start: Position {
+            line: 0,
+            character: 0,
+        },
+        end: Position {
+            line: 0,
+            character: 0,
+        },
+    },
+    new_text: "<!-- oxlint-disable svelte/script_invalid_context -->\n",
+}
+
+
+########### Fix All Action
+None

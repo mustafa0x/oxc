@@ -5,13 +5,16 @@ use std::{
 
 use rustc_hash::FxHashSet;
 use schemars::{JsonSchema, r#gen, schema::Schema};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use oxc_config::GlobSet;
 
 use crate::{LintPlugins, OxlintEnv, OxlintGlobals, config::OxlintRules};
 
-use super::external_plugins::{ExternalPluginEntry, external_plugins_schema};
+use super::{
+    external_plugins::{ExternalPluginEntry, external_plugins_schema},
+    settings::OxlintSettings,
+};
 
 // nominal wrapper required to add JsonSchema impl
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
@@ -77,9 +80,9 @@ impl JsonSchema for OxlintOverrides {
     }
 }
 
-#[derive(Debug, Default, Clone, Deserialize, Serialize, JsonSchema)]
+#[derive(Debug, Default, Clone, Serialize, JsonSchema)]
 #[non_exhaustive]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[serde(rename_all = "camelCase")]
 pub struct OxlintOverride {
     /// A list of glob patterns to override.
     ///
@@ -103,6 +106,10 @@ pub struct OxlintOverride {
     /// Enabled or disabled specific global variables.
     pub globals: Option<OxlintGlobals>,
 
+    /// Plugin-specific configuration for both built-in and custom plugins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings: Option<OxlintSettings>,
+
     /// Optionally change what plugins are enabled for this override. When
     /// omitted, the base config's plugins are used.
     #[serde(default)]
@@ -118,10 +125,97 @@ pub struct OxlintOverride {
     #[schemars(schema_with = "external_plugins_schema")]
     pub external_plugins: Option<FxHashSet<ExternalPluginEntry>>,
 
+    /// Internal ID for `languageOptions` loaded from `oxlint.config.ts`.
+    #[serde(rename = "_languageOptionsId", default, skip_serializing_if = "Option::is_none")]
+    #[schemars(skip)]
+    pub language_options_id: Option<u32>,
+
+    /// Internal parser-presence flag for `languageOptions` loaded from `oxlint.config.ts`.
+    #[serde(
+        rename = "_languageOptionsHasParser",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schemars(skip)]
+    pub language_options_has_parser: Option<bool>,
+
     #[serde(default)]
     pub rules: OxlintRules,
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[expect(dead_code)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct PublicOxlintOverride {
+    pub files: GlobSet,
+    #[serde(default)]
+    pub exclude_files: GlobSet,
+    pub env: Option<OxlintEnv>,
+    pub globals: Option<OxlintGlobals>,
+    #[serde(default)]
+    pub settings: Option<OxlintSettings>,
+    #[serde(default)]
+    pub plugins: Option<LintPlugins>,
+    #[serde(rename = "jsPlugins", default)]
+    pub external_plugins: Option<FxHashSet<ExternalPluginEntry>>,
+    #[serde(default)]
+    pub rules: OxlintRules,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct InternalOxlintOverride {
+    pub files: GlobSet,
+    #[serde(default)]
+    pub exclude_files: GlobSet,
+    pub env: Option<OxlintEnv>,
+    pub globals: Option<OxlintGlobals>,
+    #[serde(default)]
+    pub settings: Option<OxlintSettings>,
+    #[serde(default)]
+    pub plugins: Option<LintPlugins>,
+    #[serde(rename = "jsPlugins", default)]
+    pub external_plugins: Option<FxHashSet<ExternalPluginEntry>>,
+    #[serde(rename = "_languageOptionsId", default)]
+    pub language_options_id: Option<u32>,
+    #[serde(rename = "_languageOptionsHasParser", default)]
+    pub language_options_has_parser: Option<bool>,
+    #[serde(default)]
+    pub rules: OxlintRules,
+}
+
+fn strip_internal_language_options_fields(value: &mut serde_json::Value) {
+    if let serde_json::Value::Object(object) = value {
+        object.remove("_languageOptionsId");
+        object.remove("_languageOptionsHasParser");
+    }
+}
+
+impl<'de> Deserialize<'de> for OxlintOverride {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw_value = serde_json::Value::deserialize(deserializer)?;
+        let mut public_value = raw_value.clone();
+        strip_internal_language_options_fields(&mut public_value);
+
+        let _: PublicOxlintOverride =
+            serde_json::from_value(public_value).map_err(serde::de::Error::custom)?;
+        let raw: InternalOxlintOverride =
+            serde_json::from_value(raw_value).map_err(serde::de::Error::custom)?;
+
+        Ok(Self {
+            files: raw.files,
+            exclude_files: raw.exclude_files,
+            env: raw.env,
+            globals: raw.globals,
+            settings: raw.settings,
+            plugins: raw.plugins,
+            external_plugins: raw.external_plugins,
+            language_options_id: raw.language_options_id,
+            language_options_has_parser: raw.language_options_has_parser,
+            rules: raw.rules,
+        })
+    }
+}
 #[cfg(test)]
 mod test {
     use crate::config::{globals::GlobalValue, plugins::LintPlugins};

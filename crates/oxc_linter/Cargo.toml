@@ -17,6 +17,7 @@ description.workspace = true
 default = []
 ruledocs = ["oxc_macros/ruledocs"] # Enables the `ruledocs` feature for conditional compilation
 force_test_reporter = []
+svelte-rsvelte-backend = ["dep:oxc_svelte_backend", "oxc_svelte_backend/rsvelte"]
 
 [lints]
 workspace = true
@@ -45,6 +46,7 @@ oxc_resolver = { workspace = true }
 oxc_semantic = { workspace = true, features = ["cfg", "linter"] }
 oxc_span = { workspace = true, features = ["schemars", "serialize"] }
 oxc_str = { workspace = true, features = ["serialize"] }
+oxc_svelte_backend = { path = "../oxc_svelte_backend", optional = true }
 oxc_syntax = { workspace = true, features = ["serialize"] }
 
 #

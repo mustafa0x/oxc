@@ -1,5 +1,18 @@
 // Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
 
+exports[`LSP linting > basic linting > should handle default/test.svelte 1`] = `
+"--- FILE -----------
+default/test.svelte
+--- Diagnostics ---------
+  3 | </script>
+  4 |
+> 5 | <script context="not-module"></script>
+    |         ^^^^^^^^^^^^^^^^^^^^ Error: script_invalid_context: If the context attribute is supplied, its value must be "module"
+https://svelte.dev/e/script_invalid_context
+  6 |
+--------------------"
+`;
+
 exports[`LSP linting > basic linting > should handle default/test.ts 1`] = `
 "--- FILE -----------
 default/test.ts
@@ -19,6 +32,20 @@ default/test.tsx
     | ^^^^^^^^^ Warning: \`debugger\` statement is not allowed
 help: Remove the debugger statement
   2 |
+--------------------"
+`;
+
+exports[`LSP linting > basic linting > should handle default/test-valid.svelte 1`] = `
+"--- FILE -----------
+default/test-valid.svelte
+--- Diagnostics ---------
+  1 | <script>
+> 2 | debugger;
+    | ^^^^^^^^^ Warning: \`debugger\` statement is not allowed
+help: Remove the debugger statement
+  3 | </script>
+  4 |
+  5 | <h1>Hello</h1>
 --------------------"
 `;
 
@@ -166,6 +193,25 @@ help: Remove the debugger statement
     |       ^^ Warning: Expected === and instead saw ==
 help: Prefer === operator
   3 | }
+  4 |
+--------------------"
+`;
+
+exports[`LSP linting > config options > should explicitly degrade type-aware Svelte linting 1`] = `
+"--- FILE -----------
+default/test-valid.svelte
+--- Diagnostics ---------
+  1 | <script>
+> 2 | debugger;
+    | ^^^^^^^^^ Warning: \`debugger\` statement is not allowed
+help: Remove the debugger statement
+  3 | </script>
+  4 |
+  5 | <h1>Hello</h1>
+--------------------> 1 | <script>
+    | ^ Information: Type-aware Svelte linting is not supported yet; this \`.svelte\` file is excluded from TypeScript type-aware checks and uses rsvelte syntax diagnostics plus non-type-aware linting.
+  2 | debugger;
+  3 | </script>
   4 |
 --------------------"
 `;

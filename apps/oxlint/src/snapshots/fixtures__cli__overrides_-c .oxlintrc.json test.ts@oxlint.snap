@@ -1,5 +1,6 @@
 ---
 source: apps/oxlint/src/tester.rs
+assertion_line: 142
 ---
 ########## 
 arguments: -c .oxlintrc.json test.ts

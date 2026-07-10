@@ -7,9 +7,18 @@
   "type": "module",
   "main": "dist/index.js",
   "imports": {
-    "#oxlint": "./dist/index.js",
-    "#oxlint/plugins": "./dist-pkg-plugins/index.js",
-    "#oxlint/plugins-dev": "./dist/plugins-dev.js"
+    "#oxlint": {
+      "code": "./src-js/index.ts",
+      "default": "./dist/index.js"
+    },
+    "#oxlint/plugins": {
+      "code": "./src-js/plugins.ts",
+      "default": "./dist-pkg-plugins/index.js"
+    },
+    "#oxlint/plugins-dev": {
+      "code": "./src-js/plugins-dev.ts",
+      "default": "./dist/plugins-dev.js"
+    }
   },
   "exports": {
     ".": {
@@ -29,11 +38,11 @@
     "build-napi": "napi build --esm --platform --js ./bindings.js --dts ./bindings.d.ts --output-dir src-js --no-dts-cache",
     "build-napi-test": "pnpm run build-napi --features testing --profile coverage",
     "build-napi-release": "pnpm run build-napi --release --features allocator",
-    "build-js": "node scripts/build.ts",
-    "generate-config-types": "node scripts/generate-config-types.ts",
-    "test": "vitest --dir ./test run",
+    "build-js": "node --experimental-strip-types scripts/build.ts",
+    "generate-config-types": "node --experimental-strip-types scripts/generate-config-types.ts",
+    "test": "vitest run",
     "init-conformance": "cd conformance; ./init.sh",
-    "conformance": "cross-env NODE_DISABLE_COLORS=1 tsx --conditions=code ./conformance/src/index.ts"
+    "conformance": "cross-env NODE_DISABLE_COLORS=1 CONFORMANCE=true tsx --conditions=code ./conformance/src/index.ts"
   },
   "devDependencies": {
     "@arethetypeswrong/core": "catalog:",

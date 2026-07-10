@@ -839,6 +839,7 @@ impl ServerLinter {
                         message_to_lsp_diagnostic(
                             message,
                             uri,
+                            path,
                             source_text,
                             self.rules_customization.as_ref(),
                         )
@@ -884,6 +885,31 @@ impl ServerLinter {
             return path.starts_with(&self.cwd);
         }
         false
+    }
+}
+
+fn is_svelte_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(std::ffi::OsStr::to_str)
+        .is_some_and(|extension| extension == "svelte")
+}
+
+fn type_aware_svelte_unsupported_report() -> DiagnosticReport {
+    let position = Position::new(0, 0);
+
+    DiagnosticReport {
+        diagnostic: Diagnostic {
+            range: Range::new(position, position),
+            severity: Some(DiagnosticSeverity::INFORMATION),
+            code: Some(NumberOrString::String("svelte-type-aware-unsupported".into())),
+            code_description: None,
+            source: Some("oxc".into()),
+            message: "Type-aware Svelte linting is not supported yet; this `.svelte` file is excluded from TypeScript type-aware checks and uses rsvelte syntax diagnostics plus non-type-aware linting.".into(),
+            related_information: None,
+            tags: None,
+            data: None,
+        },
+        code_action: None,
     }
 }
 
@@ -1386,8 +1412,11 @@ mod test {
 
     #[test]
     fn test_invalid_syntax_file() {
-        Tester::new("fixtures/lsp/invalid_syntax", json!({}))
-            .test_and_snapshot_multiple_file(&["debugger.ts", "invalid.vue"]);
+        Tester::new("fixtures/lsp/invalid_syntax", json!({})).test_and_snapshot_multiple_file(&[
+            "debugger.ts",
+            "invalid.vue",
+            "invalid.svelte",
+        ]);
     }
 
     #[test]
@@ -1497,7 +1526,7 @@ mod test {
     #[cfg(not(target_endian = "big"))]
     fn test_config_file_type_aware_used_when_lsp_not_set() {
         let tester = Tester::new("fixtures/lsp/tsgolint/type_aware_config", json!({}));
-        tester.test_and_snapshot_single_file("test.ts");
+        tester.test_and_snapshot_multiple_file(&["test.ts", "test.svelte"]);
     }
 
     #[test]

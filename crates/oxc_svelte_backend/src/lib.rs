@@ -1,0 +1,604 @@
+//! Feature-gated adapter for using rsvelte as Oxc's Svelte backend.
+//!
+//! This crate is intentionally small while the Phase 0 dependency spike is
+//! underway. Product crates should depend on this adapter rather than reaching
+//! into rsvelte directly.
+
+#[cfg(feature = "rsvelte")]
+mod rsvelte_backend {
+    use std::fmt;
+
+    use oxc_span::Span;
+    use svelte_compiler_rust::{
+        CompileOptions, GenerateMode, ParseOptions,
+        ast::{Fragment, Script, ScriptContext, TemplateNode, arena::SerializeArenaGuard},
+        compiler::phases::phase2_analyze::{AnalysisError, analyze_component},
+        compiler::phases::phase3_transform::{TransformError, transform_component},
+        error::ParseError,
+        parse,
+    };
+
+    /// Zero-based byte span plus one-based line / zero-based column positions.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct SvelteSourceRange {
+        pub span: Span,
+        pub start: SvelteSourcePosition,
+        pub end: SvelteSourcePosition,
+    }
+
+    impl SvelteSourceRange {
+        fn new(source: &str, start: u32, end: u32) -> Self {
+            Self {
+                span: Span::new(start, end),
+                start: source_position(source, start),
+                end: source_position(source, end),
+            }
+        }
+    }
+
+    /// Source position using rsvelte/Svelte line-column conventions.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct SvelteSourcePosition {
+        pub line: u32,
+        pub column: u32,
+    }
+
+    /// Svelte comment kind normalized for Oxc callers.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum SvelteCommentKind {
+        Html,
+        JsLine,
+        JsBlock,
+    }
+
+    /// Comment captured from either Svelte markup or embedded JavaScript.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct SvelteComment {
+        pub kind: SvelteCommentKind,
+        pub range: SvelteSourceRange,
+        pub text: String,
+    }
+
+    /// Svelte script block kind.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum SvelteScriptKind {
+        Instance,
+        Module,
+    }
+
+    /// Script tag metadata needed by linting and formatting entrypoints.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct SvelteScript {
+        pub kind: SvelteScriptKind,
+        pub tag_range: SvelteSourceRange,
+        pub body_range: SvelteSourceRange,
+        pub is_typescript: bool,
+    }
+
+    /// Parser warning emitted by rsvelte.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct SvelteParseWarning {
+        pub code: String,
+        pub message: String,
+        pub range: SvelteSourceRange,
+    }
+
+    /// Oxc-facing parse payload for `.svelte` files.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct SvelteParseResult {
+        pub scripts: Vec<SvelteScript>,
+        pub comments: Vec<SvelteComment>,
+        pub warnings: Vec<SvelteParseWarning>,
+        pub top_level_node_count: usize,
+    }
+
+    /// Oxc-facing parse error for `.svelte` files.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct SvelteParseError {
+        pub code: String,
+        pub message: String,
+        pub range: SvelteSourceRange,
+    }
+
+    impl fmt::Display for SvelteParseError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "{}: {}", self.code, self.message)
+        }
+    }
+
+    impl std::error::Error for SvelteParseError {}
+
+    /// Small, stable parse summary used by Phase 0 smoke tests.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct SvelteParseSummary {
+        pub has_instance_script: bool,
+        pub has_module_script: bool,
+        pub top_level_node_count: usize,
+        pub comment_count: usize,
+        pub warning_count: usize,
+    }
+
+    /// Parse Svelte source with rsvelte and return the Oxc-facing payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns the normalized rsvelte parse error when the source is invalid.
+    pub fn parse_svelte(source: &str) -> Result<SvelteParseResult, SvelteParseError> {
+        let mut root = parse(source, ParseOptions::default())
+            .map_err(|error| convert_parse_error(source, &error))?;
+        // SAFETY: `root.arena` lives until the guard is dropped at the end of this function.
+        let _arena_guard = unsafe { SerializeArenaGuard::new(&raw const root.arena) };
+
+        let mut scripts = Vec::with_capacity(2);
+        if let Some(script) = root.module.as_deref() {
+            scripts.push(convert_script(source, SvelteScriptKind::Module, script));
+        }
+        if let Some(script) = root.instance.as_deref() {
+            scripts.push(convert_script(source, SvelteScriptKind::Instance, script));
+        }
+        scripts.sort_by_key(|script| script.tag_range.span.start);
+
+        let mut comments = Vec::new();
+        for comment in &root.comments {
+            let kind = match comment.kind {
+                svelte_compiler_rust::ast::template::JsCommentKind::Line => {
+                    SvelteCommentKind::JsLine
+                }
+                svelte_compiler_rust::ast::template::JsCommentKind::Block => {
+                    SvelteCommentKind::JsBlock
+                }
+            };
+            comments.push(SvelteComment {
+                kind,
+                range: SvelteSourceRange::new(source, comment.start, comment.end),
+                text: comment.value.to_string(),
+            });
+        }
+        collect_html_comments(source, &root.fragment, &mut comments);
+        comments.sort_by_key(|comment| comment.range.span.start);
+
+        let compile_options = CompileOptions {
+            generate: GenerateMode::None,
+            enable_sourcemap: false,
+            ..CompileOptions::default()
+        };
+        let analysis = analyze_component(&mut root, source, &compile_options)
+            .map_err(|error| convert_analysis_error(source, &error))?;
+        let transform = transform_component(&analysis, &root, source, &compile_options)
+            .map_err(|error| convert_transform_error(source, &error))?;
+
+        Ok(SvelteParseResult {
+            scripts,
+            comments,
+            warnings: transform
+                .warnings
+                .into_iter()
+                .map(|warning| {
+                    let start = warning.start.unwrap_or(0);
+                    let end = warning.end.unwrap_or(start).max(start);
+                    SvelteParseWarning {
+                        code: warning.code,
+                        message: warning.message,
+                        range: SvelteSourceRange::new(source, start, end),
+                    }
+                })
+                .collect(),
+            top_level_node_count: root.fragment.nodes.len(),
+        })
+    }
+
+    /// Parse Svelte source with rsvelte and return a minimal Oxc-facing summary.
+    ///
+    /// # Errors
+    ///
+    /// Returns the normalized rsvelte parse error message when the source is invalid.
+    pub fn parse_svelte_summary(source: &str) -> Result<SvelteParseSummary, String> {
+        let parsed = parse_svelte(source).map_err(|error| error.to_string())?;
+
+        Ok(SvelteParseSummary {
+            has_instance_script: parsed
+                .scripts
+                .iter()
+                .any(|script| script.kind == SvelteScriptKind::Instance),
+            has_module_script: parsed
+                .scripts
+                .iter()
+                .any(|script| script.kind == SvelteScriptKind::Module),
+            top_level_node_count: parsed.top_level_node_count,
+            comment_count: parsed.comments.len(),
+            warning_count: parsed.warnings.len(),
+        })
+    }
+
+    /// Format Svelte source with rsvelte's formatter.
+    ///
+    /// # Errors
+    ///
+    /// Returns the rsvelte formatter error message when formatting fails.
+    pub fn format_svelte(source: &str) -> Result<String, String> {
+        format_svelte_with_options(source, rsvelte_formatter::JsFormatOptions::default())
+    }
+
+    /// Format Svelte source with rsvelte's formatter and Oxc JS options.
+    ///
+    /// # Errors
+    ///
+    /// Returns the rsvelte formatter error message when formatting fails.
+    pub fn format_svelte_with_options(
+        source: &str,
+        js_options: rsvelte_formatter::JsFormatOptions,
+    ) -> Result<String, String> {
+        format_svelte_with_options_and_indent(source, js_options, true)
+    }
+
+    /// Format Svelte source with Oxc JS options and script/style indentation control.
+    pub fn format_svelte_with_options_and_indent(
+        source: &str,
+        js_options: rsvelte_formatter::JsFormatOptions,
+        indent_script_and_style: bool,
+    ) -> Result<String, String> {
+        let options = rsvelte_formatter::FormatOptions {
+            js: js_options,
+            indent_script_and_style,
+            style_formatter: None,
+        };
+        rsvelte_formatter::format(source, &options).map_err(|error| error.to_string())
+    }
+
+    fn convert_script(source: &str, kind: SvelteScriptKind, script: &Script) -> SvelteScript {
+        let body_start = script.content_offset;
+        let body_end = find_script_body_end(source, body_start).unwrap_or(script.end);
+
+        debug_assert!(matches!(
+            (kind, script.context),
+            (SvelteScriptKind::Instance, ScriptContext::Default)
+                | (SvelteScriptKind::Module, ScriptContext::Module)
+        ));
+
+        SvelteScript {
+            kind,
+            tag_range: SvelteSourceRange::new(source, script.start, script.end),
+            body_range: SvelteSourceRange::new(source, body_start, body_end),
+            is_typescript: script.is_typescript,
+        }
+    }
+
+    fn find_script_body_end(source: &str, body_start: u32) -> Option<u32> {
+        let body_start = usize::try_from(body_start).ok()?;
+        let body = source.get(body_start..)?;
+        let close = body.find("</script")?;
+        u32::try_from(body_start + close).ok()
+    }
+
+    fn convert_parse_error(source: &str, error: &ParseError) -> SvelteParseError {
+        let (start, end) = error.span();
+        SvelteParseError {
+            code: parse_error_code(error).to_string(),
+            message: error.to_string(),
+            range: SvelteSourceRange::new(
+                source,
+                u32::try_from(start).unwrap_or(u32::MAX),
+                u32::try_from(end).unwrap_or(u32::MAX),
+            ),
+        }
+    }
+
+    fn convert_analysis_error(source: &str, error: &AnalysisError) -> SvelteParseError {
+        let (code, message) = match error {
+            AnalysisError::Scope(message) => ("scope_error", message.as_str()),
+            AnalysisError::Validation(message) => ("validation_error", message.as_str()),
+            AnalysisError::Css(message) => ("css_error", message.as_str()),
+            AnalysisError::ValidationWithCode { code, message } => {
+                (code.as_str(), message.as_str())
+            }
+        };
+
+        SvelteParseError {
+            code: code.to_string(),
+            message: message.to_string(),
+            range: SvelteSourceRange::new(
+                source,
+                0,
+                u32::try_from(source.len()).unwrap_or(u32::MAX),
+            ),
+        }
+    }
+
+    fn convert_transform_error(source: &str, error: &TransformError) -> SvelteParseError {
+        let code = match error {
+            TransformError::CodeGen(_) => "codegen_error",
+            TransformError::Css(_) => "css_transform_error",
+        };
+
+        SvelteParseError {
+            code: code.to_string(),
+            message: error.to_string(),
+            range: SvelteSourceRange::new(
+                source,
+                0,
+                u32::try_from(source.len()).unwrap_or(u32::MAX),
+            ),
+        }
+    }
+
+    fn parse_error_code(error: &ParseError) -> &str {
+        match error {
+            ParseError::UnexpectedEof { .. } => "unexpected_eof",
+            ParseError::UnexpectedToken { .. } => "unexpected_token",
+            ParseError::UnclosedElement { .. } => "unclosed_element",
+            ParseError::UnclosedBlock { .. } => "unclosed_block",
+            ParseError::InvalidAttribute { .. } => "invalid_attribute",
+            ParseError::InvalidExpression { .. } => "invalid_expression",
+            ParseError::Generic { .. } => "generic",
+            ParseError::SvelteError { code, .. } => code.as_str(),
+            ParseError::TypeScriptInvalidFeature { .. } => "typescript_invalid_feature",
+        }
+    }
+
+    fn collect_html_comments(source: &str, fragment: &Fragment, comments: &mut Vec<SvelteComment>) {
+        for node in &fragment.nodes {
+            collect_html_comments_from_node(source, node, comments);
+        }
+    }
+
+    fn collect_html_comments_from_node(
+        source: &str,
+        node: &TemplateNode,
+        comments: &mut Vec<SvelteComment>,
+    ) {
+        match node {
+            TemplateNode::Comment(comment) => comments.push(SvelteComment {
+                kind: SvelteCommentKind::Html,
+                range: SvelteSourceRange::new(source, comment.start, comment.end),
+                text: comment.data.to_string(),
+            }),
+            TemplateNode::IfBlock(block) => {
+                collect_html_comments(source, &block.consequent, comments);
+                if let Some(alternate) = &block.alternate {
+                    collect_html_comments(source, alternate, comments);
+                }
+            }
+            TemplateNode::EachBlock(block) => {
+                collect_html_comments(source, &block.body, comments);
+                if let Some(fallback) = &block.fallback {
+                    collect_html_comments(source, fallback, comments);
+                }
+            }
+            TemplateNode::AwaitBlock(block) => {
+                for fragment in [&block.pending, &block.then, &block.catch].into_iter().flatten() {
+                    collect_html_comments(source, fragment, comments);
+                }
+            }
+            TemplateNode::KeyBlock(block) => {
+                collect_html_comments(source, &block.fragment, comments);
+            }
+            TemplateNode::SnippetBlock(block) => {
+                collect_html_comments(source, &block.body, comments);
+            }
+            TemplateNode::RegularElement(element) => {
+                collect_html_comments(source, &element.fragment, comments);
+            }
+            TemplateNode::Component(element) => {
+                collect_html_comments(source, &element.fragment, comments);
+            }
+            TemplateNode::TitleElement(element) => {
+                collect_html_comments(source, &element.fragment, comments);
+            }
+            TemplateNode::SlotElement(element) => {
+                collect_html_comments(source, &element.fragment, comments);
+            }
+            TemplateNode::SvelteBody(element)
+            | TemplateNode::SvelteDocument(element)
+            | TemplateNode::SvelteFragment(element)
+            | TemplateNode::SvelteBoundary(element)
+            | TemplateNode::SvelteHead(element)
+            | TemplateNode::SvelteOptions(element)
+            | TemplateNode::SvelteSelf(element)
+            | TemplateNode::SvelteWindow(element) => {
+                collect_html_comments(source, &element.fragment, comments);
+            }
+            TemplateNode::SvelteComponent(element) => {
+                collect_html_comments(source, &element.fragment, comments);
+            }
+            TemplateNode::SvelteElement(element) => {
+                collect_html_comments(source, &element.fragment, comments);
+            }
+            TemplateNode::Text(_)
+            | TemplateNode::ExpressionTag(_)
+            | TemplateNode::HtmlTag(_)
+            | TemplateNode::ConstTag(_)
+            | TemplateNode::DeclarationTag(_)
+            | TemplateNode::DebugTag(_)
+            | TemplateNode::RenderTag(_)
+            | TemplateNode::AttachTag(_) => {}
+        }
+    }
+
+    fn source_position(source: &str, offset: u32) -> SvelteSourcePosition {
+        let mut line = 1;
+        let mut line_start = 0;
+        let offset = usize::try_from(offset).unwrap_or(usize::MAX).min(source.len());
+
+        for (index, byte) in source.bytes().enumerate() {
+            if index >= offset {
+                break;
+            }
+            if byte == b'\n' {
+                line += 1;
+                line_start = index + 1;
+            }
+        }
+
+        SvelteSourcePosition {
+            line,
+            column: u32::try_from(offset.saturating_sub(line_start)).unwrap_or(u32::MAX),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{
+            SvelteCommentKind, SvelteScriptKind, format_svelte, format_svelte_with_options,
+            parse_svelte, parse_svelte_summary,
+        };
+
+        #[test]
+        fn parses_svelte_component() {
+            let summary = parse_svelte_summary(
+                r"<script>let count=1;</script>
+<button>{count}</button>",
+            )
+            .expect("Svelte source should parse");
+
+            assert!(summary.has_instance_script);
+            assert!(!summary.has_module_script);
+            assert!(summary.top_level_node_count > 0);
+        }
+
+        #[test]
+        fn formats_svelte_script_body() {
+            let formatted =
+                format_svelte("<script>let count=1+2</script>\n<button>{count}</button>")
+                    .expect("Svelte source should format");
+
+            assert!(formatted.contains("let count = 1 + 2;"));
+            assert!(formatted.contains("<button>{count}</button>"));
+        }
+
+        #[test]
+        fn formats_svelte_script_body_with_js_options() {
+            let options = rsvelte_formatter::JsFormatOptions {
+                indent_width: rsvelte_formatter::IndentWidth::try_from(4).unwrap(),
+                ..rsvelte_formatter::JsFormatOptions::default()
+            };
+
+            let formatted = format_svelte_with_options(
+                "<script>let count=1+2;</script>\n<button>{count}</button>",
+                options,
+            )
+            .expect("Svelte source should format");
+
+            assert!(formatted.contains("    let count = 1 + 2;"));
+        }
+
+        #[test]
+        fn formats_svelte_module_syntax() {
+            let formatted = format_svelte(
+                r#"<script lang="ts">
+import { tick } from "svelte";
+interface Props { value: number }
+let { value }: Props = $props();
+</script>
+{#snippet render(node: unknown)}
+<button onclick={() => tick()}>{node ?? value}</button>
+{/snippet}
+{@render render(value)}"#,
+            )
+            .expect("Svelte module syntax should format");
+
+            assert!(formatted.contains("import { tick } from \"svelte\";"));
+            assert!(formatted.contains("interface Props"));
+            assert!(formatted.contains("{#snippet render(node: unknown)}"));
+        }
+
+        #[test]
+        fn formatted_svelte_with_components_reparses() {
+            let source = r#"<script>let items=[{id:1}]</script>
+<svelte:head><title>Example</title><meta name="description" content="test" /></svelte:head>
+{#each items as item (item.id)}
+<button onclick={()=>item.id++}><Icon value={item.id} /></button>
+{/each}"#;
+
+            let formatted = format_svelte_with_options(
+                source,
+                rsvelte_formatter::JsFormatOptions {
+                    semicolons: rsvelte_formatter::Semicolons::AsNeeded,
+                    ..rsvelte_formatter::JsFormatOptions::default()
+                },
+            )
+            .expect("Svelte source should format");
+
+            assert!(formatted.contains("<Icon value={item.id} />"));
+            assert!(!formatted.contains("__rsvelte_fmt_rhs__"));
+            parse_svelte(&formatted).expect("formatted Svelte source should reparse");
+        }
+
+        #[test]
+        fn parse_payload_includes_comments_and_script_ranges() {
+            let source = r#"<script context="module">
+// module comment
+export const answer=42;
+</script>
+<!-- template comment -->
+<script lang="ts">
+/* instance comment */
+let count:number=1;
+</script>
+<button>{count}</button>"#;
+
+            let parsed = parse_svelte(source).expect("Svelte source should parse");
+
+            assert_eq!(parsed.scripts.len(), 2);
+            assert_eq!(parsed.scripts[0].kind, SvelteScriptKind::Module);
+            assert_eq!(parsed.scripts[1].kind, SvelteScriptKind::Instance);
+            assert!(parsed.scripts[1].is_typescript);
+            assert_eq!(
+                &source[parsed.scripts[1].body_range.span],
+                "\n/* instance comment */\nlet count:number=1;\n"
+            );
+            assert!(parsed.comments.iter().any(|comment| {
+                comment.kind == SvelteCommentKind::Html && comment.text.trim() == "template comment"
+            }));
+            assert!(parsed.comments.iter().any(|comment| {
+                comment.kind == SvelteCommentKind::JsLine && comment.text.trim() == "module comment"
+            }));
+            assert!(parsed.comments.iter().any(|comment| {
+                comment.kind == SvelteCommentKind::JsBlock
+                    && comment.text.trim() == "instance comment"
+            }));
+        }
+
+        #[test]
+        fn parse_payload_includes_analysis_warnings() {
+            let source = r#"<a href="javascript:void(0)">unsafe</a>"#;
+            let parsed = parse_svelte(source).expect("Svelte source should analyze");
+            let warning = parsed
+                .warnings
+                .iter()
+                .find(|warning| warning.code == "a11y_invalid_attribute")
+                .expect("rsvelte should report the unsafe href");
+
+            assert!(warning.range.span.end <= u32::try_from(source.len()).unwrap());
+        }
+
+        #[test]
+        fn analysis_errors_include_svelte_code_and_stable_range() {
+            let source = r#"<svelte:component foo="bar"/>"#;
+            let error = parse_svelte(source).expect_err("Svelte analysis should fail");
+
+            assert_eq!(error.code, "svelte_component_missing_this");
+            assert_eq!(
+                error.range.span,
+                oxc_span::Span::new(0, u32::try_from(source.len()).unwrap())
+            );
+        }
+
+        #[test]
+        fn parse_error_includes_code_and_range() {
+            let source = r#"<script context="not-module"></script>"#;
+            let error = parse_svelte(source).expect_err("Svelte source should fail to parse");
+
+            assert_eq!(error.code, "script_invalid_context");
+            assert!(error.range.span.start <= error.range.span.end);
+            assert_eq!(error.range.start.line, 1);
+        }
+    }
+}
+
+#[cfg(feature = "rsvelte")]
+pub use rsvelte_backend::{
+    SvelteComment, SvelteCommentKind, SvelteParseError, SvelteParseResult, SvelteParseSummary,
+    SvelteParseWarning, SvelteScript, SvelteScriptKind, SvelteSourcePosition, SvelteSourceRange,
+    format_svelte, format_svelte_with_options, format_svelte_with_options_and_indent, parse_svelte,
+    parse_svelte_summary,
+};

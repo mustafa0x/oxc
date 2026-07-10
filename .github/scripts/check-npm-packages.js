@@ -7,7 +7,7 @@ const path = require("path");
 
 /**
  * Check npm packages before publishing
- * Usage: node check-npm-packages.js <package_dir_pattern> [root_package_path]
+ * Usage: node check-npm-packages.js [--skip-existence-check] <package_dir_pattern> [root_package_path]
  * Example: node check-npm-packages.js "npm/oxlint*"
  * Example: node check-npm-packages.js "release-dir/*" "napi/parser"
  */
@@ -158,7 +158,9 @@ function checkPackage(packageDir, skipExistenceCheck = false) {
 }
 
 function main() {
-  const args = process.argv.slice(2);
+  const rawArgs = process.argv.slice(2);
+  const skipExistenceCheck = rawArgs.includes("--skip-existence-check");
+  const args = rawArgs.filter((arg) => arg !== "--skip-existence-check");
 
   if (args.length === 0) {
     console.error("Usage: node check-npm-packages.js <package_dir_pattern> [root_package_path]");
@@ -185,7 +187,7 @@ function main() {
 
   // Check subpackages
   for (const packageDir of packageDirs) {
-    if (!checkPackage(packageDir)) {
+    if (!checkPackage(packageDir, skipExistenceCheck)) {
       exitCode = 1;
     }
   }

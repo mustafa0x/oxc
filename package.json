@@ -8,7 +8,9 @@
     "build-wasm-dev": "pnpm --workspace-concurrency=1 --filter \"./napi/*\" build-wasm-dev",
     "test": "pnpm --workspace-concurrency=1 --filter \"./napi/*\" --filter \"./apps/*\" --filter \"./packages/*\" test",
     "fmt": "oxfmt -c oxfmtrc.jsonc",
-    "lint": "oxlint -c oxlintrc.json --deny-warnings --report-unused-disable-directives"
+    "lint": "oxlint -c oxlintrc.json --deny-warnings --report-unused-disable-directives",
+    "prepare:fork-publish": "node ./scripts/prepare-fork-publish.mjs",
+    "bootstrap:fork-trusted-publish": "node ./scripts/bootstrap-fork-trusted-publish.mjs"
   },
   "devDependencies": {
     "@napi-rs/cli": "catalog:",

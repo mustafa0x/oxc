@@ -149,6 +149,12 @@ pub fn to_prettier(config: &FormatConfig) -> Value {
     if let Some(v) = config.vue_indent_script_and_style {
         obj.insert("vueIndentScriptAndStyle".to_string(), Value::from(v));
     }
+    if let Some(plugins) = &config.plugins {
+        obj.insert(
+            "plugins".to_string(),
+            Value::Array(plugins.iter().map(|plugin| Value::from(plugin.clone())).collect()),
+        );
+    }
 
     Value::Object(obj)
 }

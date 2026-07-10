@@ -1,9 +1,9 @@
 // Auto-generated code, DO NOT EDIT DIRECTLY!
 // To edit this generated file you have to edit `tasks/ast_tools/src/generators/raw_transfer.rs`.
 
-import { tokens, initTokens } from "../plugins/tokens.js";
-import { comments, initComments } from "../plugins/comments.js";
-import { getNodeLoc } from "../plugins/location.js";
+import { tokens, initTokens } from "../plugins/tokens.ts";
+import { comments, initComments } from "../plugins/comments.ts";
+import { getNodeLoc } from "../plugins/location.ts";
 
 let uint8,
   int32,

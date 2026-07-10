@@ -13,14 +13,35 @@
  */
 
 import type { Options, Plugin } from "prettier";
+import { createRequire } from "node:module";
+import { dirname, isAbsolute, join } from "node:path";
+import { pathToFileURL } from "node:url";
+import { getRegisteredPlugin } from "../plugin_registry";
 
 const CACHES = {
   prettier: null as typeof import("prettier") | null,
-  sveltePlugin: null as Plugin | null,
   tailwindPlugin: null as typeof import("prettier-plugin-tailwindcss") | null,
   tailwindSorter: null as typeof import("prettier-plugin-tailwindcss/sorter") | null,
   oxfmtPlugin: null as Plugin | null,
 };
+
+type ExternalPluginLanguage = {
+  parsers?: string[];
+  extensions?: string[];
+  filenames?: string[];
+};
+
+type ExternalPlugin = Plugin & {
+  languages?: ExternalPluginLanguage[];
+};
+
+type ExternalPluginSpecifier = {
+  spec: string;
+  resolveFrom?: string;
+};
+
+const externalPluginCache = new Map<string, ExternalPlugin>();
+const EXTERNAL_PLUGIN_SPEC_WITH_RESOLVE_FROM_PREFIX = "__OXFMT_PLUGIN_SPEC__";
 
 async function loadCached<K extends keyof typeof CACHES>(
   key: K,
@@ -84,9 +105,9 @@ export type FormatFileParam = {
 export async function formatFile({ code, options }: FormatFileParam): Promise<string> {
   const prettier = CACHES.prettier ?? (await loadPrettier());
 
+  await resolvePluginSpecs(options);
+
   // NOTE: Plugins order matters here!
-  // This plugin add `svelte` parser to support for `.svelte` files, and is also needed for `svelte-in-md` to work
-  if ("_useSveltePlugin" in options) await setupSveltePlugin(options);
   // Enable Tailwind CSS plugin, this plugin transforms `parsers` already installed by prior plugins
   if ("_useTailwindPlugin" in options) await setupTailwindPlugin(options);
   // This plugin overrides `babel(-ts)` and `typescript` parsers to use `oxc_formatter` instead of built-in parsers
@@ -144,6 +165,8 @@ export async function formatEmbeddedCode({
 }: FormatEmbeddedCodeParam): Promise<string> {
   const prettier = CACHES.prettier ?? (await loadPrettier());
 
+  await resolvePluginSpecs(options);
+
   // Enable Tailwind CSS plugin for embedded code (e.g., html`...` in JS) if needed
   if ("_useTailwindPlugin" in options) await setupTailwindPlugin(options);
 
@@ -172,6 +195,8 @@ export async function formatEmbeddedDoc({
   options,
 }: FormatEmbeddedDocParam): Promise<string> {
   const prettier = CACHES.prettier ?? (await loadPrettier());
+
+  await resolvePluginSpecs(options);
 
   // Enable Tailwind CSS plugin for embedded code (e.g., html`...` in JS) if needed
   if ("_useTailwindPlugin" in options) await setupTailwindPlugin(options);
@@ -269,22 +294,6 @@ export async function sortTailwindClasses({
   });
 
   return sorter.sortClassAttributes(classes);
-}
-
-// ---
-// Svelte plugin support
-// ---
-
-/**
- * Load prettier-plugin-svelte to provide the `svelte` parser.
- */
-async function setupSveltePlugin(options: Options): Promise<void> {
-  CACHES.sveltePlugin ??= await loadCached(
-    "sveltePlugin",
-    async () => (await import("prettier-plugin-svelte")) as Plugin,
-  );
-  options.plugins ??= [];
-  options.plugins.push(CACHES.sveltePlugin);
 }
 
 // ---

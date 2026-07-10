@@ -9,6 +9,8 @@ describe("LSP linting", () => {
     it.each([
       ["default/test.tsx", "typescriptreact"],
       ["default/test.ts", "typescript"],
+      ["default/test-valid.svelte", "svelte"],
+      ["default/test.svelte", "svelte"],
     ])("should handle %s", async (path, languageId) => {
       expect(await lintFixture(FIXTURES_DIR, path, languageId)).toMatchSnapshot();
     });
@@ -40,6 +42,14 @@ describe("LSP linting", () => {
             typeAware: false,
           },
         ),
+      ).toMatchSnapshot();
+    });
+
+    it("should explicitly degrade type-aware Svelte linting", async () => {
+      expect(
+        await lintFixture(FIXTURES_DIR, "default/test-valid.svelte", "svelte", {
+          typeAware: true,
+        }),
       ).toMatchSnapshot();
     });
   });

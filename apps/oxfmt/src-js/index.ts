@@ -7,6 +7,7 @@ import {
   sortTailwindClasses,
 } from "./libs/apis";
 import { toFormatFileResult, toNullable } from "./libs/napi-callbacks";
+import { normalizePluginObjectsForRust } from "./plugin_registry";
 // Types are auto-generated from the JSON Schema.
 import type {
   Oxfmtrc,
@@ -86,11 +87,13 @@ export async function format(fileName: string, sourceText: string, options?: For
   if (typeof fileName !== "string") throw new TypeError("`fileName` must be a string");
   if (typeof sourceText !== "string") throw new TypeError("`sourceText` must be a string");
 
+  const normalizedOptions = normalizePluginObjectsForRust(options ?? {});
+
   BINDINGS_CACHE ??= await import("./bindings");
   return BINDINGS_CACHE.format(
     fileName,
     sourceText,
-    options ?? {},
+    normalizedOptions,
     (options, code) => toFormatFileResult(formatFile({ options, code })),
     (options, code) => toNullable(formatEmbeddedCode({ options, code })),
     (options, code) => toNullable(formatEmbeddedDoc({ options, code })),

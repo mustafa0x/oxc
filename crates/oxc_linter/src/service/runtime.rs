@@ -26,15 +26,22 @@ use oxc_resolver::Resolver;
 use oxc_semantic::{Semantic, SemanticBuilder};
 use oxc_span::{SourceType, VALID_EXTENSIONS};
 use oxc_str::CompactStr;
+#[cfg(feature = "svelte-rsvelte-backend")]
+use oxc_svelte_backend::{SvelteCommentKind, parse_svelte};
 
 use crate::{
-    Fixer, Linter, Message, PossibleFixes, RuleTimingStore,
+    AllowWarnDeny, Fixer, Linter, Message, MessageRule, PossibleFixes, RuleTimingStore,
     context::{ContextSubHost, ContextSubHostOptions},
-    disable_directives::DisableDirectives,
+    disable_directives::{DisableDirectives, create_unused_directives_diagnostics},
     loader::{JavaScriptSource, LINT_PARTIAL_LOADER_EXTENSIONS, PartialLoader},
     module_record::ModuleRecord,
     suppression::DiffManager,
     utils::read_to_arena_str,
+};
+#[cfg(feature = "svelte-rsvelte-backend")]
+use crate::{
+    disable_directives::{DisableDirectivesBuilder, RawDirectiveComment},
+    loader::SveltePartialLoader,
 };
 
 use super::LintServiceOptions;
@@ -94,6 +101,9 @@ struct ProcessedModule<'alloc_pool> {
     /// Note that `content` is `Some` even if parsing is unsuccessful as long as the source to lint is valid utf-8.
     /// It is designed this way to cover the case where some but not all the sections fail to parse.
     content: Option<ModuleContent<'alloc_pool>>,
+
+    /// Disable directives collected from the full source file outside JavaScript sections.
+    full_file_disable_directives: Option<DisableDirectives>,
 }
 
 struct ResolvedModuleRequest {
@@ -149,6 +159,7 @@ struct ModuleToLint<'alloc_pool> {
     path: Arc<OsStr>,
     section_module_records: SmallVec<[Result<Arc<ModuleRecord>, Vec<OxcDiagnostic>>; 1]>,
     content: ModuleContent<'alloc_pool>,
+    full_file_disable_directives: Option<DisableDirectives>,
 }
 impl<'alloc_pool> ModuleToLint<'alloc_pool> {
     fn from_processed_module(
@@ -163,8 +174,14 @@ impl<'alloc_pool> ModuleToLint<'alloc_pool> {
                 .map(|record_result| record_result.map(|ok| ok.module_record))
                 .collect(),
             content,
+            full_file_disable_directives: processed_module.full_file_disable_directives,
         })
     }
+}
+
+struct ProcessedSource {
+    section_module_records: SmallVec<[Result<ResolvedModuleRecord, Vec<OxcDiagnostic>>; 1]>,
+    full_file_disable_directives: Option<DisableDirectives>,
 }
 
 /// A simple trait for the `Runtime` to load and save file from a filesystem
@@ -350,6 +367,147 @@ impl Runtime {
             Ok(source_text) => Ok((source_type, source_text)),
             Err(e) => Err(e),
         })
+    }
+
+    #[cfg(feature = "svelte-rsvelte-backend")]
+    fn build_svelte_html_disable_directives(
+        source_text: &str,
+        spans: impl IntoIterator<Item = oxc_span::Span>,
+        respect_eslint_disable_directives: bool,
+    ) -> Option<DisableDirectives> {
+        let raw_comments = spans
+            .into_iter()
+            .filter_map(|span| {
+                let raw_text = source_text.get(span.start as usize..span.end as usize)?;
+                let content_start = raw_text.starts_with("<!--").then_some(span.start + 4)?;
+                let content_end = raw_text.ends_with("-->").then_some(span.end - 3)?;
+                let content_span = oxc_span::Span::new(content_start, content_end);
+                let text = source_text.get(content_start as usize..content_end as usize)?;
+
+                Some(RawDirectiveComment { span, content_span: Some(content_span), text })
+            })
+            .collect::<Vec<_>>();
+
+        if raw_comments.is_empty() {
+            return None;
+        }
+
+        let directives = DisableDirectivesBuilder::new()
+            .with_respect_eslint_disable_directives(respect_eslint_disable_directives)
+            .build_raw_comments(source_text, &raw_comments);
+        if directives.disable_rule_comments().is_empty()
+            && directives.unused_enable_comments().is_empty()
+        {
+            None
+        } else {
+            Some(directives)
+        }
+    }
+
+    #[cfg(feature = "svelte-rsvelte-backend")]
+    fn scan_svelte_html_disable_directives(
+        source_text: &str,
+        respect_eslint_disable_directives: bool,
+    ) -> Option<DisableDirectives> {
+        let mut spans = Vec::new();
+        let mut search_start = 0;
+
+        while let Some(open_offset) = source_text[search_start..].find("<!--") {
+            let start = search_start + open_offset;
+            let content_start = start + 4;
+            let Some(close_offset) = source_text[content_start..].find("-->") else {
+                break;
+            };
+            let end = content_start + close_offset + 3;
+            let (Ok(start_span), Ok(end_span)) = (u32::try_from(start), u32::try_from(end)) else {
+                break;
+            };
+            spans.push(oxc_span::Span::new(start_span, end_span));
+            search_start = end;
+        }
+
+        Self::build_svelte_html_disable_directives(
+            source_text,
+            spans,
+            respect_eslint_disable_directives,
+        )
+    }
+
+    fn filter_diagnostics_with_full_file_disable_directives(
+        diagnostics: &mut Vec<OxcDiagnostic>,
+        directives: Option<&DisableDirectives>,
+    ) {
+        let Some(directives) = directives else {
+            return;
+        };
+
+        diagnostics.retain(|diagnostic| {
+            let message = Message::new(diagnostic.clone(), PossibleFixes::None);
+            !Self::message_disabled_by_full_file_directives(&message, directives)
+        });
+    }
+
+    fn filter_messages_with_full_file_disable_directives(
+        messages: &mut Vec<Message>,
+        directives: Option<&DisableDirectives>,
+    ) {
+        let Some(directives) = directives else {
+            return;
+        };
+
+        messages
+            .retain(|message| !Self::message_disabled_by_full_file_directives(message, directives));
+    }
+
+    fn message_disabled_by_full_file_directives(
+        message: &Message,
+        directives: &DisableDirectives,
+    ) -> bool {
+        let Some(rule_name) = Self::message_rule_name(message) else {
+            return false;
+        };
+
+        directives.contains(&rule_name, message.span)
+    }
+
+    fn message_rule_name(message: &Message) -> Option<Cow<'_, str>> {
+        if let Some(MessageRule { plugin_name, rule_name }) = message.rule.as_ref() {
+            return if plugin_name == "eslint" {
+                Some(Cow::Borrowed(rule_name.as_ref()))
+            } else {
+                Some(Cow::Owned(format!("{plugin_name}/{rule_name}")))
+            };
+        }
+
+        let scope = message.error.code.scope.as_ref()?;
+        let number = message.error.code.number.as_ref()?;
+        if scope == "eslint" {
+            Some(Cow::Borrowed(number.as_ref()))
+        } else {
+            Some(Cow::Owned(format!("{scope}/{number}")))
+        }
+    }
+
+    fn report_unused_full_file_disable_directives(
+        messages: &mut Vec<Message>,
+        directives: Option<&DisableDirectives>,
+        report_unused_directive: Option<AllowWarnDeny>,
+    ) {
+        let Some(directives) = directives else {
+            return;
+        };
+        let Some(severity) = report_unused_directive else {
+            return;
+        };
+        if !severity.is_warn_deny() {
+            return;
+        }
+
+        messages.extend(
+            create_unused_directives_diagnostics(directives, severity)
+                .into_iter()
+                .map(|diagnostic| Message::new(diagnostic, PossibleFixes::None)),
+        );
     }
 
     /// Prepare entry modules for linting.
@@ -652,7 +810,11 @@ impl Runtime {
                                         ..Default::default()
                                     },
                                 )),
-                                Err(messages) => {
+                                Err(mut messages) => {
+                                    Self::filter_diagnostics_with_full_file_disable_directives(
+                                        &mut messages,
+                                        module_to_lint.full_file_disable_directives.as_ref(),
+                                    );
                                     if !messages.is_empty() {
                                         let diagnostics = DiagnosticService::wrap_diagnostics(
                                             &me.cwd,
@@ -668,6 +830,55 @@ impl Runtime {
                             .collect();
 
                         if context_sub_hosts.is_empty() {
+                            let mut messages = me.linter.run_external_only_on_source_text(
+                                path,
+                                dep.source_text,
+                                allocator_guard,
+                            );
+                            Self::filter_messages_with_full_file_disable_directives(
+                                &mut messages,
+                                module_to_lint.full_file_disable_directives.as_ref(),
+                            );
+                            Self::report_unused_full_file_disable_directives(
+                                &mut messages,
+                                module_to_lint.full_file_disable_directives.as_ref(),
+                                me.linter.options().report_unused_directive,
+                            );
+
+                            if me.linter.options().fix.is_some() {
+                                let fix_result = Fixer::new(
+                                    dep.source_text,
+                                    messages,
+                                    SourceType::from_path(path).ok().map(|st| {
+                                        if st.is_javascript() { st.with_jsx(true) } else { st }
+                                    }),
+                                )
+                                .fix();
+                                if fix_result.fixed {
+                                    let start = 0;
+                                    let end = start + dep.source_text.len();
+                                    new_source_text
+                                        .to_mut()
+                                        .replace_range(start..end, &fix_result.fixed_code);
+                                }
+                                messages = fix_result.messages;
+                            }
+
+                            if !messages.is_empty() {
+                                let errors = messages.into_iter().map(Into::into).collect();
+                                let diagnostics = DiagnosticService::wrap_diagnostics(
+                                    &me.cwd,
+                                    path,
+                                    dep.source_text,
+                                    errors,
+                                );
+                                tx_error.send(diagnostics).unwrap();
+                            }
+
+                            if let Cow::Owned(new_source_text) = &new_source_text {
+                                file_system.write_file(path, new_source_text).unwrap();
+                            }
+
                             return;
                         }
 
@@ -678,7 +889,17 @@ impl Runtime {
                                 allocator_guard,
                                 me.js_allocator_pool(),
                                 rule_timing_store,
+                                Some(dep.source_text),
                             );
+                        Self::filter_messages_with_full_file_disable_directives(
+                            &mut messages,
+                            module_to_lint.full_file_disable_directives.as_ref(),
+                        );
+                        Self::report_unused_full_file_disable_directives(
+                            &mut messages,
+                            module_to_lint.full_file_disable_directives.as_ref(),
+                            me.linter.options().report_unused_directive,
+                        );
 
                         // Store the disable directives for this file
                         if let Some(disable_directives) = disable_directives {
@@ -769,11 +990,11 @@ impl Runtime {
                 |me, mut module_to_lint| {
                     module_to_lint.content.with_dependent_mut(
                         |allocator_guard,
-                         ModuleContentDependent { source_text: _, section_contents }| {
-                            assert_eq!(
-                                module_to_lint.section_module_records.len(),
-                                section_contents.len()
-                            );
+                         ModuleContentDependent { source_text, section_contents }| {
+                        assert_eq!(
+                            module_to_lint.section_module_records.len(),
+                            section_contents.len()
+                        );
 
                             let respect_eslint_disable_directives =
                                 me.linter.respect_eslint_disable_directives();
@@ -794,32 +1015,63 @@ impl Runtime {
                                         },
                                     )),
                                     Err(diagnostics) => {
-                                        if !diagnostics.is_empty() {
-                                            messages.lock().unwrap().extend(
-                                                diagnostics.into_iter().map(|diagnostic| {
-                                                    Message::new(diagnostic, PossibleFixes::None)
-                                                }),
-                                            );
-                                        }
+                                        let mut section_messages = diagnostics
+                                            .into_iter()
+                                            .map(|diagnostic| {
+                                                Message::new(diagnostic, PossibleFixes::None)
+                                            })
+                                            .collect::<Vec<_>>();
+                                        Self::filter_messages_with_full_file_disable_directives(
+                                            &mut section_messages,
+                                            module_to_lint
+                                                .full_file_disable_directives
+                                                .as_ref(),
+                                        );
+                                        messages.lock().unwrap().extend(section_messages);
                                         None
                                     }
                                 })
                                 .collect();
 
-                            if context_sub_hosts.is_empty() {
-                                return;
-                            }
-
                             let path = Path::new(&module_to_lint.path);
 
-                            let (section_messages, disable_directives) =
+                        if context_sub_hosts.is_empty() {
+                            let mut section_messages = me.linter.run_external_only_on_source_text(
+                                path,
+                                source_text,
+                                allocator_guard,
+                            );
+                            Self::filter_messages_with_full_file_disable_directives(
+                                &mut section_messages,
+                                module_to_lint.full_file_disable_directives.as_ref(),
+                            );
+                            Self::report_unused_full_file_disable_directives(
+                                &mut section_messages,
+                                module_to_lint.full_file_disable_directives.as_ref(),
+                                me.linter.options().report_unused_directive,
+                            );
+                            messages.lock().unwrap().extend(section_messages);
+                            return;
+                        }
+
+                            let (mut section_messages, disable_directives) =
                                 me.linter.run_with_disable_directives::<false>(
-                                    path,
-                                    context_sub_hosts,
-                                    allocator_guard,
-                                    me.js_allocator_pool(),
-                                    None,
-                                );
+                                path,
+                                context_sub_hosts,
+                                allocator_guard,
+                                me.js_allocator_pool(),
+                                None,
+                                Some(source_text),
+                            );
+                            Self::filter_messages_with_full_file_disable_directives(
+                                &mut section_messages,
+                                module_to_lint.full_file_disable_directives.as_ref(),
+                            );
+                            Self::report_unused_full_file_disable_directives(
+                                &mut section_messages,
+                                module_to_lint.full_file_disable_directives.as_ref(),
+                                me.linter.options().report_unused_directive,
+                            );
 
                             if let Some(disable_directives) = disable_directives {
                                 me.disable_directives_map
@@ -870,7 +1122,11 @@ impl Runtime {
                             {
                                 match record_result {
                                     Ok(_) => {}
-                                    Err(diagnostics) => {
+                                    Err(mut diagnostics) => {
+                                        Self::filter_diagnostics_with_full_file_disable_directives(
+                                            &mut diagnostics,
+                                            module_to_lint.full_file_disable_directives.as_ref(),
+                                        );
                                         if !diagnostics.is_empty() {
                                             let wrapped = DiagnosticService::wrap_diagnostics(
                                                 &me.cwd,
@@ -913,7 +1169,7 @@ impl Runtime {
                 Some(tx_error),
                 |me, mut module| {
                     module.content.with_dependent_mut(|allocator_guard, ModuleContentDependent {
-                        source_text: _,
+                        source_text,
                         section_contents,
                     }| {
                         assert_eq!(module.section_module_records.len(), section_contents.len());
@@ -937,25 +1193,59 @@ impl Runtime {
                                     },
                                 )),
                                 Err(errors) => {
-                                    if !errors.is_empty() {
-                                        messages.lock().unwrap().extend(
-                                            errors.into_iter().map(|err| {
-                                                Message::new(err, PossibleFixes::None)
-                                            }),
-                                        );
-                                    }
+                                    let mut section_messages = errors
+                                        .into_iter()
+                                        .map(|err| Message::new(err, PossibleFixes::None))
+                                        .collect::<Vec<_>>();
+                                    Self::filter_messages_with_full_file_disable_directives(
+                                        &mut section_messages,
+                                        module.full_file_disable_directives.as_ref(),
+                                    );
+                                    messages.lock().unwrap().extend(section_messages);
                                     None
                                 }
                             })
                             .collect();
 
                         if context_sub_hosts.is_empty() {
+                            let mut section_messages = me.linter.run_external_only_on_source_text(
+                                Path::new(&module.path),
+                                source_text,
+                                allocator_guard,
+                            );
+                            Self::filter_messages_with_full_file_disable_directives(
+                                &mut section_messages,
+                                module.full_file_disable_directives.as_ref(),
+                            );
+                            Self::report_unused_full_file_disable_directives(
+                                &mut section_messages,
+                                module.full_file_disable_directives.as_ref(),
+                                me.linter.options().report_unused_directive,
+                            );
+                            messages.lock().unwrap().extend(section_messages);
                             return;
                         }
 
-                        messages.lock().unwrap().extend(
-                            me.linter.run(Path::new(&module.path), context_sub_hosts, allocator_guard),
+                        let mut section_messages =
+                            me.linter.run_with_disable_directives::<false>(
+                                Path::new(&module.path),
+                                context_sub_hosts,
+                                allocator_guard,
+                                None,
+                                None,
+                                Some(source_text),
+                            )
+                            .0;
+                        Self::filter_messages_with_full_file_disable_directives(
+                            &mut section_messages,
+                            module.full_file_disable_directives.as_ref(),
                         );
+                        Self::report_unused_full_file_disable_directives(
+                            &mut section_messages,
+                            module.full_file_disable_directives.as_ref(),
+                            me.linter.options().report_unused_directive,
+                        );
+                        messages.lock().unwrap().extend(section_messages);
                     });
                 },
             );
@@ -997,8 +1287,10 @@ impl Runtime {
         let allocator_guard = self.allocator_pool.get();
 
         if paths.contains(path) {
-            let mut records =
-                SmallVec::<[Result<ResolvedModuleRecord, Vec<OxcDiagnostic>>; 1]>::new();
+            let mut processed_source = ProcessedSource {
+                section_module_records: SmallVec::new(),
+                full_file_disable_directives: None,
+            };
 
             let module_content = ModuleContent::try_new(allocator_guard, |allocator_guard| {
                 let allocator = &**allocator_guard;
@@ -1020,7 +1312,7 @@ impl Runtime {
                 };
 
                 let mut section_contents = SmallVec::new();
-                records = self.process_source(
+                processed_source = self.process_source(
                     Path::new(path),
                     ext,
                     check_syntax_errors,
@@ -1034,7 +1326,11 @@ impl Runtime {
             });
             let module_content = module_content.ok()?;
 
-            Some(ProcessedModule { section_module_records: records, content: Some(module_content) })
+            Some(ProcessedModule {
+                section_module_records: processed_source.section_module_records,
+                content: Some(module_content),
+                full_file_disable_directives: processed_source.full_file_disable_directives,
+            })
         } else {
             let allocator = &*allocator_guard;
 
@@ -1050,7 +1346,7 @@ impl Runtime {
                 }
             };
 
-            let records = self.process_source(
+            let processed_source = self.process_source(
                 Path::new(path),
                 ext,
                 check_syntax_errors,
@@ -1060,7 +1356,11 @@ impl Runtime {
                 None,
             );
 
-            Some(ProcessedModule { section_module_records: records, content: None })
+            Some(ProcessedModule {
+                section_module_records: processed_source.section_module_records,
+                content: None,
+                full_file_disable_directives: processed_source.full_file_disable_directives,
+            })
         }
     }
 
@@ -1074,13 +1374,106 @@ impl Runtime {
         source_text: &'a str,
         allocator: &'a Allocator,
         mut out_sections: Option<&mut SectionContents<'a>>,
-    ) -> SmallVec<[Result<ResolvedModuleRecord, Vec<OxcDiagnostic>>; 1]> {
-        let section_sources = PartialLoader::parse(ext, source_text)
-            .unwrap_or_else(|| vec![JavaScriptSource::partial(source_text, source_type, 0)]);
+    ) -> ProcessedSource {
+        #[cfg_attr(not(feature = "svelte-rsvelte-backend"), expect(unused_mut))]
+        let mut full_file_disable_directives = None;
+        #[cfg(feature = "svelte-rsvelte-backend")]
+        let mut svelte_section_sources = None;
+        #[cfg(feature = "svelte-rsvelte-backend")]
+        let mut svelte_diagnostics = None;
+
+        #[cfg(feature = "svelte-rsvelte-backend")]
+        if ext == "svelte" {
+            let parsed = parse_svelte(source_text);
+            let respect_eslint_disable_directives = self.linter.respect_eslint_disable_directives();
+            full_file_disable_directives = match parsed.as_ref() {
+                Ok(parsed) => Self::build_svelte_html_disable_directives(
+                    source_text,
+                    parsed
+                        .comments
+                        .iter()
+                        .filter(|comment| comment.kind == SvelteCommentKind::Html)
+                        .map(|comment| comment.range.span),
+                    respect_eslint_disable_directives,
+                ),
+                Err(_) => Self::scan_svelte_html_disable_directives(
+                    source_text,
+                    respect_eslint_disable_directives,
+                ),
+            };
+
+            match parsed {
+                Ok(parsed) => {
+                    let diagnostics = parsed
+                        .warnings
+                        .iter()
+                        .map(|warning| {
+                            OxcDiagnostic::warn(warning.message.clone())
+                                .with_error_code("svelte", warning.code.clone())
+                                .with_label(
+                                    warning.range.span.primary_label("Svelte compiler warning"),
+                                )
+                        })
+                        .collect::<Vec<_>>();
+                    if !diagnostics.is_empty() {
+                        svelte_diagnostics = Some(diagnostics);
+                    }
+                    svelte_section_sources =
+                        Some(SveltePartialLoader::parse_scripts_from_result(source_text, &parsed));
+                }
+                Err(error) => {
+                    let diagnostic = OxcDiagnostic::error(error.message)
+                        .with_error_code("svelte", error.code)
+                        .with_label(error.range.span.primary_label("Svelte compiler error"));
+
+                    if let Some(sections) = &mut out_sections {
+                        sections.push(SectionContent {
+                            source: JavaScriptSource::partial(source_text, source_type, 0),
+                            semantic: None,
+                            parser_tokens: ArenaBox::new_empty_boxed_slice(),
+                        });
+                    }
+
+                    let mut section_module_records = SmallVec::new();
+                    section_module_records.push(Err(vec![diagnostic]));
+                    return ProcessedSource {
+                        section_module_records,
+                        full_file_disable_directives,
+                    };
+                }
+            }
+        }
+
+        let section_sources = {
+            #[cfg(feature = "svelte-rsvelte-backend")]
+            if let Some(sources) = svelte_section_sources {
+                sources
+            } else {
+                PartialLoader::parse(ext, source_text)
+                    .unwrap_or_else(|| vec![JavaScriptSource::partial(source_text, source_type, 0)])
+            }
+
+            #[cfg(not(feature = "svelte-rsvelte-backend"))]
+            {
+                PartialLoader::parse(ext, source_text)
+                    .unwrap_or_else(|| vec![JavaScriptSource::partial(source_text, source_type, 0)])
+            }
+        };
 
         let mut section_module_records = SmallVec::<
             [Result<ResolvedModuleRecord, Vec<OxcDiagnostic>>; 1],
         >::with_capacity(section_sources.len());
+        #[cfg(feature = "svelte-rsvelte-backend")]
+        if let Some(diagnostics) = svelte_diagnostics {
+            if let Some(sections) = &mut out_sections {
+                sections.push(SectionContent {
+                    source: JavaScriptSource::partial(source_text, source_type, 0),
+                    semantic: None,
+                    parser_tokens: ArenaBox::new_empty_boxed_slice(),
+                });
+            }
+            section_module_records.push(Err(diagnostics));
+        }
         for section_source in section_sources {
             match self.process_source_section(
                 path,
@@ -1121,7 +1514,7 @@ impl Runtime {
                 }
             }
         }
-        section_module_records
+        ProcessedSource { section_module_records, full_file_disable_directives }
     }
 
     #[expect(clippy::type_complexity)]

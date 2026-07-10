@@ -32,7 +32,9 @@ file://<fixture>/format/test.svelte
 <button onclick={()=>count++}>{count}</button>
 
 --- AFTER ----------
-<script>let   count=$state(0);</script>
+<script>
+  let count = $state(0);
+</script>
 <button onclick={()=>count++}>{count}</button>
 
 --------------------"
@@ -214,8 +216,7 @@ file://<fixture>/config-svelte/test.svelte
 <script>
   let count = $state(0);
 </script>
-
-<button onclick={() => count++}>{count}</button>
+<button onclick={()=>count++}>{count}</button>
 
 --------------------"
 `;
@@ -418,6 +419,22 @@ hello   world
 
 --- AFTER ----------
 hello   world
+
+--------------------"
+`;
+
+exports[`LSP formatting > in-memory document > should format uri untitled://Untitled-7 1`] = `
+"--- URI -----------
+untitled://Untitled-7
+--- BEFORE ---------
+<script>let   count=$state(0);</script>
+<button onclick={()=>count++}>{count}</button>
+
+--- AFTER ----------
+<script>
+  let count = $state(0);
+</script>
+<button onclick={()=>count++}>{count}</button>
 
 --------------------"
 `;

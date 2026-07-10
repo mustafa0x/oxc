@@ -31,8 +31,9 @@ export default defineConfig({
       "@zackad/prettier-plugin-twig",
       "prettier-plugin-astro",
       "prettier-plugin-marko",
-      // prettier-plugin-svelte's peer dependency; must be installed by the user
-      "svelte/compiler",
+      // Optional peer of prettier-plugin-tailwindcss. Oxfmt's native Svelte
+      // path never imports it.
+      "prettier-plugin-svelte",
     ],
     alwaysBundle: [
       // Bundle it to control version
@@ -45,8 +46,6 @@ export default defineConfig({
       // and must be resolved to the same instance of Prettier at runtime.
       "prettier-plugin-tailwindcss",
       "prettier-plugin-tailwindcss/sorter",
-      "prettier-plugin-svelte",
-
       // Cannot bundle: `cli-worker.js` runs in separate thread and can't resolve bundled chunks
       // Be sure to add it to "dependencies" in `npm/oxfmt/package.json`!
       // "tinypool",
@@ -58,9 +57,6 @@ export default defineConfig({
   inputOptions: {
     resolve: {
       alias: {
-        // NOTE: `prettier-plugin-svelte` is written in CJS,
-        // and tsdown(rolldown) does not deduplicate CJS imports with the ESM imports.
-        // So we need to alias it to the ESM version to avoid duplicates.
         prettier: require.resolve("prettier").replace("index.cjs", "index.mjs"),
         "prettier/doc": require.resolve("prettier/doc").replace(".js", ".mjs"),
         "prettier/plugins/babel": require.resolve("prettier/plugins/babel").replace(".js", ".mjs"),

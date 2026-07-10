@@ -1,3 +1,5 @@
+#[cfg(feature = "napi")]
+use std::borrow::Cow;
 use std::{path::Path, sync::Arc};
 
 use tracing::instrument;
@@ -15,8 +17,8 @@ use oxc_toml::Options as TomlFormatterOptions;
 
 #[cfg(feature = "napi")]
 use super::options::{
-    inject_filepath, inject_oxfmt_plugin_payload, inject_parser, inject_svelte_plugin_payload,
-    inject_tailwind_plugin_payload, to_prettier,
+    inject_filepath, inject_oxfmt_plugin_payload, inject_parser, inject_tailwind_plugin_payload,
+    to_prettier,
 };
 use super::{
     embed::dispatcher::ResolvedDispatchConfig,
@@ -110,11 +112,10 @@ pub enum FormatStrategy {
     #[cfg(feature = "napi")]
     Prettier {
         path: Arc<Path>,
-        parser_name: &'static str,
+        parser_name: Cow<'static, str>,
         config: Box<FormatConfig>,
         supports_tailwind: bool,
         supports_oxfmt: bool,
-        supports_svelte: bool,
         insert_final_newline: bool,
     },
 }
@@ -130,6 +131,8 @@ impl FormatStrategy {
             | Self::OxcFormatterYaml { path, .. }
             | Self::OxcFormatterYamlRc { path, .. }
             | Self::OxfmtToml { path, .. } => path,
+            #[cfg(feature = "svelte-rsvelte-backend")]
+            Self::RsvelteFormatter { path, .. } => path,
             #[cfg(feature = "napi")]
             Self::Prettier { path, .. } => path,
         }
@@ -227,7 +230,6 @@ impl FormatStrategy {
                 config: Box::new(config),
                 supports_tailwind,
                 supports_oxfmt,
-                supports_svelte,
                 insert_final_newline,
             },
         }
@@ -245,6 +247,59 @@ pub struct SourceFormatter {
     allocator_pool: AllocatorPool,
     #[cfg(feature = "napi")]
     external_services: Option<super::ExternalServices>,
+}
+
+fn trim_single_trailing_linebreak_len(text: &str) -> Option<usize> {
+    text.strip_suffix("\r\n")
+        .map(str::len)
+        .or_else(|| text.strip_suffix('\n').map(str::len))
+        .or_else(|| text.strip_suffix('\r').map(str::len))
+}
+
+#[cfg(test)]
+fn should_preserve_external_missing_final_newline(
+    entry: &FormatStrategy,
+    source_text: &str,
+    formatted_text: &str,
+) -> bool {
+    should_preserve_missing_final_newline_for_external(
+        is_external_format_strategy(entry),
+        source_text,
+        formatted_text,
+    )
+}
+
+fn is_external_format_strategy(entry: &FormatStrategy) -> bool {
+    #[cfg(feature = "napi")]
+    {
+        matches!(entry, FormatStrategy::ExternalFormatter { .. })
+    }
+
+    #[cfg(not(feature = "napi"))]
+    {
+        let _ = entry;
+        false
+    }
+}
+
+fn should_preserve_missing_final_newline_for_external(
+    is_external_formatter: bool,
+    source_text: &str,
+    formatted_text: &str,
+) -> bool {
+    if !is_external_formatter || source_text.ends_with('\n') || source_text.ends_with('\r') {
+        return false;
+    }
+
+    if source_text == formatted_text {
+        return true;
+    }
+
+    let Some(trimmed_len) = trim_single_trailing_linebreak_len(formatted_text) else {
+        return false;
+    };
+
+    source_text == &formatted_text[..trimmed_len]
 }
 
 impl SourceFormatter {
@@ -283,6 +338,8 @@ impl SourceFormatter {
                 code: String::new(),
             };
         }
+
+        let is_external_formatter = is_external_format_strategy(&resolved);
 
         let (result, insert_final_newline) = match resolved {
             FormatStrategy::OxcFormatter {
@@ -362,6 +419,21 @@ impl SourceFormatter {
             FormatStrategy::OxfmtToml { toml_options, insert_final_newline, .. } => {
                 (Ok(Self::format_by_toml(source_text, toml_options)), insert_final_newline)
             }
+            #[cfg(feature = "svelte-rsvelte-backend")]
+            FormatStrategy::RsvelteFormatter {
+                path,
+                format_options,
+                indent_script_and_style,
+                insert_final_newline,
+            } => (
+                Self::format_by_rsvelte_formatter(
+                    source_text,
+                    &path,
+                    &format_options,
+                    indent_script_and_style,
+                ),
+                insert_final_newline,
+            ),
             #[cfg(feature = "napi")]
             FormatStrategy::Prettier {
                 path,
@@ -369,17 +441,15 @@ impl SourceFormatter {
                 config,
                 supports_tailwind,
                 supports_oxfmt,
-                supports_svelte,
                 insert_final_newline,
             } => (
                 self.format_by_prettier(
                     source_text,
                     &path,
-                    parser_name,
+                    &parser_name,
                     &config,
                     supports_tailwind,
                     supports_oxfmt,
-                    supports_svelte,
                 ),
                 insert_final_newline,
             ),
@@ -387,13 +457,16 @@ impl SourceFormatter {
 
         match result {
             Ok(mut code) => {
-                // NOTE: `insert_final_newline` relies on the fact that:
-                // - each formatter already ensures there is traliling newline
-                // - each formatter does not have an option to disable trailing newline
-                // So we can trim it here without allocating new string.
-                if !insert_final_newline {
-                    let trimmed_len = code.trim_end().len();
-                    code.truncate(trimmed_len);
+                if insert_final_newline
+                    && should_preserve_missing_final_newline_for_external(
+                        is_external_formatter,
+                        source_text,
+                        &code,
+                    )
+                {
+                    preserve_external_missing_final_newline(&mut code);
+                } else {
+                    apply_final_newline(&mut code, insert_final_newline);
                 }
 
                 FormatResult::Success { is_changed: source_text != code, code }
@@ -597,6 +670,28 @@ impl SourceFormatter {
     fn format_by_toml(source_text: &str, options: oxc_toml::Options) -> String {
         oxc_toml::format(source_text, options)
     }
+
+    /// Format Svelte source with the native rsvelte formatter.
+    #[cfg(feature = "svelte-rsvelte-backend")]
+    #[instrument(level = "debug", name = "oxfmt::format::rsvelte", skip_all)]
+    fn format_by_rsvelte_formatter(
+        source_text: &str,
+        path: &Path,
+        format_options: &JsFormatOptions,
+        indent_script_and_style: bool,
+    ) -> Result<String, OxcDiagnostic> {
+        oxc_svelte_backend::format_svelte_with_options_and_indent(
+            source_text,
+            format_options.clone(),
+            indent_script_and_style,
+        )
+        .map_err(|err| {
+            OxcDiagnostic::error(format!(
+                "Failed to format Svelte file with rsvelte: {}\n{err}",
+                path.display()
+            ))
+        })
+    }
 }
 
 // ---
@@ -635,7 +730,6 @@ impl SourceFormatter {
         config: &FormatConfig,
         supports_tailwind: bool,
         supports_oxfmt: bool,
-        supports_svelte: bool,
     ) -> Result<String, OxcDiagnostic> {
         let mut prettier_options = to_prettier(config);
         inject_parser(&mut prettier_options, parser_name);

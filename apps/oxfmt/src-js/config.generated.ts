@@ -162,6 +162,13 @@ export interface Oxfmtrc {
    */
   overrides?: OxfmtOverrideConfig[];
   /**
+   * Prettier plugin specs preserved for external formatter compatibility paths.
+   *
+   * Legacy `prettier-plugin-svelte` entries are accepted for config migration
+   * but ignored completely; all Svelte formatting uses the native backend.
+   */
+  plugins?: string[];
+  /**
    * Specify the line length that the printer will wrap on.
    *
    * If you don't want line wrapping when formatting Markdown, you can set the `proseWrap` option to disable it.
@@ -250,20 +257,28 @@ export interface Oxfmtrc {
    */
   sortTailwindcss?: SortTailwindcssUserConfig;
   /**
-   * Options for `prettier-plugin-svelte`.
+   * Compatibility options for native Svelte formatting.
    *
-   * Pass `true` or an object to enable `.svelte` file formatting,
-   * or `false` (handy in overrides) / omit to disable.
-   * Setting `true` resets to defaults — any options inherited from a parent scope are dropped.
+   * Native `.svelte` formatting is always enabled when the rsvelte backend is built in;
+   * `false` does not disable it. Script-body indentation is supported; style bodies are
+   * preserved verbatim. Section order and attribute shorthand options are accepted for config
+   * compatibility, but their source spans are also preserved.
    *
-   * NOTE: `prettier-plugin-svelte` requires the `svelte` package (`svelte/compiler`) at runtime,
-   * but Oxfmt does NOT bundle or auto-install it.
-   * You must install `svelte` yourself in your project, formatting will fail at runtime otherwise.
-   *
-   * - Languages: Svelte
-   * - Default: Disabled
+   * - Default: Native Svelte formatting enabled with default options.
    */
   svelte?: SvelteUserConfig;
+  /**
+   * Compatibility alias for `svelte.allowShorthand`; open tags are currently preserved verbatim.
+   */
+  svelteAllowShorthand?: boolean;
+  /**
+   * Compatibility alias for `svelte.indentScriptAndStyle`; currently affects script bodies.
+   */
+  svelteIndentScriptAndStyle?: boolean;
+  /**
+   * Compatibility alias for `svelte.sortOrder`; section order is currently preserved verbatim.
+   */
+  svelteSortOrder?: string;
   /**
    * Specify the number of spaces per indentation-level.
    *
@@ -484,6 +499,13 @@ export interface FormatConfig {
    */
   objectWrap?: ObjectWrapConfig;
   /**
+   * Prettier plugin specs preserved for external formatter compatibility paths.
+   *
+   * Legacy `prettier-plugin-svelte` entries are accepted for config migration
+   * but ignored completely; all Svelte formatting uses the native backend.
+   */
+  plugins?: string[];
+  /**
    * Specify the line length that the printer will wrap on.
    *
    * If you don't want line wrapping when formatting Markdown, you can set the `proseWrap` option to disable it.
@@ -572,20 +594,28 @@ export interface FormatConfig {
    */
   sortTailwindcss?: SortTailwindcssUserConfig;
   /**
-   * Options for `prettier-plugin-svelte`.
+   * Compatibility options for native Svelte formatting.
    *
-   * Pass `true` or an object to enable `.svelte` file formatting,
-   * or `false` (handy in overrides) / omit to disable.
-   * Setting `true` resets to defaults — any options inherited from a parent scope are dropped.
+   * Native `.svelte` formatting is always enabled when the rsvelte backend is built in;
+   * `false` does not disable it. Script-body indentation is supported; style bodies are
+   * preserved verbatim. Section order and attribute shorthand options are accepted for config
+   * compatibility, but their source spans are also preserved.
    *
-   * NOTE: `prettier-plugin-svelte` requires the `svelte` package (`svelte/compiler`) at runtime,
-   * but Oxfmt does NOT bundle or auto-install it.
-   * You must install `svelte` yourself in your project, formatting will fail at runtime otherwise.
-   *
-   * - Languages: Svelte
-   * - Default: Disabled
+   * - Default: Native Svelte formatting enabled with default options.
    */
   svelte?: SvelteUserConfig;
+  /**
+   * Compatibility alias for `svelte.allowShorthand`; open tags are currently preserved verbatim.
+   */
+  svelteAllowShorthand?: boolean;
+  /**
+   * Compatibility alias for `svelte.indentScriptAndStyle`; currently affects script bodies.
+   */
+  svelteIndentScriptAndStyle?: boolean;
+  /**
+   * Compatibility alias for `svelte.sortOrder`; section order is currently preserved verbatim.
+   */
+  svelteSortOrder?: string;
   /**
    * Specify the number of spaces per indentation-level.
    *
@@ -847,17 +877,23 @@ export interface SvelteConfig {
   /**
    * Whether to allow attribute shorthand if attribute name and expression are same.
    *
+   * The native formatter currently preserves open tags verbatim.
+   *
    * - Default: `true`
    */
   allowShorthand?: boolean;
   /**
    * Whether to indent code inside `<script>` and `<style>` tags.
    *
+   * The native formatter currently applies this to script bodies and preserves style bodies.
+   *
    * - Default: `true`
    */
   indentScriptAndStyle?: boolean;
   /**
-   * The order in which Svelte component sections are printed.
+   * The requested order for Svelte component sections.
+   *
+   * The native formatter currently preserves section order verbatim.
    * Format: join the keywords `options`, `scripts`, `markup`, `styles` with a `-` in the order you want;
    * or `none` if you don't want to reorder anything.
    *

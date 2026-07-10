@@ -1,0 +1,194 @@
+name: Publish Fork Packages
+
+on:
+  workflow_dispatch:
+    inputs:
+      packages:
+        description: Comma-separated package IDs to publish
+        required: true
+        default: oxlint,oxfmt
+        type: string
+      scope:
+        description: npm scope to publish under
+        required: true
+        default: "@mustafaj"
+        type: string
+      version_suffix:
+        description: Optional suffix appended to the package version (for example -beta.1)
+        required: false
+        default: ""
+        type: string
+      npm_tag:
+        description: Optional npm dist-tag to publish under. Defaults to the prerelease identifier or latest.
+        required: false
+        default: ""
+        type: string
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  FORK_NAPI_TARGETS: aarch64-apple-darwin,x86_64-unknown-linux-gnu,x86_64-pc-windows-msvc
+
+jobs:
+  build-native:
+    name: Build ${{ matrix.package }} ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - package: oxlint
+            app_dir: apps/oxlint
+            os: macos-14
+            target: aarch64-apple-darwin
+          - package: oxlint
+            app_dir: apps/oxlint
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - package: oxlint
+            app_dir: apps/oxlint
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - package: oxfmt
+            app_dir: apps/oxfmt
+            os: macos-14
+            target: aarch64-apple-darwin
+          - package: oxfmt
+            app_dir: apps/oxfmt
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - package: oxfmt
+            app_dir: apps/oxfmt
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Skip unselected package
+        if: ${{ !contains(format(',{0},', inputs.packages), format(',{0},', matrix.package)) }}
+        run: |
+          echo "Skipping ${{ matrix.package }}; not selected in inputs.packages=${{ inputs.packages }}"
+          exit 0
+
+      - uses: jdx/mise-action@v4
+        if: ${{ contains(format(',{0},', inputs.packages), format(',{0},', matrix.package)) }}
+
+      - if: ${{ contains(format(',{0},', inputs.packages), format(',{0},', matrix.package)) }}
+        run: pnpm install --frozen-lockfile
+      - if: ${{ contains(format(',{0},', inputs.packages), format(',{0},', matrix.package)) }}
+        run: pnpm -C ${{ matrix.app_dir }} run build-napi-release --target ${{ matrix.target }}
+
+      - name: Upload NAPI artifact
+        if: ${{ contains(format(',{0},', inputs.packages), format(',{0},', matrix.package)) }}
+        uses: actions/upload-artifact@v7
+        with:
+          if-no-files-found: error
+          name: ${{ matrix.package }}-bindings-${{ matrix.target }}
+          path: ${{ matrix.app_dir }}/src-js/*.node
+
+  publish:
+    name: Publish ${{ matrix.package }}
+    needs: build-native
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - package: oxlint
+            app_dir: apps/oxlint
+          - package: oxfmt
+            app_dir: apps/oxfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Skip unselected package
+        if: ${{ !contains(format(',{0},', inputs.packages), format(',{0},', matrix.package)) }}
+        run: |
+          echo "Skipping ${{ matrix.package }}; not selected in inputs.packages=${{ inputs.packages }}"
+          exit 0
+
+      - uses: actions/download-artifact@v8
+        if: ${{ contains(format(',{0},', inputs.packages), format(',{0},', matrix.package)) }}
+        with:
+          path: artifacts
+          pattern: ${{ matrix.package }}-bindings-*
+
+      - uses: jdx/mise-action@v4
+        if: ${{ contains(format(',{0},', inputs.packages), format(',{0},', matrix.package)) }}
+
+      - if: ${{ contains(format(',{0},', inputs.packages), format(',{0},', matrix.package)) }}
+        run: npm install -g npm@latest
+      - if: ${{ contains(format(',{0},', inputs.packages), format(',{0},', matrix.package)) }}
+        run: pnpm install --frozen-lockfile
+      - if: ${{ contains(format(',{0},', inputs.packages), format(',{0},', matrix.package)) }}
+        run: pnpm -C ${{ matrix.app_dir }} run build-js
+
+      - name: Resolve publish tag
+        if: ${{ contains(format(',{0},', inputs.packages), format(',{0},', matrix.package)) }}
+        id: publish_tag
+        shell: bash
+        run: |
+          tag='${{ inputs.npm_tag }}'
+          if [ -z "$tag" ]; then
+            suffix='${{ inputs.version_suffix }}'
+            if [ -n "$suffix" ]; then
+              tag=${suffix#-}
+              tag=${tag%%.*}
+            else
+              tag='latest'
+            fi
+          fi
+          echo "value=$tag" >> "$GITHUB_OUTPUT"
+          echo "Using npm tag: $tag"
+
+      - name: Prepare fork publish package
+        if: ${{ contains(format(',{0},', inputs.packages), format(',{0},', matrix.package)) }}
+        run: >
+          pnpm prepare:fork-publish
+          --scope "${{ inputs.scope }}"
+          --packages "${{ matrix.package }}"
+          --skip-build
+          --skip-native-bundle
+          --targets "${{ env.FORK_NAPI_TARGETS }}"
+          ${{ inputs.version_suffix != '' && format('--version-suffix "{0}"', inputs.version_suffix) || '' }}
+
+      - name: Create NAPI package directories
+        if: ${{ contains(format(',{0},', inputs.packages), format(',{0},', matrix.package)) }}
+        run: |
+          mkdir -p .fork-publish/${{ matrix.package }}/npm
+          pnpm napi create-npm-dirs \
+            --package-json-path .fork-publish/${{ matrix.package }}/package/package.json \
+            --npm-dir .fork-publish/${{ matrix.package }}/npm
+
+      - name: Stage downloaded native artifacts
+        if: ${{ contains(format(',{0},', inputs.packages), format(',{0},', matrix.package)) }}
+        shell: bash
+        run: |
+          find artifacts -name '*.node' -exec cp {} ${{ matrix.app_dir }}/src-js/ \;
+
+      - name: Populate NAPI package artifacts
+        if: ${{ contains(format(',{0},', inputs.packages), format(',{0},', matrix.package)) }}
+        run: >
+          pnpm napi artifacts
+          --package-json-path .fork-publish/${{ matrix.package }}/package/package.json
+          --build-output-dir ${{ matrix.app_dir }}/src-js
+          --npm-dir .fork-publish/${{ matrix.package }}/npm
+
+      - name: Check Publish
+        if: ${{ contains(format(',{0},', inputs.packages), format(',{0},', matrix.package)) }}
+        env:
+          npm_config_tag: ${{ steps.publish_tag.outputs.value }}
+        run: >
+          node .github/scripts/check-npm-packages.js
+          --skip-existence-check
+          ".fork-publish/${{ matrix.package }}/npm/*"
+          ".fork-publish/${{ matrix.package }}/package"
+
+      - name: Trusted Publish
+        if: ${{ contains(format(',{0},', inputs.packages), format(',{0},', matrix.package)) }}
+        env:
+          npm_config_tag: ${{ steps.publish_tag.outputs.value }}
+        run: |
+          pnpm napi pre-publish --no-gh-release -t npm \
+            --package-json-path .fork-publish/${{ matrix.package }}/package/package.json \
+            --npm-dir .fork-publish/${{ matrix.package }}/npm
+          bash .github/scripts/publish-if-needed.sh .fork-publish/${{ matrix.package }}/package --provenance --access public --no-git-checks

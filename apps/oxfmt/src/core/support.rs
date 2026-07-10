@@ -1,18 +1,104 @@
+#[cfg(feature = "napi")]
+use std::borrow::Cow;
 use std::{path::Path, sync::Arc};
 
 use phf::phf_set;
+#[cfg(feature = "napi")]
+use rustc_hash::FxHashMap;
+#[cfg(feature = "napi")]
+use serde::Deserialize;
 
 use oxc_formatter_css::CssVariant;
 use oxc_formatter_json::JsonVariant;
 use oxc_span::SourceType;
 
-#[cfg(feature = "napi")]
-use super::oxfmtrc::FormatConfig;
-
 /// Classify a file path into a [`FileKind`].
 ///
 /// Returns `None` when the file type is not a formatting target.
+#[cfg(any(feature = "napi", test))]
 pub fn classify_file_kind(path: Arc<Path>) -> Option<FileKind> {
+    classify_file_kind_with_external_support(path, &ExternalPluginSupport::default())
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ExternalPluginSupport {
+    #[cfg(feature = "napi")]
+    parser_by_filename: FxHashMap<String, String>,
+    #[cfg(feature = "napi")]
+    parser_by_extension: FxHashMap<String, String>,
+}
+
+#[cfg(feature = "napi")]
+#[derive(Debug, Default, Clone, Deserialize)]
+struct ExternalPluginLanguage {
+    #[serde(default)]
+    parsers: Vec<String>,
+    #[serde(default)]
+    extensions: Vec<String>,
+    #[serde(default)]
+    filenames: Vec<String>,
+}
+
+impl ExternalPluginSupport {
+    #[cfg(feature = "napi")]
+    #[must_use]
+    pub fn from_language_json_strings(language_jsons: &[String]) -> Self {
+        let mut support = Self::default();
+
+        for language_json in language_jsons {
+            let Ok(language) = serde_json::from_str::<ExternalPluginLanguage>(language_json) else {
+                continue;
+            };
+            let Some(parser_name) = language.parsers.first().filter(|name| !name.is_empty()) else {
+                continue;
+            };
+
+            for filename in language.filenames {
+                if !filename.is_empty() {
+                    support
+                        .parser_by_filename
+                        .entry(filename)
+                        .or_insert_with(|| parser_name.clone());
+                }
+            }
+
+            for extension in language.extensions {
+                let normalized = extension.trim_start_matches('.');
+                if !normalized.is_empty() {
+                    support
+                        .parser_by_extension
+                        .entry(normalized.to_string())
+                        .or_insert_with(|| parser_name.clone());
+                }
+            }
+        }
+
+        support
+    }
+
+    #[cfg(feature = "napi")]
+    fn parser_for_path(&self, path: &Path) -> Option<&str> {
+        if let Some(file_name) = path.file_name().and_then(|f| f.to_str())
+            && let Some(parser_name) = self.parser_by_filename.get(file_name)
+        {
+            return Some(parser_name);
+        }
+
+        let extension = path.extension().and_then(|ext| ext.to_str())?;
+        self.parser_by_extension.get(extension).map(String::as_str)
+    }
+}
+
+/// Classify a file path using external plugin language metadata when available.
+///
+/// Returns `None` when the file type is not a formatting target.
+pub fn classify_file_kind_with_external_support(
+    path: Arc<Path>,
+    external_plugin_support: &ExternalPluginSupport,
+) -> Option<FileKind> {
+    #[cfg(not(feature = "napi"))]
+    let _ = external_plugin_support;
+
     // PERF: Standard JS/TS extensions are by far the most common case,
     // so resolve them straight from the path before extracting `file_name`/`extension` for anything else.
     // NOTE:
@@ -80,10 +166,9 @@ pub fn classify_file_kind(path: Arc<Path>) -> Option<FileKind> {
             let supports_svelte = SVELTE_PARSERS.contains(parser_name);
             return Some(FileKind::Prettier {
                 path,
-                parser_name,
+                parser_name: Cow::Borrowed(parser_name),
                 supports_tailwind,
                 supports_oxfmt,
-                supports_svelte,
             });
         }
     }
@@ -117,17 +202,16 @@ pub enum FileKind {
     OxfmtToml { path: Arc<Path> },
     /// Files formatted by delegating to Prettier (Tier 3/4).
     ///
-    /// `supports_tailwind` / `supports_oxfmt` / `supports_svelte` are capability
+    /// `supports_tailwind` / `supports_oxfmt` are capability
     /// flags that say "this file kind CAN use the corresponding plugin".
     /// Whether the plugin is actually activated is decided at the format step by resolved config.
     /// Only available with the `napi` feature; without it, the classifier rejects such files.
     #[cfg(feature = "napi")]
     Prettier {
         path: Arc<Path>,
-        parser_name: &'static str,
+        parser_name: Cow<'static, str>,
         supports_tailwind: bool,
         supports_oxfmt: bool,
-        supports_svelte: bool,
     },
 }
 
@@ -142,6 +226,8 @@ impl FileKind {
             | Self::OxcFormatterYaml { path }
             | Self::OxcFormatterYamlRc { path }
             | Self::OxfmtToml { path } => path,
+            #[cfg(feature = "svelte-rsvelte-backend")]
+            Self::RsvelteFormatter { path } => path,
             #[cfg(feature = "napi")]
             Self::Prettier { path, .. } => path,
         }
@@ -189,15 +275,6 @@ static OXFMT_PARSERS: phf::Set<&'static str> = phf_set! {
     "svelte",
     // "markdown",
     // "mdx",
-};
-
-/// Parsers(files) that benefit from `prettier-plugin-svelte`.
-/// `.svelte` is the primary target; `markdown`/`mdx` allow ` ```svelte ` code blocks.
-#[cfg(feature = "napi")]
-static SVELTE_PARSERS: phf::Set<&'static str> = phf_set! {
-    "svelte",
-    "markdown",
-    "mdx",
 };
 
 // ---
@@ -444,9 +521,8 @@ fn get_prettier_parser_name(file_name: &str, extension: Option<&str>) -> Option<
     if extension == Some("vue") {
         return Some("vue");
     }
-    // NOTE: `.svelte` files are recognized here, but actual formatting is gated by
-    // `ResolveOutcome::MissingPlugin` (requires `svelte: {}` in resolved config).
-    // We classify here (not skip) so that user-friendly errors/skips can be surfaced per caller.
+    // NOTE: In builds without the native rsvelte backend, `.svelte` files can still
+    // be routed to the external Prettier compatibility path.
     if extension == Some("svelte") {
         return Some("svelte");
     }
@@ -724,6 +800,13 @@ mod tests {
         // but is the lone dedicated kind for the sorting pre-process
         let kind = classify_file_kind(Arc::from(Path::new("package.json"))).unwrap();
         assert!(matches!(kind, FileKind::OxcFormatterJsonPackageJson { .. }));
+    }
+
+    #[test]
+    #[cfg(feature = "svelte-rsvelte-backend")]
+    fn test_svelte_files_route_to_rsvelte_formatter() {
+        let kind = classify_file_kind(Arc::from(Path::new("App.svelte"))).unwrap();
+        assert!(matches!(kind, FileKind::RsvelteFormatter { .. }));
     }
 
     #[test]

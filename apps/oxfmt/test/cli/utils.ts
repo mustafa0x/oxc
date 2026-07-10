@@ -1,5 +1,6 @@
 // oxlint-disable no-await-in-loop
 import { join, relative } from "node:path";
+import { tmpdir } from "node:os";
 import { readdirSync, readFileSync } from "node:fs";
 import fs from "node:fs/promises";
 import { execa } from "execa";
@@ -12,8 +13,76 @@ declare global {
   }
 }
 
-const CLI_PATH = join(import.meta.dirname, "..", "..", "dist", "cli.js");
+const PACKAGE_ROOT_PATH = join(import.meta.dirname, "..", "..");
+const BUILT_CLI_PATH = join(PACKAGE_ROOT_PATH, "dist", "cli.js");
+const RAW_CLI_PATH = join(PACKAGE_ROOT_PATH, "src-js", "cli.ts");
+const TSX_CLI_PATH = join(PACKAGE_ROOT_PATH, "node_modules", "tsx", "dist", "cli.mjs");
+const CLI_PATH = BUILT_CLI_PATH;
 const CLI_TEST_DIR = import.meta.dirname;
+
+export type CliLaunchMode = "built" | "raw";
+
+type RunCliStdinOptions = {
+  cwd?: string;
+  pipe?: string;
+  args?: string[];
+};
+
+function getCliCommand(launchMode: CliLaunchMode): { command: string; args: string[] } {
+  return launchMode === "built"
+    ? { command: process.execPath, args: [BUILT_CLI_PATH] }
+    : { command: process.execPath, args: [TSX_CLI_PATH, RAW_CLI_PATH] };
+}
+
+export function runCliWithLaunchMode(cwd: string, args: string[], launchMode: CliLaunchMode) {
+  const cliCommand = getCliCommand(launchMode);
+  return execa(cliCommand.command, [...cliCommand.args, ...args, "--threads=1"], {
+    cwd,
+    reject: false,
+    timeout: 5000,
+  });
+}
+
+export function runCli(cwd: string, args: string[]) {
+  return runCliWithLaunchMode(cwd, args, "built");
+}
+
+function quoteShellArg(arg: string): string {
+  return `'${arg.replaceAll("'", `'"'"'`)}'`;
+}
+
+export function runCliStdinWithLaunchMode(
+  input: string,
+  filepath: string,
+  launchMode: CliLaunchMode,
+  pipeOrOptions?: string | RunCliStdinOptions,
+) {
+  const options =
+    typeof pipeOrOptions === "string" ? { pipe: pipeOrOptions } : pipeOrOptions ?? {};
+
+  const cliArgs = [...(options.args ?? []), `--stdin-filepath=${filepath}`];
+  const cliCommand = getCliCommand(launchMode);
+
+  if (options.pipe) {
+    const cmd = [cliCommand.command, ...cliCommand.args, ...cliArgs].map(quoteShellArg).join(" ");
+    return execa({ shell: true, reject: false, input, cwd: options.cwd, stripFinalNewline: false })`${cmd} | ${options.pipe}`;
+  }
+
+  return execa(cliCommand.command, [...cliCommand.args, ...cliArgs], {
+    cwd: options.cwd,
+    reject: false,
+    input,
+    stripFinalNewline: false,
+  });
+}
+
+export function runCliStdin(
+  input: string,
+  filepath: string,
+  pipeOrOptions?: string | RunCliStdinOptions,
+) {
+  return runCliStdinWithLaunchMode(input, filepath, "built", pipeOrOptions);
+}
 
 // --- Types ---
 
@@ -135,6 +204,44 @@ export async function runFixture(fixture: Fixture, testCase: TestCaseOptions): P
     for (const path of gitignoreFiles) {
       await fs.rm(path, { force: true });
     }
+  }
+}
+
+// Test function for write mode
+export async function runWriteModeAndSnapshot(
+  fixtureDir: string,
+  files: string[],
+  args: string[] = [],
+  launchMode: CliLaunchMode = "built",
+): Promise<string> {
+  const tempDir = await fs.mkdtemp(join(tmpdir(), "oxfmt-test-"));
+
+  try {
+    await fs.cp(fixtureDir, tempDir, { recursive: true });
+
+    const snapshot: string[] = [];
+    for (const file of files) {
+      const filePath = join(tempDir, file);
+      const beforeContent = await fs.readFile(filePath, "utf8");
+
+      await runCliWithLaunchMode(tempDir, [...args, file], launchMode);
+      const afterContent = await fs.readFile(filePath, "utf8");
+
+      snapshot.push(
+        `
+--- FILE -----------
+${file}
+--- BEFORE ---------
+${beforeContent}
+--- AFTER ----------
+${afterContent}
+--------------------`.trim(),
+      );
+    }
+
+    return snapshot.join("\n\n");
+  } finally {
+    await fs.rm(tempDir, { recursive: true, force: true });
   }
 }
 

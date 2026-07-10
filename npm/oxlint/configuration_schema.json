@@ -16971,38 +16971,109 @@
     },
     "OxlintCategories": {
       "title": "Rule Categories",
-      "description": "Configure an entire category of rules all at once.\n\nRules enabled or disabled this way will be overwritten by individual rules in the `rules` field.\n\nExample\n```json\n{\n    \"$schema\": \"./node_modules/oxlint/configuration_schema.json\",\n    \"categories\": {\n        \"correctness\": \"warn\"\n    },\n    \"rules\": {\n        \"eslint/no-unused-vars\": \"error\"\n    }\n}\n```",
+      "description": "Configure an entire category of rules all at once.\n\nUse a severity such as `\"warn\"` or `\"error\"` to apply every enabled rule in that category.\nUse `\"recommended\"` to apply Oxlint's built-in category-default subset for that category (core ESLint plus default built-in plugins) at `\"warn\"` severity.\n\nRules enabled or disabled this way will be overwritten by individual rules in the `rules` field.\n\nExample\n```json\n{\n    \"$schema\": \"./node_modules/oxlint/configuration_schema.json\",\n    \"categories\": {\n        \"correctness\": \"warn\",\n        \"suspicious\": \"recommended\"\n    },\n    \"rules\": {\n        \"eslint/no-unused-vars\": \"error\"\n    }\n}\n```",
       "examples": [
         {
-          "correctness": "warn"
+          "correctness": "warn",
+          "suspicious": "recommended"
         }
       ],
       "type": "object",
       "properties": {
         "correctness": {
-          "$ref": "#/definitions/AllowWarnDeny"
+          "anyOf": [
+            {
+              "$ref": "#/definitions/AllowWarnDeny"
+            },
+            {
+              "type": "string",
+              "enum": [
+                "recommended"
+              ]
+            }
+          ]
         },
         "nursery": {
-          "$ref": "#/definitions/AllowWarnDeny"
+          "anyOf": [
+            {
+              "$ref": "#/definitions/AllowWarnDeny"
+            },
+            {
+              "type": "string",
+              "enum": [
+                "recommended"
+              ]
+            }
+          ]
         },
         "pedantic": {
-          "$ref": "#/definitions/AllowWarnDeny"
+          "anyOf": [
+            {
+              "$ref": "#/definitions/AllowWarnDeny"
+            },
+            {
+              "type": "string",
+              "enum": [
+                "recommended"
+              ]
+            }
+          ]
         },
         "perf": {
-          "$ref": "#/definitions/AllowWarnDeny"
+          "anyOf": [
+            {
+              "$ref": "#/definitions/AllowWarnDeny"
+            },
+            {
+              "type": "string",
+              "enum": [
+                "recommended"
+              ]
+            }
+          ]
         },
         "restriction": {
-          "$ref": "#/definitions/AllowWarnDeny"
+          "anyOf": [
+            {
+              "$ref": "#/definitions/AllowWarnDeny"
+            },
+            {
+              "type": "string",
+              "enum": [
+                "recommended"
+              ]
+            }
+          ]
         },
         "style": {
-          "$ref": "#/definitions/AllowWarnDeny"
+          "anyOf": [
+            {
+              "$ref": "#/definitions/AllowWarnDeny"
+            },
+            {
+              "type": "string",
+              "enum": [
+                "recommended"
+              ]
+            }
+          ]
         },
         "suspicious": {
-          "$ref": "#/definitions/AllowWarnDeny"
+          "anyOf": [
+            {
+              "$ref": "#/definitions/AllowWarnDeny"
+            },
+            {
+              "type": "string",
+              "enum": [
+                "recommended"
+              ]
+            }
+          ]
         }
       },
       "additionalProperties": false,
-      "markdownDescription": "Configure an entire category of rules all at once.\n\nRules enabled or disabled this way will be overwritten by individual rules in the `rules` field.\n\nExample\n```json\n{\n    \"$schema\": \"./node_modules/oxlint/configuration_schema.json\",\n    \"categories\": {\n        \"correctness\": \"warn\"\n    },\n    \"rules\": {\n        \"eslint/no-unused-vars\": \"error\"\n    }\n}\n```"
+      "markdownDescription": "Configure an entire category of rules all at once.\n\nUse a severity such as `\"warn\"` or `\"error\"` to apply every enabled rule in that category.\nUse `\"recommended\"` to apply Oxlint's built-in category-default subset for that category (core ESLint plus default built-in plugins) at `\"warn\"` severity.\n\nRules enabled or disabled this way will be overwritten by individual rules in the `rules` field.\n\nExample\n```json\n{\n    \"$schema\": \"./node_modules/oxlint/configuration_schema.json\",\n    \"categories\": {\n        \"correctness\": \"warn\",\n        \"suspicious\": \"recommended\"\n    },\n    \"rules\": {\n        \"eslint/no-unused-vars\": \"error\"\n    }\n}\n```"
     },
     "OxlintEnv": {
       "description": "Predefine global variables.\n\nEnvironments specify what global variables are predefined.\nAvailable environments:\n- amd - require() and define() globals.\n- applescript - AppleScript globals.\n- astro - Astro globals.\n- atomtest - Atom test globals.\n- audioworklet - AudioWorklet globals.\n- browser - browser globals.\n- builtin - Latest ECMAScript globals, equivalent to es2026.\n- commonjs - CommonJS globals and scoping.\n- embertest - Ember test globals.\n- es2015 - ECMAScript 2015 globals.\n- es2016 - ECMAScript 2016 globals.\n- es2017 - ECMAScript 2017 globals.\n- es2018 - ECMAScript 2018 globals.\n- es2019 - ECMAScript 2019 globals.\n- es2020 - ECMAScript 2020 globals.\n- es2021 - ECMAScript 2021 globals.\n- es2022 - ECMAScript 2022 globals.\n- es2023 - ECMAScript 2023 globals.\n- es2024 - ECMAScript 2024 globals.\n- es2025 - ECMAScript 2025 globals.\n- es2026 - ECMAScript 2026 globals.\n- es6 - ECMAScript 6 globals except modules.\n- greasemonkey - GreaseMonkey globals.\n- jasmine - Jasmine globals.\n- jest - Jest globals.\n- jquery - jQuery globals.\n- meteor - Meteor globals.\n- mocha - Mocha globals.\n- mongo - MongoDB globals.\n- nashorn - Java 8 Nashorn globals.\n- node - Node.js globals and scoping.\n- phantomjs - PhantomJS globals.\n- prototypejs - Prototype.js globals.\n- protractor - Protractor globals.\n- qunit - QUnit globals.\n- serviceworker - Service Worker globals.\n- shared-node-browser - Node.js and Browser common globals.\n- shelljs - ShellJS globals.\n- svelte - Svelte globals.\n- vitest - Vitest globals.\n- vue - Vue globals.\n- webextensions - WebExtensions globals.\n- worker - Web Workers globals.",
@@ -17139,9 +17210,17 @@
               "$ref": "#/definitions/OxlintRules"
             }
           ]
+        },
+        "settings": {
+          "description": "Plugin-specific configuration for both built-in and custom plugins.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/OxlintSettings"
+            }
+          ],
+          "markdownDescription": "Plugin-specific configuration for both built-in and custom plugins."
         }
-      },
-      "additionalProperties": false
+      }
     },
     "OxlintOverrides": {
       "type": "array",

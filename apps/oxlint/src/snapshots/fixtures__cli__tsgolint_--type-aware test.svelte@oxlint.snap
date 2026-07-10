@@ -1,10 +1,12 @@
 ---
 source: apps/oxlint/src/tester.rs
+assertion_line: 163
 ---
 ########## 
 arguments: --type-aware test.svelte
 working directory: fixtures/cli/tsgolint
 ----------
+Type-aware Svelte linting is not supported yet; `.svelte` files are excluded from TypeScript type-aware checks and use rsvelte syntax diagnostics plus non-type-aware linting.
 
   x eslint(no-debugger): `debugger` statement is not allowed
    ,-[test.svelte:2:2]

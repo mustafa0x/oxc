@@ -5,6 +5,7 @@ source: apps/oxlint/src/tester.rs
 arguments: --type-aware -c config-test.json
 working directory: fixtures/cli/tsgolint
 ----------
+Type-aware Svelte linting is not supported yet; `.svelte` files are excluded from TypeScript type-aware checks and use rsvelte syntax diagnostics plus non-type-aware linting.
 
   ! typescript(no-floating-promises): Promises must be awaited, add void operator to ignore.
    ,-[no-floating-promises.ts:2:1]
@@ -42,7 +43,7 @@ working directory: fixtures/cli/tsgolint
   help: Remove the debugger statement
 
 Found 2 warnings and 2 errors.
-Finished in <variable>ms on 60 files with 2 rules using 1 threads.
+Finished in <variable>ms on 60 files using 1 threads.
 ----------
 CLI result: LintFoundErrors
 ----------

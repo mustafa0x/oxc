@@ -5,6 +5,7 @@ source: apps/oxlint/src/tester.rs
 arguments: --type-check-only
 working directory: fixtures/cli/tsgolint_type_check_only_svelte_syntax_error
 ----------
+Type-aware Svelte linting is not supported yet; `.svelte` files are excluded from TypeScript type-aware checks and use rsvelte syntax diagnostics plus non-type-aware linting.
 
   x Unexpected token
    ,-[test.svelte:2:21]

@@ -12944,7 +12944,8 @@ function constructComment(pos, ast) {
 }
 
 function constructOptionHashbang(pos, ast) {
-  if (ast.buffer.int32[(pos >> 2) + 4] === 0 && ast.buffer.int32[(pos >> 2) + 5] === 0) return null;
+  if (ast.buffer.int32[(pos + 16) >> 2] === 0 && ast.buffer.int32[(pos + 20) >> 2] === 0)
+    return null;
   return new Hashbang(pos, ast);
 }
 
@@ -13185,12 +13186,12 @@ function constructBoxTSTypeParameterInstantiation(pos, ast) {
 }
 
 function constructOptionBoxTSTypeParameterInstantiation(pos, ast) {
-  if (ast.buffer.int32[pos >> 2] === 0 && ast.buffer.int32[(pos >> 2) + 1] === 0) return null;
+  if (ast.buffer.int32[pos >> 2] === 0 && ast.buffer.int32[(pos + 4) >> 2] === 0) return null;
   return constructBoxTSTypeParameterInstantiation(pos, ast);
 }
 
 function constructOptionStr(pos, ast) {
-  if (ast.buffer.int32[pos >> 2] === 0 && ast.buffer.int32[(pos >> 2) + 1] === 0) return null;
+  if (ast.buffer.int32[pos >> 2] === 0 && ast.buffer.int32[(pos + 4) >> 2] === 0) return null;
   return constructStr(pos, ast);
 }
 
@@ -13242,7 +13243,7 @@ function constructBoxAssignmentTargetRest(pos, ast) {
 }
 
 function constructOptionBoxAssignmentTargetRest(pos, ast) {
-  if (ast.buffer.int32[pos >> 2] === 0 && ast.buffer.int32[(pos >> 2) + 1] === 0) return null;
+  if (ast.buffer.int32[pos >> 2] === 0 && ast.buffer.int32[(pos + 4) >> 2] === 0) return null;
   return constructBoxAssignmentTargetRest(pos, ast);
 }
 
@@ -13388,7 +13389,7 @@ function constructBoxTSTypeAnnotation(pos, ast) {
 }
 
 function constructOptionBoxTSTypeAnnotation(pos, ast) {
-  if (ast.buffer.int32[pos >> 2] === 0 && ast.buffer.int32[(pos >> 2) + 1] === 0) return null;
+  if (ast.buffer.int32[pos >> 2] === 0 && ast.buffer.int32[(pos + 4) >> 2] === 0) return null;
   return constructBoxTSTypeAnnotation(pos, ast);
 }
 
@@ -13403,7 +13404,8 @@ function constructOptionForStatementInit(pos, ast) {
 }
 
 function constructOptionLabelIdentifier(pos, ast) {
-  if (ast.buffer.int32[(pos >> 2) + 4] === 0 && ast.buffer.int32[(pos >> 2) + 5] === 0) return null;
+  if (ast.buffer.int32[(pos + 16) >> 2] === 0 && ast.buffer.int32[(pos + 20) >> 2] === 0)
+    return null;
   return new LabelIdentifier(pos, ast);
 }
 
@@ -13422,12 +13424,12 @@ function constructBoxCatchClause(pos, ast) {
 }
 
 function constructOptionBoxCatchClause(pos, ast) {
-  if (ast.buffer.int32[pos >> 2] === 0 && ast.buffer.int32[(pos >> 2) + 1] === 0) return null;
+  if (ast.buffer.int32[pos >> 2] === 0 && ast.buffer.int32[(pos + 4) >> 2] === 0) return null;
   return constructBoxCatchClause(pos, ast);
 }
 
 function constructOptionBoxBlockStatement(pos, ast) {
-  if (ast.buffer.int32[pos >> 2] === 0 && ast.buffer.int32[(pos >> 2) + 1] === 0) return null;
+  if (ast.buffer.int32[pos >> 2] === 0 && ast.buffer.int32[(pos + 4) >> 2] === 0) return null;
   return constructBoxBlockStatement(pos, ast);
 }
 
@@ -13467,7 +13469,7 @@ function constructBoxBindingRestElement(pos, ast) {
 }
 
 function constructOptionBoxBindingRestElement(pos, ast) {
-  if (ast.buffer.int32[pos >> 2] === 0 && ast.buffer.int32[(pos >> 2) + 1] === 0) return null;
+  if (ast.buffer.int32[pos >> 2] === 0 && ast.buffer.int32[(pos + 4) >> 2] === 0) return null;
   return constructBoxBindingRestElement(pos, ast);
 }
 
@@ -13483,7 +13485,8 @@ function constructVecOptionBindingPattern(pos, ast) {
 }
 
 function constructOptionBindingIdentifier(pos, ast) {
-  if (ast.buffer.int32[(pos >> 2) + 4] === 0 && ast.buffer.int32[(pos >> 2) + 5] === 0) return null;
+  if (ast.buffer.int32[(pos + 16) >> 2] === 0 && ast.buffer.int32[(pos + 20) >> 2] === 0)
+    return null;
   return new BindingIdentifier(pos, ast);
 }
 
@@ -13492,7 +13495,7 @@ function constructBoxTSTypeParameterDeclaration(pos, ast) {
 }
 
 function constructOptionBoxTSTypeParameterDeclaration(pos, ast) {
-  if (ast.buffer.int32[pos >> 2] === 0 && ast.buffer.int32[(pos >> 2) + 1] === 0) return null;
+  if (ast.buffer.int32[pos >> 2] === 0 && ast.buffer.int32[(pos + 4) >> 2] === 0) return null;
   return constructBoxTSTypeParameterDeclaration(pos, ast);
 }
 
@@ -13501,7 +13504,7 @@ function constructBoxTSThisParameter(pos, ast) {
 }
 
 function constructOptionBoxTSThisParameter(pos, ast) {
-  if (ast.buffer.int32[pos >> 2] === 0 && ast.buffer.int32[(pos >> 2) + 1] === 0) return null;
+  if (ast.buffer.int32[pos >> 2] === 0 && ast.buffer.int32[(pos + 4) >> 2] === 0) return null;
   return constructBoxTSThisParameter(pos, ast);
 }
 
@@ -13514,7 +13517,7 @@ function constructBoxFunctionBody(pos, ast) {
 }
 
 function constructOptionBoxFunctionBody(pos, ast) {
-  if (ast.buffer.int32[pos >> 2] === 0 && ast.buffer.int32[(pos >> 2) + 1] === 0) return null;
+  if (ast.buffer.int32[pos >> 2] === 0 && ast.buffer.int32[(pos + 4) >> 2] === 0) return null;
   return constructBoxFunctionBody(pos, ast);
 }
 
@@ -13543,7 +13546,7 @@ function constructBoxExpression(pos, ast) {
 }
 
 function constructOptionBoxExpression(pos, ast) {
-  if (ast.buffer.int32[pos >> 2] === 0 && ast.buffer.int32[(pos >> 2) + 1] === 0) return null;
+  if (ast.buffer.int32[pos >> 2] === 0 && ast.buffer.int32[(pos + 4) >> 2] === 0) return null;
   return constructBoxExpression(pos, ast);
 }
 
@@ -13642,7 +13645,7 @@ function constructVecImportDeclarationSpecifier(pos, ast) {
 }
 
 function constructOptionVecImportDeclarationSpecifier(pos, ast) {
-  if (ast.buffer.int32[pos >> 2] === 0 && ast.buffer.int32[(pos >> 2) + 1] === 0) return null;
+  if (ast.buffer.int32[pos >> 2] === 0 && ast.buffer.int32[(pos + 4) >> 2] === 0) return null;
   return constructVecImportDeclarationSpecifier(pos, ast);
 }
 
@@ -13651,7 +13654,7 @@ function constructBoxWithClause(pos, ast) {
 }
 
 function constructOptionBoxWithClause(pos, ast) {
-  if (ast.buffer.int32[pos >> 2] === 0 && ast.buffer.int32[(pos >> 2) + 1] === 0) return null;
+  if (ast.buffer.int32[pos >> 2] === 0 && ast.buffer.int32[(pos + 4) >> 2] === 0) return null;
   return constructBoxWithClause(pos, ast);
 }
 
@@ -13715,7 +13718,7 @@ function constructBoxJSXClosingElement(pos, ast) {
 }
 
 function constructOptionBoxJSXClosingElement(pos, ast) {
-  if (ast.buffer.int32[pos >> 2] === 0 && ast.buffer.int32[(pos >> 2) + 1] === 0) return null;
+  if (ast.buffer.int32[pos >> 2] === 0 && ast.buffer.int32[(pos + 4) >> 2] === 0) return null;
   return constructBoxJSXClosingElement(pos, ast);
 }
 
@@ -14013,7 +14016,7 @@ function constructBoxTSTypeParameter(pos, ast) {
 }
 
 function constructOptionBoxObjectExpression(pos, ast) {
-  if (ast.buffer.int32[pos >> 2] === 0 && ast.buffer.int32[(pos >> 2) + 1] === 0) return null;
+  if (ast.buffer.int32[pos >> 2] === 0 && ast.buffer.int32[(pos + 4) >> 2] === 0) return null;
   return constructBoxObjectExpression(pos, ast);
 }
 
@@ -14055,7 +14058,8 @@ function constructI32(pos, ast) {
 }
 
 function constructOptionNameSpan(pos, ast) {
-  if (ast.buffer.int32[(pos >> 2) + 2] === 0 && ast.buffer.int32[(pos >> 2) + 3] === 0) return null;
+  if (ast.buffer.int32[(pos + 8) >> 2] === 0 && ast.buffer.int32[(pos + 12) >> 2] === 0)
+    return null;
   return new NameSpan(pos, ast);
 }
 

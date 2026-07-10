@@ -1,0 +1,584 @@
+//! Scope management for the analyzer.
+//!
+//! Tracks variable bindings, declarations, and references across scopes.
+
+use rustc_hash::{FxHashMap, FxHashSet};
+use smallvec::SmallVec;
+use std::cell::RefCell;
+use std::rc::Rc;
+
+/// The root scope container for a component.
+#[derive(Debug, Default)]
+pub struct ScopeRoot {
+    /// All unique bindings in the component
+    pub bindings: Vec<Binding>,
+    /// The root scope (scope at index 0)
+    pub scope: Scope,
+    /// All scopes in the component (index 0 is the root scope)
+    /// Used for scope chain lookup when validating assignments
+    pub all_scopes: Vec<Scope>,
+    /// The scope index of the instance script scope.
+    /// This is 0 if there is no instance script, or the actual index of the
+    /// instance script scope (which may be > 1 if the module script has nested
+    /// scopes like function bodies before the instance script scope is created).
+    pub instance_scope_index: usize,
+    /// Maps function body start position to the scope index created for that function.
+    /// Used by the visitor to properly track `context.scope` when entering function bodies.
+    /// Key: start position of the function body (BlockStatement start)
+    /// Value: scope index in all_scopes
+    pub function_scope_map: FxHashMap<u32, usize>,
+    /// Information about each blocks whose collection variables may need State promotion.
+    /// Each entry: (parent_scope_idx, each_scope_idx, collection_identifier_names).
+    /// Processed in Phase 2 analyze after runes detection (only in legacy mode).
+    pub each_block_collection_infos: Vec<(usize, usize, Vec<String>)>,
+    /// Maps template node start positions to scope indices.
+    /// Used by the Phase 2 visitor to properly track `context.scope` when entering
+    /// scope-creating template nodes (EachBlock, AwaitBlock, SnippetBlock, etc.).
+    /// Key: start position of the template node
+    /// Value: scope index in all_scopes
+    pub template_scope_map: FxHashMap<u32, usize>,
+    /// All declaration names from all scopes, used for unique name generation.
+    /// Mirrors the `conflicts` set in the official Svelte compiler's ScopeRoot.
+    /// Every `declare()` call adds the name here.
+    /// Wrapped in Rc<RefCell<...>> so that Memoizer can share without cloning.
+    pub conflicts: Rc<RefCell<FxHashSet<String>>>,
+}
+
+impl ScopeRoot {
+    /// Create a new scope root.
+    pub fn new() -> Self {
+        Self {
+            bindings: Vec::new(),
+            scope: Scope::new(None),
+            all_scopes: Vec::new(),
+            instance_scope_index: 0,
+            function_scope_map: FxHashMap::default(),
+            each_block_collection_infos: Vec::new(),
+            template_scope_map: FxHashMap::default(),
+            conflicts: Rc::new(RefCell::new(FxHashSet::default())),
+        }
+    }
+
+    /// Look up a binding by name starting from a specific scope and walking up the parent chain.
+    /// This is the proper way to look up bindings, respecting lexical scoping.
+    ///
+    /// # Arguments
+    /// * `name` - The name of the binding to look up
+    /// * `scope_idx` - The scope index to start the search from
+    ///
+    /// # Returns
+    /// The binding index if found, or None if not found in any scope in the chain.
+    pub fn get_binding(&self, name: &str, scope_idx: usize) -> Option<usize> {
+        let mut current_scope_idx = Some(scope_idx);
+
+        while let Some(idx) = current_scope_idx {
+            // Try to get the scope from all_scopes
+            if let Some(scope) = self.all_scopes.get(idx) {
+                // Check if the binding is declared in this scope
+                if let Some(&binding_idx) = scope.declarations.get(name) {
+                    return Some(binding_idx);
+                }
+                // Move to parent scope
+                current_scope_idx = scope.parent;
+            } else if idx == 0 {
+                // Fallback to the root scope if all_scopes is empty (backward compatibility)
+                if let Some(&binding_idx) = self.scope.declarations.get(name) {
+                    return Some(binding_idx);
+                }
+                break;
+            } else {
+                break;
+            }
+        }
+
+        None
+    }
+
+    /// Look up a binding by name, searching all scopes.
+    /// This is a fallback method when we don't know the current scope.
+    /// It searches all scopes and returns the first match found.
+    /// Note: This may return bindings from any scope, not respecting lexical scoping.
+    /// Use `get_binding` when you know the current scope for proper scoping.
+    ///
+    /// # Arguments
+    /// * `name` - The name of the binding to look up
+    ///
+    /// # Returns
+    /// The binding index if found in any scope, or None if not found.
+    pub fn find_binding_any_scope(&self, name: &str) -> Option<usize> {
+        // First check the root scope
+        if let Some(&binding_idx) = self.scope.declarations.get(name) {
+            return Some(binding_idx);
+        }
+
+        // Then search all other scopes
+        for scope in &self.all_scopes {
+            if let Some(&binding_idx) = scope.declarations.get(name) {
+                return Some(binding_idx);
+            }
+        }
+
+        None
+    }
+}
+
+/// A lexical scope containing variable bindings.
+#[derive(Debug, Default, Clone)]
+pub struct Scope {
+    /// Parent scope index (None for root)
+    pub parent: Option<usize>,
+    /// Bindings declared in this scope (name -> binding index)
+    /// Using FxHashMap for 5-10x faster lookups than std HashMap
+    pub declarations: FxHashMap<String, usize>,
+    /// References to bindings in this scope
+    pub references: Vec<Reference>,
+    /// Child scopes
+    pub children: Vec<usize>,
+    /// The function nesting depth of this scope.
+    /// Matches the official Svelte compiler's `scope.function_depth`.
+    /// Root/module scope = 0, instance scope = 1, functions inside instance = 2, etc.
+    pub function_depth: usize,
+}
+
+impl Scope {
+    /// Create a new scope.
+    pub fn new(parent: Option<usize>) -> Self {
+        Self {
+            parent,
+            declarations: FxHashMap::default(),
+            references: Vec::new(),
+            children: Vec::new(),
+            function_depth: 0,
+        }
+    }
+
+    /// Create a new scope with a specific function depth.
+    pub fn new_with_depth(parent: Option<usize>, function_depth: usize) -> Self {
+        Self {
+            parent,
+            declarations: FxHashMap::default(),
+            references: Vec::new(),
+            children: Vec::new(),
+            function_depth,
+        }
+    }
+
+    /// Declare a binding in this scope.
+    pub fn declare(&mut self, name: String, binding_index: usize) {
+        self.declarations.insert(name, binding_index);
+    }
+
+    /// Check if a name is declared in this scope.
+    pub fn is_declared(&self, name: &str) -> bool {
+        self.declarations.contains_key(name)
+    }
+}
+
+/// The kind of declaration (var, let, const, function, etc.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeclarationKind {
+    /// var declaration (hoisted, function-scoped)
+    Var,
+    /// let declaration (block-scoped)
+    Let,
+    /// const declaration (block-scoped, immutable)
+    Const,
+    /// using declaration
+    Using,
+    /// await using declaration
+    AwaitUsing,
+    /// Function declaration
+    Function,
+    /// Import declaration
+    Import,
+    /// Function/method parameter
+    Param,
+    /// Rest parameter (...args)
+    RestParam,
+    /// Synthetic (generated by compiler)
+    Synthetic,
+}
+
+/// A mutation (assignment, update expression, etc.)
+#[derive(Debug, Clone)]
+pub struct Mutation {
+    /// Start position in source
+    pub start: u32,
+    /// End position in source
+    pub end: u32,
+    /// Kind of mutation
+    pub kind: MutationKind,
+}
+
+/// The kind of mutation
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MutationKind {
+    /// Assignment (=)
+    Assignment,
+    /// Update expression (++, --)
+    Update,
+    /// Compound assignment (+=, -=, etc.)
+    CompoundAssign,
+    /// Property mutation (obj.prop = value)
+    PropertyMutation,
+}
+
+/// A variable binding.
+#[derive(Debug, Clone)]
+pub struct Binding {
+    /// The binding kind (Normal, State, Prop, etc.)
+    pub kind: BindingKind,
+    /// The name of the binding
+    pub name: String,
+    /// How the binding was declared (let, const, var, etc.)
+    pub declaration_kind: DeclarationKind,
+    /// Whether the binding has been reassigned
+    pub reassigned: bool,
+    /// Whether the binding has been mutated (property change)
+    pub mutated: bool,
+    /// The scope index where this binding is declared
+    pub scope_index: usize,
+    /// Initial value expression (if any)
+    pub initial: Option<String>,
+    /// Whether the initial value is known to be defined (not null/undefined).
+    pub initial_is_defined: bool,
+    /// All references to this binding (SmallVec avoids heap allocation for ≤4 refs)
+    pub references: SmallVec<[BindingReference; 4]>,
+    /// All mutations to this binding (SmallVec avoids heap allocation for ≤2 mutations)
+    pub mutations: SmallVec<[Mutation; 2]>,
+    /// Prop alias (for exported props with different names)
+    pub prop_alias: Option<String>,
+    /// Whether the initial value is a function (ArrowFunctionExpression, FunctionExpression,
+    /// or FunctionDeclaration). This is used by `is_function()` to match the official Svelte
+    /// compiler's behavior where snippet blocks (declared with DeclarationKind::Function) are
+    /// NOT considered functions since their initial type is SnippetBlock.
+    pub initial_is_function: bool,
+    /// The AST node type of the initial value expression (e.g., "BinaryExpression", "Literal").
+    /// Used by should_proxy() to determine if an identifier's initial value needs deep reactivity.
+    pub initial_node_type: Option<String>,
+    /// When the initial value is an Identifier, stores its name (e.g., "undefined").
+    /// Used by should_proxy() to check if the initial value is `undefined`.
+    pub initial_identifier_name: Option<String>,
+    /// Instance-level declarations may follow (or contain) a top-level `await`. In these cases,
+    /// any reads that occur in the template must wait for the corresponding promise to resolve
+    /// otherwise the initial value will not have been assigned.
+    /// It is a member expression of the form `$$promises[n]`.
+    /// Corresponds to `blocker` field in Svelte's Binding class (scope.js).
+    pub blocker: Option<BlockerExpression>,
+    /// For `legacy_reactive` bindings: the binding indices of their reactive dependencies.
+    /// These are the bindings referenced on the RHS of `$: x = <rhs>`.
+    /// Used by `collect_transitive_dependencies` to follow dependency chains.
+    /// Corresponds to `legacy_dependencies` in Svelte's Binding class (scope.js).
+    pub legacy_dependencies: Vec<usize>,
+    /// Bindings that need to be invalidated when this binding is mutated.
+    /// Populated for `<select bind:value={x}>` in legacy mode - all other scope references
+    /// are added so that changes to `x` also trigger updates for those references.
+    /// Corresponds to `legacy_indirect_bindings` in Svelte's Binding class (scope.js).
+    pub legacy_indirect_bindings: Vec<String>,
+    /// Whether this binding is referenced directly in the template (not inside a function/event handler).
+    /// This is used for `non_reactive_update` warning, which should only fire when a non-state
+    /// binding is read directly in the template, not when it's only used inside event handler callbacks.
+    pub has_direct_template_read: bool,
+    /// The start position of the declaration identifier in the source.
+    /// Used to implement `node !== binding.node` check from the official Svelte compiler
+    /// to skip warnings for the declaration node itself (e.g., `let count = $state(0)`,
+    /// the `count` identifier is the declaration node, not a reference).
+    pub declaration_start: Option<u32>,
+    /// Warning codes to ignore for this binding (from preceding svelte-ignore comments).
+    /// Used to suppress warnings like `non_reactive_update` when the declaration has a
+    /// `// svelte-ignore non_reactive_update` comment.
+    pub ignore_codes: Vec<String>,
+    /// Whether this binding is inside a rest element in an each block destructuring.
+    /// Used for the `bind_invalid_each_rest` warning.
+    pub inside_rest: bool,
+    /// The import source path (e.g., "./Foo.svelte"), if this binding comes from an import.
+    pub import_source: Option<String>,
+    /// Whether this binding is a default import (as opposed to named import).
+    pub is_default_import: bool,
+    /// For rest_prop bindings, the list of property names that are destructured
+    /// alongside the rest element (i.e., the props that should NOT be accessed
+    /// through $$props when used on this rest variable). For example, in
+    /// `let { foo, ...others } = $props()`, the `others` binding will have
+    /// `exclude_props = ["foo"]`, meaning `others.foo` should NOT become `$$props.foo`
+    /// but `others.bar` should become `$$props.bar`.
+    pub exclude_props: Vec<String>,
+}
+
+/// A blocker expression representing `$$promises[n]`.
+/// Used to track async dependencies in instance-level declarations.
+#[derive(Debug, Clone)]
+pub struct BlockerExpression {
+    /// The index in the $$promises array
+    pub index: usize,
+}
+
+/// A reference to a binding from within the code
+#[derive(Debug, Clone)]
+pub struct BindingReference {
+    /// Start position in source
+    pub start: u32,
+    /// End position in source
+    pub end: u32,
+    /// Whether this reference is in the template (Fragment)
+    /// Used for legacy mode state promotion
+    pub is_template_reference: bool,
+    /// Whether this reference is inside a `$:` reactive declaration
+    pub is_reactive_declaration_reference: bool,
+    /// Whether this reference is in a StyleDirective
+    pub is_style_directive_reference: bool,
+    /// Whether this reference is the binding's own declaration node.
+    /// Used to filter self-references in export_let_unused check.
+    pub is_self_declaration: bool,
+    /// Whether this reference is inside an ExportSpecifier (e.g., `export { x }`).
+    /// Used to filter ExportSpecifier references in export_let_unused check.
+    pub is_export_specifier: bool,
+}
+
+impl Binding {
+    /// Create a new binding.
+    pub fn new(name: String, kind: BindingKind, scope_index: usize) -> Self {
+        Self {
+            kind,
+            name,
+            declaration_kind: DeclarationKind::Let,
+            reassigned: false,
+            mutated: false,
+            scope_index,
+            initial: None,
+            initial_is_defined: false,
+            initial_is_function: false,
+            initial_node_type: None,
+            initial_identifier_name: None,
+            references: SmallVec::new(),
+            mutations: SmallVec::new(),
+            prop_alias: None,
+            blocker: None,
+            legacy_dependencies: Vec::new(),
+            legacy_indirect_bindings: Vec::new(),
+            has_direct_template_read: false,
+            declaration_start: None,
+            ignore_codes: Vec::new(),
+            inside_rest: false,
+            import_source: None,
+            is_default_import: false,
+            exclude_props: Vec::new(),
+        }
+    }
+
+    /// Create a new binding with declaration kind.
+    pub fn with_declaration_kind(
+        name: String,
+        kind: BindingKind,
+        declaration_kind: DeclarationKind,
+        scope_index: usize,
+    ) -> Self {
+        Self {
+            kind,
+            name,
+            declaration_kind,
+            reassigned: false,
+            mutated: false,
+            scope_index,
+            initial: None,
+            initial_is_defined: false,
+            initial_is_function: false,
+            initial_node_type: None,
+            initial_identifier_name: None,
+            references: SmallVec::new(),
+            mutations: SmallVec::new(),
+            prop_alias: None,
+            blocker: None,
+            legacy_dependencies: Vec::new(),
+            legacy_indirect_bindings: Vec::new(),
+            has_direct_template_read: false,
+            declaration_start: None,
+            ignore_codes: Vec::new(),
+            inside_rest: false,
+            import_source: None,
+            is_default_import: false,
+            exclude_props: Vec::new(),
+        }
+    }
+
+    /// Returns true if this binding has been updated (reassigned or mutated)
+    pub fn is_updated(&self) -> bool {
+        self.reassigned || self.mutated
+    }
+
+    /// Returns true if this binding is reactive (needs runtime tracking)
+    pub fn is_reactive(&self) -> bool {
+        self.kind.is_reactive()
+    }
+
+    /// Returns true if this binding is a rune ($state, $derived, etc.)
+    pub fn is_rune(&self) -> bool {
+        self.kind.is_rune()
+    }
+
+    /// Add a reference to this binding
+    pub fn add_reference(
+        &mut self,
+        start: u32,
+        end: u32,
+        is_template_reference: bool,
+        is_reactive_declaration_reference: bool,
+        is_style_directive_reference: bool,
+    ) {
+        self.references.push(BindingReference {
+            start,
+            end,
+            is_template_reference,
+            is_reactive_declaration_reference,
+            is_style_directive_reference,
+            is_self_declaration: false,
+            is_export_specifier: false,
+        });
+    }
+
+    /// Add a reference with export specifier flag
+    pub fn add_reference_with_flags(
+        &mut self,
+        start: u32,
+        end: u32,
+        is_template_reference: bool,
+        is_reactive_declaration_reference: bool,
+        is_style_directive_reference: bool,
+        is_export_specifier: bool,
+    ) {
+        self.references.push(BindingReference {
+            start,
+            end,
+            is_template_reference,
+            is_reactive_declaration_reference,
+            is_style_directive_reference,
+            is_self_declaration: false,
+            is_export_specifier,
+        });
+    }
+
+    /// Add a mutation to this binding
+    pub fn add_mutation(&mut self, start: u32, end: u32, kind: MutationKind) {
+        self.mutations.push(Mutation { start, end, kind });
+        match kind {
+            MutationKind::Assignment | MutationKind::Update | MutationKind::CompoundAssign => {
+                self.reassigned = true;
+            }
+            MutationKind::PropertyMutation => {
+                self.mutated = true;
+            }
+        }
+    }
+
+    /// Check if this binding represents a function.
+    ///
+    /// Corresponds to `is_function()` in Svelte's scope.js Binding class.
+    /// Returns true only if:
+    /// - The binding has not been updated (reassigned or mutated)
+    /// - The initial value is a JS function type (ArrowFunctionExpression, FunctionExpression,
+    ///   or FunctionDeclaration)
+    ///
+    /// Notably, snippet blocks are declared with DeclarationKind::Function but their initial
+    /// value is a SnippetBlock, so is_function() correctly returns false for them.
+    pub fn is_function(&self) -> bool {
+        // If the binding has been updated (reassigned or mutated), it's not a function
+        // even if it was initially declared as one.
+        if self.is_updated() {
+            return false;
+        }
+
+        // Check if the initial value is a function type
+        self.initial_is_function
+    }
+}
+
+/// The kind of binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindingKind {
+    /// A normal variable binding (let, const, var)
+    Normal,
+    /// A component prop (possibly reassigned or mutated)
+    Prop,
+    /// A bindable prop (can be used with bind:)
+    BindableProp,
+    /// A rest prop ($$restProps)
+    RestProp,
+    /// A $state() reactive variable
+    State,
+    /// A $state.raw() reactive variable
+    RawState,
+    /// A $derived() computed variable
+    Derived,
+    /// An each block item
+    EachItem,
+    /// An each block index (known to be static/immutable)
+    EachIndex,
+    /// An await block value (then value)
+    AwaitThen,
+    /// An await block error (catch error)
+    AwaitCatch,
+    /// A snippet parameter
+    SnippetParam,
+    /// A let directive binding
+    Let,
+    /// A store subscription ($store)
+    Store,
+    /// A $store subscription (automatically subscribed)
+    StoreSub,
+    /// A legacy reactive statement ($:)
+    LegacyReactive,
+    /// A template-local binding (e.g., let directive in template)
+    Template,
+    /// A binding whose value is known to be static at compile time
+    Static,
+}
+
+impl BindingKind {
+    /// Returns true if this binding kind is reactive (needs runtime tracking)
+    pub fn is_reactive(&self) -> bool {
+        matches!(
+            self,
+            BindingKind::State
+                | BindingKind::RawState
+                | BindingKind::Derived
+                | BindingKind::Prop
+                | BindingKind::BindableProp
+                | BindingKind::Store
+                | BindingKind::StoreSub
+                | BindingKind::EachItem // Each block items are reactive since they can change
+                | BindingKind::SnippetParam // Snippet parameters are reactive (called as functions)
+        )
+    }
+
+    /// Returns true if this binding is a rune-based binding ($state, $derived, etc.)
+    pub fn is_rune(&self) -> bool {
+        matches!(
+            self,
+            BindingKind::State | BindingKind::RawState | BindingKind::Derived
+        )
+    }
+}
+
+/// A reference to a binding.
+#[derive(Debug, Clone)]
+pub struct Reference {
+    /// The name being referenced
+    pub name: String,
+    /// The binding index (if resolved)
+    pub binding_index: Option<usize>,
+    /// Start position in source
+    pub start: usize,
+    /// End position in source
+    pub end: usize,
+}
+
+impl Reference {
+    /// Create a new reference.
+    pub fn new(name: String, start: usize, end: usize) -> Self {
+        Self {
+            name,
+            binding_index: None,
+            start,
+            end,
+        }
+    }
+}

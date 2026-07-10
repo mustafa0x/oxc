@@ -9,6 +9,8 @@ use super::{
     CliRunResult, FormatCommand, Mode,
     resolve::{build_global_ignore_matchers, is_ignored, resolve_ignore_paths},
 };
+#[cfg(feature = "svelte-rsvelte-backend")]
+use crate::core::FileKind;
 use crate::core::{
     ConfigResolver, ExternalServices, FormatResult, JsConfigLoaderCb, NestedConfigCtx,
     ResolveOutcome, SourceFormatter, classify_file_kind, resolve_editorconfig_path,
@@ -38,6 +40,23 @@ impl StdinRunner {
             js_config_loader,
             external_services,
         }
+    }
+
+    /// Creates a stdin runner for pure Rust CLI paths.
+    ///
+    /// This can format native backends such as JavaScript, JSON, TOML, and the
+    /// rsvelte-backed Svelte formatter. JS-backed config files and external
+    /// formatter plugins remain unavailable without the NAPI entrypoint.
+    pub fn new_without_js(options: FormatCommand) -> Self {
+        Self::new(
+            options,
+            Arc::new(|path| {
+                Err(format!(
+                    "JavaScript config loading is unavailable in the pure Rust CLI: {path}"
+                ))
+            }),
+            ExternalFormatter::unavailable(),
+        )
     }
 
     pub fn run(self) -> CliRunResult {
@@ -134,16 +153,60 @@ impl StdinRunner {
             return CliRunResult::FormatSucceeded;
         }
 
-        let Some(kind) = classify_file_kind(Arc::from(filepath)) else {
-            utils::print_and_flush(stderr, "Unsupported file type for stdin-filepath\n");
-            return CliRunResult::InvalidOptionConfig;
+        let kind = {
+            let mut classify_with_external_support = || {
+                let external_plugin_support = match tokio::task::block_in_place(|| {
+                    self.external_formatter
+                        .init(num_of_threads, &config_resolver.external_plugin_specs())
+                }) {
+                    Ok(language_jsons) => {
+                        ExternalPluginSupport::from_language_json_strings(&language_jsons)
+                    }
+                    Err(err) => {
+                        utils::print_and_flush(
+                            stderr,
+                            &format!("Failed to setup external formatter.\n{err}\n"),
+                        );
+                        return Err(CliRunResult::InvalidOptionConfig);
+                    }
+                };
+
+                let Some(kind) = classify_file_kind_with_external_support(
+                    Arc::from(filepath.clone()),
+                    &external_plugin_support,
+                ) else {
+                    utils::print_and_flush(stderr, "Unsupported file type for stdin-filepath\n");
+                    return Err(CliRunResult::InvalidOptionConfig);
+                };
+                Ok(kind)
+            };
+
+            #[cfg(feature = "svelte-rsvelte-backend")]
+            {
+                let native_kind = classify_file_kind_with_external_support(
+                    Arc::from(filepath.clone()),
+                    &ExternalPluginSupport::default(),
+                );
+                if let Some(kind) = native_kind
+                    && matches!(&kind, FileKind::RsvelteFormatter { .. })
+                {
+                    kind
+                } else {
+                    match classify_with_external_support() {
+                        Ok(kind) => kind,
+                        Err(result) => return result,
+                    }
+                }
+            }
+
+            #[cfg(not(feature = "svelte-rsvelte-backend"))]
+            match classify_with_external_support() {
+                Ok(kind) => kind,
+                Err(result) => return result,
+            }
         };
         let strategy = match config_resolver.resolve(kind) {
             Ok(ResolveOutcome::Format(strategy)) => strategy,
-            Ok(ResolveOutcome::MissingPlugin(_)) => {
-                utils::print_and_flush(stdout, &source_text);
-                return CliRunResult::FormatSucceeded;
-            }
             Err(err) => {
                 utils::print_and_flush(stderr, &format!("{err}\n"));
                 return CliRunResult::InvalidOptionConfig;
