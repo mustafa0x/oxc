@@ -710,6 +710,16 @@ let count:number=1;
         }
 
         #[test]
+        fn formats_inline_else_block_idempotently() {
+            let source = r#"{#if found}<div>Found</div>{:else}<section class="mx-auto max-w-3xl px-4 py-20 text-center"><h1 class="text-3xl font-bold">Stage not found</h1></section>{/if}"#;
+
+            let formatted = format_svelte(source).expect("Svelte if block should format");
+
+            parse_svelte_syntax(&formatted).expect("formatted Svelte if block should reparse");
+            assert_eq!(format_svelte(&formatted).unwrap(), formatted);
+        }
+
+        #[test]
         fn parse_error_includes_code_and_range() {
             let source = r#"<script context="not-module"></script>"#;
             let error = parse_svelte(source).expect_err("Svelte source should fail to parse");
