@@ -15,11 +15,12 @@ the inventory needed to decide which signals should later become native rules.
 
 Native `.svelte` linting currently covers:
 
-- rsvelte parser and analyzer errors surfaced as `svelte(<code>)`;
-- rsvelte compiler/analyzer warnings, including implemented accessibility
-  warnings, surfaced with stable source ranges;
+- rsvelte syntax errors surfaced as `svelte(<code>)`;
 - embedded module and instance `<script>` blocks through existing Oxc JS/TS
   rules;
+- component-wide semantic overlays for `eslint/no-undef` and
+  `eslint/no-unused-vars`, including module-to-instance references, template
+  usage, stores, and Svelte compiler globals;
 - Svelte/HTML `oxlint-disable` and `eslint-disable` directives for full-file
   spans and native Svelte parse diagnostics;
 - JS comment disable directives inside extracted script blocks;
@@ -36,8 +37,7 @@ Native `.svelte` linting intentionally does not cover:
 - Svelte-specific fixes or suggestions over template AST nodes;
 - parser-service compatibility for JS plugin rules without
   `svelte-eslint-parser`;
-- template-to-script symbol usage mapping for rules that currently skip
-  `.svelte`.
+- undeclared identifiers that occur only in template expressions.
 
 These are accepted hard-cut behavior differences. New Svelte template lint
 coverage must be implemented as rsvelte compiler/analyzer diagnostics or native
@@ -48,12 +48,12 @@ the backend.
 
 | Signal | Current JS-backed source | Native rsvelte/Oxc source | Severity | Fixes | Status |
 | --- | --- | --- | --- | --- | --- |
-| Svelte parser and analyzer errors | `svelte-eslint-parser` parse errors and `svelte/valid-compile` style behavior | `oxc_svelte_backend::parse_svelte` runs rsvelte parse and analysis, then converts failures to `svelte(<code>)` diagnostics | error | no | covered for diagnostics implemented by the pinned rsvelte revision |
+| Svelte parser errors | `svelte-eslint-parser` parse errors | `oxc_svelte_backend::parse_svelte_for_lint` converts rsvelte syntax failures to `svelte(<code>)` diagnostics | error | no | covered for syntax diagnostics implemented by the pinned rsvelte revision |
 | `svelte/no-useless-mustaches` | Pinned real recommended fixture reports `svelte/no-useless-mustaches` for `{"hello"}` | none yet | error | upstream has fixes for some cases | accepted drop for hard cut; native Rust rule is a follow-up |
-| `svelte/valid-compile` and compiler diagnostics | Historical/recommended Svelte plugin signal, depending on plugin version/config | rsvelte analysis and no-codegen transform pass; warnings retain rsvelte codes and ranges | warning/error from compiler | no | covered for diagnostics implemented by the pinned rsvelte revision; parity gaps remain rsvelte gaps |
+| `svelte/valid-compile` and compiler diagnostics | Historical/recommended Svelte plugin signal, depending on plugin version/config | no native lint rule currently emits rsvelte analysis or transform diagnostics | warning/error from compiler | no | accepted drop; syntax diagnostics remain covered |
 | Svelte/HTML disable directives | External parser comments from `svelte-eslint-parser` | HTML comments collected from rsvelte parse payload, with source scan fallback for parse errors | n/a | unused-directive suggestions not wired for file-level HTML comments | covered for suppressing/reporting; richer fixes pending |
 | JS disable directives in scripts | JS comments from embedded script AST | existing partial script lint path | n/a | existing JS directive fixes | covered |
-| Module and instance script lint | `svelte-eslint-parser` script AST/services | existing Oxc partial script extraction after rsvelte parse gate | configured rule severity | existing JS fixes | covered for JS/TS script rules |
+| Module and instance script lint | `svelte-eslint-parser` script AST/services | Oxc partial script extraction plus a compact rsvelte semantic overlay | configured rule severity | existing JS fixes | covered for JS/TS script rules, including component-aware `no-undef` and `no-unused-vars` |
 | Comments and tokens for JS plugin source APIs | `svelte-eslint-parser` `SourceCode` comments/tokens | rsvelte adapter exposes comments for native directives; no ESTree source-code bridge | n/a | n/a | accepted drop; JS Svelte plugin bridge removed |
 | Parser services | `parserServices.isSvelte`, Svelte context, style context, parser options | none in native path | n/a | n/a | accepted drop; JS Svelte plugin bridge removed |
 | Fixes/suggestions over template nodes | `eslint-plugin-svelte` rules over Svelte ESTree nodes | none | rule-specific | no | accepted drop until native rules provide their own fixes |
@@ -62,14 +62,15 @@ the backend.
 | CLI stdin | no current `oxlint` stdin CLI surface found | n/a | n/a | n/a | not applicable unless a stdin lint surface is added |
 | LSP diagnostics | LSP run source path | same runtime path; has rsvelte parse diagnostics and type-aware degradation notice | configured/info | code actions exist | covered for current native diagnostics |
 
-## Existing Native Rule Skips
+## Partial-file Rule Handling
 
-These built-in Oxc rules intentionally skip `.svelte` today because template
-usage is not visible from the extracted JS/TS AST alone:
+These built-in Oxc rules need explicit handling because template usage is not
+visible from an extracted JS/TS AST alone:
 
 | Rule | Current behavior | Cutover requirement |
 | --- | --- | --- |
-| `eslint/no-unused-vars` | skips `.svelte`, `.vue`, `.astro`, and `.d.ts` | keep skipped until rsvelte maps template identifier usage to script symbols |
+| `eslint/no-unused-vars` | runs for `.svelte` when rsvelte semantic analysis succeeds; skips on analysis fallback | component-wide overlay supplies template and cross-script usage |
+| `eslint/no-undef` | runs for `.svelte` when rsvelte semantic analysis succeeds; skips on analysis fallback | component-wide overlay resolves cross-script references, stores, and compiler globals |
 | `typescript/consistent-type-imports` | skips `.svelte`, `.vue`, and `.astro` | keep skipped until type-only usage can be proven across template and script |
 | `react/rules-of-hooks` | skips `.svelte` and `.vue` | keep skipped; Svelte `use*` calls are not React hooks |
 | `eslint/no-unused-labels` | skips `.svelte` | re-evaluate once rsvelte script/template ranges are the only Svelte parse source |
@@ -85,8 +86,8 @@ usage is not visible from the extracted JS/TS AST alone:
 3. Convert or remove bridge-only fixtures that assert
    `svelte-eslint-parser`, parser services, external template traversal, or JS
    template fixes.
-4. Keep the built-in rule skips until there is tested template-to-script usage
-   mapping from rsvelte.
+4. Add native undefined-name diagnostics for references that occur only in the
+   template and therefore never enter an extracted Oxc script AST.
 
 ## Removed Bridge Fixture Inventory
 

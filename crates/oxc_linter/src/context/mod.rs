@@ -23,7 +23,7 @@ use crate::{
 };
 
 mod host;
-pub use host::{ContextHost, ContextSubHost, ContextSubHostOptions};
+pub use host::{ContextHost, ContextSubHost, ContextSubHostOptions, PartialFileSemantic};
 
 /// Contains all of the state and context specific to this lint rule.
 ///
@@ -161,6 +161,14 @@ impl<'a> LintContext<'a> {
     #[inline]
     pub fn file_extension(&self) -> Option<&OsStr> {
         self.parent.file_extension()
+    }
+
+    pub(crate) fn source_text_offset(&self) -> u32 {
+        self.parent.current_sub_host().source_text_offset()
+    }
+
+    pub(crate) fn partial_semantic(&self) -> Option<&PartialFileSemantic> {
+        self.parent.partial_semantic()
     }
 
     /// Plugin settings

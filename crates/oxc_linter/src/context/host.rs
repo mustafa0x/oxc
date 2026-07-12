@@ -33,6 +33,51 @@ use crate::frameworks::{has_jest_imports, has_vitest_imports, is_jestlike_file};
 
 use super::LintContext;
 
+/// Semantic facts that connect independently parsed sections of a partial file.
+#[derive(Debug)]
+pub struct PartialFileSemantic {
+    resolved_references: Box<[Span]>,
+    used_bindings: Box<[u32]>,
+    implicit_globals: Box<[Box<str>]>,
+}
+
+impl PartialFileSemantic {
+    #[cfg_attr(not(feature = "svelte-rsvelte-backend"), expect(dead_code))]
+    pub(crate) fn new(
+        mut resolved_references: Vec<Span>,
+        mut used_bindings: Vec<u32>,
+        implicit_globals: Vec<String>,
+    ) -> Self {
+        resolved_references.sort_unstable_by_key(|span| (span.start, span.end));
+        resolved_references.dedup();
+        used_bindings.sort_unstable();
+        used_bindings.dedup();
+        let mut implicit_globals =
+            implicit_globals.into_iter().map(String::into_boxed_str).collect::<Vec<_>>();
+        implicit_globals.sort_unstable();
+        implicit_globals.dedup();
+        Self {
+            resolved_references: resolved_references.into_boxed_slice(),
+            used_bindings: used_bindings.into_boxed_slice(),
+            implicit_globals: implicit_globals.into_boxed_slice(),
+        }
+    }
+
+    pub(crate) fn resolves_reference(&self, span: Span) -> bool {
+        self.resolved_references
+            .binary_search_by_key(&(span.start, span.end), |span| (span.start, span.end))
+            .is_ok()
+    }
+
+    pub(crate) fn uses_binding(&self, declaration_start: u32) -> bool {
+        self.used_bindings.binary_search(&declaration_start).is_ok()
+    }
+
+    pub(crate) fn has_implicit_global(&self, name: &str) -> bool {
+        self.implicit_globals.binary_search_by(|global| global.as_ref().cmp(name)).is_ok()
+    }
+}
+
 /// Stores shared information about a script block being linted.
 pub struct ContextSubHost<'a> {
     /// Semantic information about the file being linted, which includes scopes, symbols and AST nodes.
@@ -50,6 +95,7 @@ pub struct ContextSubHost<'a> {
     pub(super) parser_tokens: ArenaBox<'a, [Token]>,
     /// The source text offset of the sub host
     pub(super) source_text_offset: u32,
+    pub(super) partial_semantic: Option<Arc<PartialFileSemantic>>,
 }
 
 impl<'a> ContextSubHost<'a> {
@@ -83,6 +129,7 @@ impl<'a> ContextSubHost<'a> {
             disable_directives,
             framework_options: options.framework_options,
             parser_tokens: options.parser_tokens,
+            partial_semantic: options.partial_semantic,
         }
     }
 
@@ -120,6 +167,7 @@ pub struct ContextSubHostOptions<'a> {
     pub framework_options: FrameworkOptions,
     pub parser_tokens: ArenaBox<'a, [Token]>,
     pub respect_eslint_disable_directives: bool,
+    pub(crate) partial_semantic: Option<Arc<PartialFileSemantic>>,
 }
 
 impl Default for ContextSubHostOptions<'_> {
@@ -128,6 +176,7 @@ impl Default for ContextSubHostOptions<'_> {
             framework_options: FrameworkOptions::Default,
             parser_tokens: ArenaBox::new_empty_boxed_slice(),
             respect_eslint_disable_directives: true,
+            partial_semantic: None,
         }
     }
 }
@@ -610,6 +659,10 @@ impl<'a> ContextHost<'a> {
 
     pub fn frameworks_options(&self) -> FrameworkOptions {
         self.current_sub_host().framework_options
+    }
+
+    pub(crate) fn partial_semantic(&self) -> Option<&PartialFileSemantic> {
+        self.current_sub_host().partial_semantic.as_deref()
     }
 
     pub fn other_file_hosts(&self) -> Vec<&ContextSubHost<'a>> {

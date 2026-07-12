@@ -1,0 +1,9 @@
+{
+  "globals": {
+    "configuredGlobal": "readonly"
+  },
+  "rules": {
+    "no-undef": "error",
+    "no-unused-vars": "error"
+  }
+}

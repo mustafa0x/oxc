@@ -415,6 +415,17 @@ Linted file: fixtures/lsp/frameworks/svelte/debugger.svelte
 ########## Diagnostic Reports
 File URI: file://<variable>/fixtures/lsp/frameworks/svelte/debugger.svelte
 
+code: "eslint(no-unused-vars)"
+code_description.href: "https://oxc.rs/docs/guide/usage/linter/rules/eslint/no-unused-vars.html"
+message: "Variable 'name2' is declared but never used. Unused variables should start with a '_'.\nhelp: Consider removing this declaration."
+range: Range { start: Position { line: 19, character: 5 }, end: Position { line: 19, character: 10 } }
+related_information[0].message: "'name2' is declared here"
+related_information[0].location.uri: "file://<variable>/fixtures/lsp/frameworks/svelte/debugger.svelte"
+related_information[0].location.range: Range { start: Position { line: 19, character: 5 }, end: Position { line: 19, character: 10 } }
+severity: Some(Warning)
+source: Some("oxc")
+tags: None
+
 code: "eslint(no-debugger)"
 code_description.href: "https://oxc.rs/docs/guide/usage/linter/rules/eslint/no-debugger.html"
 message: "`debugger` statement is not allowed\nhelp: Remove the debugger statement"
@@ -427,6 +438,42 @@ source: Some("oxc")
 tags: None
 
 ########### Code Actions/Commands
+CodeAction: 
+Title: Disable no-unused-vars for this line
+Is Preferred: Some(false)
+TextEdit: TextEdit {
+    range: Range {
+        start: Position {
+            line: 19,
+            character: 0,
+        },
+        end: Position {
+            line: 19,
+            character: 0,
+        },
+    },
+    new_text: "\t// oxlint-disable-next-line no-unused-vars\n",
+}
+
+
+CodeAction: 
+Title: Disable no-unused-vars for this whole file
+Is Preferred: Some(false)
+TextEdit: TextEdit {
+    range: Range {
+        start: Position {
+            line: 1,
+            character: 0,
+        },
+        end: Position {
+            line: 1,
+            character: 0,
+        },
+    },
+    new_text: "// oxlint-disable no-unused-vars\n",
+}
+
+
 CodeAction: 
 Title: Remove the debugger statement
 Is Preferred: Some(true)

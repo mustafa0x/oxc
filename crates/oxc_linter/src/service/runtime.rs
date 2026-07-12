@@ -27,11 +27,11 @@ use oxc_semantic::{Semantic, SemanticBuilder};
 use oxc_span::{SourceType, VALID_EXTENSIONS};
 use oxc_str::CompactStr;
 #[cfg(feature = "svelte-rsvelte-backend")]
-use oxc_svelte_backend::{SvelteCommentKind, parse_svelte_syntax};
+use oxc_svelte_backend::{SvelteCommentKind, parse_svelte_for_lint};
 
 use crate::{
     AllowWarnDeny, Fixer, Linter, Message, MessageRule, PossibleFixes, RuleTimingStore,
-    context::{ContextSubHost, ContextSubHostOptions},
+    context::{ContextSubHost, ContextSubHostOptions, PartialFileSemantic},
     disable_directives::{DisableDirectives, create_unused_directives_diagnostics},
     loader::{JavaScriptSource, LINT_PARTIAL_LOADER_EXTENSIONS, PartialLoader},
     module_record::ModuleRecord,
@@ -149,6 +149,7 @@ struct SectionContent<'a> {
     /// Parser tokens for the section.
     /// Empty if section parsing failed, or if token collection was not requested (no JS plugins).
     parser_tokens: ArenaBox<'a, [Token]>,
+    partial_semantic: Option<Arc<PartialFileSemantic>>,
 }
 
 /// A module with its source text and semantic, ready to be linted.
@@ -807,6 +808,7 @@ impl Runtime {
                                         framework_options: section.source.framework_options,
                                         parser_tokens: section.parser_tokens,
                                         respect_eslint_disable_directives,
+                                        partial_semantic: section.partial_semantic,
                                         ..Default::default()
                                     },
                                 )),
@@ -1011,6 +1013,7 @@ impl Runtime {
                                             framework_options: section.source.framework_options,
                                             parser_tokens: section.parser_tokens,
                                             respect_eslint_disable_directives,
+                                            partial_semantic: section.partial_semantic,
                                             ..Default::default()
                                         },
                                     )),
@@ -1189,6 +1192,7 @@ impl Runtime {
                                         framework_options: section.source.framework_options,
                                         parser_tokens: section.parser_tokens,
                                         respect_eslint_disable_directives,
+                                        partial_semantic: section.partial_semantic,
                                         ..Default::default()
                                     },
                                 )),
@@ -1377,14 +1381,16 @@ impl Runtime {
     ) -> ProcessedSource {
         #[cfg_attr(not(feature = "svelte-rsvelte-backend"), expect(unused_mut))]
         let mut full_file_disable_directives = None;
+        #[cfg_attr(not(feature = "svelte-rsvelte-backend"), expect(unused_mut))]
+        let mut partial_semantic = None;
         #[cfg(feature = "svelte-rsvelte-backend")]
         let mut svelte_section_sources = None;
         #[cfg(feature = "svelte-rsvelte-backend")]
         if ext == "svelte" {
-            let parsed = parse_svelte_syntax(source_text);
+            let parsed = parse_svelte_for_lint(source_text);
             let respect_eslint_disable_directives = self.linter.respect_eslint_disable_directives();
             full_file_disable_directives = match parsed.as_ref() {
-                Ok(parsed) => Self::build_svelte_html_disable_directives(
+                Ok((parsed, _)) => Self::build_svelte_html_disable_directives(
                     source_text,
                     parsed
                         .comments
@@ -1400,7 +1406,14 @@ impl Runtime {
             };
 
             match parsed {
-                Ok(parsed) => {
+                Ok((parsed, semantic)) => {
+                    partial_semantic = semantic.map(|semantic| {
+                        Arc::new(PartialFileSemantic::new(
+                            semantic.resolved_references,
+                            semantic.used_bindings,
+                            semantic.implicit_globals,
+                        ))
+                    });
                     svelte_section_sources =
                         Some(SveltePartialLoader::parse_scripts_from_result(source_text, &parsed));
                 }
@@ -1414,6 +1427,7 @@ impl Runtime {
                             source: JavaScriptSource::partial(source_text, source_type, 0),
                             semantic: None,
                             parser_tokens: ArenaBox::new_empty_boxed_slice(),
+                            partial_semantic: None,
                         });
                     }
 
@@ -1461,6 +1475,7 @@ impl Runtime {
                             source: section_source,
                             semantic: Some(semantic),
                             parser_tokens,
+                            partial_semantic: partial_semantic.clone(),
                         });
                     }
                 }
@@ -1481,6 +1496,7 @@ impl Runtime {
                             source: section_source,
                             semantic: None,
                             parser_tokens: ArenaBox::new_empty_boxed_slice(),
+                            partial_semantic: partial_semantic.clone(),
                         });
                     }
                 }

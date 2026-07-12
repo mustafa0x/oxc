@@ -11,8 +11,13 @@ mod rsvelte_backend {
     use oxc_span::Span;
     use svelte_compiler_rust::{
         CompileOptions, GenerateMode, ParseOptions,
-        ast::{Fragment, Root, Script, ScriptContext, TemplateNode, arena::SerializeArenaGuard},
-        compiler::phases::phase2_analyze::{AnalysisError, analyze_component},
+        ast::{
+            Fragment, Root, Script, ScriptContext, TemplateNode, arena::SerializeArenaGuard,
+            typed_expr::JsNode,
+        },
+        compiler::phases::phase2_analyze::{
+            AnalysisError, Binding, BindingKind, ComponentAnalysis, analyze_component,
+        },
         compiler::phases::phase3_transform::{TransformError, transform_component},
         error::ParseError,
         parse,
@@ -90,6 +95,17 @@ mod rsvelte_backend {
         pub comments: Vec<SvelteComment>,
         pub warnings: Vec<SvelteParseWarning>,
         pub top_level_node_count: usize,
+    }
+
+    /// Component-wide semantic facts needed by partial-file lint rules.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct SvelteSemanticSummary {
+        /// Absolute source spans that rsvelte resolved to a component binding.
+        pub resolved_references: Vec<Span>,
+        /// Absolute declaration starts with uses outside Oxc's isolated script scope.
+        pub used_bindings: Vec<u32>,
+        /// Framework-provided globals that are valid in embedded scripts.
+        pub implicit_globals: Vec<String>,
     }
 
     /// Oxc-facing parse error for `.svelte` files.
@@ -197,6 +213,258 @@ mod rsvelte_backend {
         let _arena_guard = unsafe { SerializeArenaGuard::new(&raw const root.arena) };
 
         Ok(build_parse_result(source, &root))
+    }
+
+    /// Parse a component and retain compact cross-section semantic facts for linting.
+    ///
+    /// Analysis errors intentionally produce no semantic summary. The lint runtime can still
+    /// report syntax diagnostics and lint rules that do not require component-wide scopes.
+    ///
+    /// # Errors
+    ///
+    /// Returns the normalized rsvelte parse error when the component has invalid syntax.
+    pub fn parse_svelte_for_lint(
+        source: &str,
+    ) -> Result<(SvelteParseResult, Option<SvelteSemanticSummary>), SvelteParseError> {
+        let mut root = parse(source, ParseOptions::default())
+            .map_err(|error| convert_parse_error(source, &error))?;
+        // SAFETY: `root.arena` lives until the guard is dropped at the end of this function.
+        let _arena_guard = unsafe { SerializeArenaGuard::new(&raw const root.arena) };
+
+        let parsed = build_parse_result(source, &root);
+        let compile_options = CompileOptions {
+            generate: GenerateMode::None,
+            enable_sourcemap: false,
+            ..CompileOptions::default()
+        };
+        let semantic = analyze_component(&mut root, source, &compile_options)
+            .ok()
+            .map(|analysis| build_semantic_summary(source, &analysis, &root, &parsed.scripts));
+
+        Ok((parsed, semantic))
+    }
+
+    fn build_semantic_summary(
+        source: &str,
+        analysis: &ComponentAnalysis,
+        root: &Root,
+        scripts: &[SvelteScript],
+    ) -> SvelteSemanticSummary {
+        let mut resolved_references = Vec::new();
+        let mut used_bindings = Vec::new();
+
+        for binding in &analysis.root.bindings {
+            resolved_references.extend(
+                binding
+                    .references
+                    .iter()
+                    .map(|reference| Span::new(reference.start, reference.end)),
+            );
+
+            let Some(declaration_start) = binding_declaration_start(source, binding, root, scripts)
+            else {
+                continue;
+            };
+            let declaration_script = scripts.iter().find(|script| {
+                let span = script.body_range.span;
+                declaration_start >= span.start && declaration_start < span.end
+            });
+            if binding.references.iter().any(|reference| {
+                reference.is_template_reference
+                    || declaration_script.is_some_and(|script| {
+                        let span = script.body_range.span;
+                        !(span.start..span.end).contains(&reference.start)
+                    })
+            }) {
+                used_bindings.push(declaration_start);
+            }
+        }
+
+        for store_subscription in analysis.root.bindings.iter().filter(|binding| {
+            binding.kind == BindingKind::StoreSub && !binding.references.is_empty()
+        }) {
+            let Some(store_name) = store_subscription.name.strip_prefix('$') else {
+                continue;
+            };
+            if let Some(binding_index) =
+                analysis.root.get_binding(store_name, analysis.root.instance_scope_index)
+                && let Some(declaration_start) = binding_declaration_start(
+                    source,
+                    &analysis.root.bindings[binding_index],
+                    root,
+                    scripts,
+                )
+            {
+                used_bindings.push(declaration_start);
+            }
+        }
+
+        let mut component_bindings = Vec::new();
+        collect_component_bindings(&root.fragment, &mut component_bindings);
+        for binding_index in component_bindings {
+            if let Some(binding) = analysis.root.bindings.get(binding_index)
+                && let Some(declaration_start) =
+                    binding_declaration_start(source, binding, root, scripts)
+            {
+                used_bindings.push(declaration_start);
+            }
+        }
+
+        let mut implicit_globals = Vec::new();
+        if analysis.runes {
+            implicit_globals.extend(
+                ["$state", "$derived", "$props", "$bindable", "$effect", "$inspect", "$host"]
+                    .map(str::to_string),
+            );
+        } else {
+            if analysis.uses_props {
+                implicit_globals.push("$$props".to_string());
+            }
+            if analysis.uses_rest_props {
+                implicit_globals.push("$$restProps".to_string());
+            }
+            if analysis.uses_slots {
+                implicit_globals.push("$$slots".to_string());
+            }
+        }
+
+        resolved_references.sort_unstable_by_key(|span| (span.start, span.end));
+        resolved_references.dedup();
+        used_bindings.sort_unstable();
+        used_bindings.dedup();
+        implicit_globals.sort_unstable();
+
+        SvelteSemanticSummary { resolved_references, used_bindings, implicit_globals }
+    }
+
+    fn binding_declaration_start(
+        source: &str,
+        binding: &Binding,
+        root: &Root,
+        scripts: &[SvelteScript],
+    ) -> Option<u32> {
+        let matches_name = |start: u32| {
+            usize::try_from(start).ok().is_some_and(|start| {
+                start
+                    .checked_add(binding.name.len())
+                    .is_some_and(|end| source.get(start..end) == Some(binding.name.as_str()))
+            })
+        };
+
+        if let Some(start) = binding
+            .references
+            .iter()
+            .find(|reference| reference.is_self_declaration)
+            .map(|reference| reference.start)
+            .filter(|start| matches_name(*start))
+        {
+            return Some(start);
+        }
+
+        if let Some(start) = binding.declaration_start {
+            if matches_name(start) {
+                return Some(start);
+            }
+            if let Some(start) = scripts.iter().find_map(|script| {
+                start
+                    .checked_sub(script.body_range.span.start)
+                    .filter(|candidate| matches_name(*candidate))
+            }) {
+                return Some(start);
+            }
+        }
+
+        let script = if binding.scope_index == 0 {
+            root.module.as_deref()
+        } else {
+            root.instance.as_deref()
+        }?;
+        let program = script.content.as_node();
+        root.arena
+            .get_js_children(program.body_stmts())
+            .iter()
+            .filter(|statement| matches!(statement, JsNode::ImportDeclaration { .. }))
+            .flat_map(|statement| root.arena.get_js_children(statement.specifiers()))
+            .filter_map(JsNode::local)
+            .map(|local| root.arena.get_js_node(local))
+            .find_map(|local| match local {
+                JsNode::Identifier { name, start, .. }
+                    if name.as_str() == binding.name && matches_name(*start) =>
+                {
+                    Some(*start)
+                }
+                _ => None,
+            })
+    }
+
+    fn collect_component_bindings(fragment: &Fragment, bindings: &mut Vec<usize>) {
+        for node in &fragment.nodes {
+            match node {
+                TemplateNode::Component(component) => {
+                    bindings.extend(component.metadata.expression.references.iter().copied());
+                    collect_component_bindings(&component.fragment, bindings);
+                }
+                TemplateNode::IfBlock(block) => {
+                    collect_component_bindings(&block.consequent, bindings);
+                    if let Some(alternate) = &block.alternate {
+                        collect_component_bindings(alternate, bindings);
+                    }
+                }
+                TemplateNode::EachBlock(block) => {
+                    collect_component_bindings(&block.body, bindings);
+                    if let Some(fallback) = &block.fallback {
+                        collect_component_bindings(fallback, bindings);
+                    }
+                }
+                TemplateNode::AwaitBlock(block) => {
+                    for fragment in
+                        [&block.pending, &block.then, &block.catch].into_iter().flatten()
+                    {
+                        collect_component_bindings(fragment, bindings);
+                    }
+                }
+                TemplateNode::KeyBlock(block) => {
+                    collect_component_bindings(&block.fragment, bindings);
+                }
+                TemplateNode::SnippetBlock(block) => {
+                    collect_component_bindings(&block.body, bindings);
+                }
+                TemplateNode::RegularElement(element) => {
+                    collect_component_bindings(&element.fragment, bindings);
+                }
+                TemplateNode::TitleElement(element) => {
+                    collect_component_bindings(&element.fragment, bindings);
+                }
+                TemplateNode::SlotElement(element) => {
+                    collect_component_bindings(&element.fragment, bindings);
+                }
+                TemplateNode::SvelteBody(element)
+                | TemplateNode::SvelteDocument(element)
+                | TemplateNode::SvelteFragment(element)
+                | TemplateNode::SvelteBoundary(element)
+                | TemplateNode::SvelteHead(element)
+                | TemplateNode::SvelteOptions(element)
+                | TemplateNode::SvelteSelf(element)
+                | TemplateNode::SvelteWindow(element) => {
+                    collect_component_bindings(&element.fragment, bindings);
+                }
+                TemplateNode::SvelteComponent(element) => {
+                    collect_component_bindings(&element.fragment, bindings);
+                }
+                TemplateNode::SvelteElement(element) => {
+                    collect_component_bindings(&element.fragment, bindings);
+                }
+                TemplateNode::Text(_)
+                | TemplateNode::Comment(_)
+                | TemplateNode::ExpressionTag(_)
+                | TemplateNode::HtmlTag(_)
+                | TemplateNode::ConstTag(_)
+                | TemplateNode::DeclarationTag(_)
+                | TemplateNode::DebugTag(_)
+                | TemplateNode::RenderTag(_)
+                | TemplateNode::AttachTag(_) => {}
+            }
+        }
     }
 
     fn build_parse_result(source: &str, root: &Root) -> SvelteParseResult {
@@ -518,7 +786,7 @@ mod rsvelte_backend {
     mod tests {
         use super::{
             SvelteCommentKind, SvelteScriptKind, format_svelte, format_svelte_with_options,
-            parse_svelte, parse_svelte_summary, parse_svelte_syntax,
+            parse_svelte, parse_svelte_for_lint, parse_svelte_summary, parse_svelte_syntax,
         };
 
         #[test]
@@ -644,6 +912,37 @@ let count:number=1;
         }
 
         #[test]
+        fn lint_payload_includes_cross_section_semantics() {
+            let source = r"<script module>
+const from_module = 1;
+</script>
+<script>
+import Widget from './Widget.svelte';
+import { writable } from 'svelte/store';
+const count = writable(0);
+const from_instance = from_module;
+let state = $state(0);
+</script>
+<Widget>{from_instance} {$count} {state}</Widget>";
+
+            let (_, semantic) = parse_svelte_for_lint(source).expect("Svelte source should parse");
+            let semantic = semantic.expect("Svelte source should analyze");
+
+            for declaration in
+                ["from_module =", "Widget from", "count =", "from_instance =", "state ="]
+            {
+                let start = u32::try_from(source.find(declaration).unwrap()).unwrap();
+                assert!(
+                    semantic.used_bindings.contains(&start),
+                    "expected {declaration} to be used outside its isolated script scope"
+                );
+            }
+            let module_reference = u32::try_from(source.rfind("from_module").unwrap()).unwrap();
+            assert!(semantic.resolved_references.iter().any(|span| span.start == module_reference));
+            assert!(semantic.implicit_globals.iter().any(|name| name == "$state"));
+        }
+
+        #[test]
         fn parse_payload_includes_analysis_warnings() {
             let source = r#"<a href="javascript:void(0)">unsafe</a>"#;
             let parsed = parse_svelte(source).expect("Svelte source should analyze");
@@ -734,7 +1033,8 @@ let count:number=1;
 #[cfg(feature = "rsvelte")]
 pub use rsvelte_backend::{
     SvelteComment, SvelteCommentKind, SvelteFormatOptions, SvelteParseError, SvelteParseResult,
-    SvelteParseSummary, SvelteParseWarning, SvelteScript, SvelteScriptKind, SvelteSourcePosition,
-    SvelteSourceRange, format_svelte, format_svelte_with_config, format_svelte_with_options,
-    format_svelte_with_options_and_indent, parse_svelte, parse_svelte_summary, parse_svelte_syntax,
+    SvelteParseSummary, SvelteParseWarning, SvelteScript, SvelteScriptKind, SvelteSemanticSummary,
+    SvelteSourcePosition, SvelteSourceRange, format_svelte, format_svelte_with_config,
+    format_svelte_with_options, format_svelte_with_options_and_indent, parse_svelte,
+    parse_svelte_for_lint, parse_svelte_summary, parse_svelte_syntax,
 };

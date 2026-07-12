@@ -1295,6 +1295,38 @@ mod test {
         assert!(output.contains("Unused oxlint-disable directive (no problems were reported)."));
     }
 
+    #[cfg(feature = "svelte-rsvelte-backend")]
+    #[test]
+    fn lint_svelte_core_rules_use_component_semantics() {
+        let output = Tester::new()
+            .with_cwd("fixtures/cli/svelte-core-semantics".into())
+            .test_output_verbose(&["."]);
+
+        assert_eq!(output.matches("eslint(no-undef)").count(), 2);
+        assert_eq!(output.matches("eslint(no-unused-vars)").count(), 2);
+        assert!(output.contains("definitely_missing"));
+        assert!(output.contains("definitely_unused"));
+        assert!(output.contains("module_missing"));
+        assert!(output.contains("module_unused"));
+        for name in [
+            "moduleValue",
+            "Widget",
+            "count",
+            "current",
+            "state",
+            "local",
+            "props",
+            "rest",
+            "slots",
+            "$state",
+            "$effect",
+            "configuredGlobal",
+        ] {
+            assert!(!output.contains(&format!("'{name}' is not defined")));
+            assert!(!output.contains(&format!("'{name}' is declared but never used")));
+        }
+    }
+
     #[test]
     fn test_category_recommended_uses_builtin_subset() {
         let output = Tester::new()

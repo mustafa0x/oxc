@@ -64,9 +64,9 @@ impl Rule for NoUndef {
     }
 
     fn run_once(&self, ctx: &LintContext) {
-        // Svelte module and instance scripts share bindings, and `$store` subscriptions are
-        // synthesized by the Svelte compiler. Partial script scopes cannot model either safely.
-        if ctx.file_extension().is_some_and(|ext| ext == "svelte") {
+        if ctx.file_extension().is_some_and(|ext| ext == "svelte")
+            && ctx.partial_semantic().is_none()
+        {
             return;
         }
 
@@ -83,7 +83,26 @@ impl Rule for NoUndef {
 
                 let name = ctx.semantic().reference_name(reference);
 
-                if ctx.is_global_defined(name) || inline_globals.contains(name) {
+                if ctx.is_global_defined(name)
+                    || inline_globals.contains(name)
+                    || ctx
+                        .partial_semantic()
+                        .is_some_and(|semantic| semantic.has_implicit_global(name))
+                {
+                    continue;
+                }
+
+                let node = ctx.nodes().get_node(reference.node_id());
+                let span = node.kind().span();
+                let source_text_offset = ctx.source_text_offset();
+                let full_file_span = Span::new(
+                    span.start.saturating_add(source_text_offset),
+                    span.end.saturating_add(source_text_offset),
+                );
+                if ctx
+                    .partial_semantic()
+                    .is_some_and(|semantic| semantic.resolves_reference(full_file_span))
+                {
                     continue;
                 }
 
@@ -98,7 +117,6 @@ impl Rule for NoUndef {
                     continue;
                 }
 
-                let node = ctx.nodes().get_node(reference.node_id());
                 if !self.type_of && has_typeof_operator(node, ctx) {
                     continue;
                 }

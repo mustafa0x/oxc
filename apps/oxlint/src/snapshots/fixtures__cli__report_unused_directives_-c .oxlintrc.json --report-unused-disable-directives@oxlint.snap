@@ -213,14 +213,6 @@ working directory: fixtures/cli/report_unused_directives
     `----
   help: Remove the debugger statement
 
-  ! Unused eslint-disable directive (no problems were reported).
-    ,-[test.svelte:13:1]
- 12 | 
- 13 | // eslint-disable-next-line no-unused-vars
-    : ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
- 14 | const unusedVariable2 = 100;
-    `----
-
   ! Unused eslint-disable directive (no problems were reported from no-debugger).
     ,-[test.svelte:24:41]
  23 | 
