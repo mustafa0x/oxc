@@ -1457,6 +1457,12 @@ impl Runtime {
             }
         };
 
+        // rsvelte has already parsed and analyzed the complete component. Running Oxc's semantic
+        // syntax checks on isolated script sections produces false positives for valid
+        // cross-section constructs such as exporting a top-level snippet from `<script module>`.
+        #[cfg(feature = "svelte-rsvelte-backend")]
+        let check_syntax_errors = check_syntax_errors && ext != "svelte";
+
         let mut section_module_records = SmallVec::<
             [Result<ResolvedModuleRecord, Vec<OxcDiagnostic>>; 1],
         >::with_capacity(section_sources.len());
