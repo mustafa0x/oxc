@@ -38,6 +38,7 @@ use super::LintContext;
 pub struct PartialFileSemantic {
     resolved_references: Box<[Span]>,
     used_bindings: Box<[u32]>,
+    assigned_bindings: Box<[u32]>,
     implicit_globals: Box<[Box<str>]>,
 }
 
@@ -46,12 +47,15 @@ impl PartialFileSemantic {
     pub(crate) fn new(
         mut resolved_references: Vec<Span>,
         mut used_bindings: Vec<u32>,
+        mut assigned_bindings: Vec<u32>,
         implicit_globals: Vec<String>,
     ) -> Self {
         resolved_references.sort_unstable_by_key(|span| (span.start, span.end));
         resolved_references.dedup();
         used_bindings.sort_unstable();
         used_bindings.dedup();
+        assigned_bindings.sort_unstable();
+        assigned_bindings.dedup();
         let mut implicit_globals =
             implicit_globals.into_iter().map(String::into_boxed_str).collect::<Vec<_>>();
         implicit_globals.sort_unstable();
@@ -59,6 +63,7 @@ impl PartialFileSemantic {
         Self {
             resolved_references: resolved_references.into_boxed_slice(),
             used_bindings: used_bindings.into_boxed_slice(),
+            assigned_bindings: assigned_bindings.into_boxed_slice(),
             implicit_globals: implicit_globals.into_boxed_slice(),
         }
     }
@@ -71,6 +76,10 @@ impl PartialFileSemantic {
 
     pub(crate) fn uses_binding(&self, declaration_start: u32) -> bool {
         self.used_bindings.binary_search(&declaration_start).is_ok()
+    }
+
+    pub(crate) fn assigns_binding(&self, declaration_start: u32) -> bool {
+        self.assigned_bindings.binary_search(&declaration_start).is_ok()
     }
 
     pub(crate) fn has_implicit_global(&self, name: &str) -> bool {

@@ -97,6 +97,11 @@ impl Rule for NoUnassignedVars {
         let BindingPattern::BindingIdentifier(ident) = &declarator.id else {
             return;
         };
+        if ctx.partial_semantic().is_some_and(|semantic| {
+            semantic.assigns_binding(ident.span.start.saturating_add(ctx.source_text_offset()))
+        }) {
+            return;
+        }
         let symbol_id = ident.symbol_id();
         let mut has_read = false;
         for reference in ctx.symbol_references(symbol_id) {

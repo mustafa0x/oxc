@@ -4,6 +4,7 @@
   },
   "rules": {
     "no-undef": "error",
+    "no-unassigned-vars": "error",
     "no-unused-vars": "error"
   }
 }

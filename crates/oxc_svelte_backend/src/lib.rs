@@ -104,6 +104,8 @@ mod rsvelte_backend {
         pub resolved_references: Vec<Span>,
         /// Absolute declaration starts with uses outside Oxc's isolated script scope.
         pub used_bindings: Vec<u32>,
+        /// Absolute declaration starts updated by component semantics such as `bind:this`.
+        pub assigned_bindings: Vec<u32>,
         /// Framework-provided globals that are valid in embedded scripts.
         pub implicit_globals: Vec<String>,
     }
@@ -252,6 +254,7 @@ mod rsvelte_backend {
     ) -> SvelteSemanticSummary {
         let mut resolved_references = Vec::new();
         let mut used_bindings = Vec::new();
+        let mut assigned_bindings = Vec::new();
 
         for binding in &analysis.root.bindings {
             resolved_references.extend(
@@ -265,6 +268,9 @@ mod rsvelte_backend {
             else {
                 continue;
             };
+            if binding.is_updated() {
+                assigned_bindings.push(declaration_start);
+            }
             let declaration_script = scripts.iter().find(|script| {
                 let span = script.body_range.span;
                 declaration_start >= span.start && declaration_start < span.end
@@ -335,9 +341,16 @@ mod rsvelte_backend {
         resolved_references.dedup();
         used_bindings.sort_unstable();
         used_bindings.dedup();
+        assigned_bindings.sort_unstable();
+        assigned_bindings.dedup();
         implicit_globals.sort_unstable();
 
-        SvelteSemanticSummary { resolved_references, used_bindings, implicit_globals }
+        SvelteSemanticSummary {
+            resolved_references,
+            used_bindings,
+            assigned_bindings,
+            implicit_globals,
+        }
     }
 
     fn binding_declaration_start(
@@ -1044,6 +1057,21 @@ value = 1;
                     "expected {reference} to have its source reference span"
                 );
             }
+        }
+
+        #[test]
+        fn lint_payload_marks_bind_this_targets_assigned() {
+            let source = r"<div bind:this={element}></div>
+<script>
+let element;
+console.log(element);
+</script>";
+
+            let (_, semantic) = parse_svelte_for_lint(source).expect("Svelte source should parse");
+            let semantic = semantic.expect("Svelte source should analyze");
+            let declaration = u32::try_from(source.find("element;").unwrap()).unwrap();
+
+            assert!(semantic.assigned_bindings.contains(&declaration));
         }
 
         #[test]

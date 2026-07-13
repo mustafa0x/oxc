@@ -1411,6 +1411,7 @@ impl Runtime {
                         Arc::new(PartialFileSemantic::new(
                             semantic.resolved_references,
                             semantic.used_bindings,
+                            semantic.assigned_bindings,
                             semantic.implicit_globals,
                         ))
                     });

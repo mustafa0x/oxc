@@ -1303,6 +1303,7 @@ mod test {
             .test_output_verbose(&["."]);
 
         assert_eq!(output.matches("eslint(no-undef)").count(), 2);
+        assert_eq!(output.matches("eslint(no-unassigned-vars)").count(), 0);
         assert_eq!(output.matches("eslint(no-unused-vars)").count(), 2);
         assert!(output.contains("definitely_missing"));
         assert!(output.contains("definitely_unused"));
