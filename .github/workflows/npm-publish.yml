@@ -28,7 +28,7 @@ permissions:
   id-token: write
 
 env:
-  FORK_NAPI_TARGETS: aarch64-apple-darwin,x86_64-unknown-linux-gnu,x86_64-pc-windows-msvc
+  FORK_NAPI_TARGETS: aarch64-apple-darwin,x86_64-unknown-linux-gnu
 
 jobs:
   build-native:
@@ -45,10 +45,6 @@ jobs:
             app_dir: apps/oxlint
             os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-          - package: oxlint
-            app_dir: apps/oxlint
-            os: windows-latest
-            target: x86_64-pc-windows-msvc
           - package: oxfmt
             app_dir: apps/oxfmt
             os: macos-14
@@ -57,10 +53,6 @@ jobs:
             app_dir: apps/oxfmt
             os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-          - package: oxfmt
-            app_dir: apps/oxfmt
-            os: windows-latest
-            target: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
