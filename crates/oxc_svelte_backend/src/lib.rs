@@ -986,6 +986,38 @@ function handle_click() {}
         }
 
         #[test]
+        fn lint_payload_marks_legacy_event_handler_bindings_used() {
+            let source = r"<svelte:window on:keydown={on_window_keydown} />
+<script>
+function on_window_keydown() {}
+</script>";
+
+            let (_, semantic) = parse_svelte_for_lint(source).expect("Svelte source should parse");
+            let semantic = semantic.expect("Svelte source should analyze");
+            let declaration = u32::try_from(source.rfind("on_window_keydown").unwrap()).unwrap();
+
+            assert!(semantic.used_bindings.contains(&declaration));
+        }
+
+        #[test]
+        fn lint_payload_resolves_store_subscription_in_default_parameter() {
+            let source = r"<script>
+import { writable } from 'svelte/store';
+const search_params = writable({ page: 1 });
+function goto_page(page = $search_params.page) {}
+</script>";
+
+            let (_, semantic) = parse_svelte_for_lint(source).expect("Svelte source should parse");
+            let semantic = semantic.expect("Svelte source should analyze");
+            let reference = u32::try_from(source.find("$search_params").unwrap()).unwrap();
+
+            assert!(
+                semantic.resolved_references.iter().any(|span| span.start == reference),
+                "expected the store subscription reference to resolve"
+            );
+        }
+
+        #[test]
         fn lint_payload_marks_directives_spreads_and_bindables_used() {
             let source = r"<div use:action transition:slide {...rest}></div>
 <script>
