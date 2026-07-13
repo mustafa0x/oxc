@@ -3,6 +3,11 @@
 This branch publishes forked `oxlint` and `oxfmt` packages under `@mustafaj`
 from `.github/workflows/npm-publish.yml`.
 
+The fork publish matrix intentionally targets only Apple ARM64 and Linux x64.
+Windows packages are disabled because their build consistently dominates the
+release loop; add Windows back to both the matrix and `FORK_NAPI_TARGETS` if it
+becomes a supported consumer platform.
+
 ## Required Tool Pins
 
 The workflow depends on `mise.toml` being present in the repository:
