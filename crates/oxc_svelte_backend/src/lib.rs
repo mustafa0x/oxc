@@ -789,7 +789,8 @@ mod rsvelte_backend {
     mod tests {
         use super::{
             SvelteCommentKind, SvelteScriptKind, format_svelte, format_svelte_with_options,
-            parse_svelte, parse_svelte_for_lint, parse_svelte_summary, parse_svelte_syntax,
+            format_svelte_with_options_and_indent, parse_svelte, parse_svelte_for_lint,
+            parse_svelte_summary, parse_svelte_syntax,
         };
 
         #[test]
@@ -829,6 +830,31 @@ mod rsvelte_backend {
             .expect("Svelte source should format");
 
             assert!(formatted.contains("    let count = 1 + 2;"));
+        }
+
+        #[test]
+        fn unindented_svelte_script_retains_full_line_width() {
+            let options = rsvelte_formatter::JsFormatOptions {
+                indent_width: rsvelte_formatter::IndentWidth::try_from(4).unwrap(),
+                line_width: rsvelte_formatter::LineWidth::try_from(100).unwrap(),
+                ..rsvelte_formatter::JsFormatOptions::default()
+            };
+            let source = r"<script>
+const metrics = $derived.by(() => {
+    return {
+        recurring_amount:
+            overview.recurring_snapshot?.currencies?.[0]?.committed_monthly_equivalent_display ||
+            'No recurring base yet',
+    }
+})
+</script>";
+
+            let formatted = format_svelte_with_options_and_indent(source, options, false)
+                .expect("Svelte source should format");
+
+            assert!(formatted.contains(
+                "overview.recurring_snapshot?.currencies?.[0]?.committed_monthly_equivalent_display ||"
+            ));
         }
 
         #[test]
@@ -947,10 +973,10 @@ let state = $state(0);
 
         #[test]
         fn lint_payload_marks_event_handler_bindings_used() {
-            let source = r#"<button onclick={handle_click}>Click</button>
+            let source = r"<button onclick={handle_click}>Click</button>
 <script>
 function handle_click() {}
-</script>"#;
+</script>";
 
             let (_, semantic) = parse_svelte_for_lint(source).expect("Svelte source should parse");
             let semantic = semantic.expect("Svelte source should analyze");
@@ -961,13 +987,13 @@ function handle_click() {}
 
         #[test]
         fn lint_payload_marks_directives_spreads_and_bindables_used() {
-            let source = r#"<div use:action transition:slide {...rest}></div>
+            let source = r"<div use:action transition:slide {...rest}></div>
 <script>
 import { slide } from 'svelte/transition';
 function action() {}
 let { value = $bindable(), ...rest } = $props();
 value = 1;
-</script>"#;
+</script>";
 
             let (_, semantic) = parse_svelte_for_lint(source).expect("Svelte source should parse");
             let semantic = semantic.expect("Svelte source should analyze");
