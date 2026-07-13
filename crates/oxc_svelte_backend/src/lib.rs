@@ -269,13 +269,16 @@ mod rsvelte_backend {
                 let span = script.body_range.span;
                 declaration_start >= span.start && declaration_start < span.end
             });
-            if binding.references.iter().any(|reference| {
+            let used_outside_script = binding.references.iter().any(|reference| {
                 reference.is_template_reference
                     || declaration_script.is_some_and(|script| {
                         let span = script.body_range.span;
                         !(span.start..span.end).contains(&reference.start)
                     })
-            }) {
+            });
+            let externally_observed_bindable =
+                binding.kind == BindingKind::BindableProp && binding.is_updated();
+            if used_outside_script || externally_observed_bindable {
                 used_bindings.push(declaration_start);
             }
         }
@@ -940,6 +943,49 @@ let state = $state(0);
             let module_reference = u32::try_from(source.rfind("from_module").unwrap()).unwrap();
             assert!(semantic.resolved_references.iter().any(|span| span.start == module_reference));
             assert!(semantic.implicit_globals.iter().any(|name| name == "$state"));
+        }
+
+        #[test]
+        fn lint_payload_marks_event_handler_bindings_used() {
+            let source = r#"<button onclick={handle_click}>Click</button>
+<script>
+function handle_click() {}
+</script>"#;
+
+            let (_, semantic) = parse_svelte_for_lint(source).expect("Svelte source should parse");
+            let semantic = semantic.expect("Svelte source should analyze");
+            let declaration = u32::try_from(source.rfind("handle_click").unwrap()).unwrap();
+
+            assert!(semantic.used_bindings.contains(&declaration));
+        }
+
+        #[test]
+        fn lint_payload_marks_directives_spreads_and_bindables_used() {
+            let source = r#"<div use:action transition:slide {...rest}></div>
+<script>
+import { slide } from 'svelte/transition';
+function action() {}
+let { value = $bindable(), ...rest } = $props();
+value = 1;
+</script>"#;
+
+            let (_, semantic) = parse_svelte_for_lint(source).expect("Svelte source should parse");
+            let semantic = semantic.expect("Svelte source should analyze");
+
+            for declaration in ["slide }", "action()", "value = $bindable", "rest } = $props"] {
+                let start = u32::try_from(source.rfind(declaration).unwrap()).unwrap();
+                assert!(
+                    semantic.used_bindings.contains(&start),
+                    "expected {declaration} to be semantically used"
+                );
+            }
+            for reference in ["action transition", "slide {...rest", "rest}></div>"] {
+                let start = u32::try_from(source.find(reference).unwrap()).unwrap();
+                assert!(
+                    semantic.resolved_references.iter().any(|span| span.start == start),
+                    "expected {reference} to have its source reference span"
+                );
+            }
         }
 
         #[test]
