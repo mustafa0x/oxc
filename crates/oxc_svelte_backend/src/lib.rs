@@ -1036,6 +1036,26 @@ function goto_page(page = $search_params.page) {}
         }
 
         #[test]
+        fn lint_payload_resolves_repeated_store_subscriptions() {
+            let source = r#"<script lang="ts">
+import { session } from './stores.js';
+type User = { name: string };
+const current = $derived($session.user ? ($session.user as User) : null);
+</script>"#;
+
+            let (_, semantic) = parse_svelte_for_lint(source).expect("Svelte source should parse");
+            let semantic = semantic.expect("Svelte source should analyze");
+
+            for (reference, _) in source.match_indices("$session") {
+                let reference = u32::try_from(reference).unwrap();
+                assert!(
+                    semantic.resolved_references.iter().any(|span| span.start == reference),
+                    "expected every store subscription reference to resolve"
+                );
+            }
+        }
+
+        #[test]
         fn lint_payload_marks_directives_spreads_and_bindables_used() {
             let source = r"<div use:action transition:slide {...rest}></div>
 <script>

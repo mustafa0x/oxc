@@ -1315,6 +1315,7 @@ mod test {
             "Widget",
             "count",
             "current",
+            "repeated",
             "state",
             "local",
             "props",

@@ -452,8 +452,19 @@ pub fn detect_store_subscriptions(
         // creating a StoreSub for the top-level `$effect` store subscription.
         if let Some(binding_idx) = analysis.root.find_binding_any_scope(ref_name) {
             let binding = &analysis.root.bindings[binding_idx];
+            let binding_scope_index = binding.scope_index;
+            let binding_kind = binding.kind;
             let instance_scope2 = analysis.root.instance_scope_index;
-            if binding.scope_index == 0 || binding.scope_index == instance_scope2 {
+            if binding_scope_index == 0 || binding_scope_index == instance_scope2 {
+                if binding_kind == BindingKind::StoreSub {
+                    analysis.root.bindings[binding_idx].add_reference(
+                        store_ref.position as u32,
+                        (store_ref.position + ref_name.len()) as u32,
+                        false,
+                        false,
+                        false,
+                    );
+                }
                 continue;
             }
         }
@@ -2162,6 +2173,38 @@ mod tests {
             .iter()
             .any(|b| b.name == "$items" && matches!(b.kind, BindingKind::StoreSub));
         assert!(has_items_store, "Should have a StoreSub binding for $items");
+    }
+
+    #[test]
+    fn repeated_store_subscriptions_record_every_reference() {
+        use crate::ast::arena::{clear_serialize_arena, set_serialize_arena};
+        use crate::compiler::CompileOptions;
+        use crate::compiler::phases::phase1_parse::{ParseOptions, parse};
+        use crate::compiler::phases::phase2_analyze::analyze_component;
+
+        let source = r#"<script lang="ts">
+import { session } from './stores.js';
+type User = { name: string };
+const current = $derived($session.user ? ($session.user as User) : null);
+</script>"#;
+        let mut ast =
+            parse(source, &oxc_allocator::Allocator::default(), ParseOptions::default()).unwrap();
+        // SAFETY: `ast` outlives the analyze call; `clear_serialize_arena()` runs
+        // before `ast` is dropped, so the installed pointer never dangles.
+        unsafe { set_serialize_arena(&ast.arena as *const _) };
+        let analysis = analyze_component(&mut ast, source, &CompileOptions::default()).unwrap();
+        clear_serialize_arena();
+
+        let store_subscription = analysis
+            .root
+            .bindings
+            .iter()
+            .find(|binding| binding.name == "$session" && binding.kind == BindingKind::StoreSub)
+            .expect("expected a store subscription binding");
+        let expected_references = source.match_indices("$session").map(|(start, _)| start as u32);
+        assert!(expected_references.into_iter().all(|start| {
+            store_subscription.references.iter().any(|reference| reference.start == start)
+        }));
     }
 
     /// Collect the `StoreSub` binding names in declaration order — this is the
