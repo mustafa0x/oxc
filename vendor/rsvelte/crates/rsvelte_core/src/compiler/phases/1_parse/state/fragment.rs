@@ -33,11 +33,37 @@
 use crate::ast::template::{Fragment, FragmentType, Root, RootType, TemplateNode};
 use crate::error::ParseResult;
 
-use super::super::parser::Parser;
+use super::super::parser::{MAX_NESTING_DEPTH, Parser};
 
-impl Parser<'_> {
+impl<'a> Parser<'a> {
     /// Parse the source into a Root AST node.
-    pub fn parse(&mut self) -> ParseResult<Root> {
+    pub fn parse(&mut self) -> ParseResult<Root<'a>> {
+        let deferred_error = match self.parse_inner() {
+            Ok(root) => return Ok(root),
+            Err(error) if !self.should_defer_template_parse() => return Err(error),
+            Err(error) => error,
+        };
+
+        // Upstream parses scripts and template expressions as it encounters
+        // them. The compile path defers that work, so an immediate later error
+        // (a duplicate script, an unclosed block, and so on) can otherwise hide
+        // the earlier JS error. Replay only this already-failing path eagerly;
+        // successful compilation keeps the deferred fast path unchanged.
+        let mut options = self.options;
+        options.defer_script_parse = false;
+        let mut parser = Parser::new(self.source, options);
+        // SAFETY: `parser.arena` outlives the guard and the replay. The guard
+        // restores the outer parser's arena when it is dropped.
+        let _guard =
+            unsafe { crate::ast::arena::SerializeArenaGuard::new(&parser.arena as *const _) };
+
+        match parser.parse_inner() {
+            Err(eager_error) => Err(eager_error),
+            Ok(_) => Err(deferred_error),
+        }
+    }
+
+    fn parse_inner(&mut self) -> ParseResult<Root<'a>> {
         use super::super::parser::StackEntry;
         use super::super::utils::is_void_element;
 
@@ -48,11 +74,7 @@ impl Parser<'_> {
             && let Some(entry) = self.stack.last()
         {
             match entry {
-                StackEntry::Element {
-                    name,
-                    start,
-                    element_type,
-                } => {
+                StackEntry::Element { name, start, element_type } => {
                     // Upstream (1-parse/index.js) only reports `element_unclosed`
                     // when the innermost open node is a *RegularElement*; every
                     // other node type (Component, SvelteElement, TitleElement,
@@ -134,7 +156,7 @@ impl Parser<'_> {
                 return Err(crate::error::ParseError::svelte(
                     "void_element_invalid_content",
                     "Void elements cannot have children or closing tags",
-                    (close_start, close_start + 2 + tag_name.len()),
+                    (close_start, close_start),
                 ));
             }
         }
@@ -143,13 +165,23 @@ impl Parser<'_> {
         // block. `parse_fragment` stops on `{/...}` without consuming it, so any
         // leftover close marker here is an error in strict mode. (Comments
         // `{/*`, `{//` are not close markers.)
-        if !self.options.loose && self.match_block_close_marker().is_some() {
+        if !self.options.loose
+            && let Some(slash_pos) = self.match_block_close_marker()
+        {
+            // Upstream `close()` reports at `parser.index - 1` — the `/` it just
+            // ate, not the `{`.
             return Err(crate::error::ParseError::svelte(
                 "block_unexpected_close",
                 "Unexpected block closing tag",
-                (self.index, self.index + 1),
+                (slash_pos, slash_pos),
             ));
         }
+
+        // Upstream validates `<svelte:options>` here, once the whole template
+        // has been parsed (`1-parse/index.js` L164-166), so a duplicate or a
+        // misplaced meta tag anywhere in the file outranks an attribute-value
+        // error and an attribute-value error outranks the element's children.
+        self.read_svelte_options()?;
 
         // Determine the end position of script/style tags
         let script_end = self
@@ -165,14 +197,14 @@ impl Parser<'_> {
         // But only if they're at the very end of the file (after script/style too)
         while let Some(TemplateNode::Text(text)) = fragment.nodes.last() {
             let after_special = text.end >= max_special_end;
-            // Fast byte-level whitespace check
-            let is_whitespace = text.data.as_bytes().iter().all(|&b| {
-                b == b' '
-                    || b == b'\t'
-                    || b == b'\n'
-                    || b == b'\r'
-                    || (b >= 0x80 && (b as char).is_whitespace())
-            });
+            // ASCII-only by design: the parser already dropped every trailing
+            // run of JS whitespace when it set `content_end`, so a wider test
+            // here would be unreachable, not more correct.
+            let is_whitespace = text
+                .data
+                .as_bytes()
+                .iter()
+                .all(|&b| b == b' ' || b == b'\t' || b == b'\n' || b == b'\r');
             if is_whitespace && after_special {
                 fragment.nodes.pop();
             } else {
@@ -180,44 +212,9 @@ impl Parser<'_> {
             }
         }
 
-        // Calculate end position - consider fragment nodes, script, and style
-        let fragment_end = fragment
-            .nodes
-            .last()
-            .map(|node| match node {
-                TemplateNode::Text(t) => t.end,
-                TemplateNode::Comment(c) => c.end,
-                TemplateNode::ExpressionTag(e) => e.end,
-                TemplateNode::HtmlTag(h) => h.end,
-                TemplateNode::ConstTag(c) => c.end,
-                TemplateNode::DeclarationTag(d) => d.end,
-                TemplateNode::DebugTag(d) => d.end,
-                TemplateNode::RenderTag(r) => r.end,
-                TemplateNode::AttachTag(a) => a.end,
-                TemplateNode::IfBlock(b) => b.end,
-                TemplateNode::EachBlock(b) => b.end,
-                TemplateNode::AwaitBlock(b) => b.end,
-                TemplateNode::KeyBlock(b) => b.end,
-                TemplateNode::SnippetBlock(b) => b.end,
-                TemplateNode::RegularElement(e) => e.end,
-                TemplateNode::Component(c) => c.end,
-                TemplateNode::TitleElement(t) => t.end,
-                TemplateNode::SlotElement(s) => s.end,
-                TemplateNode::SvelteBody(s)
-                | TemplateNode::SvelteDocument(s)
-                | TemplateNode::SvelteFragment(s)
-                | TemplateNode::SvelteBoundary(s)
-                | TemplateNode::SvelteHead(s)
-                | TemplateNode::SvelteOptions(s)
-                | TemplateNode::SvelteSelf(s)
-                | TemplateNode::SvelteWindow(s) => s.end,
-                TemplateNode::SvelteComponent(c) => c.end,
-                TemplateNode::SvelteElement(e) => e.end,
-            })
-            .unwrap_or(0);
-
-        // End is the maximum of fragment end, script end, and style end
-        let end = fragment_end.max(max_special_end);
+        // Upstream parses `template.trimEnd()` but sets `this.root.end =
+        // template.length` on the UNTRIMMED source (`phases/1-parse/index.js`).
+        let end = self.source.len() as u32;
 
         Ok(Root {
             css: self.stylesheet.take().map(Box::new),
@@ -242,6 +239,7 @@ impl Parser<'_> {
             },
             instance: self.instance_script.take().map(Box::new),
             module: self.module_script.take().map(Box::new),
+            skip_expression_loc: self.options.skip_expression_loc,
             parse_warnings: std::mem::take(&mut self.parse_warnings),
             source: None,
             arena: std::mem::take(&mut self.arena),
@@ -251,24 +249,32 @@ impl Parser<'_> {
     /// Check if the remaining content from current position to EOF is only whitespace.
     #[inline]
     pub fn remaining_is_whitespace_only(&self) -> bool {
-        // Fast path: scan bytes for ASCII whitespace
-        let bytes = &self.bytes[self.index..];
-        for &b in bytes {
-            if b == b' ' || b == b'\t' || b == b'\n' || b == b'\r' {
-                continue;
-            }
-            if b < 0x80 {
-                // ASCII non-whitespace
-                return false;
-            }
-            // Non-ASCII: fall back to char-based check for entire remaining string
-            return self.source[self.index..].chars().all(|c| c.is_whitespace());
-        }
-        true
+        // `content_end` is one past the last non-whitespace byte, so everything
+        // at or after it is whitespace and everything before it is not.
+        self.index >= self.content_end
     }
 
     /// Parse a fragment (sequence of nodes).
-    pub fn parse_fragment(&mut self) -> ParseResult<Fragment> {
+    ///
+    /// Every nested element and block re-enters here, so this is the single
+    /// choke point where template recursion is bounded.
+    pub fn parse_fragment(&mut self) -> ParseResult<Fragment<'a>> {
+        if self.depth >= MAX_NESTING_DEPTH {
+            return Err(crate::error::ParseError::svelte(
+                "template_nesting_too_deep",
+                format!(
+                    "Template is nested more than {MAX_NESTING_DEPTH} levels deep. Split the markup into components"
+                ),
+                (self.index, self.index),
+            ));
+        }
+        self.depth += 1;
+        let result = self.parse_fragment_inner();
+        self.depth -= 1;
+        result
+    }
+
+    fn parse_fragment_inner(&mut self) -> ParseResult<Fragment<'a>> {
         use super::super::parser::StackEntry;
         use super::super::utils::is_void_element;
 
@@ -281,20 +287,26 @@ impl Parser<'_> {
             // Check for end conditions based on first byte. Whitespace is
             // allowed between `{` and the `/` / `:` marker char (upstream
             // `tag()` runs `allow_whitespace()` before dispatching).
-            let (is_block_close, is_block_continuation) = if first_byte == b'{' {
-                (
-                    self.match_block_close_marker().is_some(),
-                    self.match_block_continuation_marker().is_some(),
-                )
-            } else {
-                (false, false)
-            };
+            let (is_block_close, is_block_continuation) =
+                if first_byte == b'{' { self.match_block_markers() } else { (false, false) };
 
             // If we see a closing tag and the stack only has Root (root level), this is an error
             if first_byte == b'<'
                 && self.index + 1 < self.bytes.len()
                 && self.bytes[self.index + 1] == b'/'
             {
+                // Upstream reads the name off a right-trimmed template, so a
+                // `</` with nothing but whitespace left runs out of input
+                // before any closing-tag rule can apply.
+                if !self.options.loose && self.source[self.index + 2..].trim_start().is_empty() {
+                    let at = self.index + 2;
+                    return Err(crate::error::ParseError::svelte(
+                        "unexpected_eof",
+                        "Unexpected end of input",
+                        (at, at),
+                    ));
+                }
+
                 // Check if this is a closing tag at root level (only Root on stack)
                 let is_root_level =
                     self.stack.len() == 1 && matches!(self.stack.first(), Some(StackEntry::Root));
@@ -317,7 +329,7 @@ impl Parser<'_> {
                         return Err(crate::error::ParseError::svelte(
                             "void_element_invalid_content",
                             "Void elements cannot have children or closing tags",
-                            (close_start, close_start + 2 + tag_name.len()),
+                            (close_start, close_start),
                         ));
                     } else {
                         // Non-void closing tag without matching opening tag.
@@ -330,7 +342,7 @@ impl Parser<'_> {
                             return Err(crate::error::ParseError::svelte(
                                 "element_invalid_closing_tag_autoclosed",
                                 format!(
-                                    "`</{}>` attempted to close element that was already automatically closed by `<{}>` (cannot nest `<{}>` inside `</{}>`)",
+                                    "`</{}>` attempted to close element that was already automatically closed by `<{}>` (cannot nest `<{}>` inside `<{}>`)",
                                     tag_name, reason, reason, tag_name
                                 ),
                                 (close_start, close_start),
@@ -396,7 +408,7 @@ impl Parser<'_> {
                         return Err(crate::error::ParseError::svelte(
                             "void_element_invalid_content",
                             "Void elements cannot have children or closing tags",
-                            (close_start, close_start + 2 + tag_name.len()),
+                            (close_start, close_start),
                         ));
                     }
                     if let Some(ref last_auto) = self.last_auto_closed_tag
@@ -406,7 +418,7 @@ impl Parser<'_> {
                         return Err(crate::error::ParseError::svelte(
                             "element_invalid_closing_tag_autoclosed",
                             format!(
-                                "`</{}>` attempted to close element that was already automatically closed by `<{}>` (cannot nest `<{}>` inside `</{}>`)",
+                                "`</{}>` attempted to close element that was already automatically closed by `<{}>` (cannot nest `<{}>` inside `<{}>`)",
                                 tag_name, reason, reason, tag_name
                             ),
                             (close_start, close_start),
@@ -429,7 +441,9 @@ impl Parser<'_> {
                 // Block continuation tags like {:else}, {:then}, {:catch} are only valid
                 // within IfBlock, EachBlock, or AwaitBlock contexts
                 if is_block_continuation {
-                    let cont_start = self.index;
+                    // Upstream `next()` reports at `parser.index - 1` — the `:`
+                    // it just ate, not the `{`.
+                    let cont_start = self.match_block_continuation_marker().unwrap_or(self.index);
                     // Get the current context from the stack
                     let current_context = self.stack.last();
                     let is_valid_continuation_context = matches!(
@@ -456,14 +470,7 @@ impl Parser<'_> {
             }
 
             // Skip trailing whitespace at EOF - don't parse it as a Text node
-            // Only check if the first byte looks like whitespace (fast path)
-            if (first_byte == b' '
-                || first_byte == b'\t'
-                || first_byte == b'\n'
-                || first_byte == b'\r'
-                || first_byte >= 0x80)
-                && self.remaining_is_whitespace_only()
-            {
+            if self.remaining_is_whitespace_only() {
                 break;
             }
 
@@ -472,11 +479,7 @@ impl Parser<'_> {
             }
         }
 
-        Ok(Fragment {
-            node_type: FragmentType::Fragment,
-            nodes,
-            ..Default::default()
-        })
+        Ok(Fragment { node_type: FragmentType::Fragment, nodes, ..Default::default() })
     }
 
     /// Parse a single node.
@@ -492,7 +495,7 @@ impl Parser<'_> {
     /// - `parser.match('{')` → `tag` (JS) / `parse_mustache()` (Rust)
     /// - Otherwise → `text` (JS) / `parse_text()` (Rust)
     #[inline]
-    pub fn parse_node(&mut self) -> ParseResult<Option<TemplateNode>> {
+    pub fn parse_node(&mut self) -> ParseResult<Option<TemplateNode<'a>>> {
         if self.index >= self.bytes.len() {
             return Ok(None);
         }

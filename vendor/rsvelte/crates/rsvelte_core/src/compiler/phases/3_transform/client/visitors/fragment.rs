@@ -7,9 +7,10 @@
 //! The Fragment visitor handles the transformation of Fragment nodes into client-side
 //! JavaScript code. It creates a template block and processes its children.
 
-use std::rc::Rc;
+use std::{cell::Cell, rc::Rc};
 
 use crate::ast::template::{Fragment, TemplateNode};
+use crate::compiler::phases::phase3_transform::client::source_anchor::CommentRegion;
 use crate::compiler::phases::phase3_transform::client::transform_template::{
     Namespace, Template, transform_template,
 };
@@ -101,16 +102,18 @@ pub fn fragment(
         parent,
         &node.nodes,
         &context.path,
+        context.state.metadata.in_text_element,
         &namespace,
         context.state.scope,
         context.state.analysis,
         context.state.preserve_whitespace,
         context.state.options.preserve_comments,
+        context.state.options.hmr,
     );
 
     // Early return if no nodes
     if cleaned.hoisted.is_empty() && cleaned.trimmed.is_empty() {
-        return JsBlockStatement { body: Vec::new() };
+        return JsBlockStatement::new();
     }
 
     // Analyze trimmed nodes
@@ -132,6 +135,16 @@ pub fn fragment(
     // Initialize result containers
     let mut body: Vec<JsStatement> = Vec::new();
     let mut close: Option<JsStatement> = None;
+
+    let mut fragment_transform = context.state.transform.clone();
+    let mut fragment_transform_deep_read = context.state.transform_deep_read.clone();
+    let mut fragment_shadowed_prop_names = context.state.shadowed_prop_names.clone();
+    crate::compiler::phases::phase3_transform::client::utils::shadow_snippet_declarations(
+        &node.nodes,
+        &mut fragment_transform,
+        &mut fragment_transform_deep_read,
+        &mut fragment_shadowed_prop_names,
+    );
 
     // Create new state for this fragment
     // Use Memoizer::with_parent_conflicts to inherit conflicts from the parent,
@@ -155,8 +168,10 @@ pub fn fragment(
         let_directives: Vec::new(),
         node: context.state.node.clone(),
         memoizer: Memoizer::with_parent_conflicts(&context.state.memoizer),
-        transform: context.state.transform.clone(),
-        transform_deep_read: context.state.transform_deep_read.clone(),
+        transform: fragment_transform,
+        transform_deep_read: fragment_transform_deep_read,
+        await_binding_names: context.state.await_binding_names.clone(),
+        each_shadowing_names: context.state.each_shadowing_names.clone(),
         events: indexmap::IndexSet::default(), // Start empty, merge back later
         metadata: ComponentMetadata {
             namespace: namespace.clone(),
@@ -164,6 +179,8 @@ pub fn fragment(
             // Reset svelte_element_child flag for the new state - it was only
             // needed to prevent namespace inference at the immediate child level
             svelte_element_child: false,
+            in_text_element: context.state.metadata.in_text_element,
+            bound_contenteditable: context.state.metadata.bound_contenteditable,
         },
         in_constructor: false,
         in_derived: false,
@@ -176,8 +193,8 @@ pub fn fragment(
         module_level_snippets: Vec::new(),
         snippet_names: context.state.snippet_names.clone(),
         in_direct_assignment_lhs: false,
-        in_bind_directive: false,
-        in_event_attribute_handler: false,
+        state_declarator_name: None,
+        assignment_is_statement: false,
         event_handler_arrow_body_level: 0,
         is_controlled_each: false,
         is_controlled_html: false,
@@ -206,7 +223,7 @@ pub fn fragment(
         destructure_array_counter: context.state.destructure_array_counter.clone(),
         needs_props_from_events: context.state.needs_props_from_events.clone(),
         hidden_let_bindings: context.state.hidden_let_bindings.clone(),
-        shadowed_prop_names: context.state.shadowed_prop_names.clone(),
+        shadowed_prop_names: fragment_shadowed_prop_names,
         blocker_map: context.state.blocker_map.clone(),
         blocker_map_primary_names: context.state.blocker_map_primary_names.clone(),
         extra_blocker_indices: Vec::new(),
@@ -216,6 +233,9 @@ pub fn fragment(
         needs_mutation_validation: context.state.needs_mutation_validation.clone(),
         templates: Rc::clone(&context.state.templates),
         pending_error: None,
+        suppress_pickled_await_instrumentation: Cell::new(
+            context.state.suppress_pickled_await_instrumentation.get(),
+        ),
     };
 
     // Swap context.state with our local state so that process_children uses it
@@ -233,6 +253,13 @@ pub fn fragment(
             // Generate a unique identifier for the element
             let id_name = context.state.memoizer.generate_id(&element.name);
             let id = b::id(&id_name);
+            let name_start = element.start.saturating_add(1);
+            let name_end = name_start.saturating_add(element.name.len() as u32);
+            // Upstream reuses this located Identifier for the declaration and
+            // every runtime use. The shared-fragment path registers the same
+            // identity in `flush_node`; do it here as well for the root path,
+            // which bypasses `process_children` entirely.
+            context.arena.note_identifier_span(&id_name, name_start, name_end);
 
             // Visit the element with the id as the node
             let saved_node = std::mem::replace(&mut context.state.node, id.clone());
@@ -262,22 +289,33 @@ pub fn fragment(
             // Initialize element: `var <id_name> = root();`
             context.state.init.insert(
                 0,
-                b::var_decl(
+                b::var_decl_anchored(
                     &context.arena,
                     &id_name,
                     Some(b::call(&context.arena, template_id_expr, vec![])),
+                    Some((name_start, name_end)),
                 ),
             );
 
             // Append to anchor
-            close = Some(b::stmt(
+            let mut append_id = JsExpr::Spanned(context.arena.alloc_expr(id), name_start, name_end);
+            let mut comment_anchored = false;
+            if let [TemplateNode::ExpressionTag(tag)] = element.fragment.nodes.as_slice()
+                && let Some(region) = CommentRegion::of(&context.state, tag, name_start)
+            {
+                append_id = region.anchor(&context.arena, append_id, name_start, name_end);
+                comment_anchored = true;
+            }
+            let mut append = b::call(
                 &context.arena,
-                b::call(
-                    &context.arena,
-                    b::member_path(&context.arena, "$.append"),
-                    vec![b::id("$$anchor"), id],
-                ),
-            ));
+                b::member_path(&context.arena, "$.append"),
+                vec![b::id("$$anchor"), append_id],
+            );
+            if !comment_anchored {
+                append =
+                    JsExpr::Spanned(context.arena.alloc_expr(append), element.start, element.end);
+            }
+            close = Some(b::stmt(&context.arena, append));
         }
     } else if is_single_child_not_needing_template {
         // Single child not needing template (SvelteFragment or TitleElement)
@@ -321,10 +359,7 @@ pub fn fragment(
             .iter()
             .any(|node| matches!(node.as_ref(), TemplateNode::ExpressionTag(_)))
             && cleaned.trimmed.iter().all(|node| {
-                matches!(
-                    node.as_ref(),
-                    TemplateNode::Text(_) | TemplateNode::ExpressionTag(_)
-                )
+                matches!(node.as_ref(), TemplateNode::Text(_) | TemplateNode::ExpressionTag(_))
             });
 
         if use_space_template {
@@ -345,11 +380,7 @@ pub fn fragment(
                 b::var_decl(
                     &context.arena,
                     &text_id_name,
-                    Some(b::call(
-                        &context.arena,
-                        b::member_path(&context.arena, "$.text"),
-                        vec![],
-                    )),
+                    Some(b::call(&context.arena, b::member_path(&context.arena, "$.text"), vec![])),
                 ),
             );
 
@@ -361,20 +392,12 @@ pub fn fragment(
                     vec![b::id("$$anchor"), text_id],
                 ),
             ));
-        } else if cleaned.is_standalone && !context.state.options.hmr {
+        } else if cleaned.is_standalone {
             // No need to create a template, we can just use the existing block's anchor.
-            // When HMR is enabled, we always need a fragment wrapper because $.hmr()
-            // uses block/branch effects that need a stable anchor node.
-            // Reference: utils.js line 288 checks `!state.options.hmr`
             // Set is_standalone on state so component/render-tag visitors know
             // they need to emit $.next() after $.async() wrapping.
             context.state.is_standalone = true;
-            process_children(
-                &cleaned.trimmed,
-                |_is_text| b::id("$$anchor"),
-                false,
-                context,
-            );
+            process_children(&cleaned.trimmed, |_is_text| b::id("$$anchor"), false, context);
         } else {
             // Standard case with template
             let id_for_closure = id.clone();
@@ -500,11 +523,7 @@ pub fn fragment(
     if is_root_fragment && cleaned.is_text_first {
         body.push(b::stmt(
             &context.arena,
-            b::call(
-                &context.arena,
-                b::member_path(&context.arena, "$.next"),
-                vec![],
-            ),
+            b::call(&context.arena, b::member_path(&context.arena, "$.next"), vec![]),
         ));
     }
 
@@ -692,11 +711,7 @@ pub fn fragment(
                     .collect();
                 all_blocker_exprs.extend(const_blocker_exprs);
 
-                if all_blocker_exprs.is_empty() {
-                    None
-                } else {
-                    Some(b::array(all_blocker_exprs))
-                }
+                if all_blocker_exprs.is_empty() { None } else { Some(b::array(all_blocker_exprs)) }
             }
         };
 
@@ -747,14 +762,8 @@ pub fn fragment(
     context.state.hoisted.extend(state.hoisted);
 
     // Merge snippet declarations
-    context
-        .state
-        .module_level_snippets
-        .extend(state.module_level_snippets);
-    context
-        .state
-        .instance_level_snippets
-        .extend(state.instance_level_snippets);
+    context.state.module_level_snippets.extend(state.module_level_snippets);
+    context.state.instance_level_snippets.extend(state.instance_level_snippets);
 
     // Merge events back to parent for delegation
     context.state.events.extend(state.events);
@@ -762,7 +771,7 @@ pub fn fragment(
     // Merge memoizer conflicts back to parent so sibling scopes also avoid collisions
     context.state.memoizer.merge_conflicts(&state.memoizer);
 
-    JsBlockStatement { body }
+    JsBlockStatement::with_body(body)
 }
 
 /// Collect all identifier names from a JS statement.
@@ -827,6 +836,9 @@ pub(crate) fn collect_ids_from_expr(
     names: &mut Vec<compact_str::CompactString>,
 ) {
     match expr {
+        JsExpr::Spanned(inner, _, _) => {
+            collect_ids_from_expr(arena.get_expr(*inner), arena, names);
+        }
         JsExpr::Identifier(name) if !names.contains(name) => {
             names.push(name.clone());
         }
@@ -844,7 +856,8 @@ pub(crate) fn collect_ids_from_expr(
                         collect_ids_from_expr(arena.get_expr(*prop), arena, names);
                     }
                 }
-                JsMemberProperty::Identifier(id) => {
+                JsMemberProperty::Identifier(id)
+                | JsMemberProperty::SpannedIdentifier { name: id, .. } => {
                     // Only collect non-computed property names for $$props access
                     // (e.g., $$props.name -> "name") since those are actual variable references.
                     // Don't collect general property accesses like `obj.length` as they
@@ -990,6 +1003,9 @@ pub(crate) fn collect_ids_from_expr_props(
     names: &mut Vec<compact_str::CompactString>,
 ) {
     match expr {
+        JsExpr::Spanned(inner, _, _) => {
+            collect_ids_from_expr_props(arena.get_expr(*inner), arena, names);
+        }
         JsExpr::Identifier(name) if !names.contains(name) => {
             names.push(name.clone());
         }
@@ -1007,7 +1023,8 @@ pub(crate) fn collect_ids_from_expr_props(
                         collect_ids_from_expr_props(arena.get_expr(*prop), arena, names);
                     }
                 }
-                JsMemberProperty::Identifier(id) => {
+                JsMemberProperty::Identifier(id)
+                | JsMemberProperty::SpannedIdentifier { name: id, .. } => {
                     if !names.contains(id) {
                         names.push(id.clone());
                     }
@@ -1053,8 +1070,12 @@ pub(crate) fn collect_ids_from_expr_props(
                         // Check if this property is named "children" or "$$slots" -
                         // skip their arrow/function values as children handle their own async
                         let prop_name = match &prop.key {
-                            JsPropertyKey::Identifier(name) => Some(name.as_str()),
+                            JsPropertyKey::Identifier(name)
+                            | JsPropertyKey::SpannedIdentifier { name, .. } => Some(name.as_str()),
                             JsPropertyKey::Literal(JsLiteral::String(name)) => Some(name.as_str()),
+                            JsPropertyKey::SpannedStringLiteral { value, .. } => {
+                                Some(value.as_str())
+                            }
                             _ => None,
                         };
                         let is_children_prop = matches!(prop_name, Some("children" | "$$slots"));
@@ -1177,6 +1198,9 @@ fn collect_ids_from_expr_deep(
     names: &mut Vec<compact_str::CompactString>,
 ) {
     match expr {
+        JsExpr::Spanned(inner, _, _) => {
+            collect_ids_from_expr_deep(arena.get_expr(*inner), arena, names);
+        }
         JsExpr::Identifier(name) if !names.contains(name) => {
             names.push(name.clone());
         }
@@ -1194,7 +1218,8 @@ fn collect_ids_from_expr_deep(
                         collect_ids_from_expr_deep(arena.get_expr(*prop), arena, names);
                     }
                 }
-                JsMemberProperty::Identifier(id) => {
+                JsMemberProperty::Identifier(id)
+                | JsMemberProperty::SpannedIdentifier { name: id, .. } => {
                     if !names.contains(id) {
                         names.push(id.clone());
                     }
@@ -1273,291 +1298,6 @@ fn collect_ids_from_expr_deep(
                 collect_identifiers_from_statement_deep(s, arena, names);
             }
         }
-        _ => {}
-    }
-}
-
-/// Collect identifiers that appear as arguments to `$.get()` calls in a statement.
-///
-/// This is used for blocker detection in template_effect. Only identifiers accessed
-/// via `$.get(name)` are considered blocker candidates, because blocker variables
-/// (from instance script async body) are always accessed through `$.get()`.
-/// Other identifiers (snippet parameters, local variables) use different access
-/// patterns and should not be treated as blockers.
-pub fn collect_get_arg_identifiers_from_statement(
-    stmt: &JsStatement,
-    arena: &crate::compiler::phases::phase3_transform::js_ast::arena::JsArena,
-    names: &mut Vec<compact_str::CompactString>,
-) {
-    match stmt {
-        JsStatement::Expression(expr_stmt) => {
-            collect_get_arg_ids_from_expr(arena.get_expr(expr_stmt.expression), arena, names);
-        }
-        JsStatement::Block(block_stmt) => {
-            for s in &block_stmt.body {
-                collect_get_arg_identifiers_from_statement(s, arena, names);
-            }
-        }
-        JsStatement::VariableDeclaration(decl) => {
-            for declarator in &decl.declarations {
-                if let Some(init) = &declarator.init {
-                    collect_get_arg_ids_from_expr(arena.get_expr(*init), arena, names);
-                }
-            }
-        }
-        JsStatement::Return(ret) => {
-            if let Some(expr) = &ret.argument {
-                collect_get_arg_ids_from_expr(arena.get_expr(*expr), arena, names);
-            }
-        }
-        JsStatement::If(if_stmt) => {
-            collect_get_arg_ids_from_expr(arena.get_expr(if_stmt.test), arena, names);
-            collect_get_arg_identifiers_from_statement(
-                arena.get_stmt(if_stmt.consequent),
-                arena,
-                names,
-            );
-            if let Some(alt) = if_stmt.alternate {
-                collect_get_arg_identifiers_from_statement(arena.get_stmt(alt), arena, names);
-            }
-        }
-        _ => {}
-    }
-}
-
-/// Collect identifiers from `$.get(name)` call patterns in an expression.
-fn collect_get_arg_ids_from_expr(
-    expr: &JsExpr,
-    arena: &crate::compiler::phases::phase3_transform::js_ast::arena::JsArena,
-    names: &mut Vec<compact_str::CompactString>,
-) {
-    match expr {
-        JsExpr::Call(call) => {
-            // Check if this is a $.get(name) call
-            if is_dollar_get_call(call, arena) {
-                if let Some(JsExpr::Identifier(arg_name)) = call.arguments.first() {
-                    if !names.contains(arg_name) {
-                        names.push(arg_name.clone());
-                    }
-                }
-            }
-            // Always recurse into callee and arguments to find nested $.get() calls
-            collect_get_arg_ids_from_expr(arena.get_expr(call.callee), arena, names);
-            for arg in &call.arguments {
-                collect_get_arg_ids_from_expr(arg, arena, names);
-            }
-        }
-        JsExpr::Binary(bin) => {
-            collect_get_arg_ids_from_expr(arena.get_expr(bin.left), arena, names);
-            collect_get_arg_ids_from_expr(arena.get_expr(bin.right), arena, names);
-        }
-        JsExpr::Logical(log) => {
-            collect_get_arg_ids_from_expr(arena.get_expr(log.left), arena, names);
-            collect_get_arg_ids_from_expr(arena.get_expr(log.right), arena, names);
-        }
-        JsExpr::Unary(un) => {
-            collect_get_arg_ids_from_expr(arena.get_expr(un.argument), arena, names);
-        }
-        JsExpr::Conditional(cond) => {
-            collect_get_arg_ids_from_expr(arena.get_expr(cond.test), arena, names);
-            collect_get_arg_ids_from_expr(arena.get_expr(cond.consequent), arena, names);
-            collect_get_arg_ids_from_expr(arena.get_expr(cond.alternate), arena, names);
-        }
-        JsExpr::TemplateLiteral(tl) => {
-            for e in &tl.expressions {
-                collect_get_arg_ids_from_expr(e, arena, names);
-            }
-        }
-        JsExpr::Sequence(seq) => {
-            for e in &seq.expressions {
-                collect_get_arg_ids_from_expr(e, arena, names);
-            }
-        }
-        JsExpr::Array(arr) => {
-            for e in arr.elements.iter().flatten() {
-                collect_get_arg_ids_from_expr(e, arena, names);
-            }
-        }
-        JsExpr::Object(obj) => {
-            for member in &obj.properties {
-                match member {
-                    JsObjectMember::Property(prop) => {
-                        collect_get_arg_ids_from_expr(arena.get_expr(prop.value), arena, names);
-                    }
-                    JsObjectMember::SpreadElement(spread) => {
-                        collect_get_arg_ids_from_expr(arena.get_expr(*spread), arena, names);
-                    }
-                }
-            }
-        }
-        JsExpr::Member(member) => {
-            collect_get_arg_ids_from_expr(arena.get_expr(member.object), arena, names);
-        }
-        JsExpr::Assignment(assign) => {
-            collect_get_arg_ids_from_expr(arena.get_expr(assign.right), arena, names);
-        }
-        JsExpr::Spread(inner) | JsExpr::Void(inner) => {
-            collect_get_arg_ids_from_expr(arena.get_expr(*inner), arena, names);
-        }
-        // Don't cross function boundaries
-        JsExpr::Arrow(_) | JsExpr::Function(_) => {}
-        _ => {}
-    }
-}
-
-/// Check if a call expression is a `$.get(...)` call.
-fn is_dollar_get_call(
-    call: &JsCallExpression,
-    arena: &crate::compiler::phases::phase3_transform::js_ast::arena::JsArena,
-) -> bool {
-    if let JsExpr::Member(member) = arena.get_expr(call.callee) {
-        if let JsExpr::Identifier(obj) = arena.get_expr(member.object) {
-            if obj == "$" {
-                if let JsMemberProperty::Identifier(prop) = &member.property {
-                    return prop == "get";
-                }
-            }
-        }
-    }
-    false
-}
-
-/// Collect property names from `$$props.XXX` member access patterns in a statement.
-///
-/// This is used to detect blocked variables accessed through $$props destructuring.
-/// For example, `$$props.name` yields "name" which can be checked against the blocker_map.
-pub fn collect_props_member_names_from_statement(
-    stmt: &JsStatement,
-    arena: &crate::compiler::phases::phase3_transform::js_ast::arena::JsArena,
-    names: &mut Vec<compact_str::CompactString>,
-) {
-    match stmt {
-        JsStatement::Expression(expr_stmt) => {
-            collect_props_member_names_from_expr(
-                arena.get_expr(expr_stmt.expression),
-                arena,
-                names,
-            );
-        }
-        JsStatement::Block(block_stmt) => {
-            for s in &block_stmt.body {
-                collect_props_member_names_from_statement(s, arena, names);
-            }
-        }
-        JsStatement::VariableDeclaration(decl) => {
-            for declarator in &decl.declarations {
-                if let Some(init) = &declarator.init {
-                    collect_props_member_names_from_expr(arena.get_expr(*init), arena, names);
-                }
-            }
-        }
-        JsStatement::Return(ret) => {
-            if let Some(expr) = &ret.argument {
-                collect_props_member_names_from_expr(arena.get_expr(*expr), arena, names);
-            }
-        }
-        JsStatement::If(if_stmt) => {
-            collect_props_member_names_from_expr(arena.get_expr(if_stmt.test), arena, names);
-            collect_props_member_names_from_statement(
-                arena.get_stmt(if_stmt.consequent),
-                arena,
-                names,
-            );
-            if let Some(alt) = if_stmt.alternate {
-                collect_props_member_names_from_statement(arena.get_stmt(alt), arena, names);
-            }
-        }
-        _ => {}
-    }
-}
-
-/// Collect property names from `$$props.XXX` member access patterns in an expression.
-fn collect_props_member_names_from_expr(
-    expr: &JsExpr,
-    arena: &crate::compiler::phases::phase3_transform::js_ast::arena::JsArena,
-    names: &mut Vec<compact_str::CompactString>,
-) {
-    match expr {
-        JsExpr::Member(member) => {
-            // Check if this is $$props.XXX
-            if let JsExpr::Identifier(obj) = arena.get_expr(member.object) {
-                if obj == "$$props" {
-                    if let JsMemberProperty::Identifier(prop_name) = &member.property {
-                        if !names.contains(prop_name) {
-                            names.push(prop_name.clone());
-                        }
-                    }
-                }
-            }
-            // Recurse into object
-            collect_props_member_names_from_expr(arena.get_expr(member.object), arena, names);
-            if let JsMemberProperty::Expression(prop_expr) = &member.property {
-                if member.computed {
-                    collect_props_member_names_from_expr(arena.get_expr(*prop_expr), arena, names);
-                }
-            }
-        }
-        JsExpr::Call(call) => {
-            collect_props_member_names_from_expr(arena.get_expr(call.callee), arena, names);
-            for arg in &call.arguments {
-                collect_props_member_names_from_expr(arg, arena, names);
-            }
-        }
-        JsExpr::Binary(bin) => {
-            collect_props_member_names_from_expr(arena.get_expr(bin.left), arena, names);
-            collect_props_member_names_from_expr(arena.get_expr(bin.right), arena, names);
-        }
-        JsExpr::Logical(log) => {
-            collect_props_member_names_from_expr(arena.get_expr(log.left), arena, names);
-            collect_props_member_names_from_expr(arena.get_expr(log.right), arena, names);
-        }
-        JsExpr::Unary(un) => {
-            collect_props_member_names_from_expr(arena.get_expr(un.argument), arena, names);
-        }
-        JsExpr::Conditional(cond) => {
-            collect_props_member_names_from_expr(arena.get_expr(cond.test), arena, names);
-            collect_props_member_names_from_expr(arena.get_expr(cond.consequent), arena, names);
-            collect_props_member_names_from_expr(arena.get_expr(cond.alternate), arena, names);
-        }
-        JsExpr::TemplateLiteral(tl) => {
-            for e in &tl.expressions {
-                collect_props_member_names_from_expr(e, arena, names);
-            }
-        }
-        JsExpr::Sequence(seq) => {
-            for e in &seq.expressions {
-                collect_props_member_names_from_expr(e, arena, names);
-            }
-        }
-        JsExpr::Array(arr) => {
-            for e in arr.elements.iter().flatten() {
-                collect_props_member_names_from_expr(e, arena, names);
-            }
-        }
-        JsExpr::Object(obj) => {
-            for member in &obj.properties {
-                match member {
-                    JsObjectMember::Property(prop) => {
-                        collect_props_member_names_from_expr(
-                            arena.get_expr(prop.value),
-                            arena,
-                            names,
-                        );
-                    }
-                    JsObjectMember::SpreadElement(spread) => {
-                        collect_props_member_names_from_expr(arena.get_expr(*spread), arena, names);
-                    }
-                }
-            }
-        }
-        JsExpr::Assignment(assign) => {
-            collect_props_member_names_from_expr(arena.get_expr(assign.right), arena, names);
-        }
-        JsExpr::Spread(inner) | JsExpr::Void(inner) => {
-            collect_props_member_names_from_expr(arena.get_expr(*inner), arena, names);
-        }
-        // Don't cross function boundaries
-        JsExpr::Arrow(_) | JsExpr::Function(_) => {}
         _ => {}
     }
 }

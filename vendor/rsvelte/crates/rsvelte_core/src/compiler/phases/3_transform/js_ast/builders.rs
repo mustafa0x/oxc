@@ -8,21 +8,17 @@ use super::nodes::*;
 use compact_str::CompactString;
 use smallvec::smallvec;
 
-/// Check if a string is a valid JavaScript identifier.
-fn is_valid_identifier(s: &str) -> bool {
-    if s.is_empty() {
-        return false;
+/// Upstream's `regex_is_valid_identifier` — `/^[a-zA-Z_$][a-zA-Z_$0-9]*$/`.
+/// Deliberately ASCII-only: a prop named with a non-ASCII letter is a legal JS
+/// identifier but upstream still emits it as a quoted key, and matching that is
+/// the point.
+pub fn is_valid_identifier(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c == '_' || c == '$' || c.is_ascii_alphabetic() => {}
+        _ => return false,
     }
-
-    // First character must be a letter, underscore, or dollar sign
-    let first_char = s.chars().next().unwrap();
-    if !first_char.is_alphabetic() && first_char != '_' && first_char != '$' {
-        return false;
-    }
-
-    // Remaining characters must be alphanumeric, underscore, or dollar sign
-    s.chars()
-        .all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+    chars.all(|c| c == '_' || c == '$' || c.is_ascii_alphanumeric())
 }
 
 // ============================================================================
@@ -80,11 +76,6 @@ pub fn true_literal() -> JsExpr {
     boolean(true)
 }
 
-/// Create the `false` literal.
-pub fn false_literal() -> JsExpr {
-    boolean(false)
-}
-
 /// Create a `this` expression.
 pub fn this() -> JsExpr {
     JsExpr::This
@@ -96,10 +87,7 @@ pub fn this() -> JsExpr {
 
 /// Create a template literal.
 pub fn template(quasis: Vec<JsTemplateElement>, expressions: Vec<JsExpr>) -> JsExpr {
-    JsExpr::TemplateLiteral(JsTemplateLiteral {
-        quasis,
-        expressions,
-    })
+    JsExpr::TemplateLiteral(JsTemplateLiteral { quasis, expressions })
 }
 
 /// Create a template element.
@@ -120,12 +108,11 @@ pub fn template_string(s: impl Into<CompactString>) -> JsExpr {
 
 /// Create an array expression.
 pub fn array(elements: Vec<JsExpr>) -> JsExpr {
-    JsExpr::Array(JsArrayExpression {
-        elements: elements.into_iter().map(Some).collect(),
-    })
+    JsExpr::Array(JsArrayExpression { elements: elements.into_iter().map(Some).collect() })
 }
 
-/// Create an array expression with possible holes.
+/// Create an array whose `None` elements print as holes (`[a,,b]`), which is
+/// how upstream's `b.array` renders the `null` its `objectify` returns.
 pub fn array_with_holes(elements: Vec<Option<JsExpr>>) -> JsExpr {
     JsExpr::Array(JsArrayExpression { elements })
 }
@@ -263,6 +250,25 @@ pub fn getter(
         shorthand: false,
         method: false,
     })
+}
+
+/// Attach a source span to a static property key.
+///
+/// The key remains a property-key variant rather than becoming a spanned
+/// expression, so object/member lowering can continue to match its structure.
+pub fn with_property_key_span(mut member: JsObjectMember, start: u32, end: u32) -> JsObjectMember {
+    if let JsObjectMember::Property(property) = &mut member {
+        property.key = match &property.key {
+            JsPropertyKey::Identifier(name) => {
+                JsPropertyKey::SpannedIdentifier { name: name.clone(), start, end }
+            }
+            JsPropertyKey::Literal(JsLiteral::String(value)) => {
+                JsPropertyKey::SpannedStringLiteral { value: value.clone(), start, end }
+            }
+            key => key.clone(),
+        };
+    }
+    member
 }
 
 /// Create a setter property.
@@ -434,7 +440,7 @@ pub fn unthunk(arena: &JsArena, expr: JsExpr) -> JsExpr {
     }
 
     // Body must be a call expression
-    let JsExpr::Call(call) = arena.get_expr(*body_expr_id) else {
+    let JsExpr::Call(call) = unspanned(arena, arena.get_expr(*body_expr_id)) else {
         return expr;
     };
 
@@ -445,10 +451,12 @@ pub fn unthunk(arena: &JsArena, expr: JsExpr) -> JsExpr {
     }
 
     // Callee must be an identifier, or a member expression on the `$` namespace.
-    let callee_is_static = match arena.get_expr(call.callee) {
-        JsExpr::Identifier(_) => true,
+    let callee_is_static = match unspanned(arena, arena.get_expr(call.callee)) {
+        // A read transform's getter callee is opaque so it is not re-read; it is
+        // still a plain identifier for the purpose of dropping the arrow.
+        JsExpr::Identifier(_) | JsExpr::OpaqueIdentifier(_) => true,
         JsExpr::Member(m) => {
-            matches!(arena.get_expr(m.object), JsExpr::Identifier(name) if name == "$")
+            matches!(unspanned(arena, arena.get_expr(m.object)), JsExpr::Identifier(name) if name == "$")
         }
         _ => false,
     };
@@ -467,7 +475,7 @@ pub fn unthunk(arena: &JsArena, expr: JsExpr) -> JsExpr {
             return expr;
         };
 
-        let JsExpr::Identifier(arg_name) = &call.arguments[i] else {
+        let JsExpr::Identifier(arg_name) = unspanned(arena, &call.arguments[i]) else {
             return expr;
         };
 
@@ -480,6 +488,13 @@ pub fn unthunk(arena: &JsArena, expr: JsExpr) -> JsExpr {
     arena.get_expr(call.callee).clone()
 }
 
+fn unspanned<'a>(arena: &'a JsArena, mut expr: &'a JsExpr) -> &'a JsExpr {
+    while let JsExpr::Spanned(inner, _, _) = expr {
+        expr = arena.get_expr(*inner);
+    }
+    expr
+}
+
 /// Check if a JsExpr contains any AwaitExpression (not crossing function boundaries).
 /// Arena-aware version.
 fn has_await_expression_arena(arena: &JsArena, expr: &JsExpr) -> bool {
@@ -490,10 +505,7 @@ fn has_await_expression_arena(arena: &JsArena, expr: &JsExpr) -> bool {
         // Recursively check sub-expressions
         JsExpr::Call(call) => {
             has_await_expression_arena(arena, arena.get_expr(call.callee))
-                || call
-                    .arguments
-                    .iter()
-                    .any(|a| has_await_expression_arena(arena, a))
+                || call.arguments.iter().any(|a| has_await_expression_arena(arena, a))
         }
         JsExpr::Member(member) => {
             has_await_expression_arena(arena, arena.get_expr(member.object))
@@ -514,17 +526,16 @@ fn has_await_expression_arena(arena: &JsArena, expr: &JsExpr) -> bool {
                 || has_await_expression_arena(arena, arena.get_expr(cond.consequent))
                 || has_await_expression_arena(arena, arena.get_expr(cond.alternate))
         }
-        JsExpr::Sequence(seq) => seq
-            .expressions
-            .iter()
-            .any(|e| has_await_expression_arena(arena, e)),
+        JsExpr::Sequence(seq) => {
+            seq.expressions.iter().any(|e| has_await_expression_arena(arena, e))
+        }
         JsExpr::Assignment(assign) => {
             has_await_expression_arena(arena, arena.get_expr(assign.right))
         }
-        JsExpr::Array(arr) => arr.elements.iter().any(|e| {
-            e.as_ref()
-                .is_some_and(|ex| has_await_expression_arena(arena, ex))
-        }),
+        JsExpr::Array(arr) => arr
+            .elements
+            .iter()
+            .any(|e| e.as_ref().is_some_and(|ex| has_await_expression_arena(arena, ex))),
         JsExpr::Object(obj) => obj.properties.iter().any(|p| match p {
             super::nodes::JsObjectMember::Property(prop) => {
                 has_await_expression_arena(arena, arena.get_expr(prop.value))
@@ -533,24 +544,16 @@ fn has_await_expression_arena(arena: &JsArena, expr: &JsExpr) -> bool {
                 has_await_expression_arena(arena, arena.get_expr(*e))
             }
         }),
-        JsExpr::TemplateLiteral(tmpl) => tmpl
-            .expressions
-            .iter()
-            .any(|e| has_await_expression_arena(arena, e)),
+        JsExpr::TemplateLiteral(tmpl) => {
+            tmpl.expressions.iter().any(|e| has_await_expression_arena(arena, e))
+        }
         JsExpr::TaggedTemplate(tt) => {
             has_await_expression_arena(arena, arena.get_expr(tt.tag))
-                || tt
-                    .quasi
-                    .expressions
-                    .iter()
-                    .any(|e| has_await_expression_arena(arena, e))
+                || tt.quasi.expressions.iter().any(|e| has_await_expression_arena(arena, e))
         }
         JsExpr::New(new_expr) => {
             has_await_expression_arena(arena, arena.get_expr(new_expr.callee))
-                || new_expr
-                    .arguments
-                    .iter()
-                    .any(|a| has_await_expression_arena(arena, a))
+                || new_expr.arguments.iter().any(|a| has_await_expression_arena(arena, a))
         }
         JsExpr::Yield(y) => y
             .argument
@@ -564,6 +567,7 @@ fn has_await_expression_arena(arena: &JsArena, expr: &JsExpr) -> bool {
         // Span wrapper carries an inner expression for source maps — recurse so
         // wrapping an awaiting expression doesn't hide the await. H-069.
         JsExpr::Spanned(inner, _, _) => has_await_expression_arena(arena, arena.get_expr(*inner)),
+        JsExpr::SourceAnchored(a) => has_await_expression_arena(arena, arena.get_expr(a.inner)),
         // Genuine leaves with no sub-expression to traverse. Class bodies are
         // function-boundary / non-async scopes, so they can't surface a
         // top-level await. The match is exhaustive (no `_`) so a future
@@ -610,26 +614,6 @@ pub fn save(arena: &JsArena, expression: JsExpr) -> JsExpr {
     let inner_call = call(arena, member_path(arena, "$.save"), vec![expression]);
     let await_expr = JsExpr::Await(arena.alloc_expr(inner_call));
     call(arena, await_expr, vec![])
-}
-
-/// Apply `$.save()` wrapping to await expressions in an expression tree.
-///
-/// In async template effect values, `await X` expressions that are NOT in
-/// "tail position" (i.e., not the last evaluated sub-expression) should be
-/// wrapped as `(await $.save(X))()` to preserve reactivity.
-///
-/// This corresponds to the `pickled_awaits` mechanism in the official Svelte
-/// compiler, which marks await expressions in Phase 2 analysis and transforms
-/// them in Phase 3 via the `AwaitExpression` visitor.
-///
-/// The `is_last_evaluated_expression` logic from the official compiler is
-/// replicated here as a top-down tree transformation.
-pub fn apply_save_wrapping(arena: &JsArena, expr: JsExpr) -> JsExpr {
-    // Only process if there are await expressions
-    if !has_await_expression_arena(arena, &expr) {
-        return expr;
-    }
-    apply_save_recursive(arena, expr, true)
 }
 
 /// Apply `$.save()` wrapping with the expression NOT in tail position.
@@ -753,10 +737,7 @@ fn apply_save_recursive(arena: &JsArena, expr: JsExpr, is_tail: bool) -> JsExpr 
                     apply_save_recursive(arena, arg, arg_is_tail)
                 })
                 .collect();
-            JsExpr::New(JsNewExpression {
-                callee: arena.alloc_expr(callee),
-                arguments,
-            })
+            JsExpr::New(JsNewExpression { callee: arena.alloc_expr(callee), arguments })
         }
 
         JsExpr::Array(arr) => {
@@ -844,10 +825,7 @@ fn apply_save_recursive(arena: &JsArena, expr: JsExpr, is_tail: bool) -> JsExpr 
                     apply_save_recursive(arena, e, e_is_tail)
                 })
                 .collect();
-            JsExpr::TemplateLiteral(JsTemplateLiteral {
-                quasis: tmpl.quasis,
-                expressions,
-            })
+            JsExpr::TemplateLiteral(JsTemplateLiteral { quasis: tmpl.quasis, expressions })
         }
 
         JsExpr::TaggedTemplate(tt) => {
@@ -868,10 +846,7 @@ fn apply_save_recursive(arena: &JsArena, expr: JsExpr, is_tail: bool) -> JsExpr 
                 .collect();
             JsExpr::TaggedTemplate(JsTaggedTemplate {
                 tag: arena.alloc_expr(tag),
-                quasi: JsTemplateLiteral {
-                    quasis: tt.quasi.quasis,
-                    expressions,
-                },
+                quasi: JsTemplateLiteral { quasis: tt.quasi.quasis, expressions },
             })
         }
 
@@ -1004,36 +979,6 @@ pub fn function_expr(
     })
 }
 
-/// Create a function declaration.
-pub fn function_decl(
-    name: impl Into<CompactString>,
-    params: Vec<JsPattern>,
-    body: Vec<JsStatement>,
-) -> JsStatement {
-    JsStatement::FunctionDeclaration(JsFunctionDeclaration {
-        id: Some(name.into()),
-        params: params.into(),
-        body: JsBlockStatement::with_body(body),
-        is_async: false,
-        is_generator: false,
-    })
-}
-
-/// Create an async function declaration.
-pub fn async_function_decl(
-    name: impl Into<CompactString>,
-    params: Vec<JsPattern>,
-    body: Vec<JsStatement>,
-) -> JsStatement {
-    JsStatement::FunctionDeclaration(JsFunctionDeclaration {
-        id: Some(name.into()),
-        params: params.into(),
-        body: JsBlockStatement::with_body(body),
-        is_async: true,
-        is_generator: false,
-    })
-}
-
 // ============================================================================
 // Calls and Member Access
 // ============================================================================
@@ -1041,11 +986,35 @@ pub fn async_function_decl(
 /// Create a call expression.
 #[inline]
 pub fn call(arena: &JsArena, callee: JsExpr, arguments: Vec<JsExpr>) -> JsExpr {
-    JsExpr::Call(JsCallExpression {
-        callee: arena.alloc_expr(callee),
-        arguments,
-        optional: false,
-    })
+    JsExpr::Call(JsCallExpression { callee: arena.alloc_expr(callee), arguments, optional: false })
+}
+
+/// Create the getter call a read transform produces (`x` -> `x()`).
+///
+/// A source-level `x()` and a transform-produced `x()` are the same shape, so the
+/// callee is marked opaque: without it a second `apply_transforms_to_expression`
+/// pass over an already-transformed subtree reads the binding twice (`x()()`).
+#[inline]
+pub fn getter_call(arena: &JsArena, node: JsExpr) -> JsExpr {
+    // The read transform hands the identifier over inside its span wrapper, and
+    // opacity is chosen by variant: the mark has to reach the identifier the
+    // wrapper holds, or the next pass reads the binding again.
+    let opaque = match &node {
+        JsExpr::Identifier(name) => Some(JsExpr::OpaqueIdentifier(name.clone())),
+        JsExpr::Spanned(inner, start, end) => match arena.get_expr(*inner) {
+            JsExpr::Identifier(name) => {
+                let name = name.clone();
+                Some(JsExpr::Spanned(
+                    arena.alloc_expr(JsExpr::OpaqueIdentifier(name)),
+                    *start,
+                    *end,
+                ))
+            }
+            _ => None,
+        },
+        _ => None,
+    };
+    call(arena, opaque.unwrap_or(node), vec![])
 }
 
 /// Create a call expression with trailing undefined/false arguments stripped.
@@ -1098,17 +1067,32 @@ pub fn optional_call(arena: &JsArena, callee: JsExpr, arguments: Vec<JsExpr>) ->
         arguments,
         optional: true,
     });
-    JsExpr::Chain(JsChainExpression {
-        expression: arena.alloc_expr(call),
-    })
+    JsExpr::Chain(JsChainExpression { expression: arena.alloc_expr(call) })
+}
+
+/// Close an optional chain by wrapping it in a `ChainExpression`, so a member
+/// access built on top of it stays *outside* the chain (upstream keeps the
+/// source `ChainExpression` node, which is what makes esrap parenthesize).
+/// Non-chains and already-wrapped chains are returned unchanged.
+pub fn close_optional_chain(arena: &JsArena, expr: JsExpr) -> JsExpr {
+    fn is_open_chain(arena: &JsArena, expr: &JsExpr) -> bool {
+        match expr {
+            JsExpr::Member(m) => m.optional || is_open_chain(arena, arena.get_expr(m.object)),
+            JsExpr::Call(c) => c.optional || is_open_chain(arena, arena.get_expr(c.callee)),
+            _ => false,
+        }
+    }
+
+    if is_open_chain(arena, &expr) {
+        JsExpr::Chain(JsChainExpression { expression: arena.alloc_expr(expr) })
+    } else {
+        expr
+    }
 }
 
 /// Create a new expression.
 pub fn new_expr(arena: &JsArena, callee: JsExpr, arguments: Vec<JsExpr>) -> JsExpr {
-    JsExpr::New(JsNewExpression {
-        callee: arena.alloc_expr(callee),
-        arguments,
-    })
+    JsExpr::New(JsNewExpression { callee: arena.alloc_expr(callee), arguments })
 }
 
 /// Create a member expression with identifier property.
@@ -1248,25 +1232,6 @@ pub fn logical_str(arena: &JsArena, op: &str, left: JsExpr, right: JsExpr) -> Js
     logical(arena, operator, left, right)
 }
 
-/// Create a unary expression.
-pub fn unary(arena: &JsArena, op: JsUnaryOp, argument: JsExpr) -> JsExpr {
-    JsExpr::Unary(JsUnaryExpression {
-        operator: op,
-        argument: arena.alloc_expr(argument),
-        prefix: true,
-    })
-}
-
-/// Create a NOT expression.
-pub fn not(arena: &JsArena, expr: JsExpr) -> JsExpr {
-    unary(arena, JsUnaryOp::Not, expr)
-}
-
-/// Create a typeof expression.
-pub fn type_of(arena: &JsArena, expr: JsExpr) -> JsExpr {
-    unary(arena, JsUnaryOp::TypeOf, expr)
-}
-
 /// Create an update expression.
 pub fn update(arena: &JsArena, op: JsUpdateOp, argument: JsExpr, prefix: bool) -> JsExpr {
     JsExpr::Update(JsUpdateExpression {
@@ -1274,16 +1239,6 @@ pub fn update(arena: &JsArena, op: JsUpdateOp, argument: JsExpr, prefix: bool) -
         argument: arena.alloc_expr(argument),
         prefix,
     })
-}
-
-/// Create an increment expression.
-pub fn increment(arena: &JsArena, expr: JsExpr, prefix: bool) -> JsExpr {
-    update(arena, JsUpdateOp::Increment, expr, prefix)
-}
-
-/// Create a decrement expression.
-pub fn decrement(arena: &JsArena, expr: JsExpr, prefix: bool) -> JsExpr {
-    update(arena, JsUpdateOp::Decrement, expr, prefix)
 }
 
 /// Create an assignment expression.
@@ -1352,14 +1307,13 @@ pub fn await_expr(arena: &JsArena, argument: JsExpr) -> JsExpr {
 pub fn stmt(arena: &JsArena, expression: JsExpr) -> JsStatement {
     JsStatement::Expression(JsExpressionStatement {
         expression: arena.alloc_expr(expression),
+        comment_anchor: None,
     })
 }
 
 /// Create a return statement.
 pub fn return_stmt(arena: &JsArena, argument: Option<JsExpr>) -> JsStatement {
-    JsStatement::Return(JsReturnStatement {
-        argument: argument.map(|a| arena.alloc_expr(a)),
-    })
+    JsStatement::Return(JsReturnStatement { argument: argument.map(|a| arena.alloc_expr(a)) })
 }
 
 /// Create a return statement with a value.
@@ -1386,92 +1340,9 @@ pub fn block(body: Vec<JsStatement>) -> JsStatement {
     JsStatement::Block(JsBlockStatement::with_body(body))
 }
 
-/// Create a for statement.
-pub fn for_stmt(
-    arena: &JsArena,
-    init: Option<JsForInit>,
-    test: Option<JsExpr>,
-    update: Option<JsExpr>,
-    body: JsStatement,
-) -> JsStatement {
-    JsStatement::For(JsForStatement {
-        init,
-        test: test.map(|t| arena.alloc_expr(t)),
-        update: update.map(|u| arena.alloc_expr(u)),
-        body: arena.alloc_stmt(body),
-    })
-}
-
-/// Create a for-of statement.
-pub fn for_of(
-    arena: &JsArena,
-    left: JsForOfLeft,
-    right: JsExpr,
-    body: JsStatement,
-    is_await: bool,
-) -> JsStatement {
-    JsStatement::ForOf(JsForOfStatement {
-        left,
-        right: arena.alloc_expr(right),
-        body: arena.alloc_stmt(body),
-        is_await,
-        is_for_in: false,
-    })
-}
-
-/// Create a while statement.
-pub fn while_stmt(arena: &JsArena, test: JsExpr, body: JsStatement) -> JsStatement {
-    JsStatement::While(JsWhileStatement {
-        test: arena.alloc_expr(test),
-        body: arena.alloc_stmt(body),
-    })
-}
-
-/// Create a do-while statement.
-pub fn do_while(arena: &JsArena, body: JsStatement, test: JsExpr) -> JsStatement {
-    JsStatement::DoWhile(JsDoWhileStatement {
-        body: arena.alloc_stmt(body),
-        test: arena.alloc_expr(test),
-    })
-}
-
-/// Create a throw statement.
-pub fn throw(arena: &JsArena, expr: JsExpr) -> JsStatement {
-    JsStatement::Throw(arena.alloc_expr(expr))
-}
-
-/// Create a throw error statement.
-pub fn throw_error(arena: &JsArena, message: impl Into<CompactString>) -> JsStatement {
-    let new_error = new_expr(arena, id("Error"), vec![string(message)]);
-    throw(arena, new_error)
-}
-
-/// Create a labeled statement.
-pub fn labeled(arena: &JsArena, label: impl Into<CompactString>, body: JsStatement) -> JsStatement {
-    JsStatement::Labeled(JsLabeledStatement {
-        label: label.into(),
-        body: arena.alloc_stmt(body),
-    })
-}
-
-/// Create a break statement.
-pub fn break_stmt(label: Option<CompactString>) -> JsStatement {
-    JsStatement::Break(label)
-}
-
-/// Create a continue statement.
-pub fn continue_stmt(label: Option<CompactString>) -> JsStatement {
-    JsStatement::Continue(label)
-}
-
 /// Create a debugger statement.
 pub fn debugger() -> JsStatement {
     JsStatement::Debugger
-}
-
-/// Create an empty statement.
-pub fn empty() -> JsStatement {
-    JsStatement::Empty
 }
 
 // ============================================================================
@@ -1485,6 +1356,7 @@ pub fn const_decl(arena: &JsArena, name: impl Into<CompactString>, init: JsExpr)
         declarations: vec![JsVariableDeclarator {
             id: id_pattern(name),
             init: Some(arena.alloc_expr(init)),
+            comment_anchor: None,
         }],
     })
 }
@@ -1500,6 +1372,7 @@ pub fn let_decl(
         declarations: vec![JsVariableDeclarator {
             id: id_pattern(name),
             init: init.map(|e| arena.alloc_expr(e)),
+            comment_anchor: None,
         }],
     })
 }
@@ -1516,6 +1389,32 @@ pub fn var_decl(
         declarations: vec![JsVariableDeclarator {
             id: id_pattern(name),
             init: init.map(|e| arena.alloc_expr(e)),
+            comment_anchor: None,
+        }],
+    })
+}
+
+/// `var name = init;` whose identifier carries the original-source offset
+/// upstream stamps on it (`b.var(b.id(name, element.name_loc), …)`). See
+/// [`JsVariableDeclarator::comment_anchor`].
+pub fn var_decl_anchored(
+    arena: &JsArena,
+    name: impl Into<CompactString>,
+    init: Option<JsExpr>,
+    // The span is the *source* name's, which the generated identifier does not
+    // reproduce byte for byte once the source name is non-ASCII.
+    anchor: Option<(u32, u32)>,
+) -> JsStatement {
+    let name = name.into();
+    JsStatement::VariableDeclaration(JsVariableDeclaration {
+        kind: JsVariableKind::Var,
+        declarations: vec![JsVariableDeclarator {
+            id: match anchor {
+                Some((start, end)) => JsPattern::SpannedIdentifier { name, start, end },
+                None => id_pattern(name),
+            },
+            init: init.map(|e| arena.alloc_expr(e)),
+            comment_anchor: anchor.map(|(start, _)| start),
         }],
     })
 }
@@ -1532,39 +1431,14 @@ pub fn var_decl_pattern(
         declarations: vec![JsVariableDeclarator {
             id: pattern,
             init: init.map(|e| arena.alloc_expr(e)),
+            comment_anchor: None,
         }],
-    })
-}
-
-/// Create a multi-variable declaration.
-pub fn var_decl_multi(
-    arena: &JsArena,
-    kind: JsVariableKind,
-    declarations: Vec<(JsPattern, Option<JsExpr>)>,
-) -> JsStatement {
-    JsStatement::VariableDeclaration(JsVariableDeclaration {
-        kind,
-        declarations: declarations
-            .into_iter()
-            .map(|(id, init)| JsVariableDeclarator {
-                id,
-                init: init.map(|e| arena.alloc_expr(e)),
-            })
-            .collect(),
     })
 }
 
 // ============================================================================
 // Imports and Exports
 // ============================================================================
-
-/// Create a side-effect import.
-pub fn import_side_effect(source: impl Into<CompactString>) -> JsStatement {
-    JsStatement::Import(JsImportDeclaration {
-        source: source.into(),
-        specifiers: vec![JsImportSpecifier::SideEffect],
-    })
-}
 
 /// Create a namespace import (import * as name from 'source').
 pub fn import_namespace(
@@ -1574,34 +1448,6 @@ pub fn import_namespace(
     JsStatement::Import(JsImportDeclaration {
         source: source.into(),
         specifiers: vec![JsImportSpecifier::Namespace(name.into())],
-    })
-}
-
-/// Create a default import.
-pub fn import_default(
-    name: impl Into<CompactString>,
-    source: impl Into<CompactString>,
-) -> JsStatement {
-    JsStatement::Import(JsImportDeclaration {
-        source: source.into(),
-        specifiers: vec![JsImportSpecifier::Default(name.into())],
-    })
-}
-
-/// Create a named import.
-pub fn import_named(
-    specifiers: Vec<(impl Into<CompactString>, impl Into<CompactString>)>,
-    source: impl Into<CompactString>,
-) -> JsStatement {
-    JsStatement::Import(JsImportDeclaration {
-        source: source.into(),
-        specifiers: specifiers
-            .into_iter()
-            .map(|(imported, local)| JsImportSpecifier::Named {
-                imported: imported.into(),
-                local: local.into(),
-            })
-            .collect(),
     })
 }
 
@@ -1619,13 +1465,6 @@ pub fn export_default_function(
             is_async: false,
             is_generator: false,
         }),
-    })
-}
-
-/// Create an export default expression.
-pub fn export_default(arena: &JsArena, expr: JsExpr) -> JsStatement {
-    JsStatement::ExportDefault(JsExportDefault {
-        declaration: JsExportDefaultDeclaration::Expression(arena.alloc_expr(expr)),
     })
 }
 
@@ -1648,28 +1487,6 @@ pub fn rest_pattern(argument: JsPattern) -> JsPattern {
     JsPattern::Rest(Box::new(argument))
 }
 
-/// Create an assignment pattern (default value).
-pub fn assignment_pattern(arena: &JsArena, left: JsPattern, right: JsExpr) -> JsPattern {
-    JsPattern::Assignment(JsAssignmentPattern {
-        left: Box::new(left),
-        right: arena.alloc_expr(right),
-    })
-}
-
-/// Create an object pattern property.
-pub fn object_prop_pattern(
-    key: impl Into<CompactString>,
-    value: JsPattern,
-    shorthand: bool,
-) -> JsObjectPatternProperty {
-    JsObjectPatternProperty::Property {
-        key: JsPropertyKey::Identifier(key.into()),
-        value,
-        computed: false,
-        shorthand,
-    }
-}
-
 // ============================================================================
 // Svelte Runtime Helpers
 // ============================================================================
@@ -1678,11 +1495,6 @@ pub fn object_prop_pattern(
 pub fn svelte_call(arena: &JsArena, method: &str, args: Vec<JsExpr>) -> JsExpr {
     let callee = member(arena, id("$"), method);
     call(arena, callee, args)
-}
-
-/// Create $.template(html).
-pub fn svelte_template(arena: &JsArena, html: impl Into<CompactString>) -> JsExpr {
-    svelte_call(arena, "template", vec![template_string(html)])
 }
 
 /// Create $.from_html(html) or $.from_html(html, flags).
@@ -1698,410 +1510,9 @@ pub fn svelte_from_html(
     svelte_call(arena, "from_html", args)
 }
 
-/// Create $.first_child(node).
-pub fn svelte_first_child(arena: &JsArena, node: JsExpr) -> JsExpr {
-    svelte_call(arena, "first_child", vec![node])
-}
-
-/// Create $.sibling(node) or $.sibling(node, count).
-pub fn svelte_sibling(arena: &JsArena, node: JsExpr, count: Option<i32>) -> JsExpr {
-    let mut args = vec![node];
-    if let Some(c) = count {
-        args.push(number(c as f64));
-    }
-    svelte_call(arena, "sibling", args)
-}
-
-/// Create $.child(node) or $.child(node, true) for preserving whitespace.
-pub fn svelte_child(arena: &JsArena, node: JsExpr, preserve_whitespace: Option<bool>) -> JsExpr {
-    let mut args = vec![node];
-    if let Some(true) = preserve_whitespace {
-        args.push(boolean(true));
-    }
-    svelte_call(arena, "child", args)
-}
-
-/// Create $.text() or $.text(content).
-pub fn svelte_text(arena: &JsArena, content: Option<JsExpr>) -> JsExpr {
-    let args = content.map(|c| vec![c]).unwrap_or_default();
-    svelte_call(arena, "text", args)
-}
-
-/// Create $.comment().
-pub fn svelte_comment(arena: &JsArena) -> JsExpr {
-    svelte_call(arena, "comment", vec![])
-}
-
 /// Create $.append(anchor, node).
 pub fn svelte_append(arena: &JsArena, anchor: JsExpr, node: JsExpr) -> JsExpr {
     svelte_call(arena, "append", vec![anchor, node])
-}
-
-/// Create $.template_effect(fn).
-pub fn svelte_template_effect(arena: &JsArena, callback: JsExpr) -> JsExpr {
-    svelte_call(arena, "template_effect", vec![callback])
-}
-
-/// Create $.template_effect(fn, values).
-pub fn svelte_template_effect_with_values(
-    arena: &JsArena,
-    callback: JsExpr,
-    values: JsExpr,
-) -> JsExpr {
-    svelte_call(arena, "template_effect", vec![callback, values])
-}
-
-/// Create $.set_text(node, text).
-pub fn svelte_set_text(arena: &JsArena, node: JsExpr, text: JsExpr) -> JsExpr {
-    svelte_call(arena, "set_text", vec![node, text])
-}
-
-/// Create $.get(source).
-pub fn svelte_get(arena: &JsArena, source: JsExpr) -> JsExpr {
-    svelte_call(arena, "get", vec![source])
-}
-
-/// Create $.set(source, value).
-pub fn svelte_set(arena: &JsArena, source: JsExpr, value: JsExpr) -> JsExpr {
-    svelte_call(arena, "set", vec![source, value])
-}
-
-/// Create $.set(source, value, true).
-pub fn svelte_set_sync(arena: &JsArena, source: JsExpr, value: JsExpr) -> JsExpr {
-    svelte_call(arena, "set", vec![source, value, true_literal()])
-}
-
-/// Create $.event(event_name, element, handler).
-pub fn svelte_event(
-    arena: &JsArena,
-    event_name: impl Into<CompactString>,
-    element: JsExpr,
-    handler: JsExpr,
-) -> JsExpr {
-    svelte_call(arena, "event", vec![string(event_name), element, handler])
-}
-
-/// Create $.state(value).
-pub fn svelte_state(arena: &JsArena, value: JsExpr) -> JsExpr {
-    svelte_call(arena, "state", vec![value])
-}
-
-/// Create $.proxy(value).
-pub fn svelte_proxy(arena: &JsArena, value: JsExpr) -> JsExpr {
-    svelte_call(arena, "proxy", vec![value])
-}
-
-/// Create $.derived(() => expr).
-pub fn svelte_derived(arena: &JsArena, expr: JsExpr) -> JsExpr {
-    let thunked = thunk(arena, expr);
-    svelte_call(arena, "derived", vec![thunked])
-}
-
-/// Create $.effect(fn).
-pub fn svelte_effect(arena: &JsArena, callback: JsExpr) -> JsExpr {
-    svelte_call(arena, "effect", vec![callback])
-}
-
-/// Create $.push(props, runes).
-pub fn svelte_push(arena: &JsArena, props: JsExpr, runes: bool) -> JsExpr {
-    svelte_call(arena, "push", vec![props, boolean(runes)])
-}
-
-/// Create $.pop().
-pub fn svelte_pop(arena: &JsArena) -> JsExpr {
-    svelte_call(arena, "pop", vec![])
-}
-
-/// Create $.each(anchor, flags, () => collection, key_fn, (anchor, item, index) => { ... }).
-pub fn svelte_each(
-    arena: &JsArena,
-    anchor: JsExpr,
-    flags: i32,
-    collection: JsExpr,
-    key_fn: JsExpr,
-    callback: JsExpr,
-) -> JsExpr {
-    let thunked = thunk(arena, collection);
-    svelte_call(
-        arena,
-        "each",
-        vec![anchor, number(flags as f64), thunked, key_fn, callback],
-    )
-}
-
-/// Create $.await(anchor, () => promise, pending_fn, then_fn).
-pub fn svelte_await(
-    arena: &JsArena,
-    anchor: JsExpr,
-    promise_getter: JsExpr,
-    pending_fn: Option<JsExpr>,
-    then_fn: JsExpr,
-) -> JsExpr {
-    svelte_call(
-        arena,
-        "await",
-        vec![
-            anchor,
-            promise_getter,
-            pending_fn.unwrap_or_else(null),
-            then_fn,
-        ],
-    )
-}
-
-/// Create $.if(anchor, () => condition, consequent_fn, alternate_fn).
-pub fn svelte_if(
-    arena: &JsArena,
-    anchor: JsExpr,
-    condition_getter: JsExpr,
-    consequent_fn: JsExpr,
-    alternate_fn: Option<JsExpr>,
-) -> JsExpr {
-    let mut args = vec![anchor, condition_getter, consequent_fn];
-    if let Some(alt) = alternate_fn {
-        args.push(alt);
-    }
-    svelte_call(arena, "if", args)
-}
-
-/// Create $.element(anchor, tag, is_svg).
-pub fn svelte_element(arena: &JsArena, anchor: JsExpr, tag: JsExpr, is_svg: bool) -> JsExpr {
-    svelte_call(arena, "element", vec![anchor, tag, boolean(is_svg)])
-}
-
-/// Create $.delegate(events).
-pub fn svelte_delegate(arena: &JsArena, events: Vec<String>) -> JsExpr {
-    svelte_call(
-        arena,
-        "delegate",
-        vec![array(events.into_iter().map(string).collect())],
-    )
-}
-
-/// Create $.bind_value(element, getter, setter).
-pub fn svelte_bind_value(
-    arena: &JsArena,
-    element: JsExpr,
-    getter: JsExpr,
-    setter: JsExpr,
-) -> JsExpr {
-    svelte_call(arena, "bind_value", vec![element, getter, setter])
-}
-
-/// Create $.bind_this(element, setter, getter).
-pub fn svelte_bind_this(
-    arena: &JsArena,
-    element: JsExpr,
-    setter: JsExpr,
-    getter: JsExpr,
-) -> JsExpr {
-    svelte_call(arena, "bind_this", vec![element, setter, getter])
-}
-
-/// Create $.prop(props, name, flags, fallback).
-pub fn svelte_prop(
-    arena: &JsArena,
-    props: JsExpr,
-    name: impl Into<CompactString>,
-    flags: i32,
-    fallback: Option<JsExpr>,
-) -> JsExpr {
-    let mut args = vec![props, string(name), number(flags as f64)];
-    if let Some(fb) = fallback {
-        args.push(fb);
-    }
-    svelte_call(arena, "prop", args)
-}
-
-/// Create $.rest_props(props, exclude).
-pub fn svelte_rest_props(arena: &JsArena, props: JsExpr, exclude: Vec<CompactString>) -> JsExpr {
-    svelte_call(
-        arena,
-        "rest_props",
-        vec![props, array(exclude.into_iter().map(string).collect())],
-    )
-}
-
-/// Create $.update(source) or $.update(source, delta).
-pub fn svelte_update(arena: &JsArena, source: JsExpr, delta: Option<i32>) -> JsExpr {
-    let mut args = vec![source];
-    if let Some(d) = delta {
-        args.push(number(d as f64));
-    }
-    svelte_call(arena, "update", args)
-}
-
-/// Create $.reset(element).
-pub fn svelte_reset(arena: &JsArena, element: JsExpr) -> JsExpr {
-    svelte_call(arena, "reset", vec![element])
-}
-
-/// Create $.next().
-pub fn svelte_next(arena: &JsArena, count: Option<i32>) -> JsExpr {
-    let args = if let Some(c) = count {
-        vec![number(c as f64)]
-    } else {
-        vec![]
-    };
-    svelte_call(arena, "next", args)
-}
-
-/// Create $.attr(element, name, value).
-pub fn svelte_attr(
-    arena: &JsArena,
-    element: JsExpr,
-    name: impl Into<CompactString>,
-    value: JsExpr,
-) -> JsExpr {
-    svelte_call(arena, "attr", vec![element, string(name), value])
-}
-
-/// Create $.set_attribute(element, name, value).
-pub fn svelte_set_attribute(
-    arena: &JsArena,
-    element: JsExpr,
-    name: impl Into<CompactString>,
-    value: JsExpr,
-) -> JsExpr {
-    svelte_call(arena, "set_attribute", vec![element, string(name), value])
-}
-
-/// Create $.remove_input_defaults(element).
-pub fn svelte_remove_input_defaults(arena: &JsArena, element: JsExpr) -> JsExpr {
-    svelte_call(arena, "remove_input_defaults", vec![element])
-}
-
-/// Create $.index (reference to the index key function).
-pub fn svelte_index(arena: &JsArena) -> JsExpr {
-    member(arena, id("$"), "index")
-}
-
-/// Create $.autofocus(element, value).
-pub fn svelte_autofocus(arena: &JsArena, element: JsExpr, value: bool) -> JsExpr {
-    svelte_call(arena, "autofocus", vec![element, boolean(value)])
-}
-
-/// Create $.set_custom_element_data(element, name, value).
-pub fn svelte_set_custom_element_data(
-    arena: &JsArena,
-    element: JsExpr,
-    name: impl Into<CompactString>,
-    value: JsExpr,
-) -> JsExpr {
-    svelte_call(
-        arena,
-        "set_custom_element_data",
-        vec![element, string(name), value],
-    )
-}
-
-/// Create $.html(node, fn).
-pub fn svelte_html(arena: &JsArena, node: JsExpr, getter: JsExpr) -> JsExpr {
-    svelte_call(arena, "html", vec![node, getter])
-}
-
-/// Create $.set_class(element, flags, class_attr, class_binding, class_map, class_directives).
-pub fn svelte_set_class(
-    arena: &JsArena,
-    element: JsExpr,
-    flags: JsExpr,
-    class_attr: JsExpr,
-    class_binding: JsExpr,
-    class_map: JsExpr,
-    class_directives: JsExpr,
-) -> JsExpr {
-    svelte_call(
-        arena,
-        "set_class",
-        vec![
-            element,
-            flags,
-            class_attr,
-            class_binding,
-            class_map,
-            class_directives,
-        ],
-    )
-}
-
-/// Create $.set_style(element, style_attr, style_binding, style_directives).
-pub fn svelte_set_style(
-    arena: &JsArena,
-    element: JsExpr,
-    style_attr: JsExpr,
-    style_binding: JsExpr,
-    style_directives: JsExpr,
-) -> JsExpr {
-    svelte_call(
-        arena,
-        "set_style",
-        vec![element, style_attr, style_binding, style_directives],
-    )
-}
-
-/// Create $.action(element, callback) or $.action(element, callback, argument_getter).
-pub fn svelte_action(
-    arena: &JsArena,
-    element: JsExpr,
-    callback: JsExpr,
-    arg_getter: Option<JsExpr>,
-) -> JsExpr {
-    let mut args = vec![element, callback];
-    if let Some(arg) = arg_getter {
-        args.push(arg);
-    }
-    svelte_call(arena, "action", args)
-}
-
-/// Transition flag constants.
-/// Corresponds to constants in `svelte/packages/svelte/src/constants.js`.
-pub const TRANSITION_IN: u32 = 1;
-pub const TRANSITION_OUT: u32 = 1 << 1; // 2
-pub const TRANSITION_GLOBAL: u32 = 1 << 2; // 4
-
-/// Create $.transition(flags, element, name_thunk) or $.transition(flags, element, name_thunk, expr_thunk).
-pub fn svelte_transition(
-    arena: &JsArena,
-    flags: u32,
-    element: JsExpr,
-    name_thunk: JsExpr,
-    expr_thunk: Option<JsExpr>,
-) -> JsExpr {
-    let mut args = vec![number(flags as f64), element, name_thunk];
-    if let Some(expr) = expr_thunk {
-        args.push(expr);
-    }
-    svelte_call(arena, "transition", args)
-}
-
-// ============================================================================
-// DOM Manipulation Helpers
-// ============================================================================
-
-/// Create element.textContent = value assignment.
-pub fn set_text_content(arena: &JsArena, element: JsExpr, value: JsExpr) -> JsExpr {
-    let m = member(arena, element, "textContent");
-    assign(arena, m, value)
-}
-
-/// Create option.value = option.__value = value assignment.
-pub fn set_option_value(arena: &JsArena, option: JsExpr, value: JsExpr) -> JsExpr {
-    // option.value = option.__value = value
-    let inner_member = member(arena, option.clone(), "__value");
-    let inner_assign = assign(arena, inner_member, value);
-    let outer_member = member(arena, option, "value");
-    assign(arena, outer_member, inner_assign)
-}
-
-/// Create element.prop = value assignment for a property.
-pub fn set_property(
-    arena: &JsArena,
-    element: JsExpr,
-    prop: impl Into<CompactString>,
-    value: JsExpr,
-) -> JsExpr {
-    let m = member(arena, element, prop);
-    assign(arena, m, value)
 }
 
 // ============================================================================
@@ -2127,7 +1538,7 @@ pub fn literal_number(value: f64) -> JsExpr {
 }
 
 #[cfg(test)]
-mod await_walker_tests {
+mod tests {
     use super::*;
 
     fn awaited(arena: &JsArena, name: &str) -> JsExpr {
@@ -2140,9 +1551,7 @@ mod await_walker_tests {
         // walker previously treated Chain as a leaf and missed the await.
         let arena = JsArena::new();
         let inner_call = call(&arena, id("b"), vec![awaited(&arena, "x")]);
-        let chain = JsExpr::Chain(JsChainExpression {
-            expression: arena.alloc_expr(inner_call),
-        });
+        let chain = JsExpr::Chain(JsChainExpression { expression: arena.alloc_expr(inner_call) });
         assert!(js_expr_has_await(&arena, &chain));
     }
 
@@ -2155,12 +1564,56 @@ mod await_walker_tests {
     }
 
     #[test]
+    fn unthunks_a_spanned_call() {
+        let arena = JsArena::new();
+        let callee = JsExpr::Spanned(arena.alloc_expr(id("get_list")), 0, 8);
+        let call_expr = call(&arena, callee, vec![]);
+        let spanned_call = JsExpr::Spanned(arena.alloc_expr(call_expr), 0, 10);
+
+        assert!(matches!(thunk(&arena, spanned_call), JsExpr::Spanned(..)));
+    }
+
+    #[test]
     fn chain_without_await_is_false() {
         let arena = JsArena::new();
         let inner_call = call(&arena, id("b"), vec![id("x")]);
-        let chain = JsExpr::Chain(JsChainExpression {
-            expression: arena.alloc_expr(inner_call),
-        });
+        let chain = JsExpr::Chain(JsChainExpression { expression: arena.alloc_expr(inner_call) });
         assert!(!js_expr_has_await(&arena, &chain));
+    }
+
+    #[test]
+    fn property_key_span_preserves_identifier_shape() {
+        let arena = JsArena::new();
+        let member = with_property_key_span(getter(&arena, "value", vec![]), 4, 14);
+
+        assert!(matches!(
+            member,
+            JsObjectMember::Property(JsProperty {
+                key: JsPropertyKey::SpannedIdentifier {
+                    ref name,
+                    start: 4,
+                    end: 14,
+                },
+                ..
+            }) if name == "value"
+        ));
+    }
+
+    #[test]
+    fn property_key_span_preserves_quoted_key_shape() {
+        let arena = JsArena::new();
+        let member = with_property_key_span(getter(&arena, "foo-bar", vec![]), 4, 16);
+
+        assert!(matches!(
+            member,
+            JsObjectMember::Property(JsProperty {
+                key: JsPropertyKey::SpannedStringLiteral {
+                    ref value,
+                    start: 4,
+                    end: 16,
+                },
+                ..
+            }) if value == "foo-bar"
+        ));
     }
 }

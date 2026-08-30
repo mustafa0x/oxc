@@ -1,6 +1,21 @@
 //! Destructuring assignment transformations and IIFE generation.
 
 use super::SCRIPT_ARRAY_COUNTER;
+use super::rune_transforms::{
+    derived_prop_access, exclude_from_object_keys, find_default_equals,
+    find_derived_property_colon, split_derived_array_elements, split_derived_object_properties,
+};
+use crate::compiler::phases::phase3_transform::js_ast::to_oxc::SINGLE_TARGET_DESTRUCTURE_SEQUENCE_MARKER;
+use crate::compiler::phases::phase3_transform::shared::js_scan::{code_bytes, code_bytes_from};
+use crate::compiler::phases::phase3_transform::shared::offsets::{
+    ByteOffset, CharOffset, CharToByte,
+};
+use crate::compiler::utils::{is_escaped, is_escaped_char};
+use oxc_allocator::Allocator;
+use oxc_ast::ast::{Expression, Statement};
+use oxc_parser::{ParseOptions, Parser};
+use oxc_span::SourceType;
+use std::borrow::Cow;
 
 pub(super) fn unthunk_string(expr: &str) -> String {
     let trimmed = expr.trim();
@@ -14,9 +29,7 @@ pub(super) fn unthunk_string(expr: &str) -> String {
     // but `() => value.toString()` stays as `() => value.toString()`
     if let Some(callee) = trimmed.strip_suffix("()") {
         let is_plain_identifier = !callee.is_empty()
-            && callee
-                .chars()
-                .all(|c| c.is_alphanumeric() || c == '_' || c == '$');
+            && callee.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '$');
         let is_dollar_member = callee.starts_with("$.")
             && callee[2..].chars().all(|c| c.is_alphanumeric() || c == '_');
         if is_plain_identifier || is_dollar_member {
@@ -57,25 +70,36 @@ pub(super) fn transform_destructure_assignments(
     state_vars: &[String],
     store_sub_vars: &[String],
 ) -> String {
-    transform_destructure_assignments_with_props(statement, state_vars, store_sub_vars, &[])
+    transform_destructure_assignments_with_props(statement, state_vars, &[], store_sub_vars, &[])
+        .into_owned()
 }
 
 /// Transform destructure assignments, with knowledge of prop variables.
 ///
 /// `prop_vars` are variable names that will be transformed to function calls
-/// (e.g., `numbers` → `numbers()` for prop getters). When the RHS of a
-/// destructuring is a prop variable, we must use the IIFE form (with `$$value`
-/// caching) because the official compiler visits the RHS first, transforming it
-/// to a CallExpression, and then checks `should_cache = value.type !== 'Identifier'`.
-pub(super) fn transform_destructure_assignments_with_props(
-    statement: &str,
+/// (e.g., `numbers` → `numbers()` for prop getters). They matter twice: a prop
+/// *target* makes the destructure eligible for the expansion just like a state
+/// or store target (upstream routes every extracted path through the ordinary
+/// assignment lowering), and a prop on the *right-hand side* forces the IIFE
+/// form (with `$$value` caching) because the official compiler visits the RHS
+/// first, turning it into a CallExpression, and then checks
+/// `should_cache = value.type !== 'Identifier'`.
+///
+/// `non_reactive_state_vars` is subtracted from `state_vars` for that same
+/// right-hand-side test: only a state variable whose read becomes `$.get(…)`
+/// makes the visited value a CallExpression.
+pub(super) fn transform_destructure_assignments_with_props<'a>(
+    statement: &'a str,
     state_vars: &[String],
+    non_reactive_state_vars: &[String],
     store_sub_vars: &[String],
     prop_vars: &[String],
-) -> String {
+) -> Cow<'a, str> {
+    #[cfg(feature = "measure-destructure-scanner")]
+    crate::measure_destructure_scanner::record_entry();
     // Quick check: destructure assignments require `=` with `[` or `{` on the LHS
     if state_vars.is_empty() && store_sub_vars.is_empty() && prop_vars.is_empty() {
-        return statement.to_string();
+        return Cow::Borrowed(statement);
     }
 
     // Byte-level fast path: a destructure assignment requires either `]` or `}`
@@ -85,26 +109,35 @@ pub(super) fn transform_destructure_assignments_with_props(
     // is the common case for plain declarations like `let x = $state(0);` which
     // call this function once per statement when `state_vars` is non-empty.
     if memchr::memchr2(b']', b'}', statement.as_bytes()).is_none() {
-        return statement.to_string();
+        #[cfg(feature = "measure-destructure-scanner")]
+        crate::measure_destructure_scanner::record_quick_skip();
+        return Cow::Borrowed(statement);
     }
 
-    let mut result = statement.to_string();
+    let mut result = Cow::Borrowed(statement);
 
     // Build HashSets once for O(1) lookups across all iterations
-    let state_set: rustc_hash::FxHashSet<&str> = state_vars.iter().map(|s| s.as_str()).collect();
     let store_set: rustc_hash::FxHashSet<&str> =
         store_sub_vars.iter().map(|s| s.as_str()).collect();
+    let prop_set: rustc_hash::FxHashSet<&str> = prop_vars.iter().map(|s| s.as_str()).collect();
+    let reactive_state_set: rustc_hash::FxHashSet<&str> = state_vars
+        .iter()
+        .map(|s| s.as_str())
+        .filter(|s| !non_reactive_state_vars.iter().any(|n| n == s))
+        .collect();
 
     // Process the statement, looking for destructure assignments.
     // We scan for patterns and replace them with IIFEs.
     while let Some(transformed) = find_and_transform_one_destructure(
         &result,
         store_sub_vars,
-        prop_vars,
-        &state_set,
         &store_set,
+        &prop_set,
+        &reactive_state_set,
     ) {
-        result = transformed;
+        #[cfg(feature = "measure-destructure-scanner")]
+        crate::measure_destructure_scanner::record_rewrite();
+        result = Cow::Owned(transformed);
     }
 
     result
@@ -125,23 +158,18 @@ pub(super) fn transform_destructure_assignments_with_props(
 pub(super) fn find_and_transform_one_destructure(
     statement: &str,
     store_sub_vars: &[String],
-    prop_vars: &[String],
-    state_set: &rustc_hash::FxHashSet<&str>,
     store_set: &rustc_hash::FxHashSet<&str>,
+    prop_set: &rustc_hash::FxHashSet<&str>,
+    reactive_state_set: &rustc_hash::FxHashSet<&str>,
 ) -> Option<String> {
+    #[cfg(feature = "measure-destructure-scanner")]
+    crate::measure_destructure_scanner::record_scan(statement.len());
     let chars: Vec<char> = statement.chars().collect();
     let len = chars.len();
 
     // Build char-index → byte-index mapping for safe string slicing with multi-byte chars
-    let byte_offsets: Vec<usize> = statement.char_indices().map(|(b, _)| b).collect();
-    let byte_len = statement.len();
-    let b = |char_idx: usize| -> usize {
-        if char_idx >= byte_offsets.len() {
-            byte_len
-        } else {
-            byte_offsets[char_idx]
-        }
-    };
+    let table = CharToByte::new(statement);
+    let b = |char_idx: CharOffset| -> ByteOffset { table.byte(char_idx) };
 
     // Scan for `] =` or `} =` patterns that indicate destructure assignments.
     // We need to be careful to avoid:
@@ -150,12 +178,12 @@ pub(super) fn find_and_transform_one_destructure(
     // - Patterns inside strings or comments
 
     // Collect all valid candidate destructures, then pick the rightmost one.
-    // Each candidate stores (close_bracket_char_idx, pattern_start, close_bracket, rhs_start_after_eq)
+    // Each candidate stores (close_bracket_char_idx, pattern_start, rhs_start_after_eq)
+    #[derive(Clone, Copy)]
     struct Candidate {
-        close_pos: usize,     // char index of ] or }
-        pattern_start: usize, // char index of [ or {
-        close_bracket: char,  // ] or }
-        eq_pos: usize,        // char index of =
+        close_pos: CharOffset,
+        pattern_start: CharOffset,
+        eq_pos: CharOffset,
     }
     let mut candidates: Vec<Candidate> = Vec::new();
 
@@ -172,7 +200,7 @@ pub(super) fn find_and_transform_one_destructure(
                 i += 1;
                 continue;
             }
-        } else if Some(c) == in_string && (i == 0 || chars[i - 1] != '\\') {
+        } else if Some(c) == in_string && !is_escaped_char(&chars, i) {
             in_string = None;
             i += 1;
             continue;
@@ -185,26 +213,42 @@ pub(super) fn find_and_transform_one_destructure(
 
         // Look for `] =` or `} =` (possibly with spaces)
         if (c == ']' || c == '}') && i + 1 < len {
+            #[cfg(feature = "measure-destructure-scanner")]
+            crate::measure_destructure_scanner::record_candidate_closer();
             // Find the `=` after the bracket (skipping any whitespace including newlines)
             let mut j = i + 1;
             while j < len && chars[j].is_whitespace() {
                 j += 1;
             }
             if j < len && chars[j] == '=' && (j + 1 >= len || chars[j + 1] != '=') {
+                #[cfg(feature = "measure-destructure-scanner")]
+                crate::measure_destructure_scanner::record_assignment_closer();
                 // Found a potential destructure assignment
                 let close_bracket = c;
                 let open_bracket = if c == ']' { '[' } else { '{' };
 
-                // Walk backwards from position `i` to find the matching open bracket
-                if let Some(pattern_start) =
-                    find_matching_open_bracket(statement, i, open_bracket, close_bracket)
-                {
-                    let pattern_str = &statement[b(pattern_start)..b(i + 1)];
+                // Walk backwards from position `i` to find the matching open bracket.
+                // The helper works in byte offsets; this loop indexes by char.
+                if let Some(pattern_start) = find_matching_open_bracket(
+                    statement,
+                    table.byte(CharOffset::new(i)),
+                    open_bracket,
+                    close_bracket,
+                )
+                .map(|byte| {
+                    // The helper only returns ASCII bracket positions, which are
+                    // always char starts; a miss would be a bug, not input.
+                    table
+                        .char_of(byte)
+                        .unwrap_or_else(|| bracket_offset_miss(byte.get(), statement.len()))
+                }) {
+                    let pattern_end = CharOffset::new(i).next();
+                    let pattern_str = b(pattern_start).to(b(pattern_end), statement);
                     let rhs_start = j + 1;
 
                     // For array patterns, check if `[` is actually member access
-                    if open_bracket == '[' && pattern_start > 0 {
-                        let before_char = chars[pattern_start - 1];
+                    if open_bracket == '[' && pattern_start > CharOffset::ZERO {
+                        let before_char = chars[pattern_start.get() - 1];
                         if before_char.is_ascii_alphanumeric()
                             || before_char == '_'
                             || before_char == '$'
@@ -217,7 +261,7 @@ pub(super) fn find_and_transform_one_destructure(
                     }
 
                     // Skip declaration destructures (let/const/var)
-                    let before_pattern = statement[..b(pattern_start)].trim_end();
+                    let before_pattern = b(pattern_start).before(statement).trim_end();
                     if before_pattern.ends_with("let")
                         || before_pattern.ends_with("const")
                         || before_pattern.ends_with("var")
@@ -245,7 +289,7 @@ pub(super) fn find_and_transform_one_destructure(
                     // brace/bracket depth. If we encounter an unmatched
                     // opening `{` or `[` before hitting a statement boundary,
                     // we're nested inside another pattern and should skip.
-                    if is_inside_enclosing_pattern(statement, b(pattern_start)) {
+                    if is_inside_enclosing_pattern(statement, b(pattern_start).get()) {
                         i = j + 1;
                         continue;
                     }
@@ -253,10 +297,15 @@ pub(super) fn find_and_transform_one_destructure(
                     // Extract target identifiers from the pattern
                     let targets = extract_destructure_targets(pattern_str);
 
-                    // Check if any target is a reactive variable
-                    let has_reactive_target = targets
-                        .iter()
-                        .any(|t| state_set.contains(t.as_str()) || store_set.contains(t.as_str()));
+                    // Check if any target needs the lowered form. Upstream's
+                    // `visit_assignment_expression` routes every extracted path
+                    // through the normal assignment lowering, so a prop target
+                    // (`a = …` → `a(…)`) counts exactly like a state or store one.
+                    let has_reactive_target = targets.iter().any(|t| {
+                        reactive_state_set.contains(t.as_str())
+                            || store_set.contains(t.as_str())
+                            || prop_set.contains(t.as_str())
+                    });
 
                     if !has_reactive_target {
                         i = j + 1;
@@ -264,8 +313,9 @@ pub(super) fn find_and_transform_one_destructure(
                     }
 
                     // Find the end of the RHS expression
+                    let rhs_start = CharOffset::new(rhs_start);
                     let rhs_end = find_destructure_rhs_end(statement, rhs_start);
-                    let rhs_str = statement[b(rhs_start)..b(rhs_end)].trim();
+                    let rhs_str = b(rhs_start).to(b(rhs_end), statement).trim();
 
                     if rhs_str.is_empty() {
                         i = j + 1;
@@ -273,11 +323,12 @@ pub(super) fn find_and_transform_one_destructure(
                     }
 
                     // Valid candidate - store it
+                    #[cfg(feature = "measure-destructure-scanner")]
+                    crate::measure_destructure_scanner::record_accepted_candidate();
                     candidates.push(Candidate {
-                        close_pos: i,
+                        close_pos: CharOffset::new(i),
                         pattern_start,
-                        close_bracket,
-                        eq_pos: j,
+                        eq_pos: CharOffset::new(j),
                     });
                 }
             }
@@ -286,6 +337,26 @@ pub(super) fn find_and_transform_one_destructure(
         i += 1;
     }
 
+    if candidates.is_empty() {
+        return None;
+    }
+
+    // A candidate that sits *inside* another candidate's pattern is not an
+    // assignment at all — it is that pattern's `AssignmentPattern` default
+    // (`({ a: { b } = { b: 3 } } = src)`), which the outer expansion lowers
+    // through `$.fallback`. Rewriting it on its own would plant a call in an
+    // LValue slot. (The `let` / `const` / `var` form is caught earlier by
+    // `is_inside_enclosing_pattern`, which has no outer candidate to compare
+    // against.)
+    let candidates: Vec<Candidate> = candidates
+        .iter()
+        .copied()
+        .filter(|c| {
+            !candidates
+                .iter()
+                .any(|other| other.pattern_start < c.pattern_start && c.close_pos < other.close_pos)
+        })
+        .collect();
     if candidates.is_empty() {
         return None;
     }
@@ -301,14 +372,14 @@ pub(super) fn find_and_transform_one_destructure(
     // the other and should be deferred.
     let candidate_idx = {
         // Compute rhs_end for each candidate to determine containment
-        let rhs_ends: Vec<usize> = candidates
+        let rhs_ends: Vec<CharOffset> = candidates
             .iter()
-            .map(|c| find_destructure_rhs_end(statement, c.eq_pos + 1))
+            .map(|c| find_destructure_rhs_end(statement, c.eq_pos.next()))
             .collect();
 
         let mut selected = 0; // default to first
         'outer: for (ci, c) in candidates.iter().enumerate() {
-            let rhs_start = c.eq_pos + 1;
+            let rhs_start = c.eq_pos.next();
             let rhs_end = rhs_ends[ci];
             // Check if any other candidate's close_pos is inside this candidate's RHS range
             let mut contains_other = false;
@@ -330,48 +401,54 @@ pub(super) fn find_and_transform_one_destructure(
         selected
     };
     let candidate = &candidates[candidate_idx];
-    let i = candidate.close_pos;
+    let pattern_end = candidate.close_pos.next();
     let pattern_start = candidate.pattern_start;
-    let close_bracket = candidate.close_bracket;
-    let j = candidate.eq_pos;
-    let rhs_start = j + 1;
+    let rhs_start = candidate.eq_pos.next();
 
-    let pattern_str = &statement[b(pattern_start)..b(i + 1)];
+    let pattern_str = b(pattern_start).to(b(pattern_end), statement);
     let rhs_end = find_destructure_rhs_end(statement, rhs_start);
-    let rhs_str = statement[b(rhs_start)..b(rhs_end)].trim();
+    let rhs_str = b(rhs_start).to(b(rhs_end), statement).trim();
 
     // Check for surrounding parentheses
     let mut actual_start = b(pattern_start);
     let mut actual_end = b(rhs_end);
 
-    let before = statement[..b(pattern_start)].trim_end();
+    let before = b(pattern_start).before(statement).trim_end();
     if before.ends_with('(') {
-        let paren_pos = statement[..b(pattern_start)].rfind('(').unwrap();
-        let after_rhs = &statement[b(rhs_end)..];
+        let paren_pos = b(pattern_start).before(statement).rfind('(').unwrap();
+        let after_rhs = b(rhs_end).after(statement);
         if let Some(close_paren_offset) = after_rhs.find(')') {
-            actual_start = paren_pos;
-            actual_end = b(rhs_end) + close_paren_offset + 1;
+            actual_start = ByteOffset::new(paren_pos);
+            actual_end = ByteOffset::new(b(rhs_end).get() + close_paren_offset + 1);
         }
     }
 
-    // Determine if standalone statement
-    let before_text = statement[..actual_start].trim_end();
-    let after_text = statement[actual_end..].trim_start();
+    // Determine if standalone statement. Only spaces and tabs are trimmed: a
+    // line break is itself a statement boundary here, and trimming it away left
+    // the `\n` tests below unreachable — so an assignment whose neighbour was
+    // separated by nothing but a newline was read as a sub-expression and got a
+    // `return` the official compiler does not emit.
+    let before_text = actual_start.before(statement).trim_end_matches([' ', '\t']);
+    let after_text = actual_end.after(statement).trim_start_matches([' ', '\t']);
     let is_standalone = (before_text.is_empty()
         || before_text.ends_with(';')
         || before_text.ends_with('{')
         || before_text.ends_with('}')
+        || before_text.ends_with(')')
         || before_text.ends_with('\n'))
-        && (after_text.is_empty() || after_text.starts_with(';') || after_text.starts_with('\n'));
+        && (after_text.is_empty()
+            || after_text.starts_with(';')
+            || after_text.starts_with('}')
+            || after_text.starts_with('\n'));
 
     // Check if RHS will become a function call
     let rhs_trimmed = rhs_str.trim();
-    let rhs_will_be_call = prop_vars.iter().any(|p| p == rhs_trimmed)
-        || store_sub_vars.iter().any(|s| s == rhs_trimmed);
+    let rhs_will_be_call = prop_set.contains(rhs_trimmed)
+        || store_set.contains(rhs_trimmed)
+        || reactive_state_set.contains(rhs_trimmed);
 
     // Generate the IIFE replacement
     let iife = generate_destructure_iife(
-        close_bracket,
         pattern_str,
         rhs_str,
         is_standalone,
@@ -381,11 +458,17 @@ pub(super) fn find_and_transform_one_destructure(
 
     // Replace the destructure expression with the IIFE
     let mut new_statement = String::new();
-    new_statement.push_str(&statement[..actual_start]);
+    new_statement.push_str(actual_start.before(statement));
     new_statement.push_str(&iife);
-    new_statement.push_str(&statement[actual_end..]);
+    new_statement.push_str(actual_end.after(statement));
 
     Some(new_statement)
+}
+
+#[cold]
+#[inline(never)]
+fn bracket_offset_miss(byte: usize, len: usize) -> ! {
+    panic!("bracket byte offset {byte} is not a char start in a {len}-byte statement")
 }
 
 /// Returns true when the byte position `pattern_open_byte` (the `{` or `[`
@@ -407,12 +490,12 @@ pub(super) fn find_and_transform_one_destructure(
 /// `{` of a function body, …) leaves the inner pattern eligible for the
 /// usual destructure-assignment rewrite.
 fn is_inside_enclosing_pattern(statement: &str, pattern_open_byte: usize) -> bool {
-    let bytes = statement.as_bytes();
+    // A backwards walk cannot tell code from a comment or string, so the
+    // lexical state is established by a forward pass first.
+    let code: Vec<(usize, u8)> =
+        code_bytes(statement.as_bytes()).take_while(|&(i, _)| i < pattern_open_byte).collect();
     let mut depth: i32 = 0;
-    let mut i = pattern_open_byte;
-    while i > 0 {
-        i -= 1;
-        let b = bytes[i];
+    for &(i, b) in code.iter().rev() {
         match b {
             b'}' | b']' => depth += 1,
             b'{' | b'[' => {
@@ -436,25 +519,25 @@ fn is_inside_enclosing_pattern(statement: &str, pattern_open_byte: usize) -> boo
 /// Find the matching opening bracket, respecting nesting and strings.
 pub(super) fn find_matching_open_bracket(
     s: &str,
-    close_pos: usize,
+    close_pos: ByteOffset,
     open_bracket: char,
     close_bracket: char,
-) -> Option<usize> {
-    let chars: Vec<char> = s.chars().collect();
+) -> Option<ByteOffset> {
+    let (open, close) = (open_bracket as u8, close_bracket as u8);
+    // Collect forward so opaque runs are skipped, then walk the code bytes back.
+    let code: Vec<(usize, u8)> =
+        code_bytes(s.as_bytes()).take_while(|(i, _)| *i < close_pos.get()).collect();
+    #[cfg(feature = "measure-destructure-scanner")]
+    crate::measure_destructure_scanner::record_helper(code.len());
+
     let mut depth = 1;
-    let mut i = close_pos;
-
-    // Walk backwards
-    while i > 0 {
-        i -= 1;
-        let c = chars[i];
-
-        if c == close_bracket {
+    for &(i, c) in code.iter().rev() {
+        if c == close {
             depth += 1;
-        } else if c == open_bracket {
+        } else if c == open {
             depth -= 1;
             if depth == 0 {
-                return Some(i);
+                return Some(ByteOffset::new(i));
             }
         }
     }
@@ -488,11 +571,7 @@ pub(super) fn extract_destructure_targets(pattern: &str) -> Vec<String> {
         }
 
         // Handle rest element: ...rest
-        let part = if let Some(rest) = part.strip_prefix("...") {
-            rest.trim()
-        } else {
-            part
-        };
+        let part = if let Some(rest) = part.strip_prefix("...") { rest.trim() } else { part };
 
         // Handle default value BEFORE colon check: target = default
         // This is critical because a default value may contain a ternary expression
@@ -521,8 +600,12 @@ pub(super) fn extract_destructure_targets(pattern: &str) -> Vec<String> {
             targets.push(root);
         }
 
-        // Also recurse into nested patterns
-        if part.starts_with('[') || part.starts_with('{') {
+        // Also recurse into nested patterns. Only a *closed* bracket pair is
+        // recursed into: an unbalanced fragment strips nothing, so the callee
+        // would re-derive the identical part and never terminate.
+        if (part.starts_with('[') && part.ends_with(']'))
+            || (part.starts_with('{') && part.ends_with('}'))
+        {
             let nested = extract_destructure_targets(part);
             targets.extend(nested);
         }
@@ -534,44 +617,23 @@ pub(super) fn extract_destructure_targets(pattern: &str) -> Vec<String> {
 /// Split a string on top-level commas (not inside brackets, parens, or strings).
 pub(super) fn split_on_commas(s: &str) -> Vec<String> {
     let mut parts = Vec::new();
-    let mut current = String::new();
     let mut depth = 0;
-    let mut in_string: Option<char> = None;
+    let mut start = 0usize;
 
-    for c in s.chars() {
-        if in_string.is_some() {
-            current.push(c);
-            if Some(c) == in_string {
-                in_string = None;
-            }
-            continue;
-        }
-
+    for (i, c) in code_bytes(s.as_bytes()) {
         match c {
-            '\'' | '"' | '`' => {
-                in_string = Some(c);
-                current.push(c);
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            b',' if depth == 0 => {
+                parts.push(s[start..i].to_string());
+                start = i + 1;
             }
-            '(' | '[' | '{' => {
-                depth += 1;
-                current.push(c);
-            }
-            ')' | ']' | '}' => {
-                depth -= 1;
-                current.push(c);
-            }
-            ',' if depth == 0 => {
-                parts.push(current.clone());
-                current.clear();
-            }
-            _ => {
-                current.push(c);
-            }
+            _ => {}
         }
     }
 
-    if !current.is_empty() {
-        parts.push(current);
+    if start < s.len() {
+        parts.push(s[start..].to_string());
     }
 
     parts
@@ -580,21 +642,12 @@ pub(super) fn split_on_commas(s: &str) -> Vec<String> {
 /// Find the position of a top-level colon in a string (not inside brackets or strings).
 pub(super) fn find_top_level_colon(s: &str) -> Option<usize> {
     let mut depth = 0;
-    let mut in_string: Option<char> = None;
 
-    for (i, c) in s.char_indices() {
-        if in_string.is_some() {
-            if Some(c) == in_string {
-                in_string = None;
-            }
-            continue;
-        }
-
+    for (i, c) in code_bytes(s.as_bytes()) {
         match c {
-            '\'' | '"' | '`' => in_string = Some(c),
-            '(' | '[' | '{' => depth += 1,
-            ')' | ']' | '}' => depth -= 1,
-            ':' if depth == 0 => return Some(i),
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            b':' if depth == 0 => return Some(i),
             _ => {}
         }
     }
@@ -604,35 +657,24 @@ pub(super) fn find_top_level_colon(s: &str) -> Option<usize> {
 
 /// Find the position of a top-level `=` in a string (not `==` or `===`).
 pub(super) fn find_top_level_equals(s: &str) -> Option<usize> {
-    let chars: Vec<char> = s.chars().collect();
+    let bytes = s.as_bytes();
     let mut depth = 0;
-    let mut in_string: Option<char> = None;
+    let mut prev: Option<u8> = None;
 
-    for (i, &c) in chars.iter().enumerate() {
-        if in_string.is_some() {
-            if Some(c) == in_string {
-                in_string = None;
-            }
-            continue;
-        }
-
+    for (i, c) in code_bytes(bytes) {
         match c {
-            '\'' | '"' | '`' => in_string = Some(c),
-            '(' | '[' | '{' => depth += 1,
-            ')' | ']' | '}' => depth -= 1,
-            '=' if depth == 0 => {
-                // Make sure it's not == or ===
-                if i + 1 < chars.len() && chars[i + 1] == '=' {
-                    continue;
-                }
-                // Make sure it's not != or <=, >=
-                if i > 0 && matches!(chars[i - 1], '!' | '<' | '>') {
-                    continue;
-                }
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            // Not `==`/`===`, and not the tail of `!=` / `<=` / `>=`.
+            b'=' if depth == 0
+                && bytes.get(i + 1) != Some(&b'=')
+                && !matches!(prev, Some(b'!') | Some(b'<') | Some(b'>')) =>
+            {
                 return Some(i);
             }
             _ => {}
         }
+        prev = Some(c);
     }
 
     None
@@ -660,19 +702,73 @@ pub(super) fn extract_root_identifier(s: &str) -> Option<String> {
         }
     }
 
-    if end > 0 {
-        Some(s[..end].to_string())
-    } else {
-        None
-    }
+    if end > 0 { Some(s[..end].to_string()) } else { None }
+}
+
+/// Whether a character at the end of a line can be the last character of a
+/// complete expression. A trailing operator means the expression continues, so
+/// no semicolon is inserted after it.
+fn can_end_expression(c: char) -> bool {
+    !matches!(
+        c,
+        '+' | '-'
+            | '*'
+            | '/'
+            | '%'
+            | '&'
+            | '|'
+            | '^'
+            | '~'
+            | '!'
+            | '='
+            | '<'
+            | '>'
+            | ','
+            | '.'
+            | '?'
+            | ':'
+            | '('
+            | '['
+            | '{'
+    )
+}
+
+/// Whether a character starting the next line can continue the expression on the
+/// previous one. These are exactly the tokens for which JavaScript does *not*
+/// insert a semicolon — which is why semicolon-free style writes a leading `;`
+/// before a line opening with `(` or `[`.
+fn can_continue_expression(c: char) -> bool {
+    matches!(
+        c,
+        '.' | '?'
+            | ':'
+            | ','
+            | ')'
+            | ']'
+            | '}'
+            | '='
+            | '+'
+            | '-'
+            | '*'
+            | '/'
+            | '%'
+            | '&'
+            | '|'
+            | '^'
+            | '<'
+            | '>'
+            | '('
+            | '['
+            | '`'
+    )
 }
 
 /// Find the end of the RHS expression in a destructure assignment.
-/// Handles balanced brackets, parentheses, and semicolons.
-pub(super) fn find_destructure_rhs_end(statement: &str, start: usize) -> usize {
+/// Handles balanced brackets, parentheses, semicolons and line breaks.
+pub(super) fn find_destructure_rhs_end(statement: &str, start: CharOffset) -> CharOffset {
     let chars: Vec<char> = statement.chars().collect();
     let len = chars.len();
-    let mut i = start;
+    let mut i = start.get();
     let mut depth = 0;
     let mut in_string: Option<char> = None;
 
@@ -687,7 +783,7 @@ pub(super) fn find_destructure_rhs_end(statement: &str, start: usize) -> usize {
         let c = chars[i];
 
         if in_string.is_some() {
-            if Some(c) == in_string && (i == 0 || chars[i - 1] != '\\') {
+            if Some(c) == in_string && !is_escaped_char(&chars, i) {
                 in_string = None;
             }
             i += 1;
@@ -706,7 +802,7 @@ pub(super) fn find_destructure_rhs_end(statement: &str, start: usize) -> usize {
             ')' => {
                 if depth == 0 {
                     // This closing paren belongs to an outer context
-                    return i;
+                    return CharOffset::new(i);
                 }
                 depth -= 1;
                 i += 1;
@@ -730,17 +826,35 @@ pub(super) fn find_destructure_rhs_end(statement: &str, start: usize) -> usize {
             }
             ']' | '}' => {
                 if depth == 0 {
-                    return i;
+                    return CharOffset::new(i);
                 }
                 depth -= 1;
                 i += 1;
             }
             ';' if depth == 0 => {
-                return i;
+                return CharOffset::new(i);
             }
             ',' if depth == 0 => {
                 // Could be end of expression in sequence
-                return i;
+                return CharOffset::new(i);
+            }
+            '\n' if depth == 0 => {
+                // Semicolon-free source ends the assignment here, by ASI. Apply
+                // the same rule: the break ends the RHS unless one of its two
+                // sides is a token that carries the expression across it.
+                let ends = chars[expr_start..i]
+                    .iter()
+                    .rev()
+                    .find(|c| !c.is_whitespace())
+                    .is_some_and(|&c| can_end_expression(c));
+                let continues_next = chars[i + 1..]
+                    .iter()
+                    .find(|c| !c.is_whitespace())
+                    .is_some_and(|&c| can_continue_expression(c));
+                if ends && !continues_next {
+                    return CharOffset::new(i);
+                }
+                i += 1;
             }
             _ => {
                 i += 1;
@@ -754,22 +868,7 @@ pub(super) fn find_destructure_rhs_end(statement: &str, start: usize) -> usize {
     while end > expr_start && chars[end - 1].is_whitespace() {
         end -= 1;
     }
-    end
-}
-
-/// Generate a member access expression for a destructuring key.
-/// For computed keys like `[expr]`, generates `obj[expr]` (bracket notation).
-/// For static keys like `prop`, generates `obj.prop` (dot notation).
-pub(super) fn member_access(obj: &str, key: &str) -> String {
-    if key.starts_with('[') && key.ends_with(']') {
-        // Computed property key: obj[expr]
-        // Strip the outer brackets to get the expression
-        let expr = &key[1..key.len() - 1];
-        format!("{}[{}]", obj, expr)
-    } else {
-        // Static property key: obj.prop
-        format!("{}.{}", obj, key)
-    }
+    CharOffset::new(end)
 }
 
 /// Check if a generated code string contains `await` as a keyword (not inside string literals).
@@ -811,14 +910,14 @@ pub(super) fn code_contains_await(code: &str) -> bool {
                     continue;
                 }
                 // Check for end of template literal
-                if c == b'`' && (i == 0 || bytes[i - 1] != b'\\') {
+                if c == b'`' && !is_escaped(bytes, i) {
                     in_string = None;
                     i += 1;
                     continue;
                 }
             } else {
                 // Inside single or double quoted string
-                if c == quote && (i == 0 || bytes[i - 1] != b'\\') {
+                if c == quote && !is_escaped(bytes, i) {
                     in_string = None;
                     i += 1;
                     continue;
@@ -1034,67 +1133,26 @@ pub(super) fn skip_balanced_braces(bytes: &[u8], start: usize) -> usize {
 /// Skip balanced brackets from start (which should be the opening bracket).
 /// Returns position after the closing bracket.
 pub(super) fn skip_balanced(bytes: &[u8], start: usize, open: u8, close: u8) -> usize {
-    let len = bytes.len();
     let mut depth = 0;
-    let mut i = start;
-    let mut in_string: Option<u8> = None;
-
-    while i < len {
-        if let Some(q) = in_string {
-            if bytes[i] == b'\\' {
-                i += 2;
-                continue;
-            }
-            if bytes[i] == q {
-                in_string = None;
-            }
-            i += 1;
-            continue;
-        }
-        if bytes[i] == b'\'' || bytes[i] == b'"' || bytes[i] == b'`' {
-            in_string = Some(bytes[i]);
-            i += 1;
-            continue;
-        }
-        if bytes[i] == open {
+    for (i, c) in code_bytes_from(bytes, start) {
+        if c == open {
             depth += 1;
-        } else if bytes[i] == close {
+        } else if c == close {
             depth -= 1;
             if depth == 0 {
                 return i + 1;
             }
         }
-        i += 1;
     }
-    len
+    bytes.len()
 }
 
 /// Skip an expression (arrow body without braces). Ends at a `,`, `)`, `]`, or `}`
 /// at depth 0, or at end of input.
 pub(super) fn skip_expression(bytes: &[u8], start: usize) -> usize {
-    let len = bytes.len();
     let mut depth = 0usize;
-    let mut i = start;
-    let mut in_string: Option<u8> = None;
-
-    while i < len {
-        if let Some(q) = in_string {
-            if bytes[i] == b'\\' {
-                i += 2;
-                continue;
-            }
-            if bytes[i] == q {
-                in_string = None;
-            }
-            i += 1;
-            continue;
-        }
-        if bytes[i] == b'\'' || bytes[i] == b'"' || bytes[i] == b'`' {
-            in_string = Some(bytes[i]);
-            i += 1;
-            continue;
-        }
-        match bytes[i] {
+    for (i, c) in code_bytes_from(bytes, start) {
+        match c {
             b'(' | b'[' | b'{' => {
                 depth += 1;
             }
@@ -1109,63 +1167,124 @@ pub(super) fn skip_expression(bytes: &[u8], start: usize) -> usize {
             }
             _ => {}
         }
-        i += 1;
     }
-    len
+    bytes.len()
 }
 
 /// Check if a string expression is a "simple" expression that doesn't need thunk wrapping.
 ///
-/// Simple expressions: identifiers, literals (numbers, strings, booleans),
-/// arrow functions, function expressions. Does NOT include call expressions,
-/// member expressions, etc.
+/// The string is re-parsed so the answer comes from the expression's real shape —
+/// a purely textual test cannot tell `q ? 1 : 2` (simple) from `q ? a.b : c` (not).
 pub(super) fn string_is_simple_expression(s: &str) -> bool {
     let trimmed = s.trim();
     if trimmed.is_empty() {
         return false;
     }
 
-    // Identifiers: purely alphanumeric + _ + $
-    if trimmed
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
-    {
-        return true;
+    let allocator = Allocator::default();
+    // Parenthesised so a leading `{` parses as an object literal, not a block.
+    let wrapped = format!("({})", trimmed);
+    let _pt = super::super::profile::timer_start();
+    let ret = Parser::new(&allocator, &wrapped, SourceType::mjs().with_typescript(true))
+        .with_options(ParseOptions { preserve_parens: false, ..ParseOptions::default() })
+        .parse();
+    super::super::profile::record_direct_parse(
+        super::super::profile::timer_elapsed(_pt),
+        wrapped.len(),
+    );
+    if !ret.diagnostics.is_empty() || ret.program.body.len() != 1 {
+        return false;
     }
-
-    // Numeric literals
-    if trimmed.parse::<f64>().is_ok() {
-        return true;
+    match ret.program.body.first() {
+        Some(Statement::ExpressionStatement(stmt)) => expression_is_simple(&stmt.expression),
+        _ => false,
     }
+}
 
-    // String literals
-    if (trimmed.starts_with('\'') && trimmed.ends_with('\''))
-        || (trimmed.starts_with('"') && trimmed.ends_with('"'))
-    {
-        return true;
+/// The *value* of a literal destructuring key's source text, or `None` when the
+/// text is not a literal. Upstream rebuilds `$.exclude_from_object` keys with
+/// `b.literal(...)`, which carries no `raw`, so the printed key is the decoded
+/// value — `"aAb"` becomes `'aAb'`. Re-parsing with oxc is the only way to
+/// resolve escape sequences exactly.
+pub(super) fn literal_key_value(source: &str) -> Option<String> {
+    let allocator = Allocator::default();
+    let wrapped = format!("({})", source.trim());
+    let _pt = super::super::profile::timer_start();
+    let ret = Parser::new(&allocator, &wrapped, SourceType::mjs())
+        .with_options(ParseOptions { preserve_parens: false, ..ParseOptions::default() })
+        .parse();
+    super::super::profile::record_direct_parse(
+        super::super::profile::timer_elapsed(_pt),
+        wrapped.len(),
+    );
+    if !ret.diagnostics.is_empty() || ret.program.body.len() != 1 {
+        return None;
     }
-
-    // Boolean/null literals
-    if trimmed == "true" || trimmed == "false" || trimmed == "null" || trimmed == "undefined" {
-        return true;
+    let Some(Statement::ExpressionStatement(stmt)) = ret.program.body.first() else {
+        return None;
+    };
+    match &stmt.expression {
+        Expression::StringLiteral(lit) => Some(lit.value.to_string()),
+        Expression::NumericLiteral(lit) => Some(js_number_to_string(lit.value)),
+        Expression::BooleanLiteral(lit) => Some(lit.value.to_string()),
+        Expression::NullLiteral(_) => Some("null".to_string()),
+        _ => None,
     }
+}
 
-    // Arrow functions and function expressions
-    if trimmed.starts_with("() =>") || trimmed.starts_with("function") {
-        return true;
+/// `String(<number>)` drops the fractional part of an integer.
+pub(super) fn js_number_to_string(value: f64) -> String {
+    if value.fract() == 0.0 && value.abs() < i64::MAX as f64 {
+        (value as i64).to_string()
+    } else {
+        value.to_string()
     }
+}
 
-    false
+/// Faithful port of the official compiler's `is_simple_expression()` from `utils/ast.js`.
+fn expression_is_simple(expr: &Expression<'_>) -> bool {
+    match expr {
+        Expression::BooleanLiteral(_)
+        | Expression::NullLiteral(_)
+        | Expression::NumericLiteral(_)
+        | Expression::BigIntLiteral(_)
+        | Expression::RegExpLiteral(_)
+        | Expression::StringLiteral(_)
+        | Expression::Identifier(_)
+        | Expression::ArrowFunctionExpression(_)
+        | Expression::FunctionExpression(_) => true,
+        Expression::ConditionalExpression(e) => {
+            expression_is_simple(&e.test)
+                && expression_is_simple(&e.consequent)
+                && expression_is_simple(&e.alternate)
+        }
+        Expression::BinaryExpression(e) => {
+            expression_is_simple(&e.left) && expression_is_simple(&e.right)
+        }
+        Expression::LogicalExpression(e) => {
+            expression_is_simple(&e.left) && expression_is_simple(&e.right)
+        }
+        _ => false,
+    }
 }
 
 /// Build a `$.fallback(expression, default)` string, applying async thunk wrapping
 /// when the default value contains `await`.
 ///
-/// Mirrors the official Svelte compiler's `build_fallback()` from `utils/ast.js`:
-/// 1. Simple expression (no await): `$.fallback(access, default)`
-/// 2. Simple `await simple_expr`: `await $.fallback(access, simple_expr)` (unwrap await)
-/// 3. Non-simple with await: `await $.fallback(access, async () => default, true)`
-/// 4. Non-simple, no await: `$.fallback(access, () => default, true)`
+/// Mirrors the shapes the official compiler's `build_fallback()` (`utils/ast.js`)
+/// ends up printing for a client `$derived` destructuring default:
+/// 1. Simple expression, no await: `$.fallback(access, default)`
+/// 2. `await <simple>`: `await $.fallback(access, simple)`
+/// 3. `await <non-simple, no further await>`: upstream hoists the leading `await`
+///    out to the call and the thunk stays sync — `b = await f()` prints
+///    `await $.fallback(access, f, true)`, `b = await x.y()` prints
+///    `await $.fallback(access, () => x.y(), true)`
+/// 4. Any other await-bearing default: `await $.fallback(access, async () => default, true)`
+/// 5. Non-simple, no await: `$.fallback(access, () => default, true)`
+///
+/// Sync thunks go through `unthunk_string` because upstream builds them with
+/// `b.thunk()`, which collapses `() => f()` to `f`; the async thunk keeps its
+/// arrow, since upstream's `unthunk()` bails on `async`.
 pub(super) fn build_fallback_string(access: &str, default_val: &str) -> String {
     let trimmed = default_val.trim();
 
@@ -1182,22 +1301,17 @@ pub(super) fn build_fallback_string(access: &str, default_val: &str) -> String {
         }
     }
 
-    // Case 3: Expression contains await -> async thunk (with unthunk optimization)
+    // Cases 3 and 4: the default contains `await`
     if string_expr_has_await(trimmed) {
-        // Unthunk optimization: `async () => await expr` → `() => expr`
-        // when expr itself has no nested await.
-        // This mirrors the official compiler's `unthunk()` function.
+        // Case 3: only a leading `await`, which upstream hoists out to the
+        // `$.fallback(...)` call, leaving the thunk synchronous.
         if let Some(inner) = trimmed.strip_prefix("await ") {
             let inner = inner.trim();
             if !string_expr_has_await(inner) {
-                // Optimized: sync thunk wrapping the non-await inner expression
-                return format!(
-                    "await $.fallback({}, () => {}, true)",
-                    access,
-                    wrap_arrow_body(inner)
-                );
+                return format!("await $.fallback({}, {}, true)", access, unthunk_string(inner));
             }
         }
+        // Case 4: the await is nested, so the thunk has to stay async.
         return format!(
             "await $.fallback({}, async () => {}, true)",
             access,
@@ -1205,12 +1319,8 @@ pub(super) fn build_fallback_string(access: &str, default_val: &str) -> String {
         );
     }
 
-    // Case 4: Non-simple, no await -> sync thunk
-    format!(
-        "$.fallback({}, () => {}, true)",
-        access,
-        wrap_arrow_body(default_val)
-    )
+    // Case 5: Non-simple, no await -> sync thunk
+    format!("$.fallback({}, {}, true)", access, unthunk_string(default_val))
 }
 
 /// Wrap an arrow function body that starts with `{` in parens so it's parsed
@@ -1218,411 +1328,279 @@ pub(super) fn build_fallback_string(access: &str, default_val: &str) -> String {
 /// Mirrors `unthunk_string`'s disambiguation (baseballyama/rsvelte#150) for
 /// callers that build the `() => expr` form directly.
 fn wrap_arrow_body(body: &str) -> String {
-    if body.trim_start().starts_with('{') {
-        format!("({})", body)
-    } else {
-        body.to_string()
-    }
+    if body.trim_start().starts_with('{') { format!("({})", body) } else { body.to_string() }
 }
 
-/// Generate an IIFE for a destructure assignment.
+/// How a path reads the `$$array` helper that an array pattern contributes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum ArrayHelperRead {
+    /// Assignment lowering — the helper is a plain `var`, read directly.
+    Value,
+    /// Declaration lowering — the helper is a `$.derived`, read through `$.get`.
+    Signal,
+}
+
+/// Port of upstream's `_extract_paths` (`utils/ast.js`) over a destructuring
+/// pattern's source text: appends one `(target, initializer)` pair per bound leaf
+/// to `paths`, and one `($$array, $.to_array(...))` helper per array pattern to
+/// `inserts`, both in the same depth-first order upstream walks the pattern in.
 ///
-/// For array patterns: `(($$value) => { var $$array = $.to_array($$value, N); target1 = $$array[0]; ... })(rhs)`
-/// For object patterns: `(($$value) => { target1 = $$value.key1; ... })(rhs)`
+/// The recursion is what makes a nested pattern work at all — every level feeds
+/// the member access it built as the next level's base expression, so a leaf
+/// carries the whole path (`$$value.a.b`) instead of only its last hop.
+pub(super) fn extract_destructure_paths(
+    pattern: &str,
+    expression: &str,
+    array_read: ArrayHelperRead,
+    paths: &mut Vec<(String, String)>,
+    inserts: &mut Vec<(String, String)>,
+) {
+    extract_destructure_paths_named(pattern, expression, array_read, "$$array", paths, inserts);
+}
+
+/// [`extract_destructure_paths`] with the array helper's base name spelled out —
+/// upstream's server `$derived` expansion generates `$$derived_array` instead.
+pub(super) fn extract_destructure_paths_named(
+    pattern: &str,
+    expression: &str,
+    array_read: ArrayHelperRead,
+    array_prefix: &str,
+    paths: &mut Vec<(String, String)>,
+    inserts: &mut Vec<(String, String)>,
+) {
+    let pattern = pattern.trim();
+    if pattern.is_empty() {
+        return;
+    }
+
+    // `AssignmentPattern` — checked before the bracket forms, since a nested
+    // pattern with a default (`{ b } = { b: 3 }`) also starts with `{`.
+    if !pattern.starts_with("...")
+        && let Some(eq_pos) = find_default_equals(pattern)
+    {
+        let fallback = build_fallback_string(expression, pattern[eq_pos + 1..].trim());
+        extract_destructure_paths_named(
+            &pattern[..eq_pos],
+            &fallback,
+            array_read,
+            array_prefix,
+            paths,
+            inserts,
+        );
+        return;
+    }
+
+    if pattern.starts_with('{') && pattern.ends_with('}') {
+        let props = split_derived_object_properties(&pattern[1..pattern.len() - 1]);
+        let has_rest = props.iter().any(|prop| prop.trim().starts_with("..."));
+        let excluded_keys =
+            if has_rest { exclude_from_object_keys(&props).join(", ") } else { String::new() };
+
+        for prop in &props {
+            let prop = prop.trim();
+            if prop.is_empty() {
+                continue;
+            }
+            if let Some(rest_target) = prop.strip_prefix("...") {
+                let rest_expression =
+                    format!("$.exclude_from_object({}, [{}])", expression, excluded_keys);
+                extract_destructure_paths_named(
+                    rest_target,
+                    &rest_expression,
+                    array_read,
+                    array_prefix,
+                    paths,
+                    inserts,
+                );
+                continue;
+            }
+
+            let (key, value) = match find_derived_property_colon(prop) {
+                Some(colon_pos) => (prop[..colon_pos].trim(), prop[colon_pos + 1..].trim()),
+                // Shorthand: the key is the name, the value is the whole
+                // property (so `{ a = 1 }` still becomes an `AssignmentPattern`).
+                None => match find_default_equals(prop) {
+                    Some(eq_pos) => (prop[..eq_pos].trim(), prop),
+                    None => (prop, prop),
+                },
+            };
+            let object_expression = derived_prop_access(expression, expression, key);
+            extract_destructure_paths_named(
+                value,
+                &object_expression,
+                array_read,
+                array_prefix,
+                paths,
+                inserts,
+            );
+        }
+        return;
+    }
+
+    if pattern.starts_with('[') && pattern.ends_with(']') {
+        let mut elements = split_derived_array_elements(&pattern[1..pattern.len() - 1]);
+        // A trailing comma is not an elision, so it contributes no element.
+        if elements.last().is_some_and(|el| el.trim().is_empty()) {
+            elements.pop();
+        }
+        let ends_with_rest = elements.last().is_some_and(|el| el.trim().starts_with("..."));
+
+        let array_var = next_script_array_var_named(array_prefix);
+        let to_array = if ends_with_rest {
+            format!("$.to_array({})", expression)
+        } else {
+            format!("$.to_array({}, {})", expression, elements.len())
+        };
+        inserts.push((array_var.clone(), to_array));
+
+        let helper = match array_read {
+            ArrayHelperRead::Value => array_var,
+            ArrayHelperRead::Signal => format!("$.get({})", array_var),
+        };
+        for (i, element) in elements.iter().enumerate() {
+            let element = element.trim();
+            if element.is_empty() {
+                continue;
+            }
+            let (target, element_expression) = match element.strip_prefix("...") {
+                Some(rest_target) => (rest_target, format!("{}.slice({})", helper, i)),
+                None => (element, format!("{}[{}]", helper, i)),
+            };
+            extract_destructure_paths_named(
+                target,
+                &element_expression,
+                array_read,
+                array_prefix,
+                paths,
+                inserts,
+            );
+        }
+        return;
+    }
+
+    paths.push((pattern.to_string(), expression.to_string()));
+}
+
+/// The next `$$array` / `$$array_<n>` helper name, mirroring upstream's
+/// `scope.generate('$$array')`.
+fn next_script_array_var_named(prefix: &str) -> String {
+    let index = SCRIPT_ARRAY_COUNTER.with(|c| {
+        let current = c.get();
+        c.set(current + 1);
+        current
+    });
+    if index == 0 { prefix.to_string() } else { format!("{}_{}", prefix, index) }
+}
+
+/// Whether the text is a bare identifier — upstream's
+/// `should_cache = value.type !== 'Identifier'` test, on source text.
+fn string_is_identifier(s: &str) -> bool {
+    !s.is_empty()
+        && !s.starts_with(|c: char| c.is_ascii_digit())
+        && s.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+}
+
+/// Lower a destructuring assignment the way upstream's
+/// `visit_assignment_expression` (`shared/assignments.js`) does: every leaf of
+/// the pattern — however deeply nested — becomes one flat assignment from the
+/// full member path, and every array pattern contributes a `$$array` helper.
 ///
-/// When `is_standalone` is false (the destructure is part of a larger expression),
-/// `return $$value;` is appended so the IIFE returns the value.
+/// With no helper and an identifier right-hand side the result is a sequence
+/// expression (`(a = rhs.x, b = rhs.y)`); otherwise the statements go into an
+/// IIFE whose parameter is the RHS identifier itself when it needs no caching
+/// (`should_cache = value.type !== 'Identifier'`) and `$$value` when it does.
+///
+/// When `is_standalone` is false (the destructure is part of a larger
+/// expression), the value is appended so the form still evaluates to the RHS.
 pub(super) fn generate_destructure_iife(
-    pattern_type: char, // ']' for array, '}' for object
     pattern_str: &str,
     rhs_str: &str,
     is_standalone: bool,
     store_sub_vars: &[String],
     force_cache_rhs: bool,
 ) -> String {
-    let trimmed = pattern_str.trim();
+    let rhs_trimmed = rhs_str.trim();
+    // Upstream visits the right-hand side first, so a state / store / prop read
+    // is already a call by the time `should_cache = value.type !== 'Identifier'`
+    // is evaluated — which is what `force_cache_rhs` carries here.
+    let should_cache = force_cache_rhs || !string_is_identifier(rhs_trimmed);
+    let param_name = if should_cache { "$$value" } else { rhs_trimmed };
 
-    // Remove outer brackets (both array `[...]` and object `{...}`)
-    let inner = &trimmed[1..trimmed.len() - 1];
+    let mut paths = Vec::new();
+    let mut inserts = Vec::new();
+    extract_destructure_paths(
+        pattern_str,
+        param_name,
+        ArrayHelperRead::Value,
+        &mut paths,
+        &mut inserts,
+    );
 
-    let parts = split_on_commas(inner);
+    if paths.is_empty() && inserts.is_empty() {
+        return format!("({} = {})", pattern_str.trim(), rhs_str);
+    }
 
-    if pattern_type == ']' {
-        // Array destructure
-        let array_name = SCRIPT_ARRAY_COUNTER.with(|c| {
-            let count = c.get();
-            let name = if count == 0 {
-                "$$array".to_string()
-            } else {
-                format!("$$array_{}", count)
-            };
-            c.set(count + 1);
-            name
-        });
-
-        // Check if last element is a rest element
-        let has_rest = parts
-            .last()
-            .map(|p| p.trim().starts_with("..."))
-            .unwrap_or(false);
-
-        let to_array_args = if has_rest {
-            "$.to_array($$value)".to_string()
-        } else {
-            format!("$.to_array($$value, {})", parts.len())
-        };
-
-        let mut body_lines = Vec::new();
-        body_lines.push(format!("\tvar {} = {};", array_name, to_array_args));
-        body_lines.push(String::new()); // blank line
-
-        for (idx, part) in parts.iter().enumerate() {
-            let part = part.trim();
-            if part.is_empty() {
-                continue; // Skip holes
-            }
-
-            if let Some(rest_target) = part.strip_prefix("...") {
-                let rest_target = rest_target.trim();
-                if rest_target.starts_with('{') && rest_target.ends_with('}') {
-                    // Rest with object destructure pattern: ...{ z = 26 }
-                    // Generate inline property access from .slice() result
-                    let slice_expr = format!("{}.slice({})", array_name, idx);
-                    let obj_inner = &rest_target[1..rest_target.len() - 1];
-                    let obj_parts = split_on_commas(obj_inner);
-                    for obj_part in &obj_parts {
-                        let obj_part = obj_part.trim();
-                        if obj_part.is_empty() {
-                            continue;
-                        }
-                        if let Some(eq_pos) = find_top_level_equals(obj_part) {
-                            let prop_name = obj_part[..eq_pos].trim();
-                            let default_val = obj_part[eq_pos + 1..].trim();
-                            let access = format!("{}.{}", slice_expr, prop_name);
-                            let fallback = build_fallback_string(&access, default_val);
-                            body_lines.push(format!("\t{} = {};", prop_name, fallback));
-                        } else {
-                            body_lines
-                                .push(format!("\t{} = {}.{};", obj_part, slice_expr, obj_part));
-                        }
-                    }
+    if inserts.is_empty() && !should_cache {
+        // No `$$array` helper and no caching: upstream emits a plain sequence
+        // expression, whose elements are ordinary assignments. A store target
+        // has to be lowered here — nothing downstream rewrites a store write
+        // that is not its own statement.
+        let mut expressions: Vec<String> = paths
+            .iter()
+            .map(|(target, access)| {
+                if target.starts_with('$') && store_sub_vars.iter().any(|v| v == target) {
+                    format!("$.store_set({}, {})", &target[1..], access)
                 } else {
-                    body_lines.push(format!(
-                        "\t{} = {}.slice({});",
-                        rest_target, array_name, idx
-                    ));
+                    format!("{} = {}", target, access)
                 }
-            } else {
-                // Handle default value: `target = default`
-                let (target, default_val) = if let Some(eq_pos) = find_top_level_equals(part) {
-                    let t = part[..eq_pos].trim();
-                    let d = part[eq_pos + 1..].trim();
-                    (t, Some(d))
-                } else {
-                    (part, None)
-                };
-
-                if let Some(default_val) = default_val {
-                    let access = format!("{}[{}]", array_name, idx);
-                    let fallback = build_fallback_string(&access, default_val);
-                    body_lines.push(format!("\t{} = {};", target, fallback));
-                } else {
-                    body_lines.push(format!("\t{} = {}[{}];", target, array_name, idx));
-                }
-            }
-        }
+            })
+            .collect();
 
         if !is_standalone {
-            body_lines.push(String::new()); // blank line before return
-            body_lines.push("\treturn $$value;".to_string());
+            // This is part of an expression, so the sequence must end with the value.
+            expressions.push(rhs_trimmed.to_string());
         }
 
-        let body = body_lines.join("\n");
-        // When the IIFE body or RHS contains `await`, the arrow must be async
-        // and the whole call must be `await`ed. This matches the official Svelte
-        // compiler which generates `await (async ($$value) => { ... })(rhs)`.
-        if code_contains_await(&body) || code_contains_await(rhs_str) {
-            format!("await (async ($$value) => {{\n{}\n}})({})", body, rhs_str)
-        } else {
-            format!("(($$value) => {{\n{}\n}})({})", body, rhs_str)
+        if expressions.len() == 1 {
+            // Upstream always lowers through `b.sequence(assignments)` — a real
+            // `SequenceExpression`, unconditionally, even with one element — and
+            // esrap always self-parenthesizes a `SequenceExpression`. A bare
+            // `(assignment)` would reparse as a plain (non-sequence) expression
+            // and lose those parens downstream; the marker call preserves the
+            // "must be a sequence" decision through the reparse. See
+            // `SINGLE_TARGET_DESTRUCTURE_SEQUENCE_MARKER`.
+            return format!("{}({})", SINGLE_TARGET_DESTRUCTURE_SEQUENCE_MARKER, expressions[0]);
         }
+        // Single-line comma expression format.
+        // IMPORTANT: Must be single-line because downstream processing in
+        // process_accumulated/find_statement_end_client treats newlines at depth 0
+        // as statement boundaries, which would break multi-line expressions.
+        return format!("({})", expressions.join(", "));
+    }
+
+    // Upstream emits every `$$array` helper first, then every assignment, so a
+    // nested helper is declared before the paths that read it.
+    let mut body_lines: Vec<String> =
+        inserts.iter().map(|(name, value)| format!("\tvar {} = {};", name, value)).collect();
+    if !body_lines.is_empty() {
+        body_lines.push(String::new());
+    }
+    // A store target keeps its plain `$store = …` form here: the IIFE body is a
+    // statement list, so the ordinary store-assignment transform still sees it.
+    body_lines.extend(paths.iter().map(|(target, access)| format!("\t{} = {};", target, access)));
+
+    if !is_standalone {
+        body_lines.push(String::new());
+        body_lines.push(format!("\treturn {};", param_name));
+    }
+
+    let body = body_lines.join("\n");
+    // When the IIFE body or RHS contains `await`, the arrow must be async and the
+    // whole call must be `await`ed, matching upstream's `is_expression_async` test.
+    if code_contains_await(&body) || code_contains_await(rhs_str) {
+        format!("await (async ({}) => {{\n{}\n}})({})", param_name, body, rhs_str)
     } else {
-        // Object destructure
-        //
-        // Optimization: when the RHS is a simple identifier and the pattern has only
-        // simple targets (no defaults, no nested patterns, no rest elements), we can
-        // generate a comma/sequence expression instead of an IIFE.
-        // This matches the official Svelte compiler output:
-        //   `({$a, $b} = obj)` → `($.store_set(a, obj.$a), $.store_set(b, obj.$b));`
-        // instead of:
-        //   `(($$value) => { ... })(obj);`
-        let rhs_is_simple_identifier = rhs_str
-            .trim()
-            .chars()
-            .all(|c| c.is_alphanumeric() || c == '_' || c == '$');
-        // Check if all parts are "simple enough" to use direct property access instead of IIFE.
-        // Allow defaults (= sign) since we can use $.fallback() with direct access.
-        let all_parts_simple = !parts.is_empty()
-            && parts.iter().all(|p| {
-                let p = p.trim();
-                if p.is_empty() {
-                    return true;
-                }
-                // No rest elements
-                if p.starts_with("...") {
-                    return false;
-                }
-                // If key-value, target must be simple identifier (no nested patterns)
-                if let Some(colon_pos) = find_top_level_colon(p) {
-                    let target = p[colon_pos + 1..].trim();
-                    // Check for default value in key-value pair
-                    let target_without_default = if let Some(eq_pos) = find_top_level_equals(target)
-                    {
-                        target[..eq_pos].trim()
-                    } else {
-                        target
-                    };
-                    // No nested array/object patterns
-                    if target_without_default.starts_with('[')
-                        || target_without_default.starts_with('{')
-                    {
-                        return false;
-                    }
-                } else {
-                    // Shorthand with default: check the name part
-                    if let Some(eq_pos) = find_top_level_equals(p) {
-                        let name = p[..eq_pos].trim();
-                        if name.starts_with('[') || name.starts_with('{') {
-                            return false;
-                        }
-                    }
-                }
-                true
-            });
-
-        if rhs_is_simple_identifier && all_parts_simple && !force_cache_rhs {
-            // Generate comma/sequence expression with individual assignments.
-            // When the RHS is a simple identifier (and won't be transformed to a call),
-            // there's no need for caching in $$value.
-            // This matches the official Svelte compiler output:
-            //   `({$a, $b} = obj)` -> `($.store_set(a, obj.$a), $.store_set(b, obj.$b));`
-            //   `({store1, store2} = context)` -> `(store1 = context.store1, store2 = context.store2)`
-            //
-            // For store sub targets: generate $.store_set() directly
-            // For state var targets: generate plain assignment (downstream transforms add $.set() etc.)
-            //
-            // Use a single line to avoid issues with downstream transforms that treat
-            // newlines as statement boundaries (find_statement_end_client).
-            let mut assignments: Vec<String> = Vec::new();
-            for part in &parts {
-                let part = part.trim();
-                if part.is_empty() {
-                    continue;
-                }
-                let (key, target_with_default) = if let Some(colon_pos) = find_top_level_colon(part)
-                {
-                    (
-                        part[..colon_pos].trim().to_string(),
-                        part[colon_pos + 1..].trim().to_string(),
-                    )
-                } else {
-                    // Shorthand: {x} or {x = default} means key=x
-                    let name = if let Some(eq_pos) = find_top_level_equals(part) {
-                        part[..eq_pos].trim().to_string()
-                    } else {
-                        part.to_string()
-                    };
-                    (name.clone(), part.to_string())
-                };
-
-                // Split target from default value
-                let (target, default_val) =
-                    if let Some(eq_pos) = find_top_level_equals(&target_with_default) {
-                        (
-                            target_with_default[..eq_pos].trim().to_string(),
-                            Some(target_with_default[eq_pos + 1..].trim().to_string()),
-                        )
-                    } else {
-                        (target_with_default.clone(), None)
-                    };
-
-                let access = format!("{}.{}", rhs_str, key);
-
-                // Check if the target is a store subscription variable ($storeName)
-                if store_sub_vars.contains(&target) && target.starts_with('$') {
-                    let store_name = &target[1..]; // Remove the $ prefix
-                    if let Some(default_val) = &default_val {
-                        let fallback = build_fallback_string(&access, default_val);
-                        assignments.push(format!("$.store_set({}, {})", store_name, fallback));
-                    } else {
-                        assignments.push(format!("$.store_set({}, {})", store_name, access));
-                    }
-                } else if let Some(default_val) = &default_val {
-                    let fallback = build_fallback_string(&access, default_val);
-                    assignments.push(format!("{} = {}", target, fallback));
-                } else {
-                    assignments.push(format!("{} = {}", target, access));
-                }
-            }
-
-            if !is_standalone {
-                // Part of a larger expression - need the value at the end
-                assignments.push(rhs_str.to_string());
-            }
-
-            if assignments.len() == 1 {
-                return format!("({})", assignments[0]);
-            } else {
-                // Single-line comma expression format.
-                // IMPORTANT: Must be single-line because downstream processing in
-                // process_accumulated/find_statement_end_client treats newlines at depth 0
-                // as statement boundaries, which would break multi-line expressions.
-                return format!("({})", assignments.join(", "));
-            }
-        }
-
-        let mut body_lines = Vec::new();
-        let mut prepend_lines: Vec<String> = Vec::new();
-
-        for part in &parts {
-            let part = part.trim();
-            if part.is_empty() {
-                continue;
-            }
-
-            if let Some(rest_target) = part.strip_prefix("...") {
-                // Rest element: ...rest = $.exclude_from_object($$value, [keys...])
-                let rest_target = rest_target.trim();
-                let keys: Vec<String> = parts
-                    .iter()
-                    .filter(|p| !p.trim().starts_with("..."))
-                    .map(|p| {
-                        let p = p.trim();
-                        // Extract the key name
-                        if let Some(colon_pos) = find_top_level_colon(p) {
-                            let key = p[..colon_pos].trim();
-                            format!("'{}'", key)
-                        } else {
-                            // Shorthand or just identifier with possible default
-                            let name = if let Some(eq_pos) = find_top_level_equals(p) {
-                                p[..eq_pos].trim()
-                            } else {
-                                p
-                            };
-                            format!("'{}'", name)
-                        }
-                    })
-                    .collect();
-                body_lines.push(format!(
-                    "\t{} = $.exclude_from_object($$value, [{}]);",
-                    rest_target,
-                    keys.join(", ")
-                ));
-            } else if let Some(colon_pos) = find_top_level_colon(part) {
-                // Key-value pair: key: target
-                let key = part[..colon_pos].trim();
-                let target = part[colon_pos + 1..].trim();
-
-                // Handle default value
-                // Use member_access to handle computed property keys like [expr]
-                let value_access = member_access("$$value", key);
-                if let Some(eq_pos) = find_top_level_equals(target) {
-                    let actual_target = target[..eq_pos].trim();
-                    let default_val = target[eq_pos + 1..].trim();
-                    let fallback = build_fallback_string(&value_access, default_val);
-                    body_lines.push(format!("\t{} = {};", actual_target, fallback));
-                } else if target.starts_with('[') && target.ends_with(']') {
-                    // Nested array pattern: key: [a, b, c]
-                    // Inline the array destructuring instead of creating a nested IIFE
-                    let inner_parts = split_on_commas(&target[1..target.len() - 1]);
-                    let array_name = SCRIPT_ARRAY_COUNTER.with(|c| {
-                        let count = c.get();
-                        let name = if count == 0 {
-                            "$$array".to_string()
-                        } else {
-                            format!("$$array_{}", count)
-                        };
-                        c.set(count + 1);
-                        name
-                    });
-                    // Insert the to_array call at the beginning of body_lines
-                    // We use a marker to insert it at the right place later
-                    let has_rest = inner_parts
-                        .last()
-                        .map(|p| p.trim().starts_with("..."))
-                        .unwrap_or(false);
-                    let to_array_args = if has_rest {
-                        format!("$.to_array({})", value_access)
-                    } else {
-                        format!("$.to_array({}, {})", value_access, inner_parts.len())
-                    };
-                    // We need to insert the var declaration before the assignments
-                    // Store it as a "prepend" item
-                    prepend_lines.push(format!("\tvar {} = {};", array_name, to_array_args));
-
-                    for (idx, inner_part) in inner_parts.iter().enumerate() {
-                        let inner_part = inner_part.trim();
-                        if inner_part.is_empty() {
-                            continue;
-                        }
-                        if let Some(rest_target) = inner_part.strip_prefix("...") {
-                            body_lines.push(format!(
-                                "\t{} = {}.slice({});",
-                                rest_target.trim(),
-                                array_name,
-                                idx
-                            ));
-                        } else if let Some(eq_pos) = find_top_level_equals(inner_part) {
-                            let actual_target = inner_part[..eq_pos].trim();
-                            let default_val = inner_part[eq_pos + 1..].trim();
-                            let access = format!("{}[{}]", array_name, idx);
-                            let fallback = build_fallback_string(&access, default_val);
-                            body_lines.push(format!("\t{} = {};", actual_target, fallback));
-                        } else {
-                            body_lines.push(format!("\t{} = {}[{}];", inner_part, array_name, idx));
-                        }
-                    }
-                } else {
-                    body_lines.push(format!("\t{} = {};", target, value_access));
-                }
-            } else {
-                // Shorthand: {x} means key=x, target=x
-                let name = if let Some(eq_pos) = find_top_level_equals(part) {
-                    let actual_name = part[..eq_pos].trim();
-                    let default_val = part[eq_pos + 1..].trim();
-                    let access = format!("$$value.{}", actual_name);
-                    let fallback = build_fallback_string(&access, default_val);
-                    body_lines.push(format!("\t{} = {};", actual_name, fallback));
-                    continue;
-                } else {
-                    part
-                };
-
-                body_lines.push(format!("\t{} = $$value.{};", name, name));
-            }
-        }
-
-        // Prepend array destructure declarations before assignments
-        if !prepend_lines.is_empty() {
-            prepend_lines.push(String::new()); // blank line after declarations
-            let mut all_lines = prepend_lines;
-            all_lines.extend(body_lines);
-            body_lines = all_lines;
-        }
-
-        if !is_standalone {
-            body_lines.push(String::new()); // blank line before return
-            body_lines.push("\treturn $$value;".to_string());
-        }
-
-        let body = body_lines.join("\n");
-        // When the IIFE body or RHS contains `await`, the arrow must be async
-        // and the whole call must be `await`ed.
-        if code_contains_await(&body) || code_contains_await(rhs_str) {
-            format!("await (async ($$value) => {{\n{}\n}})({})", body, rhs_str)
-        } else {
-            format!("(($$value) => {{\n{}\n}})({})", body, rhs_str)
-        }
+        format!("(({}) => {{\n{}\n}})({})", param_name, body, rhs_str)
     }
 }
 
@@ -1631,6 +1609,8 @@ pub(super) fn generate_destructure_iife(
 /// Detects patterns at any nesting level (including inside function bodies) like:
 /// - `var.prop = expr` -> `$.mutate(var, var.prop = expr)`
 /// - `var[idx] = expr` -> `$.mutate(var, var[idx] = expr)`
+/// - `var.prop++` -> `$.mutate(var, var.prop++)`
+/// - `--var[idx]` -> `$.mutate(var, --var[idx])`
 ///
 /// Only applies when the base of the member expression is a state variable in
 /// non-runes (legacy) mode.
@@ -1638,19 +1618,19 @@ pub(super) fn generate_destructure_iife(
 /// The subsequent `wrap_state_vars_in_expr` call will handle `$.get()` wrapping
 /// inside the mutation expression (the `in_mutate_first_arg` guard in that
 /// function ensures the first argument of `$.mutate()` is NOT double-wrapped).
-pub(super) fn transform_member_mutations(
-    line: &str,
+pub(super) fn transform_member_mutations<'a>(
+    line: &'a str,
     state_vars: &[String],
     non_reactive_state_vars: &[String],
     raw_state_vars: &[String],
     invalidate_bodies: &rustc_hash::FxHashMap<String, String>,
-) -> String {
+) -> Cow<'a, str> {
     if state_vars.is_empty() {
-        return line.to_string();
+        return Cow::Borrowed(line);
     }
 
-    // AST-based pre-pass for `obj.prop = rhs` (legacy state member
-    // mutations). When the AST helper has rewritten, skip the text
+    // AST-based pre-pass for assignments and updates of legacy state members.
+    // When the AST helper has rewritten, skip the text
     // loop below — the AST is a complete replacement, and its
     // idempotency mechanism uses `visit_call_expression` wrap
     // detection (the text loop's `before.ends_with` guard is
@@ -1664,8 +1644,162 @@ pub(super) fn transform_member_mutations(
             raw_state_vars,
             invalidate_bodies,
         );
-    if let Some(rewritten) = ast_result {
-        return rewritten;
+    ast_result.map_or(Cow::Borrowed(line), Cow::Owned)
+}
+
+#[cfg(test)]
+mod non_ascii_tests {
+    use super::find_top_level_equals;
+
+    #[test]
+    fn find_top_level_equals_handles_non_ascii_before_equals() {
+        // `let [café = 1] = arr` — the `=` lands past a multi-byte char, so the
+        // returned index must be a byte offset usable for slicing (no panic).
+        let s = "café = 1";
+        let pos = find_top_level_equals(s).expect("should find top-level =");
+        assert_eq!(&s[..pos], "café ");
+        assert_eq!(s[pos + 1..].trim(), "1");
     }
-    line.to_string()
+
+    #[test]
+    fn find_top_level_equals_skips_not_equals_after_non_ascii() {
+        // `!=` is not a top-level assignment; the preceding-char check must run
+        // against the correct char even when a multi-byte char sits earlier.
+        assert_eq!(find_top_level_equals("café != x"), None);
+    }
+
+    #[test]
+    fn scans_ignore_delimiters_in_comments_and_strings() {
+        use super::{
+            extract_destructure_targets, find_top_level_colon, skip_balanced, skip_expression,
+            split_on_commas,
+        };
+
+        // A comma in a comment or a string is text, not a separator.
+        assert_eq!(split_on_commas("a /* x, y */, b").len(), 2);
+        assert_eq!(split_on_commas("a: ',', b").len(), 2);
+        assert_eq!(split_on_commas("a // one, two\n, b").len(), 2);
+
+        // A colon in a comment or a string does not rename a property.
+        assert_eq!(find_top_level_colon("a /* k: v */"), None);
+        assert_eq!(find_top_level_colon("a = ':'"), None);
+
+        // A brace in a comment or a string does not close the block.
+        let src = b"{ /* } */ a }rest";
+        assert_eq!(skip_balanced(src, 0, b'{', b'}'), src.len() - 4);
+        let src = b"{ a = '}' }rest";
+        assert_eq!(skip_balanced(src, 0, b'{', b'}'), src.len() - 4);
+
+        // A depth-0 comma in a comment does not end the arrow body.
+        let src = b"a /* , */ + b, c";
+        assert_eq!(skip_expression(src, 0), 13);
+
+        // The whole pattern still yields the right targets when commented.
+        assert_eq!(
+            extract_destructure_targets("{ a /* , b */, c }"),
+            vec!["a".to_string(), "c".to_string()]
+        );
+    }
+
+    /// An unbalanced `{`- or `[`-prefixed fragment strips to itself, so recursing
+    /// into it never shrinks the input — that overflowed the stack and aborted the
+    /// host process instead of producing output or an error.
+    #[test]
+    fn extract_destructure_targets_terminates_on_an_unbalanced_fragment() {
+        use super::extract_destructure_targets;
+
+        assert!(extract_destructure_targets("{\n\t\t// } c\n\t\tbar").is_empty());
+        assert!(extract_destructure_targets("{ a").is_empty());
+        assert!(extract_destructure_targets("[ a").is_empty());
+        assert!(extract_destructure_targets("{ a: [b").is_empty());
+        // A balanced pattern still yields its targets.
+        assert_eq!(extract_destructure_targets("{ a: [b] }"), vec!["b".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn destructure_rewrite_keeps_char_and_byte_offsets_separate() {
+        let props = vec!["a".to_string()];
+        let out = transform_destructure_assignments_with_props(
+            "({ café: a } = value);",
+            &[],
+            &[],
+            &[],
+            &props,
+        );
+        assert!(out.contains("a = value.café"), "{out}");
+    }
+
+    #[test]
+    fn destructure_at_end_of_callback_block_does_not_return_its_rhs() {
+        let state = vec!["doc".to_string()];
+        let out = transform_destructure_assignments_with_props(
+            "query((res) => { ;[doc] = res }, options);",
+            &state,
+            &[],
+            &[],
+            &[],
+        );
+
+        assert!(out.contains("})(res)"), "{out}");
+        assert!(!out.contains("return res"), "{out}");
+    }
+
+    #[test]
+    fn destructure_as_parenthesized_control_body_does_not_return_its_rhs() {
+        let state = vec!["icon".to_string()];
+        let out = transform_destructure_assignments_with_props(
+            "$: if (value) ({ icon } = priorities[value])",
+            &state,
+            &[],
+            &[],
+            &[],
+        );
+
+        assert!(out.contains("})(priorities[value])"), "{out}");
+        assert!(!out.contains("return $$value"), "{out}");
+    }
+
+    #[cfg(feature = "measure-destructure-scanner")]
+    #[test]
+    fn destructure_scanner_measurement_counts_a_real_rewrite_and_final_rescan() {
+        crate::measure_destructure_scanner::reset();
+        let state = vec!["a".to_string()];
+        let out =
+            transform_destructure_assignments_with_props("({ a } = value);", &state, &[], &[], &[]);
+        assert!(out.contains("a = value.a"), "{out}");
+
+        let stats = crate::measure_destructure_scanner::snapshot();
+        assert_eq!(stats.entries, 1);
+        assert_eq!(stats.rewrites, 1);
+        assert!(stats.scan_calls >= 2, "{stats:?}");
+        assert!(stats.assignment_closers >= 1, "{stats:?}");
+        assert!(stats.helper_calls >= 1, "{stats:?}");
+    }
+
+    #[test]
+    fn matching_open_bracket_ignores_string_contents() {
+        // `{ a = "}" } = obj` — the default value's `}` is text, not a closer.
+        let s = r#"{ a = "}" } = obj"#;
+        let close = ByteOffset::new(10);
+        assert_eq!(find_matching_open_bracket(s, close, '{', '}'), Some(ByteOffset::ZERO));
+    }
+
+    #[test]
+    fn matching_open_bracket_ignores_comment_contents() {
+        let s = "{ a, /* } */ b } = obj";
+        let close = ByteOffset::new(s.rfind('}').unwrap());
+        assert_eq!(find_matching_open_bracket(s, close, '{', '}'), Some(ByteOffset::ZERO));
+    }
+
+    #[test]
+    fn matching_open_bracket_still_matches_nested() {
+        let s = "{ a: { b } } = obj";
+        let close = ByteOffset::new(11);
+        assert_eq!(find_matching_open_bracket(s, close, '{', '}'), Some(ByteOffset::ZERO));
+    }
 }

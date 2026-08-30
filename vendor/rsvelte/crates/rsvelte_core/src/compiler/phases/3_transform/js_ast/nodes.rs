@@ -7,24 +7,27 @@ use super::arena::{ExprId, StmtId};
 use compact_str::CompactString;
 use smallvec::SmallVec;
 use std::fmt;
+use std::ops::Range;
 
 /// A complete JavaScript program.
 #[derive(Debug, Clone)]
 pub struct JsProgram {
     pub body: Vec<JsStatement>,
+    /// The named function whose body braces came from a source range, and that
+    /// range. One program has at most one — the component function — so it is
+    /// kept here rather than on [`JsBlockStatement`], which sits inside every
+    /// statement and expression: a field there grew `JsStatement` by 8.3% and
+    /// `JsExpr` by 8.7% for a span exactly one block ever carries.
+    pub component_brace_span: Option<(CompactString, u32, u32)>,
 }
 
 impl JsProgram {
     pub fn new() -> Self {
-        Self { body: Vec::new() }
+        Self { body: Vec::new(), component_brace_span: None }
     }
 
     pub fn with_body(body: Vec<JsStatement>) -> Self {
-        Self { body }
-    }
-
-    pub fn push(&mut self, stmt: JsStatement) {
-        self.body.push(stmt);
+        Self { body, component_brace_span: None }
     }
 }
 
@@ -47,6 +50,10 @@ pub enum JsStatement {
     VariableDeclaration(JsVariableDeclaration),
     /// Function declaration
     FunctionDeclaration(JsFunctionDeclaration),
+    /// A class declaration whose source is retained for the primary OXC path.
+    /// The structured form lets the text fallback indent it at its generated
+    /// nesting instead of replaying the template source column verbatim.
+    ClassDeclaration { class: JsClassExpression, source: CompactString },
     /// Expression statement
     Expression(JsExpressionStatement),
     /// Return statement
@@ -81,13 +88,43 @@ pub enum JsStatement {
     Try(JsTryStatement),
     /// Raw JavaScript code (as a statement, output verbatim)
     Raw(CompactString),
+    /// Raw JavaScript containing client effect calls rebuilt from source nodes.
+    RawEffect(CompactString),
     /// Raw JavaScript code with source mapping info.
     /// `source_offset` is the byte offset in the original source where this code starts.
     /// The codegen uses this to generate per-line source mappings.
     RawMapped {
         code: CompactString,
         source_offset: u32,
+        /// Explicit source position for comments emitted as a preceding chunk.
+        comment_anchor: Option<u32>,
+        /// Unchanged slices of `code` and their original source ranges.
+        ///
+        /// Unlike `source_offset`, this preserves token-level locations after
+        /// TypeScript erasure has made the script's coordinate spaces diverge.
+        copied_spans: Vec<RawMappedSpan>,
     },
+    /// Mapped raw JavaScript containing client effect calls rebuilt from source nodes.
+    RawMappedEffect {
+        code: CompactString,
+        source_offset: u32,
+        /// Explicit source position for comments emitted as a preceding chunk.
+        comment_anchor: Option<u32>,
+        effect_spans: Vec<(bool, u32, u32)>,
+        copied_spans: Vec<RawMappedSpan>,
+    },
+    /// A retained source AST inserted directly into the final OXC program.
+    RetainedAst { index: usize, fallback: CompactString, source_offset: u32, has_effect_rune: bool },
+}
+
+/// One unchanged raw-code slice and its original source location.
+#[derive(Debug, Clone)]
+pub struct RawMappedSpan {
+    pub code: Range<u32>,
+    pub source: Range<u32>,
+    /// This copied run ends with a comment that upstream keeps attached to an
+    /// erased TS declaration before an exported prop.
+    pub erased_comment_before_export_prop: bool,
 }
 
 /// Import declaration.
@@ -105,10 +142,7 @@ pub enum JsImportSpecifier {
     /// import name from 'source'
     Default(CompactString),
     /// import { imported as local } from 'source'
-    Named {
-        imported: CompactString,
-        local: CompactString,
-    },
+    Named { imported: CompactString, local: CompactString },
     /// import 'source' (side effect only)
     SideEffect,
 }
@@ -177,6 +211,11 @@ impl fmt::Display for JsVariableKind {
 pub struct JsVariableDeclarator {
     pub id: JsPattern,
     pub init: Option<ExprId>,
+    /// Original-source offset upstream stamps on this declarator's identifier
+    /// (`b.id(name, element.name_loc)`), which is where esrap flushes comments
+    /// left over from an earlier chunk. `None` for a fully synthesized
+    /// declarator.
+    pub comment_anchor: Option<u32>,
 }
 
 /// Function declaration.
@@ -193,6 +232,8 @@ pub struct JsFunctionDeclaration {
 #[derive(Debug, Clone)]
 pub struct JsExpressionStatement {
     pub expression: ExprId,
+    /// Source position of a statement following a separately parsed comment.
+    pub comment_anchor: Option<u32>,
 }
 
 /// Return statement.
@@ -271,10 +312,6 @@ impl JsBlockStatement {
 
     pub fn with_body(body: Vec<JsStatement>) -> Self {
         Self { body }
-    }
-
-    pub fn push(&mut self, stmt: JsStatement) {
-        self.body.push(stmt);
     }
 }
 
@@ -379,10 +416,7 @@ pub enum JsExpr {
     /// as a terminal in the analysis passes (await / transform / reactive-ref
     /// collection), mirroring the opaque `Raw` it replaced, so the sub-expressions
     /// are not re-transformed after conversion.
-    ImportExpression {
-        source: ExprId,
-        options: Option<ExprId>,
-    },
+    ImportExpression { source: ExprId, options: Option<ExprId> },
     /// Await expression
     Await(ExprId),
     /// Yield expression
@@ -399,6 +433,34 @@ pub enum JsExpr {
     /// Used for source map generation. The codegen emits the inner expression
     /// and records start/end mappings.
     Spanned(ExprId, u32, u32),
+    /// An expression whose COMMENT-space coordinates are the original source's.
+    /// Upstream prints the whole client output against one comment cursor over
+    /// the `.svelte` file, so where a template comment lands is decided by the
+    /// source line and column of the nodes around it. Boxed: the payload is
+    /// only built for the rare comment-bearing region, and `JsExpr`'s size is
+    /// paid by every node.
+    SourceAnchored(Box<JsSourceAnchor>),
+}
+
+/// One node's claim on a region of the original source, carried into the
+/// comment buffer so esrap measures the distances the source really has.
+#[derive(Debug, Clone)]
+pub struct JsSourceAnchor {
+    pub inner: ExprId,
+    /// Absolute source offset [`Self::region`] is cut from.
+    pub region_start: u32,
+    /// The verbatim source slice appended to the comment buffer. Every anchor
+    /// on the same region repeats it; only the first one is written.
+    pub region: CompactString,
+    /// Comments inside the region, absolute source spans, in source order.
+    /// `true` = a line comment.
+    pub comments: Vec<(u32, u32, bool)>,
+    /// Absolute source span this node claims as its location.
+    pub at: u32,
+    pub at_end: u32,
+    /// Preserve source spans carried by descendants, remapping them into the
+    /// synthetic comment region. Generated wrappers stay location-less.
+    pub preserve_inner_spans: bool,
 }
 
 /// Literal value.
@@ -491,6 +553,22 @@ pub struct JsProperty {
 #[derive(Debug, Clone)]
 pub enum JsPropertyKey {
     Identifier(CompactString),
+    /// An identifier key whose source range belongs to the key itself.
+    ///
+    /// Keep this distinct from `JsExpr::Spanned`: property keys are not
+    /// expressions, and wrapping an expression changes the variants seen by
+    /// downstream structural lowering.
+    SpannedIdentifier {
+        name: CompactString,
+        start: u32,
+        end: u32,
+    },
+    /// A string-literal key whose source range belongs to the key itself.
+    SpannedStringLiteral {
+        value: CompactString,
+        start: u32,
+        end: u32,
+    },
     Literal(JsLiteral),
     Computed(ExprId),
 }
@@ -556,6 +634,12 @@ pub struct JsMemberExpression {
 #[derive(Debug, Clone)]
 pub enum JsMemberProperty {
     Identifier(CompactString),
+    /// A source identifier property whose token span survives client lowering.
+    SpannedIdentifier {
+        name: CompactString,
+        start: u32,
+        end: u32,
+    },
     Expression(ExprId),
     PrivateIdentifier(CompactString),
 }
@@ -881,6 +965,12 @@ pub struct JsChainExpression {
 pub enum JsPattern {
     /// Simple identifier
     Identifier(CompactString),
+    /// A source-backed identifier pattern.
+    SpannedIdentifier { name: CompactString, start: u32, end: u32 },
+    /// A binding pattern whose COMMENT-space coordinates come from a slice of
+    /// the original source. Boxed so the rare template-comment carrier does
+    /// not increase the size paid by every pattern.
+    SourceAnchored(Box<JsSourcePatternAnchor>),
     /// Array destructuring
     Array(JsArrayPattern),
     /// Object destructuring
@@ -889,6 +979,19 @@ pub enum JsPattern {
     Rest(Box<JsPattern>),
     /// Assignment pattern (default value)
     Assignment(JsAssignmentPattern),
+}
+
+/// Pattern counterpart of [`JsSourceAnchor`]. Template snippet parameters keep
+/// their source location upstream even when the client wraps an identifier in
+/// a generated assignment pattern (`value = $.noop`).
+#[derive(Debug, Clone)]
+pub struct JsSourcePatternAnchor {
+    pub inner: Box<JsPattern>,
+    pub region_start: u32,
+    pub region: CompactString,
+    pub comments: Vec<(u32, u32, bool)>,
+    pub at: u32,
+    pub at_end: u32,
 }
 
 /// Array pattern.
@@ -906,12 +1009,7 @@ pub struct JsObjectPattern {
 /// Object pattern property.
 #[derive(Debug, Clone)]
 pub enum JsObjectPatternProperty {
-    Property {
-        key: JsPropertyKey,
-        value: JsPattern,
-        computed: bool,
-        shorthand: bool,
-    },
+    Property { key: JsPropertyKey, value: JsPattern, computed: bool, shorthand: bool },
     Rest(Box<JsPattern>),
 }
 

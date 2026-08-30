@@ -78,10 +78,7 @@ pub fn transform_private_member_read_wrap_ast(
             &MODULE_PRIVATE_MEMBER_READ_WRAP_ALLOC,
             src,
             SourceType::mjs(),
-            ParseOptions {
-                allow_return_outside_function: true,
-                ..ParseOptions::default()
-            },
+            ParseOptions { allow_return_outside_function: true, ..ParseOptions::default() },
             true,
             |program| {
                 let mut collector = PrivateMemberReadWrapCollector {

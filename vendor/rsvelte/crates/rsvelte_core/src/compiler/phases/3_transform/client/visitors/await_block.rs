@@ -42,6 +42,7 @@
 
 use crate::ast::js::Expression;
 use crate::ast::template::{AwaitBlock, Fragment};
+use crate::compiler::phases::phase3_transform::client::source_anchor::CommentRegion;
 use crate::compiler::phases::phase3_transform::client::types::{
     ComponentContext, ExpressionMetadata,
 };
@@ -84,12 +85,26 @@ pub fn await_block(node: &AwaitBlock, context: &mut ComponentContext) {
     // Build expression with metadata
     let expr_metadata = ExpressionMetadata::from_template_metadata(&node.metadata.expression);
 
-    let built_expr = build_expression(context, &converted_expr, &expr_metadata);
+    let mut built_expr = build_expression(context, &converted_expr, &expr_metadata);
+    if let (Some(start), Some(end), Some(header_end)) = (
+        node.expression.start(),
+        node.expression.end(),
+        crate::compiler::phases::phase1_parse::utils::find_matching_bracket(
+            &context.state.options.source,
+            node.start as usize + 1,
+            '{',
+        ),
+    ) && let Some(region) = CommentRegion::lexical_between(
+        &context.state,
+        node.start + 7,
+        header_end as u32,
+        node.start + 7,
+    ) {
+        built_expr = region.anchor(&context.arena, built_expr, start, end);
+    }
 
     // Check for blockers before moving built_expr into thunk
-    let blocker_exprs = context
-        .state
-        .get_blockers_for_expr(&built_expr, &context.arena);
+    let blocker_exprs = context.state.get_blockers_for_expr(&built_expr, &context.arena);
     let has_blockers = !blocker_exprs.is_empty();
 
     // Wrap in thunk (async if has_await)
@@ -133,15 +148,22 @@ pub fn await_block(node: &AwaitBlock, context: &mut ComponentContext) {
     if let Some(catch_fn) = catch_block {
         await_args.push(catch_fn);
     }
-    let await_call = b::call(
-        &context.arena,
-        b::member_path(&context.arena, "$.await"),
-        await_args,
+    // The promise thunk is the first located node upstream prints after the
+    // await expression. It therefore owns not only comments written inside the
+    // await header, but also a still-pending comment from the instance-script
+    // tail. Mark the argument unconditionally: when no comment is pending this
+    // is output-neutral, while restricting it to header comments lets a
+    // script-tail comment drift into the following pending callback.
+    let await_callee = JsExpr::Spanned(
+        context.arena.alloc_expr(b::member_path(&context.arena, "$.await")),
+        rsvelte_esrap::COMMENT_ARGUMENT_CALLEE_BASE + 1,
+        rsvelte_esrap::COMMENT_ARGUMENT_CALLEE_BASE + 1,
     );
+    let await_call = b::call(&context.arena, await_callee, await_args);
 
     // Add svelte metadata
     let stmt = if context.state.dev {
-        use crate::compiler::phases::phase3_transform::client::visitors::attribute::locate_in_source;
+        use crate::compiler::phases::phase3_transform::utils::locate_in_source;
         let (line, col) = locate_in_source(&context.state.analysis.source, node.start as usize);
         super::shared::utils::add_svelte_meta_dev(
             &context.arena,
@@ -205,6 +227,7 @@ fn build_block_with_argument(
     // const then_context = { ...context, state: { ...context.state, transform: { ...context.state.transform } } };
     let saved_transform = context.state.transform.clone();
     let saved_transform_deep_read = context.state.transform_deep_read.clone();
+    let saved_await_binding_names = context.state.await_binding_names.clone();
 
     // Build the argument and declarations
     let (arg_pattern, declarations) = if let Some(pattern) = argument_pattern {
@@ -230,6 +253,7 @@ fn build_block_with_argument(
     // Restore the transform state
     context.state.transform = saved_transform;
     context.state.transform_deep_read = saved_transform_deep_read;
+    context.state.await_binding_names = saved_await_binding_names;
 
     // Log for debugging if needed
     let _ = block_type;
@@ -272,11 +296,13 @@ fn create_derived_block_argument(
                 // Await block resolved values need reactive tracking
                 is_reactive: true,
                 replacement_id: None,
+                store_source: None,
             },
         );
         // Await then/catch bindings are template-kind in the official
         // compiler and need deep_read_state wrapping in legacy reactivity.
         context.state.transform_deep_read.insert(name.clone(), ());
+        context.state.await_binding_names.insert(name.clone(), ());
         return (Some(JsPattern::Identifier(name.into())), vec![]);
     }
 
@@ -294,11 +320,8 @@ fn create_derived_block_argument(
     let value_id = b::id("$$value");
 
     // Build: let { a, b } = $.get($$source); return { a, b };
-    let get_source_call = b::call(
-        &context.arena,
-        b::member_path(&context.arena, "$.get"),
-        vec![source_id.clone()],
-    );
+    let get_source_call =
+        b::call(&context.arena, b::member_path(&context.arena, "$.get"), vec![source_id.clone()]);
 
     // Build object with shorthand properties for return statement
     let return_object = b::object(
@@ -349,10 +372,12 @@ fn create_derived_block_argument(
                 // Destructured await values need reactive tracking
                 is_reactive: true,
                 replacement_id: None,
+                store_source: None,
             },
         );
         // Destructured await then/catch values are template-kind.
         context.state.transform_deep_read.insert(id.clone(), ());
+        context.state.await_binding_names.insert(id.clone(), ());
 
         // Build: var id = $.derived(() => $.get($$value).id)
         let get_value_call = b::call(
@@ -376,17 +401,9 @@ fn create_derived_block_argument(
 fn create_derived_from_block(context: &ComponentContext, block: JsBlockStatement) -> JsExpr {
     let thunk = b::arrow_block(vec![], block.body);
 
-    let method = if context.state.analysis.runes {
-        "$.derived"
-    } else {
-        "$.derived_safe_equal"
-    };
+    let method = if context.state.analysis.runes { "$.derived" } else { "$.derived_safe_equal" };
 
-    b::call(
-        &context.arena,
-        b::member_path(&context.arena, method),
-        vec![thunk],
-    )
+    b::call(&context.arena, b::member_path(&context.arena, method), vec![thunk])
 }
 
 /// Create a $.derived() or $.derived_safe_equal() call from an expression.
@@ -395,17 +412,9 @@ fn create_derived_from_block(context: &ComponentContext, block: JsBlockStatement
 fn create_derived_from_expr(context: &ComponentContext, expr: JsExpr) -> JsExpr {
     let thunk = b::thunk(&context.arena, expr);
 
-    let method = if context.state.analysis.runes {
-        "$.derived"
-    } else {
-        "$.derived_safe_equal"
-    };
+    let method = if context.state.analysis.runes { "$.derived" } else { "$.derived_safe_equal" };
 
-    b::call(
-        &context.arena,
-        b::member_path(&context.arena, method),
-        vec![thunk],
-    )
+    b::call(&context.arena, b::member_path(&context.arena, method), vec![thunk])
 }
 
 /// Get the name if the expression is a simple identifier.
@@ -415,11 +424,7 @@ fn get_identifier_name(expr: &Expression) -> Option<String> {
     // with the full pattern text in the name field (e.g., "{ result, error }" or "[a, b]").
     // Detect these cases and return None so they go through the destructuring path.
     let trimmed = name.trim();
-    if trimmed.starts_with('{') || trimmed.starts_with('[') {
-        None
-    } else {
-        Some(name.to_string())
-    }
+    if trimmed.starts_with('{') || trimmed.starts_with('[') { None } else { Some(name.to_string()) }
 }
 
 /// Extract all identifier names from a pattern expression.
@@ -628,11 +633,8 @@ fn find_top_level_colon(s: &str) -> Option<usize> {
 /// Check if a string is a valid JavaScript identifier.
 fn is_valid_identifier(s: &str) -> bool {
     !s.is_empty()
-        && s.chars()
-            .next()
-            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_' || c == '$')
-        && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+        && s.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_' || c == '$')
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
 }
 
 /// Convert an Expression to a JsPattern, applying reactive transforms for computed keys.
@@ -697,10 +699,8 @@ fn convert_value_to_pattern_with_context(
                                 .and_then(|s| s.as_bool())
                                 .unwrap_or(false);
 
-                            let computed = prop_obj
-                                .get("computed")
-                                .and_then(|c| c.as_bool())
-                                .unwrap_or(false);
+                            let computed =
+                                prop_obj.get("computed").and_then(|c| c.as_bool()).unwrap_or(false);
 
                             let value_pattern =
                                 convert_value_to_pattern_with_context(value, context);
@@ -829,10 +829,8 @@ fn convert_value_to_pattern(val: &serde_json::Value, arena: &JsArena) -> JsPatte
                                 .and_then(|s| s.as_bool())
                                 .unwrap_or(false);
 
-                            let computed = prop_obj
-                                .get("computed")
-                                .and_then(|c| c.as_bool())
-                                .unwrap_or(false);
+                            let computed =
+                                prop_obj.get("computed").and_then(|c| c.as_bool()).unwrap_or(false);
 
                             let value_pattern = convert_value_to_pattern(value, arena);
 
@@ -916,10 +914,7 @@ fn convert_value_to_js_expr_simple(val: &serde_json::Value, arena: &JsArena) -> 
             let node_type = obj.get("type").and_then(|t| t.as_str()).unwrap_or("");
             match node_type {
                 "Identifier" => {
-                    let name = obj
-                        .get("name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("undefined");
+                    let name = obj.get("name").and_then(|v| v.as_str()).unwrap_or("undefined");
                     JsExpr::Identifier(name.into())
                 }
                 "Literal" => {
@@ -948,11 +943,8 @@ fn convert_value_to_js_expr_simple(val: &serde_json::Value, arena: &JsArena) -> 
                 }
                 "TemplateLiteral" => {
                     // Convert template literal
-                    let quasis_arr = obj
-                        .get("quasis")
-                        .and_then(|q| q.as_array())
-                        .cloned()
-                        .unwrap_or_default();
+                    let quasis_arr =
+                        obj.get("quasis").and_then(|q| q.as_array()).cloned().unwrap_or_default();
                     let expressions_arr = obj
                         .get("expressions")
                         .and_then(|e| e.as_array())
@@ -986,10 +978,7 @@ fn convert_value_to_js_expr_simple(val: &serde_json::Value, arena: &JsArena) -> 
                         .map(|v| convert_value_to_js_expr_simple(v, arena))
                         .collect();
 
-                    JsExpr::TemplateLiteral(JsTemplateLiteral {
-                        quasis,
-                        expressions,
-                    })
+                    JsExpr::TemplateLiteral(JsTemplateLiteral { quasis, expressions })
                 }
                 "BinaryExpression" => {
                     let left = obj
@@ -1014,14 +1003,8 @@ fn convert_value_to_js_expr_simple(val: &serde_json::Value, arena: &JsArena) -> 
                         .map(|v| convert_value_to_js_expr_simple(v, arena))
                         .unwrap_or(JsExpr::Identifier("undefined".into()));
                     let prop_val = obj.get("property");
-                    let computed = obj
-                        .get("computed")
-                        .and_then(|c| c.as_bool())
-                        .unwrap_or(false);
-                    let optional = obj
-                        .get("optional")
-                        .and_then(|o| o.as_bool())
-                        .unwrap_or(false);
+                    let computed = obj.get("computed").and_then(|c| c.as_bool()).unwrap_or(false);
+                    let optional = obj.get("optional").and_then(|o| o.as_bool()).unwrap_or(false);
                     let property = if computed {
                         JsMemberProperty::Expression(
                             arena.alloc_expr(
@@ -1054,15 +1037,10 @@ fn convert_value_to_js_expr_simple(val: &serde_json::Value, arena: &JsArena) -> 
                         .get("arguments")
                         .and_then(|a| a.as_array())
                         .map(|arr| {
-                            arr.iter()
-                                .map(|v| convert_value_to_js_expr_simple(v, arena))
-                                .collect()
+                            arr.iter().map(|v| convert_value_to_js_expr_simple(v, arena)).collect()
                         })
                         .unwrap_or_default();
-                    let optional = obj
-                        .get("optional")
-                        .and_then(|o| o.as_bool())
-                        .unwrap_or(false);
+                    let optional = obj.get("optional").and_then(|o| o.as_bool()).unwrap_or(false);
                     JsExpr::Call(JsCallExpression {
                         callee: arena.alloc_expr(callee),
                         arguments: args,
@@ -1075,11 +1053,8 @@ fn convert_value_to_js_expr_simple(val: &serde_json::Value, arena: &JsArena) -> 
                         .map(|v| convert_value_to_js_expr_simple(v, arena))
                         .unwrap_or(JsExpr::Identifier("undefined".into()));
                     let op_str = obj.get("operator").and_then(|o| o.as_str()).unwrap_or("++");
-                    let operator = if op_str == "--" {
-                        JsUpdateOp::Decrement
-                    } else {
-                        JsUpdateOp::Increment
-                    };
+                    let operator =
+                        if op_str == "--" { JsUpdateOp::Decrement } else { JsUpdateOp::Increment };
                     let prefix = obj.get("prefix").and_then(|p| p.as_bool()).unwrap_or(false);
                     JsExpr::Update(JsUpdateExpression {
                         operator,
@@ -1100,14 +1075,10 @@ fn convert_value_to_js_expr_simple(val: &serde_json::Value, arena: &JsArena) -> 
                             let key_val = p_obj.get("key")?;
                             let key_obj = key_val.as_object()?;
                             let val = p_obj.get("value")?;
-                            let computed = p_obj
-                                .get("computed")
-                                .and_then(|c| c.as_bool())
-                                .unwrap_or(false);
-                            let shorthand = p_obj
-                                .get("shorthand")
-                                .and_then(|s| s.as_bool())
-                                .unwrap_or(false);
+                            let computed =
+                                p_obj.get("computed").and_then(|c| c.as_bool()).unwrap_or(false);
+                            let shorthand =
+                                p_obj.get("shorthand").and_then(|s| s.as_bool()).unwrap_or(false);
 
                             let key = if computed {
                                 JsPropertyKey::Computed(
@@ -1133,16 +1104,11 @@ fn convert_value_to_js_expr_simple(val: &serde_json::Value, arena: &JsArena) -> 
                             }))
                         })
                         .collect();
-                    JsExpr::Object(JsObjectExpression {
-                        properties: members,
-                    })
+                    JsExpr::Object(JsObjectExpression { properties: members })
                 }
                 "ArrayExpression" => {
-                    let elems = obj
-                        .get("elements")
-                        .and_then(|e| e.as_array())
-                        .cloned()
-                        .unwrap_or_default();
+                    let elems =
+                        obj.get("elements").and_then(|e| e.as_array()).cloned().unwrap_or_default();
                     let items: Vec<Option<JsExpr>> = elems
                         .iter()
                         .map(|e| {

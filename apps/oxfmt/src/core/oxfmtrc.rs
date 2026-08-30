@@ -304,6 +304,31 @@ pub struct FormatConfig {
 }
 
 impl FormatConfig {
+    pub fn svelte_config(&self) -> Option<SvelteConfig> {
+        let mut config = match self.svelte.clone().and_then(SvelteUserConfig::into_config) {
+            Some(config) => config,
+            None if self.svelte_sort_order.is_some()
+                || self.svelte_allow_shorthand.is_some()
+                || self.svelte_indent_script_and_style.is_some() =>
+            {
+                SvelteConfig::default()
+            }
+            None => return None,
+        };
+
+        if self.svelte_sort_order.is_some() {
+            config.sort_order.clone_from(&self.svelte_sort_order);
+        }
+        if self.svelte_allow_shorthand.is_some() {
+            config.allow_shorthand = self.svelte_allow_shorthand;
+        }
+        if self.svelte_indent_script_and_style.is_some() {
+            config.indent_script_and_style = self.svelte_indent_script_and_style;
+        }
+
+        Some(config)
+    }
+
     /// Whether embedded-language formatting is enabled by this config
     /// (`embeddedLanguageFormatting` defaults to `"auto"`; only an explicit `"off"` disables it).
     /// Consumers reach this through `ResolvedDispatchConfig::is_embedded_formatting_enabled`,

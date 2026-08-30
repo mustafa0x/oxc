@@ -8,6 +8,7 @@
 
 use crate::ast::js::Expression;
 use crate::ast::template::RenderTag;
+use crate::compiler::phases::phase3_transform::client::source_anchor::CommentRegion;
 use crate::compiler::phases::phase3_transform::client::types::*;
 use crate::compiler::phases::phase3_transform::client::visitors::expression_converter::convert_expression;
 use crate::compiler::phases::phase3_transform::client::visitors::shared::utils::build_expression;
@@ -54,6 +55,9 @@ pub fn render_tag(node: &RenderTag, context: &mut ComponentContext) -> JsStateme
     // Extract arguments and wrap them in thunks
     // Reference: RenderTag.js lines 22-33
     let raw_args = extract_call_arguments(&call_expr, context.state.parse_arena);
+    let comment_region = node.expression.end().and_then(|end| {
+        CommentRegion::between(&context.state, node.start + 9, end, node.start + 9)
+    });
 
     // Track async values for $.async() wrapping
     let mut async_values: Vec<JsExpr> = Vec::new();
@@ -68,6 +72,8 @@ pub fn render_tag(node: &RenderTag, context: &mut ComponentContext) -> JsStateme
     // duplicate `$0` when a render tag has both an awaited arg and a call arg —
     // the `let $0` would shadow the async callback param `$0` (H-099).
     let mut placeholder_index: usize = 0;
+    let derived_fn =
+        if context.state.analysis.runes { "$.derived" } else { "$.derived_safe_equal" };
     let args: Vec<JsExpr> = raw_args
         .iter()
         .enumerate()
@@ -77,7 +83,12 @@ pub fn render_tag(node: &RenderTag, context: &mut ComponentContext) -> JsStateme
             let template_metadata = node.metadata.arguments.get(i).cloned().unwrap_or_default();
             let metadata = ExpressionMetadata::from_template_metadata(&template_metadata);
             // Apply transforms ($.get() wrapping for reactive state variables)
-            let built = build_expression(context, &converted, &metadata);
+            let mut built = build_expression(context, &converted, &metadata);
+            if let (Some(region), Some(start), Some(end)) =
+                (comment_region.as_ref(), arg.start(), arg.end())
+            {
+                built = region.anchor(&context.arena, built, start, end);
+            }
 
             // Check if this argument has await
             let arg_has_await =
@@ -108,9 +119,11 @@ pub fn render_tag(node: &RenderTag, context: &mut ComponentContext) -> JsStateme
                     ),
                 )
             } else {
-                // If the argument expression has a call, we need to memoize it with $.derived()
-                let has_call_from_expr = render_tag_has_call(arg);
-                if template_metadata.has_call() || has_call_from_expr {
+                // Phase 2 applies upstream's purity rule while computing
+                // `has_call`: a pure call with pure arguments is left inline,
+                // while an impure or reactive call is memoized. A raw syntax
+                // walk cannot make that distinction.
+                if template_metadata.has_call() {
                     // Draw from the same `$N` counter as async placeholders so a
                     // memoised-call arg never collides with an async callback
                     // param in the same render block (H-099).
@@ -121,7 +134,7 @@ pub fn render_tag(node: &RenderTag, context: &mut ComponentContext) -> JsStateme
                         &id_name,
                         Some(b::call(
                             &context.arena,
-                            b::member_path(&context.arena, "$.derived"),
+                            b::member_path(&context.arena, derived_fn),
                             vec![b::thunk(&context.arena, built)],
                         )),
                     ));
@@ -169,16 +182,9 @@ pub fn render_tag(node: &RenderTag, context: &mut ComponentContext) -> JsStateme
         } else {
             snippet_function
         };
-        let mut call_args = vec![
-            context.state.node.clone(),
-            b::thunk(&context.arena, snippet_fn),
-        ];
+        let mut call_args = vec![context.state.node.clone(), b::thunk(&context.arena, snippet_fn)];
         call_args.extend(args);
-        b::call(
-            &context.arena,
-            b::member_path(&context.arena, "$.snippet"),
-            call_args,
-        )
+        b::call(&context.arena, b::member_path(&context.arena, "$.snippet"), call_args)
     } else {
         // Static snippet: direct call (optional if original was a ChainExpression)
         let mut call_args = vec![context.state.node.clone()];
@@ -194,7 +200,7 @@ pub fn render_tag(node: &RenderTag, context: &mut ComponentContext) -> JsStateme
     let mut statements: Vec<JsStatement> = derived_decls;
     // In dev mode, wrap with $.add_svelte_meta() for render tags
     if context.state.dev {
-        use crate::compiler::phases::phase3_transform::client::visitors::attribute::locate_in_source;
+        use crate::compiler::phases::phase3_transform::utils::locate_in_source;
         let (line, col) = locate_in_source(&context.state.analysis.source, node.start as usize);
         statements.push(super::shared::utils::add_svelte_meta_dev(
             &context.arena,
@@ -251,30 +257,19 @@ pub fn render_tag(node: &RenderTag, context: &mut ComponentContext) -> JsStateme
         let callback = b::arrow_block(callback_params, statements);
 
         // Build blockers argument
-        let blockers_arg = if has_blockers {
-            b::array(all_blocker_exprs)
-        } else {
-            b::undefined(&context.arena)
-        };
+        let blockers_arg =
+            if has_blockers { b::array(all_blocker_exprs) } else { b::undefined(&context.arena) };
 
         // Build async_values argument
-        let async_values_arg = if any_has_await {
-            b::array(async_values)
-        } else {
-            b::undefined(&context.arena)
-        };
+        let async_values_arg =
+            if any_has_await { b::array(async_values) } else { b::undefined(&context.arena) };
 
         let result = b::stmt(
             &context.arena,
             b::call(
                 &context.arena,
                 b::member_path(&context.arena, "$.async"),
-                vec![
-                    context.state.node.clone(),
-                    blockers_arg,
-                    async_values_arg,
-                    callback,
-                ],
+                vec![context.state.node.clone(), blockers_arg, async_values_arg, callback],
             ),
         );
 
@@ -283,11 +278,7 @@ pub fn render_tag(node: &RenderTag, context: &mut ComponentContext) -> JsStateme
             context.state.init.push(result);
             return b::stmt(
                 &context.arena,
-                b::call(
-                    &context.arena,
-                    b::member_path(&context.arena, "$.next"),
-                    vec![],
-                ),
+                b::call(&context.arena, b::member_path(&context.arena, "$.next"), vec![]),
             );
         }
 
@@ -302,7 +293,10 @@ pub fn render_tag(node: &RenderTag, context: &mut ComponentContext) -> JsStateme
 /// Unwrap optional chain expression if present.
 ///
 /// Corresponds to `unwrap_optional` in Svelte's utils.
-fn unwrap_optional(expr: &Expression, arena: &crate::ast::arena::ParseArena) -> Expression {
+fn unwrap_optional<'a>(
+    expr: &Expression<'a>,
+    arena: &crate::ast::arena::ParseArena,
+) -> Expression<'a> {
     use crate::ast::typed_expr::JsNode;
     if expr.node_type() == Some("ChainExpression") {
         let node = expr.as_node();
@@ -314,10 +308,10 @@ fn unwrap_optional(expr: &Expression, arena: &crate::ast::arena::ParseArena) -> 
 }
 
 /// Extract arguments from a call expression.
-fn extract_call_arguments(
-    expr: &Expression,
+fn extract_call_arguments<'a>(
+    expr: &Expression<'a>,
     arena: &crate::ast::arena::ParseArena,
-) -> Vec<Expression> {
+) -> Vec<Expression<'a>> {
     use crate::ast::typed_expr::JsNode;
     if expr.node_type() != Some("CallExpression") {
         return Vec::new();
@@ -334,10 +328,10 @@ fn extract_call_arguments(
 }
 
 /// Extract callee from a call expression.
-fn extract_call_callee(
-    expr: &Expression,
+fn extract_call_callee<'a>(
+    expr: &Expression<'a>,
     arena: &crate::ast::arena::ParseArena,
-) -> Option<Expression> {
+) -> Option<Expression<'a>> {
     use crate::ast::typed_expr::JsNode;
     if expr.node_type() != Some("CallExpression") {
         return None;
@@ -348,44 +342,6 @@ fn extract_call_callee(
             Some(Expression::from_node(arena.get_js_node(*callee).clone()))
         }
         _ => None,
-    }
-}
-
-/// Wrapper to check if an Expression has a call.
-fn render_tag_has_call(expr: &Expression) -> bool {
-    json_value_has_call(expr.as_json())
-}
-
-/// Recursively check if a JSON value (ESTree node) contains a CallExpression.
-/// Stops recursion at function boundaries (ArrowFunctionExpression, FunctionExpression)
-/// since calls inside those don't affect the outer expression's reactivity.
-///
-/// `SpreadElement` and `TaggedTemplateExpression` also count: the official Phase-2
-/// analyzer sets `expression.has_call = true` for both (SpreadElement.js,
-/// TaggedTemplateExpression.js), because e.g. `[...x]` is treated like
-/// `[...x.values()]`. This makes a render-tag argument such as
-/// `{ props, ...snippetProps }` memoize into a `$.derived`, matching upstream.
-fn json_value_has_call(val: &serde_json::Value) -> bool {
-    match val {
-        serde_json::Value::Object(obj) => {
-            if let Some(expr_type) = obj.get("type").and_then(|v| v.as_str()) {
-                if expr_type == "CallExpression"
-                    || expr_type == "SpreadElement"
-                    || expr_type == "TaggedTemplateExpression"
-                {
-                    return true;
-                }
-                if expr_type == "ArrowFunctionExpression"
-                    || expr_type == "FunctionExpression"
-                    || expr_type == "FunctionDeclaration"
-                {
-                    return false;
-                }
-            }
-            obj.values().any(json_value_has_call)
-        }
-        serde_json::Value::Array(arr) => arr.iter().any(json_value_has_call),
-        _ => false,
     }
 }
 

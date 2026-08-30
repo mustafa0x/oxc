@@ -30,7 +30,7 @@ use oxc_str::CompactStr;
 use oxc_svelte_backend::{SvelteCommentKind, parse_svelte_for_lint};
 
 use crate::{
-    AllowWarnDeny, Fixer, Linter, Message, MessageRule, PossibleFixes, RuleTimingStore,
+    AllowWarnDeny, Fixer, Linter, Message, PossibleFixes, RuleTimingStore,
     context::{ContextSubHost, ContextSubHostOptions, PartialFileSemantic},
     disable_directives::{DisableDirectives, create_unused_directives_diagnostics},
     loader::{JavaScriptSource, LINT_PARTIAL_LOADER_EXTENSIONS, PartialLoader},
@@ -472,14 +472,6 @@ impl Runtime {
     }
 
     fn message_rule_name(message: &Message) -> Option<Cow<'_, str>> {
-        if let Some(MessageRule { plugin_name, rule_name }) = message.rule.as_ref() {
-            return if plugin_name == "eslint" {
-                Some(Cow::Borrowed(rule_name.as_ref()))
-            } else {
-                Some(Cow::Owned(format!("{plugin_name}/{rule_name}")))
-            };
-        }
-
         let scope = message.error.code.scope.as_ref()?;
         let number = message.error.code.number.as_ref()?;
         if scope == "eslint" {
@@ -832,55 +824,6 @@ impl Runtime {
                             .collect();
 
                         if context_sub_hosts.is_empty() {
-                            let mut messages = me.linter.run_external_only_on_source_text(
-                                path,
-                                dep.source_text,
-                                allocator_guard,
-                            );
-                            Self::filter_messages_with_full_file_disable_directives(
-                                &mut messages,
-                                module_to_lint.full_file_disable_directives.as_ref(),
-                            );
-                            Self::report_unused_full_file_disable_directives(
-                                &mut messages,
-                                module_to_lint.full_file_disable_directives.as_ref(),
-                                me.linter.options().report_unused_directive,
-                            );
-
-                            if me.linter.options().fix.is_some() {
-                                let fix_result = Fixer::new(
-                                    dep.source_text,
-                                    messages,
-                                    SourceType::from_path(path).ok().map(|st| {
-                                        if st.is_javascript() { st.with_jsx(true) } else { st }
-                                    }),
-                                )
-                                .fix();
-                                if fix_result.fixed {
-                                    let start = 0;
-                                    let end = start + dep.source_text.len();
-                                    new_source_text
-                                        .to_mut()
-                                        .replace_range(start..end, &fix_result.fixed_code);
-                                }
-                                messages = fix_result.messages;
-                            }
-
-                            if !messages.is_empty() {
-                                let errors = messages.into_iter().map(Into::into).collect();
-                                let diagnostics = DiagnosticService::wrap_diagnostics(
-                                    &me.cwd,
-                                    path,
-                                    dep.source_text,
-                                    errors,
-                                );
-                                tx_error.send(diagnostics).unwrap();
-                            }
-
-                            if let Cow::Owned(new_source_text) = &new_source_text {
-                                file_system.write_file(path, new_source_text).unwrap();
-                            }
-
                             return;
                         }
 
@@ -891,7 +834,6 @@ impl Runtime {
                                 allocator_guard,
                                 me.js_allocator_pool(),
                                 rule_timing_store,
-                                Some(dep.source_text),
                             );
                         Self::filter_messages_with_full_file_disable_directives(
                             &mut messages,
@@ -992,7 +934,7 @@ impl Runtime {
                 |me, mut module_to_lint| {
                     module_to_lint.content.with_dependent_mut(
                         |allocator_guard,
-                         ModuleContentDependent { source_text, section_contents }| {
+                         ModuleContentDependent { source_text: _, section_contents }| {
                         assert_eq!(
                             module_to_lint.section_module_records.len(),
                             section_contents.len()
@@ -1038,24 +980,9 @@ impl Runtime {
 
                             let path = Path::new(&module_to_lint.path);
 
-                        if context_sub_hosts.is_empty() {
-                            let mut section_messages = me.linter.run_external_only_on_source_text(
-                                path,
-                                source_text,
-                                allocator_guard,
-                            );
-                            Self::filter_messages_with_full_file_disable_directives(
-                                &mut section_messages,
-                                module_to_lint.full_file_disable_directives.as_ref(),
-                            );
-                            Self::report_unused_full_file_disable_directives(
-                                &mut section_messages,
-                                module_to_lint.full_file_disable_directives.as_ref(),
-                                me.linter.options().report_unused_directive,
-                            );
-                            messages.lock().unwrap().extend(section_messages);
-                            return;
-                        }
+                            if context_sub_hosts.is_empty() {
+                                return;
+                            }
 
                             let (mut section_messages, disable_directives) =
                                 me.linter.run_with_disable_directives::<false>(
@@ -1064,7 +991,6 @@ impl Runtime {
                                 allocator_guard,
                                 me.js_allocator_pool(),
                                 None,
-                                Some(source_text),
                             );
                             Self::filter_messages_with_full_file_disable_directives(
                                 &mut section_messages,
@@ -1172,7 +1098,7 @@ impl Runtime {
                 Some(tx_error),
                 |me, mut module| {
                     module.content.with_dependent_mut(|allocator_guard, ModuleContentDependent {
-                        source_text,
+                        source_text: _,
                         section_contents,
                     }| {
                         assert_eq!(module.section_module_records.len(), section_contents.len());
@@ -1212,21 +1138,6 @@ impl Runtime {
                             .collect();
 
                         if context_sub_hosts.is_empty() {
-                            let mut section_messages = me.linter.run_external_only_on_source_text(
-                                Path::new(&module.path),
-                                source_text,
-                                allocator_guard,
-                            );
-                            Self::filter_messages_with_full_file_disable_directives(
-                                &mut section_messages,
-                                module.full_file_disable_directives.as_ref(),
-                            );
-                            Self::report_unused_full_file_disable_directives(
-                                &mut section_messages,
-                                module.full_file_disable_directives.as_ref(),
-                                me.linter.options().report_unused_directive,
-                            );
-                            messages.lock().unwrap().extend(section_messages);
                             return;
                         }
 
@@ -1237,7 +1148,6 @@ impl Runtime {
                                 allocator_guard,
                                 None,
                                 None,
-                                Some(source_text),
                             )
                             .0;
                         Self::filter_messages_with_full_file_disable_directives(

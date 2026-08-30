@@ -86,12 +86,11 @@ pub fn svelte_boundary(node: &SvelteElement, context: &mut ComponentContext) {
     // `{const x = …}` / `{let x = …}`) and keeps non-special snippets inside the
     // boundary callback when either is present (so the snippet can reference them).
     let has_const = use_async
-        && node.fragment.nodes.iter().any(|n| {
-            matches!(
-                n,
-                TemplateNode::ConstTag(_) | TemplateNode::DeclarationTag(_)
-            )
-        });
+        && node
+            .fragment
+            .nodes
+            .iter()
+            .any(|n| matches!(n, TemplateNode::ConstTag(_) | TemplateNode::DeclarationTag(_)));
 
     // In non-async mode, visit boundary-level `{@const}` tags FIRST, capturing
     // their generated declarations. Upstream SvelteBoundary.js: "const tags
@@ -191,10 +190,8 @@ pub fn svelte_boundary(node: &SvelteElement, context: &mut ComponentContext) {
     }
 
     // Create a fragment for the content
-    let content_fragment = crate::ast::template::Fragment {
-        nodes: content_nodes,
-        ..Default::default()
-    };
+    let content_fragment =
+        crate::ast::template::Fragment { nodes: content_nodes, ..Default::default() };
 
     // Visit the content fragment
     // Boundary content needs is_root_fragment=true because SvelteBoundary is in the
@@ -228,11 +225,8 @@ pub fn svelte_boundary(node: &SvelteElement, context: &mut ComponentContext) {
     if let Some(saved) = saved_instance_snippets {
         // The new instance_level_snippets were added by fragment() merging.
         // Take them and prepend to the boundary callback body.
-        let new_snippets: Vec<JsStatement> = context
-            .state
-            .instance_level_snippets
-            .drain(saved.len()..)
-            .collect();
+        let new_snippets: Vec<JsStatement> =
+            context.state.instance_level_snippets.drain(saved.len()..).collect();
         if !new_snippets.is_empty() {
             let mut new_body = new_snippets;
             new_body.extend(content_body);
@@ -264,10 +258,7 @@ pub fn svelte_boundary(node: &SvelteElement, context: &mut ComponentContext) {
         // Wrap in block with hoisted snippets first
         let mut block_body = hoisted_snippets;
         block_body.push(boundary_call);
-        context
-            .state
-            .init
-            .push(JsStatement::Block(JsBlockStatement { body: block_body }));
+        context.state.init.push(JsStatement::Block(JsBlockStatement::with_body(block_body)));
     }
 }
 

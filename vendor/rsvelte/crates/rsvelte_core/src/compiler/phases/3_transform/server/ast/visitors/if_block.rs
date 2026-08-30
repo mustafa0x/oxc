@@ -61,7 +61,7 @@ use super::shared::{
 };
 
 /// Visit a `{#if test}...{:else if}...{:else}...{/if}` block.
-pub fn visit_if_block<'a>(node: &IfBlock, state: &mut ServerTransformState<'a>) {
+pub fn visit_if_block<'a>(node: &IfBlock<'a>, state: &mut ServerTransformState<'a>) {
     // Aggregate blockers + has_await over the FLATTENED chain (this test plus
     // every else-if that flattens into it). Mirrors
     // `node.metadata.expression.blockers()` / `.has_await` — those metadata
@@ -69,13 +69,7 @@ pub fn visit_if_block<'a>(node: &IfBlock, state: &mut ServerTransformState<'a>) 
     let mut blocker_set = std::collections::BTreeSet::new();
     let mut local_blockers: Vec<String> = Vec::new();
     let mut has_await = false;
-    collect_chain_async(
-        node,
-        state,
-        &mut blocker_set,
-        &mut local_blockers,
-        &mut has_await,
-    );
+    collect_chain_async(node, state, &mut blocker_set, &mut local_blockers, &mut has_await);
     let blocker_indices: Vec<usize> = blocker_set.into_iter().collect();
 
     let if_stmt = build_if_chain(node, 0, state);
@@ -90,9 +84,7 @@ pub fn visit_if_block<'a>(node: &IfBlock, state: &mut ServerTransformState<'a>) 
         state.template.push(TemplateEntry::Stmt(stmt));
     }
     // `block_close` (`<!--]-->`) literal after the chain.
-    state
-        .template
-        .push(TemplateEntry::Literal(BLOCK_CLOSE.to_string()));
+    state.template.push(TemplateEntry::Literal(BLOCK_CLOSE.to_string()));
 }
 
 /// Walk the flattened chain (this IfBlock + the else-ifs that flatten into it)
@@ -142,9 +134,8 @@ fn flattens_into(elseif: &IfBlock, parent: &IfBlock, state: &ServerTransformStat
     let parent_blockers: std::collections::BTreeSet<usize> =
         expr_text_blockers(state, parent_text).into_iter().collect();
     // `has_more_blockers_than`: any blocker in `elseif` not present in `parent`.
-    let instance_ok = expr_text_blockers(state, elseif_text)
-        .into_iter()
-        .all(|b| parent_blockers.contains(&b));
+    let instance_ok =
+        expr_text_blockers(state, elseif_text).into_iter().all(|b| parent_blockers.contains(&b));
     if !instance_ok {
         return false;
     }
@@ -152,27 +143,26 @@ fn flattens_into(elseif: &IfBlock, parent: &IfBlock, state: &ServerTransformStat
     // local blocker the parent test does not already carry stays a SEPARATE
     // IfBlock (it gets its own `async_block` wrap when re-visited).
     let parent_local: std::collections::BTreeSet<String> =
-        expr_local_const_blockers(state, parent_text)
-            .into_iter()
-            .collect();
-    expr_local_const_blockers(state, elseif_text)
-        .into_iter()
-        .all(|b| parent_local.contains(&b))
+        expr_local_const_blockers(state, parent_text).into_iter().collect();
+    expr_local_const_blockers(state, elseif_text).into_iter().all(|b| parent_local.contains(&b))
 }
 
 /// Build the `if (...) {...} else if (...) {...} else {...}` statement for an
 /// IfBlock, walking the FLATTENABLE `{:else if}` chain and assigning branch
 /// markers `<!--[0-->`, `<!--[1-->`, … and the final `<!--[-1-->`.
 fn build_if_chain<'a>(
-    node: &IfBlock,
+    node: &IfBlock<'a>,
     consequent_marker_index: i32,
     state: &mut ServerTransformState<'a>,
 ) -> Statement<'a> {
     let b = state.b;
     let test = build_test(node, state);
 
-    // Consequent block, with its branch marker unshifted to the front.
+    // Consequent block, with its branch marker unshifted to the front. Its
+    // `{@const}` declarations live in the consequent's own scope.
+    let saved = state.enter_template_scope(node.start);
     let consequent = build_branch_block(&node.consequent, consequent_marker_index, state);
+    state.restore_scope(saved);
 
     // Resolve the alternate.
     let alternate = build_alternate(node, consequent_marker_index + 1, state);
@@ -187,12 +177,26 @@ fn build_test<'a>(
     node: &IfBlock,
     state: &mut ServerTransformState<'a>,
 ) -> oxc_ast::ast::Expression<'a> {
-    if let Some(text) = state.expr_source(&node.test)
+    let mut test = if let Some(text) = state.expr_source(&node.test)
         && text_has_await(text)
     {
-        return save_wrap_expr_text(state, text);
+        save_wrap_expr_text(state, text)
+    } else {
+        state.visit_expr_claiming(&node.test)
+    };
+    if let (Some(start), Some(end)) = (node.test.start(), node.test.end()) {
+        // Upstream's cursor drops a leading line comment in an if header: the
+        // newline ends that comment before the rebuilt test is encountered.
+        let header = state.source.get((node.start + 5) as usize..end as usize).unwrap_or_default();
+        if !header.contains("//") {
+            state.place_template_expression_comments(
+                (node.start + 5, end),
+                (start, end),
+                &mut test,
+            );
+        }
     }
-    state.visit_expr(&node.test)
+    test
 }
 
 /// Build the `else` arm. If `frag` is a single FLATTENABLE `{:else if}` (nested
@@ -203,24 +207,29 @@ fn build_test<'a>(
 /// is re-visited via [`build_fragment_body`], producing its OWN
 /// `create_child_block` wrap + `<!--]-->` close.
 fn build_alternate<'a>(
-    node: &IfBlock,
+    node: &IfBlock<'a>,
     next_marker_index: i32,
     state: &mut ServerTransformState<'a>,
 ) -> Statement<'a> {
     let b = state.b;
 
     if let Some(frag) = node.alternate.as_ref() {
+        // The alternate fragment owns its own scope (an if-block owns two).
+        let saved = state.enter_if_alternate_scope(node.start);
         // A single FLATTENABLE `{:else if}` recurses inline as `else if`.
-        if let Some(nested) = single_elseif(frag)
+        let out = if let Some(nested) = single_elseif(frag)
             && flattens_into(nested, node, state)
         {
-            return build_if_chain(nested, next_marker_index, state);
-        }
-        // Otherwise a terminal `else { <!--[-1--> ... }` — either a real
-        // `{:else}` body, or a NON-flattening else-if (await / new blockers)
-        // living in the fragment as a nested IfBlock that `build_fragment_body`
-        // re-visits, producing its OWN `create_child_block` wrap + `<!--]-->`.
-        return build_branch_block(frag, -1, state);
+            build_if_chain(nested, next_marker_index, state)
+        } else {
+            // Otherwise a terminal `else { <!--[-1--> ... }` — either a real
+            // `{:else}` body, or a NON-flattening else-if (await / new blockers)
+            // living in the fragment as a nested IfBlock that `build_fragment_body`
+            // re-visits, producing its OWN `create_child_block` wrap + `<!--]-->`.
+            build_branch_block(frag, -1, state)
+        };
+        state.restore_scope(saved);
+        return out;
     }
 
     // No alternate at all — upstream still emits `else { $$renderer.push('<!--[-1-->'); }`.
@@ -230,12 +239,9 @@ fn build_alternate<'a>(
 
 /// If `frag`'s single meaningful child is an `{:else if}` IfBlock (`elseif ==
 /// true`), return it; otherwise `None` (a real `{:else}` body).
-fn single_elseif(frag: &Fragment) -> Option<&IfBlock> {
-    let meaningful: Vec<&TemplateNode> = frag
-        .nodes
-        .iter()
-        .filter(|n| !is_whitespace_text(n))
-        .collect();
+fn single_elseif<'a, 'b>(frag: &'a Fragment<'b>) -> Option<&'a IfBlock<'b>> {
+    let meaningful: Vec<&TemplateNode> =
+        frag.nodes.iter().filter(|n| !is_whitespace_text(n)).collect();
     if meaningful.len() == 1
         && let TemplateNode::IfBlock(inner) = meaningful[0]
         && inner.elseif
@@ -252,12 +258,12 @@ fn is_whitespace_text(node: &TemplateNode) -> bool {
 /// Build a branch `BlockStatement` for `frag`, with the branch marker push
 /// (`$$renderer.push('<!--[N-->')`) unshifted to the front of the body.
 fn build_branch_block<'a>(
-    frag: &Fragment,
+    frag: &Fragment<'a>,
     marker_index: i32,
     state: &mut ServerTransformState<'a>,
 ) -> Statement<'a> {
     // IfBlock consequent/alternate is NOT an `is_text_first` parent.
-    let mut body = build_fragment_body(frag, false, false, state);
+    let mut body = build_fragment_body(&frag.nodes, false, false, state);
     let marker = marker_push(state.b, marker_index);
     body.insert(0, marker);
     state.b.block(body)

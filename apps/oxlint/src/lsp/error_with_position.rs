@@ -1,4 +1,4 @@
-use std::{borrow::Cow, path::Path};
+use std::borrow::Cow;
 
 use oxc_span::Span;
 use tower_lsp_server::ls_types::{
@@ -77,7 +77,6 @@ fn severity_to_lsp_severity(value: Severity) -> DiagnosticSeverity {
 pub fn message_to_lsp_diagnostic(
     message: Message,
     uri: &Uri,
-    path: &Path,
     source_text: &str,
     rules_customization: Option<&RulesCustomization>,
 ) -> Option<DiagnosticReport> {

@@ -7,7 +7,15 @@
 //!
 //! Corresponds to `transform_body()` in `svelte/packages/svelte/src/compiler/phases/3-transform/shared/transform-async.js`
 
+use crate::compiler::phases::phase3_transform::shared::js_scan::code_bytes;
+use crate::compiler::utils::{is_js_ident_continue, is_js_ident_start};
 use memchr::memmem;
+use oxc_allocator::Allocator;
+use oxc_ast::ast::{ArrowFunctionExpression, AwaitExpression, Function};
+use oxc_ast_visit::Visit;
+use oxc_parser::{ParseOptions, Parser};
+use oxc_span::SourceType;
+use oxc_syntax::scope::ScopeFlags;
 use std::fmt::Write as _;
 
 /// Result of the async body transformation.
@@ -36,16 +44,18 @@ pub fn compute_blocker_map(raw_script: &str) -> rustc_hash::FxHashMap<String, us
     }
 
     let statements = split_top_level_statements(trimmed);
+    let uncommented_statements: Vec<String> =
+        statements.iter().map(|stmt| split_leading_comments(stmt.trim()).1.to_string()).collect();
 
     // First pass: collect all declared variable names from the entire script.
     // This is used to identify which referenced identifiers are instance-scope variables.
-    let all_declared_vars = collect_all_declared_variables(&statements);
+    let all_declared_vars = collect_all_declared_variables(&uncommented_statements);
 
     // Collect function bodies by name for transitive dependency resolution.
     // When a function is called from an async thunk, all variables referenced in that
     // function's body should also be considered blocked (the official compiler traces
     // mutations through function calls via its AST-based dependency analysis).
-    let function_bodies = collect_function_bodies(&statements);
+    let function_bodies = collect_function_bodies(&uncommented_statements);
 
     // Collect variable initializer expressions by binding name. Mirrors the
     // upstream `touch` walk through `binding.assignments`: when a later async
@@ -53,7 +63,7 @@ pub fn compute_blocker_map(raw_script: &str) -> rustc_hash::FxHashMap<String, us
     // which transitively pulls in every identifier referenced by `x`'s init
     // (e.g. `let b = $derived(await delay(a * 2))` makes `a` reachable from
     // anywhere that reads `b`). Used by `apply_blocker_with_transitive`.
-    let var_init_map = collect_var_init_map(&statements);
+    let var_init_map = collect_var_init_map(&uncommented_statements);
 
     let mut found_await = false;
     let mut blocker_map = rustc_hash::FxHashMap::default();
@@ -75,6 +85,7 @@ pub fn compute_blocker_map(raw_script: &str) -> rustc_hash::FxHashMap<String, us
 
     for stmt in &statements {
         let trimmed_stmt = stmt.trim();
+        let (_, trimmed_stmt) = split_leading_comments(trimmed_stmt);
         if trimmed_stmt.is_empty() {
             continue;
         }
@@ -311,10 +322,7 @@ pub fn compute_blocker_primary_names(
                 if decl.hoist_only {
                     continue;
                 }
-                names
-                    .entry(current_async_index)
-                    .or_default()
-                    .insert(decl.name.clone());
+                names.entry(current_async_index).or_default().insert(decl.name.clone());
             }
         }
         // Non-declaration async statements don't add primary bindings; only
@@ -388,18 +396,9 @@ pub fn enrich_blocker_map_with_transitive_deps(
     }
 }
 
-/// Transform the instance script body for async components.
+/// Transform the instance script body into a sync/async split.
 ///
-/// Takes the already-transformed script text (after rune transforms, etc.)
-/// and splits it at the first top-level `await`.
-///
-/// # Arguments
-/// * `script` - The already-transformed instance script text
-/// * `runner` - The runner expression (e.g., "$.run" for client, "$$renderer.run" for server)
-/// * `dev` - Whether dev mode is enabled (affects await wrapping with $.track_reactivity_loss)
-///
-/// # Returns
-/// The transformed script with sync/async split, or None if no top-level await found.
+/// Returns `None` if no top-level await is found.
 pub fn transform_async_body(script: &str, runner: &str) -> Option<AsyncBodyResult> {
     transform_async_body_inner(script, runner, false)
 }
@@ -407,6 +406,166 @@ pub fn transform_async_body(script: &str, runner: &str) -> Option<AsyncBodyResul
 /// Transform async body with dev mode support.
 pub fn transform_async_body_dev(script: &str, runner: &str, dev: bool) -> Option<AsyncBodyResult> {
     transform_async_body_inner(script, runner, dev)
+}
+
+fn separate_restored_async_derived_hoist(transformed: &mut String, hoisted_pos: usize) {
+    if let Some(relative_end) = transformed[hoisted_pos..].find(';') {
+        let statement_end = hoisted_pos + relative_end + 1;
+        let following = &transformed[statement_end..];
+        if following.starts_with('\n')
+            && !following.starts_with("\n\n")
+            && following.trim_start().starts_with("var $$promises")
+        {
+            transformed.insert(statement_end, '\n');
+        }
+    }
+
+    let line_start = transformed[..hoisted_pos].rfind('\n').map_or(0, |newline| newline + 1);
+    let previous = transformed[..line_start].trim_end();
+    if !previous.is_empty()
+        && !previous.ends_with('{')
+        && !transformed[..line_start].ends_with("\n\n")
+    {
+        transformed.insert(line_start, '\n');
+    }
+}
+
+/// Reattach `svelte-ignore` comments that an AST lowering has detached before
+/// this text transform can hoist the declaration.
+pub fn restore_async_derived_ignore_comments(source: &str, mut transformed: String) -> String {
+    let mut search_from = 0;
+    while let Some(relative) = source[search_from..].find("svelte-ignore ") {
+        let ignore = search_from + relative;
+        let next_search = ignore + "svelte-ignore ".len();
+        let comment_start = [source[..ignore].rfind("/*"), source[..ignore].rfind("//")]
+            .into_iter()
+            .flatten()
+            .max();
+        let Some(comment_start) = comment_start else {
+            search_from = next_search;
+            continue;
+        };
+        let comment_end = if source[comment_start..].starts_with("/*") {
+            source[comment_start..].find("*/").map(|end| comment_start + end + 2)
+        } else {
+            source[comment_start..].find('\n').map(|end| comment_start + end).or(Some(source.len()))
+        };
+        let Some(comment_end) = comment_end else {
+            break;
+        };
+        let rest = source[comment_end..].trim_start();
+        let Some(declaration) = split_top_level_statements(rest).into_iter().next() else {
+            search_from = comment_end.max(next_search);
+            continue;
+        };
+        if !declaration.contains("= $derived(") && !declaration.contains("= $derived.by(") {
+            search_from = comment_end.max(next_search);
+            continue;
+        }
+        let Some(name) = extract_var_declarations(&declaration)
+            .first()
+            .map(|declaration| declaration.name.clone())
+        else {
+            search_from = comment_end.max(next_search);
+            continue;
+        };
+        let comment = &source[comment_start..comment_end];
+        let hoisted = format!("var {comment} {name};");
+        if transformed.contains(&hoisted) {
+            search_from = comment_end.max(next_search);
+            continue;
+        }
+        let hoisted_pos = [format!("var {name};"), format!("var {name},")]
+            .iter()
+            .find_map(|needle| transformed.find(needle));
+        if let Some(pos) = hoisted_pos {
+            // The AST printer may retain the source comment beside `$$promises`.
+            // It belongs on the declaration hoisted by the async-body transform.
+            transformed = transformed.replace(comment, "");
+            let suffix = if comment.starts_with("//") {
+                format!("{comment}\n")
+            } else {
+                format!("{comment} ")
+            };
+            transformed.insert_str(pos + "var ".len(), &suffix);
+            separate_restored_async_derived_hoist(&mut transformed, pos);
+        } else if let Some(pos) = ["const ", "let ", "var "]
+            .iter()
+            .find_map(|kind| transformed.find(&format!("{kind}{name} = await $.async_derived")))
+        {
+            transformed = transformed.replace(comment, "");
+            transformed.insert_str(pos, &format!("{comment}\n"));
+        }
+        search_from = comment_end.max(next_search);
+    }
+
+    transformed
+}
+
+/// Module declarations are not hoisted through the async body, so their
+/// `svelte-ignore` comments are consumed with the source declaration.
+pub fn strip_module_async_derived_ignore_comments(source: &str, mut transformed: String) -> String {
+    let mut search_from = 0;
+    while let Some(relative) = source[search_from..].find("svelte-ignore ") {
+        let ignore = search_from + relative;
+        let next_search = ignore + "svelte-ignore ".len();
+        let comment_start = [source[..ignore].rfind("/*"), source[..ignore].rfind("//")]
+            .into_iter()
+            .flatten()
+            .max();
+        let Some(comment_start) = comment_start else {
+            search_from = next_search;
+            continue;
+        };
+        let comment_end = if source[comment_start..].starts_with("/*") {
+            source[comment_start..].find("*/").map(|end| comment_start + end + 2)
+        } else {
+            source[comment_start..].find('\n').map(|end| comment_start + end).or(Some(source.len()))
+        };
+        let Some(comment_end) = comment_end else {
+            break;
+        };
+        let rest = source[comment_end..].trim_start();
+        let Some(declaration) = split_top_level_statements(rest).into_iter().next() else {
+            search_from = comment_end.max(next_search);
+            continue;
+        };
+        if !declaration.contains("= $derived(") && !declaration.contains("= $derived.by(") {
+            search_from = comment_end.max(next_search);
+            continue;
+        }
+        transformed = transformed.replace(&source[comment_start..comment_end], "");
+        search_from = comment_end.max(next_search);
+    }
+
+    transformed
+}
+
+/// Whether `stmt` IS one of the internal async placeholder statements for
+/// `marker` — the WHOLE statement, not a substring. The compiler only ever
+/// emits `/* $$marker */`, `/* $$marker:args */` (each optionally followed by
+/// `;`) or a bare `($$marker);` / `$$marker;` reference statement. User source
+/// that merely CONTAINS the marker text — a string literal, a template — must
+/// never match, or its declarations are silently deleted (#3032).
+pub(crate) fn is_placeholder_stmt(stmt: &str, marker: &str) -> bool {
+    let t = stmt.trim();
+    let t = t.trim_end_matches(';').trim_end();
+    if let Some(rest) = t.strip_prefix("/*") {
+        let Some(inner) = rest.strip_suffix("*/") else {
+            return false;
+        };
+        let inner = inner.trim();
+        return inner == marker || inner.strip_prefix(marker).is_some_and(|r| r.starts_with(':'));
+    }
+    let bare = t.strip_prefix('(').and_then(|x| x.strip_suffix(')')).unwrap_or(t).trim();
+    bare == marker
+}
+
+/// [`is_placeholder_stmt`] over every internal async placeholder marker.
+pub(crate) fn is_any_async_placeholder_stmt(stmt: &str) -> bool {
+    ["$$async_hole", "$$inspect_hole", "$$async_void_noop", "$$async_noop"]
+        .iter()
+        .any(|m| is_placeholder_stmt(stmt, m))
 }
 
 fn transform_async_body_inner(script: &str, runner: &str, dev: bool) -> Option<AsyncBodyResult> {
@@ -435,26 +594,10 @@ fn transform_async_body_inner(script: &str, runner: &str, dev: bool) -> Option<A
             continue;
         }
 
-        // Strip leading single-line comment lines from the statement.
-        // The statement splitter may combine a `// comment` line with the following
-        // code line into one statement. We need to process the code, not skip it.
-        let trimmed_stmt = {
-            let mut s = trimmed_stmt;
-            loop {
-                if s.starts_with("//") {
-                    // Skip to end of this comment line
-                    if let Some(nl) = s.find('\n') {
-                        s = s[nl + 1..].trim();
-                    } else {
-                        // Entire statement is a comment — skip
-                        s = "";
-                        break;
-                    }
-                } else {
-                    break;
-                }
-            }
-            s
+        let (leading_comments, trimmed_stmt) = if is_any_async_placeholder_stmt(trimmed_stmt) {
+            ("", trimmed_stmt)
+        } else {
+            split_leading_comments(trimmed_stmt)
         };
         if trimmed_stmt.is_empty() {
             continue;
@@ -483,10 +626,7 @@ fn transform_async_body_inner(script: &str, runner: &str, dev: bool) -> Option<A
         // leak into the prelude as a literal `$$async_hole;` statement. (The
         // post-await case is handled below as a `Hole` thunk; a `$$inspect_hole`
         // is intentionally NOT dropped here — a removed `$inspect` keeps its `;;`.)
-        if !found_await
-            && !has_await
-            && memmem::find(trimmed_stmt.as_bytes(), b"$$async_hole").is_some()
-        {
+        if !found_await && !has_await && is_placeholder_stmt(trimmed_stmt, "$$async_hole") {
             continue;
         }
 
@@ -512,8 +652,8 @@ fn transform_async_body_inner(script: &str, runner: &str, dev: bool) -> Option<A
             // `$effect` hole; only the no-await sync-prelude case differs, and
             // that never reaches this transform).
             // Produces an array hole (empty slot) in the thunk array.
-            if memmem::find(trimmed_stmt.as_bytes(), b"$$async_hole").is_some()
-                || memmem::find(trimmed_stmt.as_bytes(), b"$$inspect_hole").is_some()
+            if is_placeholder_stmt(trimmed_stmt, "$$async_hole")
+                || is_placeholder_stmt(trimmed_stmt, "$$inspect_hole")
             {
                 // Extract args if present (for blocker_map tracking)
                 let args = if let Some(colon_pos) =
@@ -538,7 +678,7 @@ fn transform_async_body_inner(script: &str, runner: &str, dev: bool) -> Option<A
 
             // Handle async void noop placeholder (from $effect() removed on server)
             // Format: /* $$async_void_noop */
-            if memmem::find(trimmed_stmt.as_bytes(), b"$$async_void_noop").is_some() {
+            if is_placeholder_stmt(trimmed_stmt, "$$async_void_noop") {
                 async_stmts.push(AsyncStmt {
                     kind: AsyncStmtKind::VoidNoop,
                     has_await: false,
@@ -549,7 +689,7 @@ fn transform_async_body_inner(script: &str, runner: &str, dev: bool) -> Option<A
 
             // Handle async noop placeholder (from $props() that transformed to empty)
             // Format: /* $$async_noop */ or /* $$async_noop:var1,var2 */
-            if memmem::find(trimmed_stmt.as_bytes(), b"$$async_noop").is_some() {
+            if is_placeholder_stmt(trimmed_stmt, "$$async_noop") {
                 // Extract variable names for hoisting if present
                 if let Some(colon_pos) = memmem::find(trimmed_stmt.as_bytes(), b"$$async_noop:") {
                     let start = colon_pos + 13; // "$$async_noop:".len()
@@ -577,8 +717,17 @@ fn transform_async_body_inner(script: &str, runner: &str, dev: bool) -> Option<A
                 let decls = extract_var_declarations(trimmed_stmt);
 
                 // Hoist all variable names
+                let mut first_hoisted = true;
                 for decl in &decls {
-                    hoisted_vars.push(decl.name.clone());
+                    if decl.name.starts_with("$$") {
+                        continue;
+                    }
+                    if first_hoisted && !leading_comments.is_empty() {
+                        hoisted_vars.push(format!("{leading_comments} {}", decl.name));
+                    } else {
+                        hoisted_vars.push(decl.name.clone());
+                    }
+                    first_hoisted = false;
                 }
 
                 // Separate non-hoist-only decls for thunk generation
@@ -596,6 +745,19 @@ fn transform_async_body_inner(script: &str, runner: &str, dev: bool) -> Option<A
                         analyzer_has_await: has_await_in_init,
                     });
                 } else if active_decls.len() > 1 {
+                    if active_decls
+                        .iter()
+                        .all(|decl| decl.init.as_ref().is_some_and(|init| has_await_in_expr(init)))
+                    {
+                        for decl in active_decls {
+                            async_stmts.push(AsyncStmt {
+                                kind: AsyncStmtKind::VarDecl(decl),
+                                has_await: true,
+                                analyzer_has_await: true,
+                            });
+                        }
+                        continue;
+                    }
                     // Multiple declarators from same statement: group into a block thunk.
                     // This handles patterns like:
                     //   let $$d = await ..., squared = ..., cubed = ...;
@@ -769,10 +931,7 @@ fn transform_async_body_inner(script: &str, runner: &str, dev: bool) -> Option<A
         output.push_str("]);\n");
     }
 
-    Some(AsyncBodyResult {
-        output,
-        blocker_map,
-    })
+    Some(AsyncBodyResult { output, blocker_map })
 }
 
 struct VarDecl {
@@ -1127,10 +1286,7 @@ fn build_thunk(stmt: &AsyncStmt, dev: bool) -> String {
             if dev {
                 // In dev mode, wrap with $.track_reactivity_loss to track reactivity loss
                 // Reference: AwaitExpression.js - non-pickled awaits in dev mode
-                format!(
-                    "async () => void (await $.track_reactivity_loss({}))()",
-                    expr
-                )
+                format!("async () => void (await $.track_reactivity_loss({}))()", expr)
             } else if let Some(name) = unthunk_bare_call(expr) {
                 // Upstream `b.thunk` calls `unthunk(() => name())` which collapses
                 // bare zero-arg identifier calls to just the callee. Matches
@@ -1213,11 +1369,43 @@ fn build_thunk(stmt: &AsyncStmt, dev: bool) -> String {
 
 /// Check if a statement (not looking into nested functions) contains a top-level `await`.
 fn has_top_level_await(s: &str) -> bool {
-    has_await_at_depth(s, true)
+    has_top_level_await_ast(s).unwrap_or_else(|| has_await_at_depth(s, true))
 }
 
 fn has_top_level_await_in_statement(s: &str) -> bool {
-    has_await_at_depth(s, true)
+    has_top_level_await_ast(s).unwrap_or_else(|| has_await_at_depth(s, true))
+}
+
+fn has_top_level_await_ast(source: &str) -> Option<bool> {
+    let allocator = Allocator::default();
+    let parsed = Parser::new(&allocator, source, SourceType::mjs())
+        .with_options(ParseOptions {
+            allow_return_outside_function: true,
+            ..ParseOptions::default()
+        })
+        .parse();
+    if parsed.panicked || !parsed.diagnostics.is_empty() {
+        return None;
+    }
+
+    struct Scan {
+        found: bool,
+    }
+
+    impl<'a> Visit<'a> for Scan {
+        fn visit_await_expression(&mut self, expr: &AwaitExpression<'a>) {
+            self.found = true;
+            oxc_ast_visit::walk::walk_await_expression(self, expr);
+        }
+
+        fn visit_function(&mut self, _: &Function<'a>, _: ScopeFlags) {}
+
+        fn visit_arrow_function_expression(&mut self, _: &ArrowFunctionExpression<'a>) {}
+    }
+
+    let mut scan = Scan { found: false };
+    scan.visit_program(&parsed.program);
+    Some(scan.found)
 }
 
 /// Check if a string contains `await` at the current nesting level
@@ -1284,7 +1472,7 @@ fn has_await_at_depth(s: &str, skip_functions: bool) -> bool {
         // Detect function/arrow boundaries
         if skip_functions && function_depth == 0 {
             // Check for `function ` or `function(`
-            if ch == b'f' && i + 8 <= len && &s[i..i + 8] == "function" {
+            if ch == b'f' && i + 8 <= len && &bytes[i..i + 8] == b"function" {
                 let next = if i + 8 < len { bytes[i + 8] } else { 0 };
                 if next == b' ' || next == b'(' || next == b'*' {
                     // This is a function declaration/expression - skip inside it
@@ -1391,11 +1579,11 @@ fn has_await_at_depth(s: &str, skip_functions: bool) -> bool {
         // Note: we only check function_depth, NOT brace_depth, because `await` inside
         // an object literal (e.g., `let d = { value: await promise }`) is still at the
         // statement's top level and requires async handling.
-        if function_depth == 0 && ch == b'a' && i + 5 <= len && &s[i..i + 5] == "await" {
+        if function_depth == 0 && ch == b'a' && i + 5 <= len && &bytes[i..i + 5] == b"await" {
             // Make sure it's a word boundary
-            let before_ok = i == 0 || !is_ident_char(bytes[i - 1]);
-            let after = if i + 5 < len { bytes[i + 5] } else { 0 };
-            let after_ok = !is_ident_char(after);
+            let before_ok = i == 0 || !s[..i].chars().next_back().is_some_and(is_js_ident_continue);
+            let after_ok =
+                i + 5 >= len || !s[i + 5..].chars().next().is_some_and(is_js_ident_continue);
             if before_ok && after_ok {
                 return true;
             }
@@ -1412,8 +1600,25 @@ fn has_await_in_expr(s: &str) -> bool {
     has_await_at_depth(s, true)
 }
 
-fn is_ident_char(c: u8) -> bool {
-    c.is_ascii_alphanumeric() || c == b'_' || c == b'$'
+fn js_ident_start_len(text: &str, i: usize) -> Option<usize> {
+    let c = text[i..].chars().next()?;
+    is_js_ident_start(c).then(|| c.len_utf8())
+}
+
+fn js_ident_continue_len(text: &str, i: usize) -> Option<usize> {
+    let c = text[i..].chars().next()?;
+    is_js_ident_continue(c).then(|| c.len_utf8())
+}
+
+fn js_identifier_end(text: &str, start: usize) -> usize {
+    let Some(first_len) = js_ident_start_len(text, start) else {
+        return start;
+    };
+    let mut end = start + first_len;
+    while let Some(len) = js_ident_continue_len(text, end) {
+        end += len;
+    }
+    end
 }
 
 /// Skip a string literal (single-quoted, double-quoted, or template literal).
@@ -1518,6 +1723,29 @@ fn skip_regex(bytes: &[u8], start: usize) -> usize {
     start + 1
 }
 
+fn split_leading_comments(mut statement: &str) -> (&str, &str) {
+    let original = statement;
+    loop {
+        statement = statement.trim_start();
+        if let Some(rest) = statement.strip_prefix("//") {
+            let Some(offset) = rest.find('\n') else {
+                return (original.trim(), "");
+            };
+            statement = &rest[offset + 1..];
+            continue;
+        }
+        if let Some(rest) = statement.strip_prefix("/*") {
+            let Some(end) = rest.find("*/") else {
+                return (original.trim(), "");
+            };
+            statement = &rest[end + 2..];
+            continue;
+        }
+        let comment_len = original.len() - statement.len();
+        return (original[..comment_len].trim(), statement);
+    }
+}
+
 /// Split a script into top-level statements.
 /// This handles semicolons, braces, and multi-line statements.
 fn split_top_level_statements(script: &str) -> Vec<String> {
@@ -1613,12 +1841,13 @@ fn split_top_level_statements(script: &str) -> Vec<String> {
                 // (e.g., `const some = { fn: () => {} }`)
                 if brace_depth == 0 && paren_depth == 0 && bracket_depth == 0 {
                     let stmt_so_far = script[stmt_start..=i].trim();
-                    let is_block_end = !stmt_so_far.starts_with("let ")
-                        && !stmt_so_far.starts_with("const ")
-                        && !stmt_so_far.starts_with("var ")
-                        && !stmt_so_far.starts_with("return ")
+                    let (_, uncommented_stmt) = split_leading_comments(stmt_so_far);
+                    let is_block_end = !uncommented_stmt.starts_with("let ")
+                        && !uncommented_stmt.starts_with("const ")
+                        && !uncommented_stmt.starts_with("var ")
+                        && !uncommented_stmt.starts_with("return ")
                         // Expression statements with object patterns (assignments)
-                        && !is_object_expr_context(stmt_so_far);
+                        && !is_object_expr_context(uncommented_stmt);
                     if is_block_end {
                         // Check if the next token is `catch` or `finally` - if so,
                         // this is a try-catch/try-finally and should NOT be split here.
@@ -1638,7 +1867,10 @@ fn split_top_level_statements(script: &str) -> Vec<String> {
                             || rest_after.starts_with("catch\n")
                             || rest_after.starts_with("finally ")
                             || rest_after.starts_with("finally{")
-                            || rest_after.starts_with("finally\n");
+                            || rest_after.starts_with("finally\n")
+                            // `do { … } while (…)` — the `while` closes the `do`.
+                            || (starts_with_keyword(stmt_so_far, "do")
+                                && starts_with_keyword(rest_after, "while"));
                         // An `else` (or `else if`) following the closing brace of
                         // an `if` consequent continues the same statement — it
                         // must not be split off, or it becomes an orphan `else`
@@ -1676,7 +1908,14 @@ fn split_top_level_statements(script: &str) -> Vec<String> {
         }
 
         // Semicolon at top level marks end of statement
-        if ch == b';' && brace_depth == 0 && paren_depth == 0 && bracket_depth == 0 {
+        if ch == b';'
+            && brace_depth == 0
+            && paren_depth == 0
+            && bracket_depth == 0
+            // A brace-less `if (a) x = 1; else …` / `do x++; while (…)` keeps
+            // going: splitting here would orphan the `else` / `while` clause.
+            && !continues_after_semicolon(script, i + 1, script[stmt_start..=i].trim())
+        {
             let stmt = script[stmt_start..=i].trim().to_string();
             if !stmt.is_empty() {
                 statements.push(stmt);
@@ -1719,6 +1958,48 @@ fn split_top_level_statements(script: &str) -> Vec<String> {
     }
 
     statements
+}
+
+/// True when `s` begins with the bare keyword `kw` (followed by a non-identifier
+/// character), rather than an identifier that merely starts with those letters.
+fn starts_with_keyword(s: &str, kw: &str) -> bool {
+    s.trim_start().strip_prefix(kw).is_some_and(|after| {
+        after.is_empty()
+            || after.starts_with(|c: char| !c.is_alphanumeric() && c != '_' && c != '$')
+    })
+}
+
+/// True when the token at `pos` continues the statement `stmt_so_far` that the
+/// top-level `;` just ended — a brace-less `if`/`else` chain, or the `while`
+/// clause of a brace-less `do`.
+fn continues_after_semicolon(script: &str, pos: usize, stmt_so_far: &str) -> bool {
+    let rest = script[pos.min(script.len())..].trim_start();
+    if starts_with_keyword(rest, "else") {
+        return true;
+    }
+    starts_with_keyword(stmt_so_far, "do") && starts_with_keyword(rest, "while")
+}
+
+/// True when `s` is a labeled statement (`outer: for (…) {…}`). Ruled out for a
+/// ternary, whose `:` can never follow the leading identifier directly.
+fn is_labeled_statement(s: &str) -> bool {
+    let s = s.trim_start();
+    let mut chars = s.char_indices();
+    let Some((_, first)) = chars.next() else {
+        return false;
+    };
+    if !(first.is_alphabetic() || first == '_' || first == '$') {
+        return false;
+    }
+    let mut end = s.len();
+    for (i, c) in chars {
+        if !(c.is_alphanumeric() || c == '_' || c == '$') {
+            end = i;
+            break;
+        }
+    }
+    let rest = s[end..].trim_start();
+    rest.starts_with(':') && !rest.starts_with("::")
 }
 
 /// Check if the text after position `pos` starts a new statement keyword.
@@ -1855,38 +2136,21 @@ fn is_function_var_declaration(s: &str) -> bool {
             || (after_eq.starts_with("(") && {
                 // Find the matching closing paren
                 let mut depth = 0;
-                let mut pos = 0;
                 let bytes = after_eq.as_bytes();
-                let mut in_string = false;
-                let mut string_char = b' ';
-                while pos < bytes.len() {
-                    let c = bytes[pos];
-                    if (c == b'"' || c == b'\'' || c == b'`')
-                        && (pos == 0 || bytes[pos - 1] != b'\\')
-                    {
-                        if !in_string {
-                            in_string = true;
-                            string_char = c;
-                        } else if c == string_char {
-                            in_string = false;
+                let mut close = None;
+                for (pos, c) in code_bytes(bytes) {
+                    if c == b'(' {
+                        depth += 1;
+                    } else if c == b')' {
+                        depth -= 1;
+                        if depth == 0 {
+                            close = Some(pos);
+                            break;
                         }
                     }
-                    if !in_string {
-                        if c == b'(' {
-                            depth += 1;
-                        } else if c == b')' {
-                            depth -= 1;
-                            if depth == 0 {
-                                // Found matching close paren - check what follows
-                                let _rest = after_eq[pos + 1..].trim_start();
-                                break;
-                            }
-                        }
-                    }
-                    pos += 1;
                 }
                 // Check what follows the closing paren
-                if depth == 0 && pos < bytes.len() {
+                if let Some(pos) = close {
                     let rest = after_eq[pos + 1..].trim_start();
                     rest.starts_with("=>")
                 } else {
@@ -1895,12 +2159,8 @@ fn is_function_var_declaration(s: &str) -> bool {
             })
             // Simple arrow: `x =>`  - check if it's an identifier followed by =>
             || {
-                let bytes = after_eq.as_bytes();
-                let mut j = 0;
-                while j < bytes.len() && is_ident_char(bytes[j]) {
-                    j += 1;
-                }
-                j > 0 && j < bytes.len() && after_eq[j..].trim_start().starts_with("=>")
+                let j = js_identifier_end(after_eq, 0);
+                j > 0 && j < after_eq.len() && after_eq[j..].trim_start().starts_with("=>")
             }
     } else {
         false
@@ -1923,11 +2183,7 @@ fn is_user_effect_call(s: &str) -> bool {
     let s = s.strip_suffix(';').unwrap_or(s).trim();
     // After transformation, $effect(...) becomes $.user_effect(...)
     // and may be wrapped in `void` e.g. `void $.user_effect(...)`
-    let check = if let Some(rest) = s.strip_prefix("void ") {
-        rest.trim()
-    } else {
-        s
-    };
+    let check = if let Some(rest) = s.strip_prefix("void ") { rest.trim() } else { s };
     // Match $effect( or $.user_effect( but NOT $effect.pre( or $.user_pre_effect(
     if check.starts_with("$effect.pre(") || check.starts_with("$.user_pre_effect(") {
         return false;
@@ -1957,6 +2213,15 @@ fn is_expression_statement(s: &str) -> bool {
     {
         // "throw" is a statement, not an expression
         // But it CAN be wrapped in a block thunk
+        return false;
+    }
+    // A bare block, a `do`/`debugger` statement and a labeled statement are all
+    // statements only: thunking them as `() => void (…)` would not parse.
+    if s.starts_with('{')
+        || starts_with_keyword(s, "do")
+        || starts_with_keyword(s, "debugger")
+        || is_labeled_statement(s)
+    {
         return false;
     }
     true
@@ -2201,38 +2466,21 @@ fn split_declarators(s: &str) -> Vec<String> {
 /// at the top nesting level in a string.
 fn find_assignment_in_str(s: &str) -> Option<usize> {
     let bytes = s.as_bytes();
-    let len = bytes.len();
-    let mut i = 0;
     let mut depth: i32 = 0; // combined nesting depth for {}, (), []
 
-    while i < len {
-        let ch = bytes[i];
-
-        // Skip strings
-        if ch == b'\'' || ch == b'"' || ch == b'`' {
-            i = skip_string(bytes, i);
-            continue;
-        }
-
+    for (i, ch) in code_bytes(bytes) {
         match ch {
             b'(' | b'[' | b'{' => depth += 1,
             b')' | b']' | b'}' => depth -= 1,
             b'=' if depth == 0 => {
                 // Check it's not ==, ===, or =>
-                let next = if i + 1 < len { bytes[i + 1] } else { 0 };
+                let next = bytes.get(i + 1).copied().unwrap_or(0);
                 if next != b'=' && next != b'>' {
                     return Some(i);
-                }
-                // Skip ==, ===
-                i += 1;
-                if next == b'=' && i + 1 < len && bytes[i + 1] == b'=' {
-                    i += 1;
                 }
             }
             _ => {}
         }
-
-        i += 1;
     }
 
     None
@@ -2389,10 +2637,11 @@ fn extract_all_identifiers_from_statement(stmt: &str) -> Vec<String> {
         }
 
         // Extract identifier tokens
-        if is_ident_start(ch) {
+        if let Some(first_len) = js_ident_start_len(stmt, i) {
             let start = i;
-            while i < len && is_ident_char(bytes[i]) {
-                i += 1;
+            i += first_len;
+            while let Some(continue_len) = js_ident_continue_len(stmt, i) {
+                i += continue_len;
             }
             let token = &stmt[start..i];
 
@@ -2407,11 +2656,6 @@ fn extract_all_identifiers_from_statement(stmt: &str) -> Vec<String> {
     }
 
     identifiers
-}
-
-/// Check if a byte can start a JS identifier (letter, underscore, or dollar sign).
-fn is_ident_start(c: u8) -> bool {
-    c.is_ascii_alphabetic() || c == b'_' || c == b'$'
 }
 
 /// Check if a token is a JavaScript keyword that should be excluded from identifier extraction.
@@ -2709,16 +2953,8 @@ fn extract_function_decl_name(s: &str) -> Option<String> {
         r.trim()
     };
 
-    let mut i = 0;
-    let bytes = rest.as_bytes();
-    while i < bytes.len() && is_ident_char(bytes[i]) {
-        i += 1;
-    }
-    if i > 0 {
-        Some(rest[..i].to_string())
-    } else {
-        None
-    }
+    let i = js_identifier_end(rest, 0);
+    if i > 0 { Some(rest[..i].to_string()) } else { None }
 }
 
 /// Extract the class name from a top-level `class Foo {…}` /
@@ -2728,11 +2964,7 @@ fn extract_function_decl_name(s: &str) -> Option<String> {
 fn extract_class_decl_name(s: &str) -> Option<String> {
     let rest = s.trim().strip_prefix("class ")?;
     let rest = rest.trim_start();
-    let bytes = rest.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() && is_ident_char(bytes[i]) {
-        i += 1;
-    }
+    let i = js_identifier_end(rest, 0);
     if i == 0 {
         return None;
     }
@@ -2757,16 +2989,8 @@ fn extract_var_decl_name(s: &str) -> Option<String> {
         s.strip_prefix("var ")?
     };
     let rest = rest.trim();
-    let mut i = 0;
-    let bytes = rest.as_bytes();
-    while i < bytes.len() && is_ident_char(bytes[i]) {
-        i += 1;
-    }
-    if i > 0 {
-        Some(rest[..i].to_string())
-    } else {
-        None
-    }
+    let i = js_identifier_end(rest, 0);
+    if i > 0 { Some(rest[..i].to_string()) } else { None }
 }
 
 /// Resolve transitive function dependencies.
@@ -2870,6 +3094,112 @@ mod tests {
     use super::*;
 
     #[test]
+    fn restores_ignore_comment_from_promise_prelude_to_hoisted_declaration() {
+        let source = "/* svelte-ignore await_waterfall */ const a = $derived(await p);";
+        let transformed = concat!(
+            "var a;\n",
+            "/* svelte-ignore await_waterfall */\n",
+            "var $$promises = $.run([async () => (a = await $.async_derived(() => p))]);"
+        );
+
+        assert_eq!(
+            restore_async_derived_ignore_comments(source, transformed.to_string()),
+            "var /* svelte-ignore await_waterfall */ a;\n\nvar $$promises = $.run([async () => (a = await $.async_derived(() => p))]);"
+        );
+    }
+
+    #[test]
+    fn restores_ignore_comment_to_a_destructured_hoist() {
+        let source = "/* svelte-ignore await_waterfall */ const { a, b } = $derived(await p);";
+        let transformed = concat!(
+            "var a, b;\n",
+            "/* svelte-ignore await_waterfall */\n",
+            "var $$promises = $.run([async () => ({ a, b } = await $.async_derived(() => p))]);"
+        );
+
+        assert_eq!(
+            restore_async_derived_ignore_comments(source, transformed.to_string()),
+            "var /* svelte-ignore await_waterfall */ a, b;\n\nvar $$promises = $.run([async () => ({ a, b } = await $.async_derived(() => p))]);"
+        );
+    }
+
+    #[test]
+    fn restores_line_ignore_comment_with_a_declaration_newline() {
+        let source = "// svelte-ignore await_waterfall\nconst a = $derived(await p);";
+        let transformed =
+            "var a;\nvar $$promises = $.run([async () => (a = await $.async_derived(() => p))]);";
+
+        assert_eq!(
+            restore_async_derived_ignore_comments(source, transformed.to_string()),
+            "var // svelte-ignore await_waterfall\na;\n\nvar $$promises = $.run([async () => (a = await $.async_derived(() => p))]);"
+        );
+    }
+
+    #[test]
+    fn restores_unrelated_ignore_comment_to_a_hoisted_declaration() {
+        let source = "// svelte-ignore state_referenced_locally\nconst a = $derived(await p);";
+        let transformed =
+            "var a;\nvar $$promises = $.run([async () => (a = await $.async_derived(() => p))]);";
+
+        assert_eq!(
+            restore_async_derived_ignore_comments(source, transformed.to_string()),
+            "var // svelte-ignore state_referenced_locally\na;\n\nvar $$promises = $.run([async () => (a = await $.async_derived(() => p))]);"
+        );
+    }
+
+    #[test]
+    fn separates_a_restored_hoist_from_a_preceding_statement() {
+        let source = "// svelte-ignore await_waterfall\nconst { a, b } = $derived(await p);";
+        let transformed = concat!(
+            "let { p } = $$props;\n",
+            "var a, b;\n",
+            "var $$promises = $.run([async () => ({ a, b } = await $.async_derived(() => p))]);"
+        );
+
+        assert_eq!(
+            restore_async_derived_ignore_comments(source, transformed.to_string()),
+            concat!(
+                "let { p } = $$props;\n\n",
+                "var // svelte-ignore await_waterfall\n",
+                "a, b;\n\n",
+                "var $$promises = $.run([async () => ({ a, b } = await $.async_derived(() => p))]);"
+            )
+        );
+    }
+
+    #[test]
+    fn strips_ignore_comment_from_a_module_async_derived_declaration() {
+        let source = "/* svelte-ignore await_waterfall */ const a = $derived(await p);";
+        let transformed =
+            "/* svelte-ignore await_waterfall */ const a = await $.async_derived(() => p);";
+
+        assert_eq!(
+            strip_module_async_derived_ignore_comments(source, transformed.to_string()),
+            " const a = await $.async_derived(() => p);"
+        );
+    }
+
+    #[test]
+    fn unrelated_line_ignore_after_block_comment_makes_progress() {
+        let source = concat!(
+            "/** prior */\n",
+            "let x = $state(0);\n",
+            "// svelte-ignore state_referenced_locally\n",
+            "const y = x;"
+        );
+        let transformed = "let x = $.state(0);\nconst y = $.get(x);";
+
+        assert_eq!(
+            restore_async_derived_ignore_comments(source, transformed.to_string()),
+            transformed
+        );
+        assert_eq!(
+            strip_module_async_derived_ignore_comments(source, transformed.to_string()),
+            transformed
+        );
+    }
+
+    #[test]
     fn test_simple_await_expression() {
         let script = "await 1;";
         let result = transform_async_body(script, "$.run").unwrap();
@@ -2888,6 +3218,56 @@ mod tests {
     }
 
     #[test]
+    fn splits_multi_declarator_async_entries() {
+        let script = "const a = await p, b = await q;";
+        let result = transform_async_body(script, "$.run").unwrap();
+
+        assert!(result.output.contains("async () => a = await p"));
+        assert!(result.output.contains("async () => b = await q"));
+        assert!(!result.output.contains("async () => {"));
+    }
+
+    #[test]
+    fn block_inline_comment_keeps_async_derived_blocker() {
+        let script =
+            "/* svelte-ignore await_waterfall */ const a = await $.async_derived(() => p);";
+        let result = transform_async_body(script, "$.run").unwrap();
+
+        assert_eq!(result.blocker_map.get("a"), Some(&0));
+    }
+
+    #[test]
+    fn raw_block_inline_comment_keeps_async_derived_blocker() {
+        let script = "/* svelte-ignore await_waterfall */ const a = $derived(await p);";
+
+        assert_eq!(compute_blocker_map(script).get("a"), Some(&0));
+    }
+
+    #[test]
+    fn raw_block_inline_comment_keeps_destructured_async_derived_blockers() {
+        let script = "/* svelte-ignore await_waterfall */ const { a, b } = $derived(await p);";
+        let blockers = compute_blocker_map(script);
+
+        let declarations = extract_var_declarations("const { a, b } = $derived(await p);");
+        assert_eq!(
+            declarations.iter().map(|declaration| declaration.name.as_str()).collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+        assert!(!declarations[0].hoist_only);
+        assert!(has_top_level_await(script));
+        assert!(has_top_level_await_in_statement("const { a, b } = $derived(await p);"));
+        assert_eq!(
+            split_top_level_statements(script)
+                .iter()
+                .map(|statement| split_leading_comments(statement.trim()).1.trim())
+                .collect::<Vec<_>>(),
+            ["const { a, b } = $derived(await p);"]
+        );
+        assert_eq!(blockers.get("a"), Some(&0));
+        assert_eq!(blockers.get("b"), Some(&0));
+    }
+
+    #[test]
     fn test_no_await() {
         let script = "let x = 1;\nlet y = 2;";
         assert!(transform_async_body(script, "$.run").is_none());
@@ -2902,14 +3282,59 @@ mod tests {
     }
 
     #[test]
+    fn function_initializer_ignores_comment_assignment_marker() {
+        for declaration in [
+            "const callback /* = */ = (value) => value;",
+            "const callback = (/* ) */ value) => value;",
+        ] {
+            assert!(is_function_var_declaration(declaration), "{declaration}");
+        }
+
+        let script = concat!(
+            "await load();\n",
+            "const callback /* = */ = (value) => value;\n",
+            "const result = await load_again();"
+        );
+        let result = transform_async_body(script, "$.run").unwrap();
+        assert!(
+            result.output.starts_with("const callback /* = */ = (value) => value;"),
+            "function initializer must remain in the sync prelude: {}",
+            result.output
+        );
+    }
+
+    #[test]
     fn test_await_in_var_decl() {
         let script = "let data = await fetch('/api');";
         let result = transform_async_body(script, "$.run").unwrap();
         assert!(result.output.contains("var data;"));
+        assert!(result.output.contains("async () => data = await fetch('/api')"));
+    }
+
+    #[test]
+    fn test_leading_block_comment_on_async_var_declaration() {
+        let script = "/* keep */ const value = await $.async_derived(() => fetch());";
+        let result = transform_async_body(script, "$.run").unwrap();
         assert!(
-            result
-                .output
-                .contains("async () => data = await fetch('/api')")
+            result.output.contains("async () => value = await $.async_derived"),
+            "async declaration was not classified as a declaration: {}",
+            result.output
+        );
+        assert!(
+            !result.output.contains("void (/*"),
+            "a declaration must not be emitted as a void expression: {}",
+            result.output
+        );
+    }
+
+    #[test]
+    fn test_inspect_hole_remains_an_async_slot() {
+        let script = "let data = await Promise.resolve(42);\n/* $$inspect_hole */";
+        let result = transform_async_body(script, "$.run").unwrap();
+        assert!(
+            result.output.contains("() => void 0"),
+            "inspect hole was dropped: {}",
+            result.output
         );
     }
 
@@ -2951,6 +3376,27 @@ mod tests {
     }
 
     #[test]
+    fn generated_destructuring_temp_stays_inside_async_thunk() {
+        let script = concat!(
+            "const $$d = await $.async_derived(() => source), ",
+            "a = $.derived(() => $.get($$d).a), ",
+            "b = $.derived(() => $.get($$d).b);"
+        );
+        let result = transform_async_body(script, "$.run").unwrap();
+
+        assert!(
+            result.output.starts_with("var a, b;"),
+            "only user bindings belong in the outer var list: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("var $$d = await $.async_derived(() => source);"),
+            "the generated temp must stay local to its async thunk: {}",
+            result.output
+        );
+    }
+
+    #[test]
     fn test_asi_statement_boundary() {
         // Test that $.effect() without semicolon is properly split from the next `let`
         let script = "await Promise.resolve();\n$.effect(() => console.log(value))\nlet value = $.state('value');";
@@ -2967,9 +3413,7 @@ mod tests {
         );
         // The output should NOT mix $.effect into the let declaration
         assert!(
-            !result
-                .output
-                .contains("$.effect(() => console.log(value))\nlet"),
+            !result.output.contains("$.effect(() => console.log(value))\nlet"),
             "Should split $.effect and let into separate statements. Output: {}",
             result.output
         );
@@ -3004,21 +3448,13 @@ mod tests {
         let script = "let foo = false;\nlet blocking = await $.async_derived(() => foo);\nlet bar = Promise.resolve(true);";
         let map = compute_blocker_map(script);
 
-        assert!(
-            map.contains_key("blocking"),
-            "Should contain 'blocking'. Map: {:?}",
-            map
-        );
+        assert!(map.contains_key("blocking"), "Should contain 'blocking'. Map: {:?}", map);
         assert!(
             map.contains_key("foo"),
             "Should contain 'foo' as a referenced variable. Map: {:?}",
             map
         );
-        assert!(
-            map.contains_key("bar"),
-            "Should contain 'bar'. Map: {:?}",
-            map
-        );
+        assert!(map.contains_key("bar"), "Should contain 'bar'. Map: {:?}", map);
 
         // foo should have the same index as blocking (both blocked by the same promise)
         assert_eq!(
@@ -3096,5 +3532,31 @@ mod tests {
         let ids = extract_all_identifiers_from_statement("$derived(await foo)");
         assert!(ids.contains(&"foo".to_string()));
         assert!(!ids.iter().any(|id| id.starts_with('$')));
+    }
+
+    #[test]
+    fn derived_by_async_callback_stays_in_sync_prelude() {
+        let script = "const a = $derived.by(async () => await p);";
+        let result = transform_async_body(script, "$.run");
+        assert!(result.is_none(), "async callback must not split its declaration");
+        assert!(compute_blocker_map(script).is_empty());
+    }
+
+    #[test]
+    fn lowered_derived_by_async_callback_is_not_top_level_await() {
+        let script = "const a = $.derived(async () => await p);";
+        assert!(!has_top_level_await(script));
+        assert!(transform_async_body(script, "$.run").is_none());
+        assert!(compute_blocker_map(script).is_empty());
+    }
+
+    #[test]
+    fn lowered_derived_by_callback_stays_sync_before_real_top_level_await() {
+        let script = "const a = $.derived(async () => await p);\nconst b = await load();";
+        let result = transform_async_body(script, "$.run").expect("real await must split the body");
+        assert!(result.output.contains("const a = $.derived(async () => await p);"));
+        assert!(result.output.contains("b = await load()"));
+        assert!(!result.blocker_map.contains_key("a"));
+        assert_eq!(result.blocker_map.get("b"), Some(&0));
     }
 }

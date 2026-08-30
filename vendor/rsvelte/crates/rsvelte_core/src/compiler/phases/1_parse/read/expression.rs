@@ -10,8 +10,9 @@
 //!
 //! - **Parser backend**: Svelte uses [Acorn](https://github.com/acornjs/acorn) for JavaScript
 //!   parsing, while this implementation uses [OXC](https://oxc.rs/) for better performance.
-//! - **AST conversion**: This module converts OXC's AST to a `serde_json::Value` format
-//!   compatible with Svelte's ESTree-based AST output.
+//! - **AST conversion**: This module converts OXC's AST into this crate's typed,
+//!   arena-allocated `JsNode`/`Expression` representation (ESTree-shaped), not a
+//!   `serde_json::Value`.
 //! - **TypeScript support**: OXC provides native TypeScript support, which is used here
 //!   to parse TypeScript expressions without additional configuration.
 //! - **Line/column tracking**: This implementation computes ESTree-style `loc` fields
@@ -22,17 +23,21 @@
 use std::cell::RefCell;
 
 use oxc_allocator::Allocator;
-use oxc_ast::ast::Expression as OxcExpression;
+use oxc_ast::ast::{Expression as OxcExpression, Program as OxcProgram};
+use oxc_diagnostics::OxcDiagnostic;
 use oxc_parser::Parser as OxcParser;
 use oxc_span::{GetSpan, SourceType};
 use serde_json::{Map, Value};
 
+use super::super::utils::TrimWs;
 use crate::ast::arena::{IdRange, ParseArena};
 use crate::ast::js::Expression;
 use crate::ast::typed_expr::{
     JsNode, LiteralValue, Loc, RegexValue, SourcePosition, TemplateElementValue,
+    alloc_deser_children, alloc_deser_node, child_node_from_value,
 };
 use crate::compiler::phases::phase1_parse::utils::find_matching_bracket;
+use crate::compiler::utils::is_escaped;
 use compact_str::CompactString;
 
 // Thread-local OXC allocator reused across all expression parses to avoid
@@ -55,6 +60,13 @@ thread_local! {
 /// the comments into `Root.comments`.
 pub(crate) fn push_expr_comment(comment: crate::ast::template::JsComment) {
     EXPR_COMMENT_SINK.with(|sink| sink.borrow_mut().push(comment));
+}
+
+/// Snapshot the per-thread expression-comment sink without draining it.
+/// Upstream's `parser.root.comments` is the same array every script parse is
+/// handed, so a script's comment walk also sees what earlier parses recorded.
+pub(crate) fn peek_expr_comments() -> Vec<crate::ast::template::JsComment> {
+    EXPR_COMMENT_SINK.with(|sink| sink.borrow().clone())
 }
 
 /// Drain the per-thread expression-comment sink. Returns all comments
@@ -80,7 +92,7 @@ where
 /// For Typed variant: returns the inner JsNode directly (zero cost).
 /// For Value variant: wraps the Value in JsNode::Raw (no clone).
 #[inline]
-fn expr_to_node(expr: Expression) -> JsNode {
+fn expr_to_node<'a>(expr: Expression<'a>) -> JsNode {
     match expr {
         Expression::Typed(te) => te.node,
         Expression::Lazy { .. } => {
@@ -167,15 +179,9 @@ fn create_comment_object(
 /// Compute `{line, column, character}` from a byte offset using line offsets.
 fn line_column_for(offset: usize, line_offsets: &[usize]) -> crate::ast::span::LineColumn {
     if line_offsets.is_empty() {
-        return crate::ast::span::LineColumn {
-            line: 1,
-            column: 0,
-            character: offset as u32,
-        };
+        return crate::ast::span::LineColumn { line: 1, column: 0, character: offset as u32 };
     }
-    let line = line_offsets
-        .partition_point(|&o| o <= offset)
-        .saturating_sub(1);
+    let line = line_offsets.partition_point(|&o| o <= offset).saturating_sub(1);
     let line_start = line_offsets.get(line).copied().unwrap_or(0);
     crate::ast::span::LineColumn {
         line: (line + 1) as u32,
@@ -210,6 +216,7 @@ fn record_oxc_comment(
         end: end as u32,
         value: compact_str::CompactString::from(value),
         loc,
+        loc_has_character: false,
     });
 }
 
@@ -220,10 +227,7 @@ fn extract_comment_value(raw: &str, kind: oxc_ast::ast::CommentKind) -> String {
     match kind {
         oxc_ast::ast::CommentKind::Line => raw.strip_prefix("//").unwrap_or(raw).to_string(),
         oxc_ast::ast::CommentKind::SingleLineBlock | oxc_ast::ast::CommentKind::MultiLineBlock => {
-            raw.strip_prefix("/*")
-                .and_then(|s| s.strip_suffix("*/"))
-                .unwrap_or(raw)
-                .to_string()
+            raw.strip_prefix("/*").and_then(|s| s.strip_suffix("*/")).unwrap_or(raw).to_string()
         }
     }
 }
@@ -241,12 +245,12 @@ fn extract_comment_value(raw: &str, kind: oxc_ast::ast::CommentKind) -> String {
 ///
 /// # Returns
 /// An empty `Identifier` node if a matching bracket is found, otherwise `None`.
-fn get_loose_identifier(
+fn get_loose_identifier<'a>(
     template: &str,
     start: usize,
     opening_token: char,
     _line_offsets: &[usize],
-) -> Option<Expression> {
+) -> Option<Expression<'a>> {
     // Find the next closing bracket and treat it as the end of the expression
     if let Some(end) = find_matching_bracket(template, start, opening_token) {
         // We don't know what the expression is and signal this by returning an empty identifier
@@ -258,6 +262,7 @@ fn get_loose_identifier(
             end: end as u32,
             loc: None,
             name: CompactString::from(""),
+            optional: false,
             type_annotation: None,
         }));
     }
@@ -281,21 +286,28 @@ fn get_loose_identifier(
 ///
 /// Returns `None` if the expression is too complex for the fast path.
 #[inline]
-fn try_parse_simple_expression(
+fn try_parse_simple_expression<'a>(
     arena: &ParseArena,
     content: &str,
     offset: usize,
     line_offsets: &[usize],
-) -> Option<Expression> {
+) -> Option<Expression<'a>> {
     let bytes = content.as_bytes();
     if bytes.is_empty() {
+        return None;
+    }
+
+    // The fast path never reaches OXC, and so never reaches the scan for the
+    // restrictions acorn applies and OXC does not. Hand anything that could
+    // carry one to the real parser instead.
+    if may_carry_acorn_violation(bytes) {
         return None;
     }
 
     let first = bytes[0];
 
     // Fast path for identifiers and member expressions (most common case)
-    if is_ident_start_byte(first) {
+    if is_ascii_ident_start_byte(first) {
         // Try simple ident/member first
         if let Some(expr) = try_parse_ident_or_member(arena, content, bytes, offset, line_offsets) {
             return Some(expr);
@@ -356,13 +368,13 @@ fn try_parse_simple_expression(
 
 /// Try to parse a unary `!expr` where expr is a simple expression.
 #[inline]
-fn try_parse_unary_not(
+fn try_parse_unary_not<'a>(
     arena: &ParseArena,
     content: &str,
     bytes: &[u8],
     offset: usize,
     line_offsets: &[usize],
-) -> Option<Expression> {
+) -> Option<Expression<'a>> {
     let inner = &content[1..];
     let inner_bytes = &bytes[1..];
     if inner_bytes.is_empty() {
@@ -385,18 +397,18 @@ fn try_parse_unary_not(
 /// Try to parse a "simple atom" - identifier, member expr, numeric, string, bool, null.
 /// This is used as a building block for compound expressions.
 #[inline]
-fn try_parse_atom(
+fn try_parse_atom<'a>(
     arena: &ParseArena,
     content: &str,
     bytes: &[u8],
     offset: usize,
     line_offsets: &[usize],
-) -> Option<Expression> {
+) -> Option<Expression<'a>> {
     if bytes.is_empty() {
         return None;
     }
     let first = bytes[0];
-    if is_ident_start_byte(first) {
+    if is_ascii_ident_start_byte(first) {
         return try_parse_ident_or_member(arena, content, bytes, offset, line_offsets);
     }
     if first.is_ascii_digit() {
@@ -414,13 +426,13 @@ fn try_parse_atom(
 /// Try to parse call expressions: `fn(arg)`, `obj.method(a, b)`
 /// Handles simple call expressions where callee is an ident/member and args are atoms.
 #[inline]
-fn try_parse_call_expression(
+fn try_parse_call_expression<'a>(
     arena: &ParseArena,
     content: &str,
     bytes: &[u8],
     offset: usize,
     line_offsets: &[usize],
-) -> Option<Expression> {
+) -> Option<Expression<'a>> {
     // Find the opening '(' - callee must be ident/member
     let paren_pos = memchr::memchr(b'(', bytes)?;
     if paren_pos == 0 {
@@ -436,7 +448,7 @@ fn try_parse_call_expression(
     // Parse callee as ident/member
     let callee_str = &content[..paren_pos];
     let callee_bytes = &bytes[..paren_pos];
-    if !is_ident_start_byte(callee_bytes[0]) {
+    if !is_ascii_ident_start_byte(callee_bytes[0]) {
         return None;
     }
     let callee = try_parse_ident_or_member(arena, callee_str, callee_bytes, offset, line_offsets)?;
@@ -445,7 +457,7 @@ fn try_parse_call_expression(
     //
     // `args_region` is the raw byte slice between `(` and `)`. `args_str` is
     // its trimmed form, used for the comma-split scan. We must add the byte
-    // count of the *leading* whitespace that `.trim()` stripped back into
+    // count of the *leading* whitespace that `.trim_ws()` stripped back into
     // every per-argument offset — otherwise multi-line argument lists like
     //
     //     {@render fn(
@@ -460,8 +472,8 @@ fn try_parse_call_expression(
     let args_start = paren_pos + 1;
     let args_end = bytes.len() - 1;
     let args_region = &content[args_start..args_end];
-    let args_str = args_region.trim();
-    let args_leading_ws = args_region.len() - args_region.trim_start().len();
+    let args_str = args_region.trim_ws();
+    let args_leading_ws = args_region.len() - args_region.trim_start_ws().len();
 
     let arguments = if args_str.is_empty() {
         Vec::new()
@@ -475,7 +487,7 @@ fn try_parse_call_expression(
 
         for (i, &b) in args_bytes.iter().enumerate() {
             if in_string != 0 {
-                if b == in_string && (i == 0 || args_bytes[i - 1] != b'\\') {
+                if b == in_string && !is_escaped(args_bytes, i) {
                     in_string = 0;
                 }
                 continue;
@@ -490,13 +502,13 @@ fn try_parse_call_expression(
                     depth -= 1;
                 }
                 b',' if depth == 0 => {
-                    let arg_str = args_str[start..i].trim();
+                    let arg_str = args_str[start..i].trim_ws();
                     let arg_bytes = arg_str.as_bytes();
                     let arg_offset = offset
                         + args_start
                         + args_leading_ws
                         + start
-                        + (args_str[start..i].len() - args_str[start..i].trim_start().len());
+                        + (args_str[start..i].len() - args_str[start..i].trim_start_ws().len());
                     let arg = try_parse_atom(arena, arg_str, arg_bytes, arg_offset, line_offsets)?;
                     args.push(expr_to_node(arg));
                     start = i + 1;
@@ -508,14 +520,14 @@ fn try_parse_call_expression(
             return None;
         }
         // Last argument
-        let arg_str = args_str[start..].trim();
+        let arg_str = args_str[start..].trim_ws();
         if !arg_str.is_empty() {
             let arg_bytes = arg_str.as_bytes();
             let arg_offset = offset
                 + args_start
                 + args_leading_ws
                 + start
-                + (args_str[start..].len() - args_str[start..].trim_start().len());
+                + (args_str[start..].len() - args_str[start..].trim_start_ws().len());
             let arg = try_parse_atom(arena, arg_str, arg_bytes, arg_offset, line_offsets)?;
             args.push(expr_to_node(arg));
         }
@@ -535,13 +547,13 @@ fn try_parse_call_expression(
 
 /// Try to parse update expressions: `count++`, `count--`, `++count`, `--count`
 #[inline]
-fn try_parse_update_expression(
+fn try_parse_update_expression<'a>(
     arena: &ParseArena,
     content: &str,
     bytes: &[u8],
     offset: usize,
     line_offsets: &[usize],
-) -> Option<Expression> {
+) -> Option<Expression<'a>> {
     let len = bytes.len();
     if len < 3 {
         return None;
@@ -551,7 +563,7 @@ fn try_parse_update_expression(
     if bytes[len - 2] == bytes[len - 1] && (bytes[len - 1] == b'+' || bytes[len - 1] == b'-') {
         let arg_str = &content[..len - 2];
         let arg_bytes = &bytes[..len - 2];
-        if !arg_str.is_empty() && is_ident_start_byte(arg_bytes[0]) {
+        if !arg_str.is_empty() && is_ascii_ident_start_byte(arg_bytes[0]) {
             let arg = try_parse_ident_or_member(arena, arg_str, arg_bytes, offset, line_offsets)?;
             let op = if bytes[len - 1] == b'+' { "++" } else { "--" };
             return Some(Expression::from_node(JsNode::UpdateExpression {
@@ -569,7 +581,7 @@ fn try_parse_update_expression(
     if bytes[0] == bytes[1] && (bytes[0] == b'+' || bytes[0] == b'-') {
         let arg_str = &content[2..];
         let arg_bytes = &bytes[2..];
-        if !arg_str.is_empty() && is_ident_start_byte(arg_bytes[0]) {
+        if !arg_str.is_empty() && is_ascii_ident_start_byte(arg_bytes[0]) {
             let arg =
                 try_parse_ident_or_member(arena, arg_str, arg_bytes, offset + 2, line_offsets)?;
             let op = if bytes[0] == b'+' { "++" } else { "--" };
@@ -589,13 +601,13 @@ fn try_parse_update_expression(
 
 /// Try to parse ternary expressions: `cond ? consequent : alternate`
 #[inline]
-fn try_parse_ternary(
+fn try_parse_ternary<'a>(
     arena: &ParseArena,
     content: &str,
     bytes: &[u8],
     offset: usize,
     line_offsets: &[usize],
-) -> Option<Expression> {
+) -> Option<Expression<'a>> {
     // Find '?' at top level (not inside strings/parens)
     let mut depth = 0u32;
     let mut in_string = 0u8;
@@ -603,7 +615,7 @@ fn try_parse_ternary(
 
     for (i, &b) in bytes.iter().enumerate() {
         if in_string != 0 {
-            if b == in_string && (i == 0 || bytes[i - 1] != b'\\') {
+            if b == in_string && !is_escaped(bytes, i) {
                 in_string = 0;
             }
             continue;
@@ -634,7 +646,7 @@ fn try_parse_ternary(
     for (i, &b) in bytes[q_pos + 1..].iter().enumerate() {
         let abs_i = q_pos + 1 + i;
         if in_string != 0 {
-            if b == in_string && (i == 0 || bytes[abs_i - 1] != b'\\') {
+            if b == in_string && !is_escaped(bytes, abs_i) {
                 in_string = 0;
             }
             continue;
@@ -657,42 +669,30 @@ fn try_parse_ternary(
     let cons_raw = &content[q_pos + 1..colon_pos];
     let alt_raw = &content[colon_pos + 1..];
 
-    let test_str = test_raw.trim();
-    let cons_str = cons_raw.trim();
-    let alt_str = alt_raw.trim();
+    let test_str = test_raw.trim_ws();
+    let cons_str = cons_raw.trim_ws();
+    let alt_str = alt_raw.trim_ws();
 
     if test_str.is_empty() || cons_str.is_empty() || alt_str.is_empty() {
         return None;
     }
 
     // Calculate precise offsets accounting for leading whitespace
-    let test_offset = offset + (test_raw.len() - test_raw.trim_start().len());
-    let cons_offset = offset + q_pos + 1 + (cons_raw.len() - cons_raw.trim_start().len());
-    let alt_offset = offset + colon_pos + 1 + (alt_raw.len() - alt_raw.trim_start().len());
+    let test_offset = offset + (test_raw.len() - test_raw.trim_start_ws().len());
+    let cons_offset = offset + q_pos + 1 + (cons_raw.len() - cons_raw.trim_start_ws().len());
+    let alt_offset = offset + colon_pos + 1 + (alt_raw.len() - alt_raw.trim_start_ws().len());
 
-    let test = try_parse_atom(
-        arena,
-        test_str,
-        test_str.as_bytes(),
-        test_offset,
-        line_offsets,
-    )
-    .or_else(|| {
-        try_parse_compound_expression(
-            arena,
-            test_str,
-            test_str.as_bytes(),
-            test_offset,
-            line_offsets,
-        )
-    })?;
-    let cons = try_parse_atom(
-        arena,
-        cons_str,
-        cons_str.as_bytes(),
-        cons_offset,
-        line_offsets,
-    )?;
+    let test = try_parse_atom(arena, test_str, test_str.as_bytes(), test_offset, line_offsets)
+        .or_else(|| {
+            try_parse_compound_expression(
+                arena,
+                test_str,
+                test_str.as_bytes(),
+                test_offset,
+                line_offsets,
+            )
+        })?;
+    let cons = try_parse_atom(arena, cons_str, cons_str.as_bytes(), cons_offset, line_offsets)?;
     let alt = try_parse_atom(arena, alt_str, alt_str.as_bytes(), alt_offset, line_offsets)?;
 
     let total_end = offset + content.len();
@@ -708,20 +708,20 @@ fn try_parse_ternary(
 
 /// Try to parse parenthesized expressions: `(expr)`
 #[inline]
-fn try_parse_parenthesized(
+fn try_parse_parenthesized<'a>(
     arena: &ParseArena,
     content: &str,
     bytes: &[u8],
     offset: usize,
     line_offsets: &[usize],
-) -> Option<Expression> {
+) -> Option<Expression<'a>> {
     // Find the matching ')' for the opening '('
     let mut depth = 1u32;
     let mut in_string = 0u8;
     let mut close = None;
     for (i, &b) in bytes[1..].iter().enumerate() {
         if in_string != 0 {
-            if b == in_string && (i == 0 || bytes[i] != b'\\') {
+            if b == in_string && !is_escaped(bytes, i + 1) {
                 in_string = 0;
             }
             continue;
@@ -768,7 +768,7 @@ fn try_parse_parenthesized(
 
     // Simple parenthesized: (expr) with nothing after
     if close + 1 == bytes.len() {
-        let inner = content[1..close].trim();
+        let inner = content[1..close].trim_ws();
         if inner.is_empty() {
             return None;
         }
@@ -781,7 +781,7 @@ fn try_parse_parenthesized(
 /// Try to parse arrow functions: `() => expr`, `(x) => expr`, `(a, b) => expr`
 /// Also handles expression body only (not block body `() => { ... }`).
 #[inline]
-fn try_parse_arrow_function(
+fn try_parse_arrow_function<'a>(
     arena: &ParseArena,
     content: &str,
     _bytes: &[u8],
@@ -789,9 +789,9 @@ fn try_parse_arrow_function(
     line_offsets: &[usize],
     close_paren: usize,
     ws_after_paren: usize,
-) -> Option<Expression> {
+) -> Option<Expression<'a>> {
     let arrow_start = close_paren + 1 + ws_after_paren + 2; // past "=>"
-    let body_str = content[arrow_start..].trim();
+    let body_str = content[arrow_start..].trim_ws();
 
     if body_str.is_empty() {
         return None;
@@ -805,7 +805,7 @@ fn try_parse_arrow_function(
     let body_bytes = body_str.as_bytes();
     let body_offset = offset
         + arrow_start
-        + (content[arrow_start..].len() - content[arrow_start..].trim_start().len());
+        + (content[arrow_start..].len() - content[arrow_start..].trim_start_ws().len());
 
     // Parse body as expression
     let body = try_parse_atom(arena, body_str, body_bytes, body_offset, line_offsets)
@@ -819,30 +819,39 @@ fn try_parse_arrow_function(
             try_parse_update_expression(arena, body_str, body_bytes, body_offset, line_offsets)
         })?;
 
-    // Parse params between ( and )
-    let params_str = content[1..close_paren].trim();
+    // Parse params between ( and ). Walk the raw `(...)` region (rather than the
+    // trimmed string) so each identifier keeps its real source span — the public
+    // `parse()` AST must match svelte/compiler, which assigns real param spans.
+    let region = &content[1..close_paren];
+    let region_base = offset + 1; // absolute position of `content[1]`
     let mut params_nodes = Vec::new();
 
-    if !params_str.is_empty() {
-        for param in params_str.split(',') {
-            let p = param.trim();
+    if !region.trim_ws().is_empty() {
+        let mut cursor = 0usize; // byte index within `region`
+        for chunk in region.split(',') {
+            let lead_ws = chunk.len() - chunk.trim_start_ws().len();
+            let p = chunk.trim_ws();
             if p.is_empty() {
                 return None;
             }
             let p_bytes = p.as_bytes();
-            if !is_ident_start_byte(p_bytes[0]) {
+            if !is_ascii_ident_start_byte(p_bytes[0]) {
                 return None; // Destructuring params — too complex
             }
-            if !p_bytes.iter().all(|&b| is_ident_continue_byte(b)) {
+            if !p_bytes.iter().all(|&b| is_ascii_ident_continue_byte(b)) {
                 return None; // Has type annotations or defaults — too complex
             }
+            let p_start = region_base + cursor + lead_ws;
+            let p_end = p_start + p.len();
             params_nodes.push(JsNode::Identifier {
-                start: 0, // Approximate — exact positions not critical for compilation
-                end: 0,
-                loc: None,
+                start: p_start as u32,
+                end: p_end as u32,
+                loc: create_typed_loc(p_start, p_end, line_offsets),
                 name: CompactString::from(p),
+                optional: false,
                 type_annotation: None,
             });
+            cursor += chunk.len() + 1; // +1 for the consumed comma
         }
     }
     let params = arena.alloc_js_children(params_nodes);
@@ -858,19 +867,21 @@ fn try_parse_arrow_function(
         expression: true,
         generator: false,
         r#async: false,
+        // This fast path bails out on any TS syntax, so never generic.
+        type_parameters: None,
     }))
 }
 
 /// Try to parse compound expressions: binary ops, logical ops, ternary.
 /// Examples: `count > 5`, `a === b`, `a && b`, `x > 0 ? 'yes' : 'no'`
 #[inline]
-fn try_parse_compound_expression(
+fn try_parse_compound_expression<'a>(
     arena: &ParseArena,
     content: &str,
     bytes: &[u8],
     offset: usize,
     line_offsets: &[usize],
-) -> Option<Expression> {
+) -> Option<Expression<'a>> {
     let len = bytes.len();
 
     // Scan for a binary/logical operator at the top level.
@@ -915,8 +926,8 @@ fn try_parse_compound_expression(
         return None;
     }
 
-    let left_content = content[..i].trim_end();
-    let right_content = content[right_start..].trim_end();
+    let left_content = content[..i].trim_end_ws();
+    let right_content = content[right_start..].trim_end_ws();
 
     let left_bytes = left_content.as_bytes();
     let right_bytes = right_content.as_bytes();
@@ -926,13 +937,8 @@ fn try_parse_compound_expression(
 
     // Check if this is a ternary: `left op right ? consequent : alternate`
     // For now, only handle simple binary/logical
-    let right = try_parse_atom(
-        arena,
-        right_content,
-        right_bytes,
-        offset + right_start,
-        line_offsets,
-    )?;
+    let right =
+        try_parse_atom(arena, right_content, right_bytes, offset + right_start, line_offsets)?;
 
     let total_end = offset + content.len();
 
@@ -989,10 +995,10 @@ fn skip_simple_token(bytes: &[u8], start: usize) -> usize {
     }
 
     // Identifier or number with possible dots (member expressions)
-    if is_ident_start_byte(bytes[pos]) || bytes[pos].is_ascii_digit() {
+    if is_ascii_ident_start_byte(bytes[pos]) || bytes[pos].is_ascii_digit() {
         while pos < len {
             let b = bytes[pos];
-            if is_ident_continue_byte(b) || b == b'.' {
+            if is_ascii_ident_continue_byte(b) || b == b'.' {
                 pos += 1;
             } else {
                 break;
@@ -1059,13 +1065,13 @@ fn match_operator(bytes: &[u8], i: usize) -> Option<(&'static str, usize)> {
 
 /// Try to parse a negative numeric literal (-1, -3.14).
 #[inline]
-fn try_parse_negative_numeric(
+fn try_parse_negative_numeric<'a>(
     arena: &ParseArena,
     content: &str,
     bytes: &[u8],
     offset: usize,
     line_offsets: &[usize],
-) -> Option<Expression> {
+) -> Option<Expression<'a>> {
     // Parse the numeric part (after the minus sign)
     let num_content = &content[1..];
     let num_bytes = &bytes[1..];
@@ -1108,13 +1114,8 @@ fn try_parse_negative_numeric(
     let total_len = content.len();
 
     // Create the inner numeric literal
-    let argument = create_numeric_literal(
-        value,
-        num_content,
-        offset + 1,
-        offset + total_len,
-        line_offsets,
-    );
+    let argument =
+        create_numeric_literal(value, num_content, offset + 1, offset + total_len, line_offsets);
 
     Some(Expression::from_node(JsNode::UnaryExpression {
         start: offset as u32,
@@ -1132,12 +1133,12 @@ fn try_parse_negative_numeric(
 /// Does NOT handle: template literals, strings with escape sequences, or
 /// strings that don't consume the entire content.
 #[inline]
-fn try_parse_string_literal(
+fn try_parse_string_literal<'a>(
     content: &str,
     bytes: &[u8],
     offset: usize,
     line_offsets: &[usize],
-) -> Option<Expression> {
+) -> Option<Expression<'a>> {
     let len = bytes.len();
     if len < 2 {
         return None;
@@ -1185,15 +1186,134 @@ fn try_parse_string_literal(
     None
 }
 
-/// Check if a byte can start a JS identifier (ASCII subset).
+/// Can `b` start a JS identifier, restricted to ASCII?
+///
+/// Deliberately narrower than [`crate::compiler::utils::is_js_ident_start`]:
+/// every caller here gates a hand-rolled fast path that bails to the general
+/// parser, so rejecting `名` costs a fallback, while admitting a byte that is
+/// only half a character would build an expression the general parser never
+/// would.
 #[inline(always)]
-fn is_ident_start_byte(b: u8) -> bool {
+fn is_ascii_ident_start_byte(b: u8) -> bool {
     b.is_ascii_alphabetic() || b == b'_' || b == b'$'
 }
 
-/// Check if a byte can continue a JS identifier (ASCII subset).
+/// Every word the fast path would spell as an ordinary identifier and the real
+/// parser would not: the reserved words, the strict-mode ones, and the two
+/// (`eval`, `arguments`) whose legality depends on how they are used.
+///
+/// The set has to be the closed one rather than the shapes anybody has hit.
+/// `import` and `new` head a construct whose node type the fast path cannot
+/// produce (`MetaProperty`, `ImportExpression`), and spelling `import.meta.url`
+/// as a member chain makes its leftmost object an unbound global — which every
+/// `is_pure` port then reads as static; `this` is the same shape one node type
+/// over (`ThisExpression`); and every remaining keyword is a program the real
+/// parser rejects and the fast path silently accepts.
+///
+/// `true` / `false` / `null` are absent on purpose: the fast path builds them as
+/// literals, which is what they are.
+#[inline]
+fn is_fast_path_suspect_word(word: &[u8]) -> bool {
+    matches!(
+        word,
+        b"await"
+            | b"break"
+            | b"case"
+            | b"catch"
+            | b"class"
+            | b"const"
+            | b"continue"
+            | b"debugger"
+            | b"default"
+            | b"delete"
+            | b"do"
+            | b"else"
+            | b"enum"
+            | b"export"
+            | b"extends"
+            | b"finally"
+            | b"for"
+            | b"function"
+            | b"if"
+            | b"import"
+            | b"in"
+            | b"instanceof"
+            | b"new"
+            | b"return"
+            | b"super"
+            | b"switch"
+            | b"this"
+            | b"throw"
+            | b"try"
+            | b"typeof"
+            | b"var"
+            | b"void"
+            | b"while"
+            | b"with"
+            | b"yield"
+            | b"let"
+            | b"static"
+            | b"implements"
+            | b"interface"
+            | b"package"
+            | b"private"
+            | b"protected"
+            | b"public"
+            | b"eval"
+            | b"arguments"
+    )
+}
+
+/// Whether `bytes` could hold something the fast path would accept and acorn
+/// would not — a legacy octal literal, an escape inside a string literal, or one
+/// of the words strict mode reserves. Deliberately over-eager: a false positive
+/// only costs a real parse.
+fn may_carry_acorn_violation(bytes: &[u8]) -> bool {
+    let mut i = 0;
+    // A word after `.` is a PROPERTY name, where every reserved word is legal —
+    // and `props.class` is ordinary Svelte, so exempting it is what keeps the
+    // widened list off the common path.
+    let mut after_dot = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\\' {
+            return true;
+        }
+        if is_ascii_ident_start_byte(b) {
+            let start = i;
+            while i < bytes.len() && is_ascii_ident_continue_byte(bytes[i]) {
+                i += 1;
+            }
+            let word = &bytes[start..i];
+            if !after_dot && is_fast_path_suspect_word(word) {
+                return true;
+            }
+            after_dot = false;
+            continue;
+        }
+        if b.is_ascii_digit() {
+            let start = i;
+            while i < bytes.len() && (is_ascii_ident_continue_byte(bytes[i]) || bytes[i] == b'.') {
+                i += 1;
+            }
+            if bytes[start] == b'0' && bytes.get(start + 1).is_some_and(u8::is_ascii_digit) {
+                return true;
+            }
+            after_dot = false;
+            continue;
+        }
+        if !b.is_ascii_whitespace() {
+            after_dot = b == b'.';
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Can `b` continue a JS identifier, restricted to ASCII? See
+/// [`is_ascii_ident_start_byte`] for why the ASCII subset is the right gate here.
 #[inline(always)]
-fn is_ident_continue_byte(b: u8) -> bool {
+fn is_ascii_ident_continue_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_' || b == b'$'
 }
 
@@ -1202,18 +1322,18 @@ fn is_ident_continue_byte(b: u8) -> bool {
 /// Scans the content and validates it matches: `ident(.ident)*` or `ident(?.ident)*`
 /// Returns None if it contains anything else.
 #[inline]
-fn try_parse_ident_or_member(
+fn try_parse_ident_or_member<'a>(
     arena: &ParseArena,
     content: &str,
     bytes: &[u8],
     offset: usize,
     line_offsets: &[usize],
-) -> Option<Expression> {
+) -> Option<Expression<'a>> {
     let len = bytes.len();
 
     // Scan the first identifier segment
     let mut pos = 0;
-    while pos < len && is_ident_continue_byte(bytes[pos]) {
+    while pos < len && is_ascii_ident_continue_byte(bytes[pos]) {
         pos += 1;
     }
 
@@ -1282,10 +1402,10 @@ fn try_parse_ident_or_member(
 
         // Scan next identifier segment
         let seg_start = pos;
-        if pos >= len || !is_ident_start_byte(bytes[pos]) {
+        if pos >= len || !is_ascii_ident_start_byte(bytes[pos]) {
             return None; // e.g., `foo.123` or `foo.`
         }
-        while pos < len && is_ident_continue_byte(bytes[pos]) {
+        while pos < len && is_ascii_ident_continue_byte(bytes[pos]) {
             pos += 1;
         }
         segments.push((&content[seg_start..pos], seg_start, pos));
@@ -1307,6 +1427,7 @@ fn try_parse_ident_or_member(
             end: (offset + seg_end) as u32,
             loc: create_typed_loc(offset + seg_start, offset + seg_end, line_offsets),
             name: CompactString::from(prop_name),
+            optional: false,
             type_annotation: None,
         };
 
@@ -1329,12 +1450,12 @@ fn try_parse_ident_or_member(
 /// Handles: `0`, `42`, `3.14`, `0.5`
 /// Does NOT handle: hex, octal, binary, exponential, bigint, separators.
 #[inline]
-fn try_parse_numeric_literal(
+fn try_parse_numeric_literal<'a>(
     content: &str,
     bytes: &[u8],
     offset: usize,
     line_offsets: &[usize],
-) -> Option<Expression> {
+) -> Option<Expression<'a>> {
     let len = bytes.len();
     let mut pos = 0;
     let mut has_dot = false;
@@ -1373,13 +1494,7 @@ fn try_parse_numeric_literal(
     // Parse the value
     let value: f64 = content.parse().ok()?;
 
-    Some(create_numeric_literal(
-        value,
-        content,
-        offset,
-        offset + len,
-        line_offsets,
-    ))
+    Some(create_numeric_literal(value, content, offset, offset + len, line_offsets))
 }
 
 /// # Arguments
@@ -1394,7 +1509,7 @@ fn try_parse_numeric_literal(
 /// # Returns
 /// A parsed `Expression` or an empty identifier in loose mode.
 /// Returns an error message if parsing fails and loose mode is disabled.
-pub fn parse_expression(
+pub fn parse_expression<'a>(
     arena: &ParseArena,
     content: &str,
     offset: usize,
@@ -1404,19 +1519,18 @@ pub fn parse_expression(
     disallow_loose: bool,
     opening_token: char,
     ts: bool,
-) -> Result<Expression, (String, usize)> {
+) -> Result<Expression<'a>, (String, usize)> {
     // Fast path: handle simple expressions (identifiers, member expressions,
     // boolean/null literals) without invoking OXC.
     if let Some(expr) = try_parse_simple_expression(arena, content, offset, line_offsets) {
         return Ok(expr);
     }
 
-    // Use known TS mode: parse with TS only if the file uses TypeScript,
-    // otherwise parse as JS directly. Fall back to the other mode only on failure.
-    let result = parse_expression_with_typescript(arena, content, offset, line_offsets, ts)
-        .or_else(|| parse_expression_with_typescript(arena, content, offset, line_offsets, !ts));
-
-    if let Some(expr) = result {
+    // Upstream picks the acorn variant once per component from `parser.ts`, so a
+    // component with no `lang="ts"` script never reaches the TypeScript grammar.
+    // Falling back to the other mode here accepted TS-only syntax in a plain
+    // component's template.
+    if let Some(expr) = parse_expression_with_typescript(arena, content, offset, line_offsets, ts) {
         return Ok(expr);
     }
 
@@ -1431,17 +1545,27 @@ pub fn parse_expression(
 
     // Check for parse errors and return them when not in loose mode
     if (!loose || disallow_loose)
-        && let Some((error_msg, _)) = check_js_parse_error_with_pos(content)
+        && let Some((error_msg, _)) = check_js_parse_error_with_pos(content, ts)
     {
         return Err((error_msg, offset));
     }
 
     // Fall back to invalid identifier
-    Ok(create_invalid_identifier(
-        offset,
-        offset + content.len(),
-        line_offsets,
-    ))
+    Ok(create_invalid_identifier(offset, offset + content.len(), line_offsets))
+}
+
+/// Wrap a source slice for OXC, keeping the suffix off the slice's last line —
+/// a trailing `//` comment would otherwise swallow it.
+///
+/// The newline sits between `content` and `suffix`, so every offset inside
+/// `content` keeps its position and an arrow's `)` stays adjacent to its `=>`.
+fn wrap_for_parse(prefix: &str, content: &str, suffix: &str) -> String {
+    let mut wrapped = String::with_capacity(prefix.len() + content.len() + suffix.len() + 1);
+    wrapped.push_str(prefix);
+    wrapped.push_str(content);
+    wrapped.push('\n');
+    wrapped.push_str(suffix);
+    wrapped
 }
 
 /// Parse a destructuring pattern (for `{@const}` tags).
@@ -1457,54 +1581,42 @@ pub fn parse_expression(
 /// - Nested patterns: `{a: {b, c}}`
 /// - Array patterns: `[a, b, ...rest]`
 /// - Rest elements: `{a, ...rest}`
-pub fn parse_destructuring_pattern(
+pub fn parse_destructuring_pattern<'a>(
     arena: &ParseArena,
     content: &str,
     offset: usize,
     line_offsets: &[usize],
-) -> Option<Expression> {
-    // Try TypeScript first, then JavaScript
-    for use_typescript in [true, false] {
-        let result = with_oxc_allocator(|allocator| {
-            let source_type = if use_typescript {
-                SourceType::ts()
-            } else {
-                SourceType::mjs()
-            };
+    ts: bool,
+) -> Option<Expression<'a>> {
+    // The component's mode only. Trying the other one accepts a TypeScript
+    // annotation in a component that never declared `lang="ts"`.
+    let source_type = if ts { SourceType::ts() } else { SourceType::mjs() };
 
-            let mut wrapped = String::with_capacity(content.len() + 12);
-            wrapped.push_str("let ");
-            wrapped.push_str(content);
-            wrapped.push_str(" = null");
-            let parser = OxcParser::new(allocator, &wrapped, source_type);
-            let result = parser.parse();
+    with_oxc_allocator(|allocator| {
+        let wrapped = wrap_for_parse("let ", content, "= null");
+        let parser = OxcParser::new(allocator, &wrapped, source_type);
+        let result = parser.parse();
 
-            if !result.diagnostics.is_empty() {
-                return None;
-            }
-
-            if let Some(oxc_ast::ast::Statement::VariableDeclaration(var_decl)) =
-                result.program.body.first()
-                && let Some(declarator) = var_decl.declarations.first()
-            {
-                let adjusted_offset = offset.wrapping_sub(4);
-                let pattern_json = convert_binding_pattern_for_param(
-                    arena,
-                    &declarator.id,
-                    adjusted_offset,
-                    line_offsets,
-                );
-                return Some(Expression::from_json(pattern_json));
-            }
-
-            None
-        });
-        if result.is_some() {
-            return result;
+        if !result.diagnostics.is_empty() {
+            return None;
         }
-    }
 
-    None
+        if let Some(oxc_ast::ast::Statement::VariableDeclaration(var_decl)) =
+            result.program.body.first()
+            && let Some(declarator) = var_decl.declarations.first()
+        {
+            let adjusted_offset = offset.wrapping_sub(4);
+            let pattern_node = convert_binding_pattern_for_param_as_node(
+                arena,
+                &declarator.id,
+                adjusted_offset,
+                line_offsets,
+            );
+            return Some(Expression::from_node(pattern_node));
+        }
+
+        None
+    })
 }
 
 /// Parse a JavaScript expression with a known end position.
@@ -1526,7 +1638,7 @@ pub fn parse_destructuring_pattern(
 /// # Returns
 /// A parsed `Expression` or an empty identifier in loose mode.
 /// Returns an error message if parsing fails and loose mode is disabled.
-pub fn parse_expression_with_end(
+pub fn parse_expression_with_end<'a>(
     arena: &ParseArena,
     content: &str,
     offset: usize,
@@ -1537,17 +1649,14 @@ pub fn parse_expression_with_end(
     disallow_loose: bool,
     _opening_token: char,
     ts: bool,
-) -> Result<Expression, (String, usize)> {
+) -> Result<Expression<'a>, (String, usize)> {
     // Fast path: handle simple expressions without OXC
     if let Some(expr) = try_parse_simple_expression(arena, content, offset, line_offsets) {
         return Ok(expr);
     }
 
-    // Use known TS mode, fall back to other mode on failure
-    let result = parse_expression_with_typescript(arena, content, offset, line_offsets, ts)
-        .or_else(|| parse_expression_with_typescript(arena, content, offset, line_offsets, !ts));
-
-    if let Some(expr) = result {
+    // The component's one language mode, as upstream picks it from `parser.ts`.
+    if let Some(expr) = parse_expression_with_typescript(arena, content, offset, line_offsets, ts) {
         return Ok(expr);
     }
 
@@ -1559,13 +1668,33 @@ pub fn parse_expression_with_end(
 
     // Check for parse errors and return them when not in loose mode
     if (!loose || disallow_loose)
-        && let Some((error_msg, _)) = check_js_parse_error_with_pos(content)
+        && let Some((error_msg, _)) = check_js_parse_error_with_pos(content, ts)
     {
         return Err((error_msg, offset));
     }
 
     // Fall back to invalid identifier
     Ok(create_invalid_identifier(offset, end, line_offsets))
+}
+
+/// The `SourceType` a template expression is parsed with. Upstream picks the
+/// acorn variant once per component from `parser.ts`, so a component with no
+/// `lang="ts"` script never reaches the TypeScript grammar.
+fn expression_source_type(ts: bool) -> SourceType {
+    if ts { SourceType::ts() } else { SourceType::mjs() }
+}
+
+/// Parse `content` unwrapped and return the first diagnostic at the offending token.
+fn bare_parse_error(content: &str, source_type: SourceType) -> Option<(String, usize)> {
+    with_oxc_allocator(|allocator| {
+        let result = OxcParser::new(allocator, content, source_type).parse();
+        let first_error = result.diagnostics.first()?;
+        let pos = first_error
+            .labels
+            .first()
+            .map_or(0, |label| (label.offset() as usize).min(content.len()));
+        Some((first_error.message.to_string(), pos))
+    })
 }
 
 /// Check if a JavaScript expression has parse errors, returning the failure
@@ -1582,55 +1711,178 @@ pub fn parse_expression_with_end(
 /// `content` is wrapped in `(...)` before being handed to OXC, so we subtract
 /// one from OXC's reported `offset + len` (the right-edge of the labeled span)
 /// to land back in the unwrapped expression's coordinate space — and clamp
-/// the result to `[0, content.len()]`. Acorn reports `err.pos` at the point
-/// where it stopped consuming tokens, which corresponds to the *end* of the
-/// problematic region, not its start.
-pub fn check_js_parse_error_with_pos(content: &str) -> Option<(String, usize)> {
+/// the result to `[0, content.len()]`. That right edge is only ever right
+/// because the clamp lands it on the close token, so when the wrapper is what
+/// failed, [`bare_parse_error`] re-reads the body and reports acorn's position
+/// directly.
+pub fn check_js_parse_error_with_pos(content: &str, ts: bool) -> Option<(String, usize)> {
+    // Two inputs acorn rejects on their very first token are described by the
+    // `(…)` wrapper below instead of by themselves — nothing is left for OXC to
+    // complain about but the parentheses it never saw in the source. Answer
+    // them here, where the wrapper cannot reach.
+    let leading_ws = content.len() - content.trim_start_ws().len();
+    let head = &content[leading_ws..];
+    if head.trim_end_ws().is_empty() || head.starts_with("...") {
+        return Some(("Unexpected token".to_string(), leading_ws));
+    }
+    // Acorn's `parseExpressionAt` consumes a dangling optional-chain marker
+    // and reports the delimiter after it. OXC labels the `?` token instead.
+    // The template delimiter is outside `content`, so its relative position is
+    // the trimmed expression's end.
+    let trimmed_end = content.trim_end_ws().len();
+    if content[..trimmed_end].ends_with("?.") {
+        return Some(("Unexpected token".to_string(), trimmed_end));
+    }
+
     let mut wrapped = String::with_capacity(content.len() + 2);
     wrapped.push('(');
     wrapped.push_str(content);
-    wrapped.push(')');
+    // a trailing `//` comment would swallow a same-line `)`
+    wrapped.push_str("\n)");
 
     let probe = |source_type: SourceType| -> Option<(String, usize)> {
-        with_oxc_allocator(|allocator| {
+        // `retry_bare` marks a diagnostic the `(…)` wrapper produced. The bare
+        // re-probe cannot run inside this closure: `with_oxc_allocator` hands
+        // out one thread-local arena and nesting it panics.
+        let (message, pos, retry_bare) = with_oxc_allocator(|allocator| {
             let parser = OxcParser::new(allocator, &wrapped, source_type);
             let result = parser.parse();
             if let Some(first_error) = result.diagnostics.first() {
+                // Acorn raises the shorthand-assignment error at the `=` token,
+                // while OXC labels the whole `a = 1` property.
+                if first_error.message.as_ref() == "Invalid assignment in object literal"
+                    && let Some(label) = first_error.labels.first()
+                {
+                    let label_start = label.offset() as usize;
+                    let label_end = label_start + label.len() as usize;
+                    if let Some(slice) = wrapped.get(label_start..label_end)
+                        && let Some(eq) = shorthand_assign_offset(slice)
+                    {
+                        return Some((
+                            "Shorthand property assignments are valid only in destructuring patterns"
+                                .to_string(),
+                            (label_start + eq).saturating_sub(1).min(content.len()),
+                            false,
+                        ));
+                    }
+                }
+                // Acorn raises "Assigning to rvalue" at the target's start, not
+                // where it stopped consuming, so this one label reads left.
+                let at_label_start = matches!(
+                    first_error.message.as_ref(),
+                    "Cannot assign to this expression" | "Invalid left-hand side in assignment"
+                );
+                // The default reads the label's END because acorn reports where
+                // it stopped consuming — true when the label is what it consumed,
+                // false when the label IS the offending token, which acorn then
+                // reports at its start. `Expected X but found Y` labels the found
+                // token, so it belongs to the second group too.
+                let report_at_label_start = at_label_start
+                    || matches!(
+                        first_error.message.as_ref(),
+                        "Unexpected token" | "Unexpected new.target expression"
+                    )
+                    || first_error.message.starts_with("Expected ");
                 let pos = first_error
                     .labels
                     .first()
-                    .map(|label| label.offset() as usize + label.len() as usize)
+                    .map(|label| {
+                        if report_at_label_start {
+                            label.offset() as usize
+                        } else {
+                            label.offset() as usize + label.len() as usize
+                        }
+                    })
                     .map(|wrapped_end| {
                         // Strip the leading `(` we added and clamp.
                         wrapped_end.saturating_sub(1).min(content.len())
                     })
                     .unwrap_or(0);
-                return Some((first_error.message.to_string(), pos));
+                // OXC recovers an AST for some early errors that acorn reports
+                // more specifically. Keep the OXC diagnostic when it occurs
+                // first, but let an acorn-only restriction at the same or an
+                // earlier byte win. In particular, a legacy octal escape is a
+                // StringLiteral in OXC's recovered tree even though its lexer
+                // also emits a generic diagnostic for the escape.
+                if let Some((at, message)) =
+                    acorn_only_violation(&result.program, &wrapped, source_type.is_typescript())
+                {
+                    let acorn_pos = (at as usize).saturating_sub(1).min(content.len());
+                    if acorn_pos <= pos {
+                        return Some((message, acorn_pos, false));
+                    }
+                }
+                if at_label_start {
+                    return Some(("Assigning to rvalue".to_string(), pos, false));
+                }
+                // `()` is the wrapper's own diagnostic for an empty tag body;
+                // acorn, given the body unwrapped, calls it an unexpected token.
+                let message = if first_error.message.as_ref() == "Empty parenthesized expression"
+                    || first_error.message.starts_with("Expected `,` or `}` but found ")
+                {
+                    "Unexpected token"
+                } else {
+                    first_error.message.as_ref()
+                };
+                // A label which is itself the offending token already has the
+                // acorn position above. Re-parsing it bare can turn that token
+                // into consumed input (for example `do`) and move the point to
+                // its end.
+                return Some((message.to_string(), pos, !report_at_label_start));
             }
             // Check for invalid assignment targets that OXC doesn't report as errors
             if let Some(oxc_ast::ast::Statement::ExpressionStatement(expr_stmt)) =
                 result.program.body.first()
                 && is_invalid_assignment_expression(&expr_stmt.expression)
             {
-                return Some(("Assigning to rvalue".to_string(), 0));
+                return Some(("Assigning to rvalue".to_string(), 0, false));
+            }
+            // A template expression is parsed by its own function, so it needs
+            // the acorn-only restrictions applied here too — the script path's
+            // scan never sees it. Acorn reports the violation's start; strip
+            // the `(` this probe wraps the expression in.
+            if let Some((at, message)) =
+                acorn_only_violation(&result.program, &wrapped, source_type.is_typescript())
+            {
+                let pos = (at as usize).saturating_sub(1).min(content.len());
+                return Some((message, pos, false));
             }
             None
-        })
+        })?;
+
+        // The `(…)` is ours, not the template's, so a diagnostic that only
+        // exists because of it (`()`, a trailing comma, an arrow parameter
+        // list) is not the one upstream's `parseExpressionAt` reports on the
+        // unwrapped body. When the body itself has a diagnostic, that is
+        // acorn's — and acorn reports the *start* of the token it stopped on.
+        if retry_bare && let Some(bare) = bare_parse_error(content, source_type) {
+            return Some(bare);
+        }
+        Some((message, pos))
     };
 
-    // Try TypeScript first
-    let ts_result = probe(SourceType::ts());
+    let result = probe(expression_source_type(ts));
 
-    // No TS errors means valid
-    ts_result.as_ref()?;
+    // A body with no code in it has nothing of its own to fail on, so whatever
+    // OXC reported describes the `(…)` this probe wrapped it in. Acorn is given
+    // the unwrapped text and says `Unexpected token` at the delimiter.
+    if is_code_empty(content, ts) {
+        return result.map(|_| ("Unexpected token".to_string(), content.len()));
+    }
+    result
+}
 
-    // Try JavaScript
-    let js_result = probe(SourceType::mjs());
-
-    // No JS errors means valid
-    js_result.as_ref()?;
-
-    js_result.or(ts_result)
+/// Whether `content` carries no JavaScript at all — only whitespace and
+/// comments. Answered by the parser rather than by a scan so that a `//` or
+/// `/*` inside a string cannot be mistaken for one.
+fn is_code_empty(content: &str, ts: bool) -> bool {
+    if content.is_empty() {
+        return true;
+    }
+    with_oxc_allocator(|allocator| {
+        let result = OxcParser::new(allocator, content, expression_source_type(ts)).parse();
+        result.program.body.is_empty() && result.diagnostics.is_empty()
+    })
 }
 
 /// Check whether a parameter list (e.g. snippet params) parses as valid
@@ -1643,30 +1895,30 @@ pub fn check_js_parse_error_with_pos(content: &str) -> Option<(String, usize)> {
 ///
 /// Returns `Some((message, pos_in_params))` when parsing fails.
 pub fn check_params_parse_error(params: &str, ts: bool) -> Option<(String, usize)> {
-    let mut wrapped = String::with_capacity(params.len() + 9);
-    wrapped.push('(');
-    wrapped.push_str(params);
-    wrapped.push_str(") => {}");
+    let wrapped = wrap_for_parse("(", params, ") => {}");
 
     with_oxc_allocator(|allocator| {
-        let source_type = if ts {
-            SourceType::ts()
-        } else {
-            SourceType::mjs()
-        };
+        let source_type = if ts { SourceType::ts() } else { SourceType::mjs() };
         let result = OxcParser::new(allocator, &wrapped, source_type).parse();
-        result.diagnostics.first().map(|first_error| {
+        if let Some(first_error) = result.diagnostics.first() {
             let pos = first_error
                 .labels
                 .first()
-                .map(|label| {
-                    (label.offset() as usize)
-                        .saturating_sub(1)
-                        .min(params.len())
-                })
+                .map(|label| (label.offset() as usize).saturating_sub(1).min(params.len()))
                 .unwrap_or(0);
-            (first_error.message.to_string(), pos)
-        })
+            let message = if !ts
+                && matches!(
+                    first_error.message.as_ref(),
+                    "Expected `,` or `)` but found `:`" | "Expected `,` or `)` but found `?`"
+                ) {
+                "Unexpected token"
+            } else {
+                first_error.message.as_ref()
+            };
+            return Some((message.to_string(), pos));
+        }
+        acorn_only_violation(&result.program, &wrapped, ts)
+            .map(|(at, message)| (message, (at as usize).saturating_sub(1).min(params.len())))
     })
 }
 
@@ -1678,21 +1930,38 @@ pub fn check_params_parse_error(params: &str, ts: bool) -> Option<(String, usize
 /// does not parse as a statement is rethrown in strict mode and surfaces as
 /// `js_parse_error` (e.g. `{let }` → "The keyword 'let' is reserved").
 pub fn check_js_statement_parse_error(content: &str, ts: bool) -> Option<(String, usize)> {
+    let leading_ws = content.len() - content.trim_start_ws().len();
+    if content.trim_ws() == "let" {
+        return Some(("The keyword 'let' is reserved".to_string(), leading_ws));
+    }
     with_oxc_allocator(|allocator| {
-        let source_type = if ts {
-            SourceType::ts()
-        } else {
-            SourceType::mjs()
-        };
+        let source_type = if ts { SourceType::ts() } else { SourceType::mjs() };
         let result = OxcParser::new(allocator, content, source_type).parse();
-        result.diagnostics.first().map(|first_error| {
+        if let Some(first_error) = result.diagnostics.first() {
             let pos = first_error
                 .labels
                 .first()
                 .map(|label| (label.offset() as usize).min(content.len()))
                 .unwrap_or(0);
-            (first_error.message.to_string(), pos)
-        })
+            return Some((first_error.message.to_string(), pos));
+        }
+        acorn_only_violation(&result.program, content, ts)
+            .map(|(at, message)| (message, (at as usize).min(content.len())))
+    })
+}
+
+/// [`trailing_token_offset`], confirmed by re-parsing the leading slice.
+///
+/// The probe reports where OXC's first label sits, which is also where an error
+/// *inside* the expression lands (`s(42 = nope)`, `1</div>`). Only a prefix that
+/// parses on its own is a place upstream's `read_expression` would have stopped,
+/// leaving the missing close token as the diagnostic.
+pub fn trailing_close_offset(content: &str, ts: bool) -> Option<usize> {
+    trailing_token_offset(content, ts).filter(|&off| {
+        off > 0
+            && content.get(..off).is_some_and(|prefix| {
+                check_js_parse_error_with_pos(prefix.trim_end(), ts).is_none()
+            })
     })
 }
 
@@ -1708,53 +1977,207 @@ pub fn check_js_statement_parse_error(content: &str, ts: bool) -> Option<(String
 /// This mirrors upstream Svelte's `read_expression` + `eat(close, true)` flow:
 /// acorn parses one maximal expression, and any leftover surfaces as
 /// `expected_token` while a broken expression surfaces as `js_parse_error`.
-pub fn trailing_token_offset(content: &str) -> Option<usize> {
+fn shorthand_assign_offset(slice: &str) -> Option<usize> {
+    use crate::compiler::phases::phase3_transform::shared::js_scan::code_bytes;
+    let bytes = slice.as_bytes();
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$' || b >= 0x80;
+    let mut iter = code_bytes(bytes);
+    let (_, first) = iter.next()?;
+    if first.is_ascii_digit() || !is_ident(first) {
+        return None;
+    }
+    let mut seen_gap = false;
+    for (i, b) in iter {
+        if is_ident(b) {
+            if seen_gap {
+                return None;
+            }
+            continue;
+        }
+        if b.is_ascii_whitespace() {
+            seen_gap = true;
+            continue;
+        }
+        if b == b'=' && !matches!(bytes.get(i + 1), Some(b'=') | Some(b'>')) {
+            return Some(i);
+        }
+        return None;
+    }
+    None
+}
+
+pub fn trailing_token_offset(content: &str, ts: bool) -> Option<usize> {
     // Wrap in parens so a *complete* leading expression is consumed greedily and
-    // the first error label lands on the first leftover token. (Parsing the bare
-    // string as a program is unreliable: OXC's statement-level error recovery
-    // folds trailing tokens into one recovered node, hiding the boundary.)
+    // the error label lands on the offending region. (Parsing the bare string as
+    // a program is unreliable: OXC's statement-level error recovery folds
+    // trailing tokens into one recovered node, hiding the boundary.)
     let mut wrapped = String::with_capacity(content.len() + 2);
     wrapped.push('(');
     wrapped.push_str(content);
-    wrapped.push(')');
+    // a trailing `//` comment would swallow a same-line `)`
+    wrapped.push_str("\n)");
 
-    let probe = |source_type: SourceType| -> Option<usize> {
-        with_oxc_allocator(|allocator| {
-            let result = OxcParser::new(allocator, &wrapped, source_type).parse();
-            let first_error = result.diagnostics.first()?;
-            let label = first_error.labels.first()?;
-            // Map the label's *start* back into `content` (strip the leading `(`).
-            let start = label.offset() as usize;
-            if start == 0 {
-                return None;
-            }
-            let content_pos = start - 1;
-            // A trailing-token error has leftover input *before* the synthetic
-            // closing `)`; an incomplete expression errors at/after the end.
-            if content_pos >= content.len() {
-                return None;
-            }
-            Some(content_pos)
-        })
-    };
-    probe(SourceType::ts()).or_else(|| probe(SourceType::mjs()))
+    let content_pos = with_oxc_allocator(|allocator| {
+        let result = OxcParser::new(allocator, &wrapped, expression_source_type(ts)).parse();
+        // OXC keeps a TypeScript-only operator in a JavaScript file and reports
+        // it as a diagnostic over the whole expression; acorn has no such node
+        // and stops where the operator begins.
+        if !ts && let Some(at) = typescript_operator_start(&result.program) {
+            return Some(at as usize);
+        }
+        let first_error = result.diagnostics.first()?;
+        let label = first_error.labels.first()?;
+        // Map the label's *start* back into `content` (strip the leading `(`).
+        let start = label.offset() as usize;
+        if start == 0 {
+            return None;
+        }
+        Some(start - 1)
+    })?;
+
+    // A trailing-token error has leftover input *before* the synthetic closing
+    // `)`; an incomplete expression errors at/after the end.
+    if content_pos >= content.len() {
+        return None;
+    }
+    // A comma continues the expression (as a SequenceExpression); acorn does
+    // not return the complete prefix and leave it for the caller's close-token
+    // check. With no following operand (`a,`) or another comma (`a,,b`) it
+    // throws a JS parse error at the missing operand instead.
+    if content.as_bytes().get(content_pos) == Some(&b',') {
+        return None;
+    }
+    // acorn parses ONE maximal expression and only then expects the close token,
+    // so leftover input is only leftover when what precedes it is itself a
+    // complete expression. Without this an error *inside* the expression (e.g.
+    // `String(a b)`) reads as a missing close token.
+    let prefix = content.get(..content_pos)?;
+    check_js_parse_error_with_pos(prefix, ts).is_none().then_some(content_pos)
+}
+
+/// The start of the leftmost TypeScript-only construct (`as`, `satisfies`, `!`,
+/// or a type annotation) OXC recovered while parsing a JavaScript file — i.e.
+/// the byte where acorn would have stopped. `None` when the program carries
+/// none.
+fn typescript_operator_start(program: &OxcProgram<'_>) -> Option<u32> {
+    use oxc_ast_visit::Visit;
+
+    #[derive(Default)]
+    struct Scan {
+        at: Option<u32>,
+    }
+    impl Scan {
+        fn record(&mut self, end: u32) {
+            self.at = Some(self.at.map_or(end, |current| current.min(end)));
+        }
+    }
+    impl<'a> Visit<'a> for Scan {
+        fn visit_ts_as_expression(&mut self, node: &oxc_ast::ast::TSAsExpression<'a>) {
+            self.record(node.expression.span().end);
+            oxc_ast_visit::walk::walk_ts_as_expression(self, node);
+        }
+        fn visit_ts_satisfies_expression(
+            &mut self,
+            node: &oxc_ast::ast::TSSatisfiesExpression<'a>,
+        ) {
+            self.record(node.expression.span().end);
+            oxc_ast_visit::walk::walk_ts_satisfies_expression(self, node);
+        }
+        fn visit_ts_non_null_expression(&mut self, node: &oxc_ast::ast::TSNonNullExpression<'a>) {
+            self.record(node.expression.span().end);
+            oxc_ast_visit::walk::walk_ts_non_null_expression(self, node);
+        }
+        fn visit_ts_type_annotation(&mut self, node: &oxc_ast::ast::TSTypeAnnotation<'a>) {
+            // `node.span.start` points at the colon in the parenthesised probe;
+            // strip the synthetic opening `(` to get the content offset.
+            self.record(node.span.start.saturating_sub(1));
+            oxc_ast_visit::walk::walk_ts_type_annotation(self, node);
+        }
+    }
+
+    let mut scan = Scan::default();
+    scan.visit_program(program);
+    scan.at
+}
+
+/// Classify a failed `read_expression` for a construct terminated by
+/// `close_char`, the way upstream's caller does: acorn parses ONE maximal
+/// expression and the caller then `eat(close_char, true)`, so leftover input
+/// after a *complete* expression is a missing close token while a malformed
+/// expression is a `js_parse_error` at the byte where the parse stopped.
+///
+/// The prefix re-parse is what separates the two: OXC labels an invalid
+/// assignment target at the target's start, which the leftover-input probe
+/// would otherwise read as "the expression ended here".
+pub fn close_token_or_parse_error(
+    msg: String,
+    trimmed: &str,
+    trimmed_offset: usize,
+    close_char: char,
+    ts: bool,
+) -> crate::error::ParseError {
+    let trailing = trailing_token_offset(trimmed, ts).filter(|&off| {
+        off > 0
+            && trimmed
+                .get(..off)
+                .is_some_and(|prefix| check_js_parse_error_with_pos(prefix, ts).is_none())
+    });
+    if let Some(off) = trailing {
+        let mut buf = [0u8; 4];
+        return crate::error::ParseError::expected_token(
+            close_char.encode_utf8(&mut buf),
+            trimmed_offset + off,
+        );
+    }
+    let at = check_js_parse_error_with_pos(trimmed, ts)
+        .map_or(trimmed_offset + trimmed.len(), |(_, pos)| trimmed_offset + pos);
+    crate::error::ParseError::svelte("js_parse_error", msg, (at, at))
+}
+
+/// Rebuild the diagnostic raised by a failed mustache expression parse.
+///
+/// Template expressions have eager and deferred entry points. Keep their
+/// classification here so deferring work cannot turn a missing `}` after a
+/// complete expression into a `js_parse_error` (or the reverse).
+pub fn mustache_parse_error(
+    msg: String,
+    content: &str,
+    start: usize,
+    ts: bool,
+) -> crate::error::ParseError {
+    // A dangling optional-chain token is part of the broken expression, not
+    // trailing input that the caller would encounter while eating `}`.
+    if !content.ends_with("?.")
+        && let Some(pos) = trailing_token_offset(content, ts)
+    {
+        return crate::error::ParseError::expected_token("}", start + pos);
+    }
+
+    let at = check_js_parse_error_with_pos(content, ts)
+        .map_or(start, |(_, content_pos)| start + content_pos);
+    crate::error::ParseError::svelte("js_parse_error", msg, (at, at))
 }
 
 /// Create an identifier for invalid expressions
-fn create_invalid_identifier(start: usize, end: usize, _line_offsets: &[usize]) -> Expression {
+fn create_invalid_identifier<'a>(
+    start: usize,
+    end: usize,
+    _line_offsets: &[usize],
+) -> Expression<'a> {
     // Note: Similar to get_loose_identifier, invalid identifiers don't include 'loc'
     Expression::from_node(JsNode::Identifier {
         start: start as u32,
         end: end as u32,
         loc: None,
         name: CompactString::from(""),
+        optional: false,
         type_annotation: None,
     })
 }
 
 /// Check if an expression is an assignment to an invalid target (e.g., `42 = nope`).
 /// OXC may parse these without errors, but they should be treated as parse errors.
-fn is_invalid_assignment_expression(expr: &oxc_ast::ast::Expression) -> bool {
+fn is_invalid_assignment_expression<'a>(expr: &oxc_ast::ast::Expression<'a>) -> bool {
     // Unwrap parenthesized expressions
     let inner = match expr {
         oxc_ast::ast::Expression::ParenthesizedExpression(paren) => &paren.expression,
@@ -1782,25 +2205,18 @@ fn is_valid_assignment_target(target: &oxc_ast::ast::AssignmentTarget) -> bool {
     }
 }
 
-fn parse_expression_with_typescript(
+fn parse_expression_with_typescript<'a>(
     arena: &ParseArena,
     content: &str,
     offset: usize,
     line_offsets: &[usize],
     use_typescript: bool,
-) -> Option<Expression> {
+) -> Option<Expression<'a>> {
     with_oxc_allocator(|allocator| {
-        let source_type = if use_typescript {
-            SourceType::ts()
-        } else {
-            SourceType::mjs()
-        };
+        let source_type = if use_typescript { SourceType::ts() } else { SourceType::mjs() };
 
         // Wrap content in parens to parse as expression
-        let mut wrapped = String::with_capacity(content.len() + 2);
-        wrapped.push('(');
-        wrapped.push_str(content);
-        wrapped.push(')');
+        let wrapped = wrap_for_parse("(", content, ")");
         let parser = OxcParser::new(allocator, &wrapped, source_type);
         let result = parser.parse();
 
@@ -1815,16 +2231,19 @@ fn parse_expression_with_typescript(
                 return None;
             }
 
+            // Same shape for every other restriction acorn applies and OXC does
+            // not — a template expression is strict too. Failing here routes the
+            // caller to `check_js_parse_error_with_pos`, which reports acorn's
+            // message and position.
+            if acorn_only_violation(&result.program, &wrapped, use_typescript).is_some() {
+                return None;
+            }
+
             // Adjust positions: subtract 1 for the opening paren we added
-            let mut expr = convert_expression(arena, &expr_stmt.expression, offset, line_offsets);
+            let expr = convert_expression(arena, &expr_stmt.expression, offset, line_offsets);
 
             // Attach comments to the expression
             if !result.program.comments.is_empty() {
-                // Get the actual expression's start and end positions
-                let inner_expr = unwrap_parenthesized(&expr_stmt.expression);
-                let expr_start = inner_expr.span().start;
-                let expr_end = inner_expr.span().end;
-
                 // Mirror upstream `parser.root.comments`: every comment seen
                 // by acorn is pushed there in source order, *in addition* to
                 // being attached as leading/trailing on the inner node.
@@ -1853,157 +2272,100 @@ fn parse_expression_with_typescript(
                     );
                 }
 
-                // Collect leading comments (before the expression)
-                let leading_comments: Vec<Value> = result
-                    .program
-                    .comments
-                    .iter()
-                    .filter(|comment| comment.span.end <= expr_start)
-                    .map(|comment| {
-                        // Adjust positions: -1 for the paren, then add offset
-                        let comment_start = offset + comment.span.start as usize - 1;
-                        let comment_end = offset + comment.span.end as usize - 1;
+                if !crate::ast::arena::comment_capture_active() {
+                    return Some(expr);
+                }
 
-                        // Get raw comment text
-                        let raw = &wrapped[comment.span.start as usize..comment.span.end as usize];
-                        let mut value = extract_comment_value(raw, comment.kind);
+                // Upstream runs the same `add_comments` walk over a template
+                // expression as over a script program (`read_expression` shares
+                // `get_comment_handlers`), so the trailing-comment rules — the
+                // last-in-body case and the `/^[,) \t]*$/` separator — hold here too.
+                let mut comment_entries: Vec<CommentEntry> =
+                    Vec::with_capacity(result.program.comments.len());
+                let mut comment_values: Vec<Value> =
+                    Vec::with_capacity(result.program.comments.len());
+                for comment in result.program.comments.iter() {
+                    // -1 for the paren the expression was wrapped in.
+                    let comment_start = offset + comment.span.start as usize - 1;
+                    let comment_end = offset + comment.span.end as usize - 1;
+                    let raw = &wrapped[comment.span.start as usize..comment.span.end as usize];
+                    let mut value = extract_comment_value(raw, comment.kind);
+                    if matches!(
+                        comment.kind,
+                        oxc_ast::ast::CommentKind::SingleLineBlock
+                            | oxc_ast::ast::CommentKind::MultiLineBlock
+                    ) {
+                        value = normalize_block_comment_indentation(
+                            &value,
+                            content,
+                            comment.span.start as usize - 1,
+                        );
+                    }
+                    let comment_text = CompactString::from(value.as_str());
+                    let comment_value = create_comment_object(
+                        comment.kind,
+                        value,
+                        comment_start,
+                        comment_end,
+                        line_offsets,
+                    )
+                    .to_value();
+                    comment_entries.push(CommentEntry {
+                        start: comment_start as u32,
+                        text: comment_text,
+                        value: comment_value.clone(),
+                    });
+                    comment_values.push(comment_value);
+                }
 
-                        // Normalize block comment indentation
-                        if matches!(
-                            comment.kind,
-                            oxc_ast::ast::CommentKind::SingleLineBlock
-                                | oxc_ast::ast::CommentKind::MultiLineBlock
-                        ) {
-                            value = normalize_block_comment_indentation(
-                                &value,
-                                content,
-                                comment.span.start as usize - 1,
-                            );
-                        }
+                let json_val = expr.as_json();
+                let root_type = json_val.get("type").and_then(Value::as_str).map(str::to_owned);
+                let root_span = json_val
+                    .get("start")
+                    .and_then(Value::as_u64)
+                    .zip(json_val.get("end").and_then(Value::as_u64))
+                    .map(|(s, e)| (s as u32, e as u32));
+                let mut ignore_comment_map: Vec<(u32, Vec<CompactString>)> = Vec::new();
+                let mut attacher = CommentAttacher {
+                    comments: &comment_entries,
+                    next: 0,
+                    content,
+                    offset: offset as u32,
+                    map: &mut ignore_comment_map,
+                    captured: Some(std::collections::HashMap::default()),
+                };
+                attacher.visit(json_val, None);
+                let claimed = attacher.next;
+                if let Some(captured) = attacher.captured.take() {
+                    for ((node_type, start, end), (leading, trailing)) in captured {
+                        arena.record_node_comments(
+                            &node_type,
+                            start,
+                            end,
+                            (!leading.is_empty()).then_some(leading),
+                            (!trailing.is_empty()).then_some(trailing),
+                        );
+                    }
+                }
 
-                        create_comment_object(
-                            comment.kind,
-                            value,
-                            comment_start,
-                            comment_end,
-                            line_offsets,
-                        )
-                        .to_value()
-                    })
-                    .collect();
-
-                // Collect trailing comments (after the expression)
-                let trailing_comments: Vec<Value> = result
-                    .program
-                    .comments
-                    .iter()
-                    .filter(|comment| comment.span.start >= expr_end)
-                    .map(|comment| {
-                        // Adjust positions: -1 for the paren, then add offset
-                        let comment_start = offset + comment.span.start as usize - 1;
-                        let comment_end = offset + comment.span.end as usize - 1;
-
-                        // Get raw comment text
-                        let raw = &wrapped[comment.span.start as usize..comment.span.end as usize];
-                        let mut value = extract_comment_value(raw, comment.kind);
-
-                        // Normalize block comment indentation
-                        if matches!(
-                            comment.kind,
-                            oxc_ast::ast::CommentKind::SingleLineBlock
-                                | oxc_ast::ast::CommentKind::MultiLineBlock
-                        ) {
-                            value = normalize_block_comment_indentation(
-                                &value,
-                                content,
-                                comment.span.start as usize - 1,
-                            );
-                        }
-
-                        create_comment_object(
-                            comment.kind,
-                            value,
-                            comment_start,
-                            comment_end,
-                            line_offsets,
-                        )
-                        .to_value()
-                    })
-                    .collect();
-
-                // Interior comments: a comment that sits *inside* the
-                // expression (after its start, before its end) is attached as a
-                // `leadingComments` entry on the sub-node it immediately
-                // precedes — mirroring acorn (e.g. `a instanceof /* c */ B`
-                // attaches `/* c */` to `B`). Svelte 5.56.1 #18330.
-                let interior_comments: Vec<(usize, Value)> = result
-                    .program
-                    .comments
-                    .iter()
-                    .filter(|c| c.span.end > expr_start && c.span.start < expr_end)
-                    .map(|c| {
-                        let comment_start = offset + c.span.start as usize - 1;
-                        let comment_end = offset + c.span.end as usize - 1;
-                        let raw = &wrapped[c.span.start as usize..c.span.end as usize];
-                        let mut value = extract_comment_value(raw, c.kind);
-                        if matches!(
-                            c.kind,
-                            oxc_ast::ast::CommentKind::SingleLineBlock
-                                | oxc_ast::ast::CommentKind::MultiLineBlock
-                        ) {
-                            value = normalize_block_comment_indentation(
-                                &value,
-                                content,
-                                c.span.start as usize - 1,
-                            );
-                        }
-                        (
-                            comment_end,
-                            create_comment_object(
-                                c.kind,
-                                value,
-                                comment_start,
-                                comment_end,
-                                line_offsets,
-                            )
-                            .to_value(),
-                        )
-                    })
-                    .collect();
-
-                // Attach comments to the expression
-                if !leading_comments.is_empty()
-                    || !trailing_comments.is_empty()
-                    || !interior_comments.is_empty()
+                // Upstream's "trailing comments after the root node" case, which
+                // is what lets a caller find the end of the expression tag.
+                if let (Some(root_type), Some((root_start, root_end))) =
+                    (root_type.as_deref(), root_span)
+                    && comment_entries.get(claimed).is_some_and(|c| c.start >= root_end)
                 {
-                    let mut json_val = expr.as_json().clone();
-                    if let Value::Object(ref mut obj) = json_val {
-                        if !leading_comments.is_empty() {
-                            obj.insert(
-                                "leadingComments".to_string(),
-                                Value::Array(leading_comments),
-                            );
-                        }
-                        if !trailing_comments.is_empty() {
-                            obj.insert(
-                                "trailingComments".to_string(),
-                                Value::Array(trailing_comments),
-                            );
-                        }
-                    }
-                    // Attach each interior comment to the node it precedes.
-                    for (comment_end, comment_obj) in interior_comments {
-                        if let Some(target) =
-                            json_min_node_start_at_or_after(&json_val, comment_end)
-                        {
-                            json_attach_leading_comment_at_start(
-                                &mut json_val,
-                                target,
-                                &comment_obj,
-                            );
-                        }
-                    }
-                    expr = Expression::from_json(json_val);
+                    let (leading, claimed_trailing) = arena
+                        .node_comments(root_type, root_start, root_end)
+                        .unwrap_or((None, None));
+                    let mut trailing = claimed_trailing.unwrap_or_default();
+                    trailing.extend(comment_values[claimed..].iter().cloned());
+                    arena.record_node_comments(
+                        root_type,
+                        root_start,
+                        root_end,
+                        leading,
+                        Some(trailing),
+                    );
                 }
             }
 
@@ -2012,98 +2374,6 @@ fn parse_expression_with_typescript(
 
         None
     })
-}
-
-/// Smallest `start` among AST nodes (objects carrying a non-comment `type`)
-/// whose `start >= threshold`. Used to find the node an interior comment
-/// immediately precedes.
-fn json_min_node_start_at_or_after(node: &Value, threshold: usize) -> Option<usize> {
-    fn walk(node: &Value, threshold: usize, best: &mut Option<usize>) {
-        match node {
-            Value::Object(map) => {
-                let is_ast_node = map
-                    .get("type")
-                    .and_then(|t| t.as_str())
-                    .is_some_and(|t| t != "Block" && t != "Line");
-                if is_ast_node
-                    && let Some(s) = map
-                        .get("start")
-                        .and_then(|v| v.as_u64())
-                        .map(|v| v as usize)
-                    && s >= threshold
-                    && best.is_none_or(|b| s < b)
-                {
-                    *best = Some(s);
-                }
-                for v in map.values() {
-                    walk(v, threshold, best);
-                }
-            }
-            Value::Array(arr) => {
-                for v in arr {
-                    walk(v, threshold, best);
-                }
-            }
-            _ => {}
-        }
-    }
-    let mut best = None;
-    walk(node, threshold, &mut best);
-    best
-}
-
-/// Attach `comment` to the `leadingComments` of the first (pre-order /
-/// outermost) AST node whose `start == target_start`.
-fn json_attach_leading_comment_at_start(
-    node: &mut Value,
-    target_start: usize,
-    comment: &Value,
-) -> bool {
-    match node {
-        Value::Object(map) => {
-            let is_ast_node = map
-                .get("type")
-                .and_then(|t| t.as_str())
-                .is_some_and(|t| t != "Block" && t != "Line");
-            let start = map
-                .get("start")
-                .and_then(|v| v.as_u64())
-                .map(|v| v as usize);
-            if is_ast_node && start == Some(target_start) {
-                let entry = map
-                    .entry("leadingComments".to_string())
-                    .or_insert_with(|| Value::Array(Vec::new()));
-                if let Value::Array(arr) = entry {
-                    arr.push(comment.clone());
-                }
-                return true;
-            }
-            for v in map.values_mut() {
-                if json_attach_leading_comment_at_start(v, target_start, comment) {
-                    return true;
-                }
-            }
-            false
-        }
-        Value::Array(arr) => {
-            for v in arr.iter_mut() {
-                if json_attach_leading_comment_at_start(v, target_start, comment) {
-                    return true;
-                }
-            }
-            false
-        }
-        _ => false,
-    }
-}
-
-/// Unwrap ParenthesizedExpression to get the inner expression.
-/// This is needed because we wrap expressions in parentheses for parsing.
-fn unwrap_parenthesized<'a>(expr: &'a OxcExpression<'a>) -> &'a OxcExpression<'a> {
-    match expr {
-        OxcExpression::ParenthesizedExpression(paren) => unwrap_parenthesized(&paren.expression),
-        _ => expr,
-    }
 }
 
 /// Strip optional markers (`?`) from TypeScript parameter names.
@@ -2174,10 +2444,7 @@ fn strip_optional_markers(content: &str) -> StrippedOptionalMarkers {
         i += 1;
     }
 
-    StrippedOptionalMarkers {
-        content: result,
-        removed_positions,
-    }
+    StrippedOptionalMarkers { content: result, removed_positions }
 }
 
 /// Split a parameter list at top-level commas (not inside braces, brackets, parens, or strings).
@@ -2219,7 +2486,7 @@ fn split_top_level_params(content: &str) -> Vec<String> {
         }
     }
 
-    if !current.trim().is_empty() {
+    if !current.trim_ws().is_empty() {
         parts.push(current);
     }
 
@@ -2228,24 +2495,21 @@ fn split_top_level_params(content: &str) -> Vec<String> {
 
 /// Parse TypeScript function parameters and return them as Expressions.
 /// Input is the content inside parentheses, e.g., "msg: string, count: number"
-pub fn parse_typescript_params(
+pub fn parse_typescript_params<'a>(
     arena: &ParseArena,
     content: &str,
     offset: usize,
     line_offsets: &[usize],
-) -> Vec<Expression> {
+) -> Vec<Expression<'a>> {
     // Use TypeScript source type to parse type annotations
     let source_type = SourceType::ts();
 
     // Wrap as arrow function to parse parameters: "(msg: string) => {}"
-    let mut wrapped = String::with_capacity(content.len() + 9);
-    wrapped.push('(');
-    wrapped.push_str(content);
-    wrapped.push_str(") => {}");
+    let wrapped = wrap_for_parse("(", content, ") => {}");
     let mut params = Vec::new();
 
-    enum ParseOutcome {
-        Ok(Vec<Expression>),
+    enum ParseOutcome<'a> {
+        Ok(Vec<Expression<'a>>),
         HasErrors,
     }
 
@@ -2291,10 +2555,7 @@ pub fn parse_typescript_params(
 
     // OXC TS parser failed - try stripping optional markers and re-parsing
     let stripped = strip_optional_markers(content);
-    let mut cleaned_wrapped = String::with_capacity(stripped.content.len() + 9);
-    cleaned_wrapped.push('(');
-    cleaned_wrapped.push_str(&stripped.content);
-    cleaned_wrapped.push_str(") => {}");
+    let cleaned_wrapped = wrap_for_parse("(", &stripped.content, ") => {}");
 
     let cleaned_ok = with_oxc_allocator(|allocator| {
         let cleaned_parser = OxcParser::new(allocator, &cleaned_wrapped, source_type);
@@ -2333,16 +2594,17 @@ pub fn parse_typescript_params(
     // Still failed - try parsing each parameter individually
     {
         let parts = split_top_level_params(content);
+        let mut search_from = 0usize;
         for part in &parts {
-            let part = part.trim();
+            let part = part.trim_ws();
             if part.is_empty() {
                 continue;
             }
             let stripped_part = strip_optional_markers(part);
-            let mut single_wrapped = String::with_capacity(stripped_part.content.len() + 9);
-            single_wrapped.push('(');
-            single_wrapped.push_str(&stripped_part.content);
-            single_wrapped.push_str(") => {}");
+            let part_offset_in_content =
+                content[search_from..].find(part).map(|p| search_from + p).unwrap_or(search_from);
+            search_from = part_offset_in_content + part.len();
+            let single_wrapped = wrap_for_parse("(", &stripped_part.content, ") => {}");
             let single_result_expr = with_oxc_allocator(|allocator| {
                 let single_parser = OxcParser::new(allocator, &single_wrapped, source_type);
                 let single_result = single_parser.parse();
@@ -2352,7 +2614,6 @@ pub fn parse_typescript_params(
                     && let OxcExpression::ArrowFunctionExpression(arrow) = &expr_stmt.expression
                     && let Some(param) = arrow.params.items.first()
                 {
-                    let part_offset_in_content = content.find(part).unwrap_or(0);
                     let param_expr = if stripped_part.removed_positions.is_empty() {
                         convert_formal_parameter(arena, param, offset - 1, line_offsets)
                     } else {
@@ -2376,15 +2637,21 @@ pub fn parse_typescript_params(
     }
 
     // Fallback: parse as comma-separated simple identifiers
-    if params.is_empty() && !content.trim().is_empty() {
+    if params.is_empty() && !content.trim_ws().is_empty() {
+        let mut search_from = 0usize;
         for part in content.split(',') {
-            let part = part.trim();
+            let part = part.trim_ws();
             if !part.is_empty() {
+                let part_pos = content[search_from..]
+                    .find(part)
+                    .map(|p| search_from + p)
+                    .unwrap_or(search_from);
+                search_from = part_pos + part.len();
                 // Extract just the name (before colon for typed params)
-                let name = part.split(':').next().unwrap_or(part).trim();
+                let name = part.split(':').next().unwrap_or(part).trim_ws();
                 // Strip optional marker '?' from the end (e.g., "c?" -> "c")
                 let name = name.strip_suffix('?').unwrap_or(name);
-                let part_offset = offset + content.find(part).unwrap_or(0);
+                let part_offset = offset + part_pos;
                 let expr =
                     create_identifier(name, part_offset, part_offset + name.len(), line_offsets);
                 params.push(expr);
@@ -2401,13 +2668,13 @@ pub fn parse_typescript_params(
 /// The `base_offset` is the position in the original source where the parameter content starts
 /// (i.e., `params_start`). The `stripped` info tells us where `?` characters were removed
 /// so we can map OXC positions (relative to cleaned content) back to original positions.
-fn convert_formal_parameter_with_remap(
+fn convert_formal_parameter_with_remap<'a>(
     arena: &ParseArena,
     param: &oxc_ast::ast::FormalParameter,
     base_offset: usize,
     line_offsets: &[usize],
     stripped: &StrippedOptionalMarkers,
-) -> Expression {
+) -> Expression<'a> {
     // OXC positions are relative to the wrapped string "(cleaned_content) => {}"
     // So position 1 in OXC = position 0 in cleaned content.
     // We need: original_source_pos = base_offset + stripped.map_to_original(oxc_pos - 1)
@@ -2439,20 +2706,14 @@ fn convert_formal_parameter_with_remap(
             // = base_offset + cleaned_pos
             let cleaned_pos = start_val as usize - base_offset;
             let original_pos = base_offset + stripped.map_to_original(cleaned_pos);
-            obj.insert(
-                "start".to_string(),
-                serde_json::Value::Number((original_pos as i64).into()),
-            );
+            obj.set_field("start", serde_json::Value::Number((original_pos as i64).into()));
         }
 
         // Fix end position
         if let Some(end_val) = obj.get("end").and_then(|e| e.as_u64()) {
             let cleaned_pos = end_val as usize - base_offset;
             let original_pos = base_offset + stripped.map_to_original(cleaned_pos);
-            obj.insert(
-                "end".to_string(),
-                serde_json::Value::Number((original_pos as i64).into()),
-            );
+            obj.set_field("end", serde_json::Value::Number((original_pos as i64).into()));
         }
 
         // Also fix the "right" field's span if this is an AssignmentPattern
@@ -2464,18 +2725,13 @@ fn convert_formal_parameter_with_remap(
             if let Some(start_val) = right_obj.get("start").and_then(|s| s.as_u64()) {
                 let cleaned_pos = start_val as usize - base_offset;
                 let original_pos = base_offset + stripped.map_to_original(cleaned_pos);
-                right_obj.insert(
-                    "start".to_string(),
-                    serde_json::Value::Number((original_pos as i64).into()),
-                );
+                right_obj
+                    .set_field("start", serde_json::Value::Number((original_pos as i64).into()));
             }
             if let Some(end_val) = right_obj.get("end").and_then(|e| e.as_u64()) {
                 let cleaned_pos = end_val as usize - base_offset;
                 let original_pos = base_offset + stripped.map_to_original(cleaned_pos);
-                right_obj.insert(
-                    "end".to_string(),
-                    serde_json::Value::Number((original_pos as i64).into()),
-                );
+                right_obj.set_field("end", serde_json::Value::Number((original_pos as i64).into()));
             }
         }
     }
@@ -2485,12 +2741,12 @@ fn convert_formal_parameter_with_remap(
 
 /// Convert oxc FormalParameter to our Expression format with type annotations.
 /// Caller should pass pre-adjusted offset if needed (e.g., offset - 1 for paren-wrapped content).
-fn convert_formal_parameter(
+fn convert_formal_parameter<'a>(
     arena: &ParseArena,
     param: &oxc_ast::ast::FormalParameter,
     adjusted_offset: usize,
     line_offsets: &[usize],
-) -> Expression {
+) -> Expression<'a> {
     // Check for TypeScript parameter properties (e.g., `constructor(private x: number)`)
     // These need to be emitted as TSParameterProperty nodes so that
     // remove_typescript_nodes can detect and report them.
@@ -2498,17 +2754,10 @@ fn convert_formal_parameter(
         let start = adjusted_offset + param.span.start as usize;
         let end = adjusted_offset + param.span.end as usize;
         let mut obj = Map::new();
-        obj.insert(
-            "type".to_string(),
-            Value::String("TSParameterProperty".to_string()),
-        );
-        obj.insert("start".to_string(), Value::Number((start as i64).into()));
-        obj.insert("end".to_string(), Value::Number((end as i64).into()));
-        if let Some(loc) = create_loc(start, end, line_offsets) {
-            obj.insert("loc".to_string(), loc);
-        }
+        obj.set_field("type", Value::String("TSParameterProperty".to_string()));
+        push_span_fields(&mut obj, start, end, line_offsets);
         if param.readonly {
-            obj.insert("readonly".to_string(), Value::Bool(true));
+            obj.set_field("readonly", Value::Bool(true));
         }
         if let Some(ref accessibility) = param.accessibility {
             let acc_str = match accessibility {
@@ -2516,14 +2765,11 @@ fn convert_formal_parameter(
                 oxc_ast::ast::TSAccessibility::Protected => "protected",
                 oxc_ast::ast::TSAccessibility::Public => "public",
             };
-            obj.insert(
-                "accessibility".to_string(),
-                Value::String(acc_str.to_string()),
-            );
+            obj.set_field("accessibility", Value::String(acc_str.to_string()));
         }
         // Include the parameter itself so remove_typescript_nodes can extract it
         let inner = convert_formal_parameter_inner(arena, param, adjusted_offset, line_offsets);
-        obj.insert("parameter".to_string(), inner.as_json().clone());
+        obj.set_field("parameter", inner.as_json().clone());
         return Expression::from_json(Value::Object(obj));
     }
 
@@ -2531,12 +2777,12 @@ fn convert_formal_parameter(
 }
 
 /// Inner implementation of convert_formal_parameter (without TSParameterProperty wrapping).
-fn convert_formal_parameter_inner(
+fn convert_formal_parameter_inner<'a>(
     arena: &ParseArena,
     param: &oxc_ast::ast::FormalParameter,
     adjusted_offset: usize,
     line_offsets: &[usize],
-) -> Expression {
+) -> Expression<'a> {
     use oxc_ast::ast::BindingPattern;
 
     // First, convert the pattern (left side)
@@ -2550,20 +2796,37 @@ fn convert_formal_parameter_inner(
                 let end = adjusted_offset + type_ann.span.end as usize;
 
                 let mut obj = Map::new();
-                obj.insert("type".to_string(), Value::String("Identifier".to_string()));
-                obj.insert("start".to_string(), Value::Number((start as i64).into()));
-                obj.insert("end".to_string(), Value::Number((end as i64).into()));
-                if let Some(loc) = create_loc(start, end, line_offsets) {
-                    obj.insert("loc".to_string(), loc);
+                obj.set_field("type", Value::String("Identifier".to_string()));
+                push_span_fields(&mut obj, start, end, line_offsets);
+                obj.set_field("name", Value::String(name.to_string()));
+
+                // TS optional marker (`b?: T`); acorn emits it after `name`.
+                if param.optional {
+                    obj.set_field("optional", Value::Bool(true));
                 }
-                obj.insert("name".to_string(), Value::String(name.to_string()));
 
                 // Convert type annotation
-                let type_ann_obj =
-                    convert_type_annotation_adjusted(type_ann, adjusted_offset, line_offsets);
-                obj.insert("typeAnnotation".to_string(), type_ann_obj);
+                let type_ann_obj = convert_type_annotation_adjusted(
+                    arena,
+                    type_ann,
+                    adjusted_offset,
+                    line_offsets,
+                );
+                obj.set_field("typeAnnotation", type_ann_obj);
 
                 Expression::from_json(Value::Object(obj))
+            } else if param.optional {
+                // Optional parameter without a type annotation (`b?`). acorn
+                // extends the identifier span to include the `?`.
+                let end = adjusted_offset + id.span.end as usize + 1;
+                Expression::from_node(JsNode::Identifier {
+                    start: start as u32,
+                    end: end as u32,
+                    loc: create_typed_loc(start, end, line_offsets),
+                    name: CompactString::from(name),
+                    optional: true,
+                    type_annotation: None,
+                })
             } else {
                 let end = adjusted_offset + id.span.end as usize;
                 create_identifier(name, start, end, line_offsets)
@@ -2581,11 +2844,11 @@ fn convert_formal_parameter_inner(
             // parameter's source by this span — without it the explicit type and
             // its optionality are lost and the member is inferred as `any` /
             // required (#912).
-            attach_param_type_annotation(expr, param, adjusted_offset, line_offsets)
+            attach_param_type_annotation(arena, expr, param, adjusted_offset, line_offsets)
         }
         BindingPattern::ArrayPattern(arr_pat) => {
             let expr = convert_array_pattern_to_expr(arena, arr_pat, adjusted_offset, line_offsets);
-            attach_param_type_annotation(expr, param, adjusted_offset, line_offsets)
+            attach_param_type_annotation(arena, expr, param, adjusted_offset, line_offsets)
         }
         BindingPattern::AssignmentPattern(assign_pat) => {
             convert_assignment_pattern_to_expr(arena, assign_pat, adjusted_offset, line_offsets)
@@ -2619,37 +2882,44 @@ fn convert_formal_parameter_inner(
 /// (the OXC span is relative to the parser's wrapped source); the annotation's
 /// spans use the same base, so callers needing original-source positions
 /// (e.g. the optional-marker remap path) still remap the top-level `end`.
-fn attach_param_type_annotation(
-    expr: Expression,
+fn attach_param_type_annotation<'a>(
+    arena: &ParseArena,
+    expr: Expression<'a>,
     param: &oxc_ast::ast::FormalParameter,
     adjusted_offset: usize,
     line_offsets: &[usize],
-) -> Expression {
+) -> Expression<'a> {
     let Some(type_ann) = &param.type_annotation else {
         return expr;
     };
-    let mut json = expr.as_json().clone();
-    if let Some(obj) = json.as_object_mut() {
-        let start = obj.get("start").and_then(|s| s.as_u64()).unwrap_or(0) as usize;
-        let end = adjusted_offset + type_ann.span.end as usize;
-        obj.insert("end".to_string(), Value::Number((end as i64).into()));
-        if let Some(loc) = create_loc(start, end, line_offsets) {
-            obj.insert("loc".to_string(), loc);
+    let annotation =
+        convert_type_annotation_adjusted(arena, type_ann, adjusted_offset, line_offsets);
+    let annotated_end = adjusted_offset + type_ann.span.end as usize;
+    let mut node = expr_to_node(expr);
+    let (start, end, loc, type_annotation) = match &mut node {
+        JsNode::ObjectPattern { start, end, loc, type_annotation, .. }
+        | JsNode::ArrayPattern { start, end, loc, type_annotation, .. } => {
+            (start, end, loc, type_annotation)
         }
-        let type_ann_obj =
-            convert_type_annotation_adjusted(type_ann, adjusted_offset, line_offsets);
-        obj.insert("typeAnnotation".to_string(), type_ann_obj);
+        // The two callers only pass object/array patterns; anything else keeps
+        // its spans rather than silently dropping the annotation.
+        _ => return Expression::from_node(node),
+    };
+    *end = annotated_end as u32;
+    if let Some(new_loc) = create_typed_loc(*start as usize, annotated_end, line_offsets) {
+        *loc = Some(new_loc);
     }
-    Expression::from_json(json)
+    *type_annotation = Some(Box::new(annotation));
+    Expression::from_node(node)
 }
 
 /// Convert oxc ObjectPattern to our Expression format (for function parameters).
-fn convert_object_pattern_to_expr(
+fn convert_object_pattern_to_expr<'a>(
     arena: &ParseArena,
     obj_pat: &oxc_ast::ast::ObjectPattern,
     adjusted_offset: usize,
     line_offsets: &[usize],
-) -> Expression {
+) -> Expression<'a> {
     let start = adjusted_offset + obj_pat.span.start as usize;
     let end = adjusted_offset + obj_pat.span.end as usize;
 
@@ -2712,12 +2982,12 @@ fn convert_object_pattern_to_expr(
 }
 
 /// Convert oxc ArrayPattern to our Expression format (for function parameters).
-fn convert_array_pattern_to_expr(
+fn convert_array_pattern_to_expr<'a>(
     arena: &ParseArena,
     arr_pat: &oxc_ast::ast::ArrayPattern,
     adjusted_offset: usize,
     line_offsets: &[usize],
-) -> Expression {
+) -> Expression<'a> {
     let start = adjusted_offset + arr_pat.span.start as usize;
     let end = adjusted_offset + arr_pat.span.end as usize;
 
@@ -2763,12 +3033,12 @@ fn convert_array_pattern_to_expr(
 }
 
 /// Convert oxc AssignmentPattern to our Expression format (for function parameters).
-fn convert_assignment_pattern_to_expr(
+fn convert_assignment_pattern_to_expr<'a>(
     arena: &ParseArena,
     assign_pat: &oxc_ast::ast::AssignmentPattern,
     adjusted_offset: usize,
     line_offsets: &[usize],
-) -> Expression {
+) -> Expression<'a> {
     let start = adjusted_offset + assign_pat.span.start as usize;
     let end = adjusted_offset + assign_pat.span.end as usize;
 
@@ -2788,12 +3058,9 @@ fn convert_assignment_pattern_to_expr(
     let right_start = adjusted_offset + assign_pat.right.span().start as usize;
     let right_end = adjusted_offset + assign_pat.right.span().end as usize;
     let mut right_obj = Map::new();
-    right_obj.insert("type".to_string(), Value::String("Expression".to_string()));
-    right_obj.insert(
-        "start".to_string(),
-        Value::Number((right_start as i64).into()),
-    );
-    right_obj.insert("end".to_string(), Value::Number((right_end as i64).into()));
+    right_obj.set_field("type", Value::String("Expression".to_string()));
+    right_obj.set_field("start", Value::Number((right_start as i64).into()));
+    right_obj.set_field("end", Value::Number((right_end as i64).into()));
 
     Expression::from_node(JsNode::AssignmentPattern {
         start: start as u32,
@@ -2818,13 +3085,9 @@ fn convert_binding_pattern_for_param(
             let start = adjusted_offset + id.span.start as usize;
             let end = adjusted_offset + id.span.end as usize;
             let mut obj = Map::new();
-            obj.insert("type".to_string(), Value::String("Identifier".to_string()));
-            obj.insert("name".to_string(), Value::String(id.name.to_string()));
-            obj.insert("start".to_string(), Value::Number((start as i64).into()));
-            obj.insert("end".to_string(), Value::Number((end as i64).into()));
-            if let Some(loc) = create_loc(start, end, line_offsets) {
-                obj.insert("loc".to_string(), loc);
-            }
+            obj.set_field("type", Value::String("Identifier".to_string()));
+            obj.set_field("name", Value::String(id.name.to_string()));
+            push_span_fields(&mut obj, start, end, line_offsets);
             Value::Object(obj)
         }
         BindingPattern::ObjectPattern(obj_pat) => {
@@ -2839,15 +3102,8 @@ fn convert_binding_pattern_for_param(
             let start = adjusted_offset + arr_pat.span.start as usize;
             let end = adjusted_offset + arr_pat.span.end as usize;
             let mut obj = Map::new();
-            obj.insert(
-                "type".to_string(),
-                Value::String("ArrayPattern".to_string()),
-            );
-            obj.insert("start".to_string(), Value::Number((start as i64).into()));
-            obj.insert("end".to_string(), Value::Number((end as i64).into()));
-            if let Some(loc) = create_loc(start, end, line_offsets) {
-                obj.insert("loc".to_string(), loc);
-            }
+            obj.set_field("type", Value::String("ArrayPattern".to_string()));
+            push_span_fields(&mut obj, start, end, line_offsets);
 
             // Convert elements
             let mut elements = Vec::new();
@@ -2870,14 +3126,11 @@ fn convert_binding_pattern_for_param(
                 let rest_end = adjusted_offset + rest.span.end as usize;
 
                 let mut rest_obj = Map::new();
-                rest_obj.insert("type".to_string(), Value::String("RestElement".to_string()));
-                rest_obj.insert(
-                    "start".to_string(),
-                    Value::Number((rest_start as i64).into()),
-                );
-                rest_obj.insert("end".to_string(), Value::Number((rest_end as i64).into()));
+                rest_obj.set_field("type", Value::String("RestElement".to_string()));
+                rest_obj.set_field("start", Value::Number((rest_start as i64).into()));
+                rest_obj.set_field("end", Value::Number((rest_end as i64).into()));
                 if let Some(loc) = create_loc(rest_start, rest_end, line_offsets) {
-                    rest_obj.insert("loc".to_string(), loc);
+                    rest_obj.set_field("loc", loc);
                 }
 
                 let argument = convert_binding_pattern_for_param(
@@ -2886,12 +3139,12 @@ fn convert_binding_pattern_for_param(
                     adjusted_offset,
                     line_offsets,
                 );
-                rest_obj.insert("argument".to_string(), argument);
+                rest_obj.set_field("argument", argument);
 
                 elements.push(Value::Object(rest_obj));
             }
 
-            obj.insert("elements".to_string(), Value::Array(elements));
+            obj.set_field("elements", Value::Array(elements));
 
             Value::Object(obj)
         }
@@ -2899,15 +3152,8 @@ fn convert_binding_pattern_for_param(
             let start = adjusted_offset + assign_pat.span.start as usize;
             let end = adjusted_offset + assign_pat.span.end as usize;
             let mut obj = Map::new();
-            obj.insert(
-                "type".to_string(),
-                Value::String("AssignmentPattern".to_string()),
-            );
-            obj.insert("start".to_string(), Value::Number((start as i64).into()));
-            obj.insert("end".to_string(), Value::Number((end as i64).into()));
-            if let Some(loc) = create_loc(start, end, line_offsets) {
-                obj.insert("loc".to_string(), loc);
-            }
+            obj.set_field("type", Value::String("AssignmentPattern".to_string()));
+            push_span_fields(&mut obj, start, end, line_offsets);
 
             // Convert left (the pattern)
             let left = convert_binding_pattern_for_param(
@@ -2916,7 +3162,7 @@ fn convert_binding_pattern_for_param(
                 adjusted_offset,
                 line_offsets,
             );
-            obj.insert("left".to_string(), left);
+            obj.set_field("left", left);
 
             // Convert right (the default value) using the full expression converter.
             // Must use with_serialize_arena to resolve IdRange children
@@ -2925,7 +3171,7 @@ fn convert_binding_pattern_for_param(
                 convert_expression(arena, &assign_pat.right, adjusted_offset, line_offsets);
             let right_val =
                 crate::ast::arena::with_serialize_arena(arena, || right_expr.as_json().clone());
-            obj.insert("right".to_string(), right_val);
+            obj.set_field("right", right_val);
 
             Value::Object(obj)
         }
@@ -2957,29 +3203,16 @@ fn convert_property_key_for_param_as_node(
         PropertyKey::PrivateIdentifier(id) => {
             let start = adjusted_offset + id.span.start as usize;
             let end = adjusted_offset + id.span.end as usize;
-            expr_to_node(create_private_identifier(
-                &id.name,
-                start,
-                end,
-                line_offsets,
-            ))
+            expr_to_node(create_private_identifier(&id.name, start, end, line_offsets))
         }
         _ => {
             if let Some(expr) = key.as_expression() {
-                expr_to_node(convert_expression(
-                    arena,
-                    expr,
-                    adjusted_offset,
-                    line_offsets,
-                ))
+                expr_to_node(convert_expression(arena, expr, adjusted_offset, line_offsets))
             } else {
                 // Fallback placeholder for truly unhandled cases (no span).
                 let mut obj = Map::new();
-                obj.insert("type".to_string(), Value::String("Identifier".to_string()));
-                obj.insert(
-                    "name".to_string(),
-                    Value::String("__computed__".to_string()),
-                );
+                obj.set_field("type", Value::String("Identifier".to_string()));
+                obj.set_field("name", Value::String("__computed__".to_string()));
                 JsNode::from_value(Value::Object(obj))
             }
         }
@@ -3046,6 +3279,7 @@ fn convert_binding_pattern_for_param_as_node(
 
 /// Convert type annotation with pre-adjusted offset.
 fn convert_type_annotation_adjusted(
+    arena: &ParseArena,
     type_ann: &oxc_ast::ast::TSTypeAnnotation,
     adjusted_offset: usize,
     line_offsets: &[usize],
@@ -3054,21 +3288,35 @@ fn convert_type_annotation_adjusted(
     let end = adjusted_offset + type_ann.span.end as usize;
 
     let mut obj = Map::new();
-    obj.insert(
-        "type".to_string(),
-        Value::String("TSTypeAnnotation".to_string()),
-    );
-    obj.insert("start".to_string(), Value::Number((start as i64).into()));
-    obj.insert("end".to_string(), Value::Number((end as i64).into()));
-    if let Some(loc) = create_loc(start, end, line_offsets) {
-        obj.insert("loc".to_string(), loc);
-    }
+    obj.set_field("type", Value::String("TSTypeAnnotation".to_string()));
+    push_span_fields(&mut obj, start, end, line_offsets);
 
     // Convert the inner type
     let inner_type =
-        convert_ts_type_adjusted(&type_ann.type_annotation, adjusted_offset, line_offsets);
-    obj.insert("typeAnnotation".to_string(), inner_type);
+        convert_ts_type_adjusted(arena, &type_ann.type_annotation, adjusted_offset, line_offsets);
+    obj.set_field("typeAnnotation", inner_type);
 
+    Value::Object(obj)
+}
+
+/// Build a TS assertion wrapper (`TSAsExpression` / `TSSatisfiesExpression` /
+/// `TSNonNullExpression`) as a serde_json `Value` in svelte/compiler's shape.
+/// `type_annotation` is `None` for `TSNonNullExpression` (which has no type).
+fn ts_assertion_value(
+    type_name: &str,
+    start: usize,
+    end: usize,
+    expression: Value,
+    type_annotation: Option<Value>,
+    line_offsets: &[usize],
+) -> Value {
+    let mut obj = Map::new();
+    obj.set_field("type", Value::String(type_name.to_string()));
+    push_span_fields(&mut obj, start, end, line_offsets);
+    obj.set_field("expression", expression);
+    if let Some(ta) = type_annotation {
+        obj.set_field("typeAnnotation", ta);
+    }
     Value::Object(obj)
 }
 
@@ -3079,11 +3327,12 @@ fn convert_type_annotation_adjusted(
 /// avoids churning the FunctionParameter / declarator call sites that already
 /// pass an `adjusted_offset`.
 fn convert_ts_type_adjusted(
+    arena: &ParseArena,
     ts_type: &oxc_ast::ast::TSType,
     adjusted_offset: usize,
     line_offsets: &[usize],
 ) -> Value {
-    convert_ts_type(ts_type, adjusted_offset, line_offsets)
+    convert_ts_type(arena, ts_type, adjusted_offset, line_offsets)
 }
 
 /// Convert TSTypeName with pre-adjusted offset.
@@ -3098,13 +3347,9 @@ fn convert_ts_type_name_adjusted(
             let end = adjusted_offset + id.span.end as usize;
 
             let mut obj = Map::new();
-            obj.insert("type".to_string(), Value::String("Identifier".to_string()));
-            obj.insert("start".to_string(), Value::Number((start as i64).into()));
-            obj.insert("end".to_string(), Value::Number((end as i64).into()));
-            if let Some(loc) = create_loc(start, end, line_offsets) {
-                obj.insert("loc".to_string(), loc);
-            }
-            obj.insert("name".to_string(), Value::String(id.name.to_string()));
+            obj.set_field("type", Value::String("Identifier".to_string()));
+            push_span_fields(&mut obj, start, end, line_offsets);
+            obj.set_field("name", Value::String(id.name.to_string()));
 
             Value::Object(obj)
         }
@@ -3115,26 +3360,19 @@ fn convert_ts_type_name_adjusted(
             let end = adjusted_offset + span.end as usize;
 
             let mut obj = Map::new();
-            obj.insert(
-                "type".to_string(),
-                Value::String("TSQualifiedName".to_string()),
-            );
-            obj.insert("start".to_string(), Value::Number((start as i64).into()));
-            obj.insert("end".to_string(), Value::Number((end as i64).into()));
-            if let Some(loc) = create_loc(start, end, line_offsets) {
-                obj.insert("loc".to_string(), loc);
-            }
+            obj.set_field("type", Value::String("TSQualifiedName".to_string()));
+            push_span_fields(&mut obj, start, end, line_offsets);
 
             // `left` recurses (it may itself be a qualified name); `right` is a
             // plain Identifier. Matches svelte/compiler's TSQualifiedName shape.
-            obj.insert(
-                "left".to_string(),
+            obj.set_field(
+                "left",
                 convert_ts_type_name_adjusted(&qualified.left, adjusted_offset, line_offsets),
             );
             let r_start = adjusted_offset + qualified.right.span.start as usize;
             let r_end = adjusted_offset + qualified.right.span.end as usize;
-            obj.insert(
-                "right".to_string(),
+            obj.set_field(
+                "right",
                 ts_identifier_value(&qualified.right.name, r_start, r_end, line_offsets),
             );
 
@@ -3146,15 +3384,8 @@ fn convert_ts_type_name_adjusted(
             let end = adjusted_offset + this.span.end as usize;
 
             let mut obj = Map::new();
-            obj.insert(
-                "type".to_string(),
-                Value::String("ThisExpression".to_string()),
-            );
-            obj.insert("start".to_string(), Value::Number((start as i64).into()));
-            obj.insert("end".to_string(), Value::Number((end as i64).into()));
-            if let Some(loc) = create_loc(start, end, line_offsets) {
-                obj.insert("loc".to_string(), loc);
-            }
+            obj.set_field("type", Value::String("ThisExpression".to_string()));
+            push_span_fields(&mut obj, start, end, line_offsets);
 
             Value::Object(obj)
         }
@@ -3169,7 +3400,12 @@ fn convert_ts_type_name_adjusted(
 /// (`$props()` destructuring annotations) and the FunctionParameter / pattern
 /// path route through here so inline annotations no longer collapse to a
 /// members-less `TSUnknownKeyword` stub (#791).
-fn convert_ts_type(ts_type: &oxc_ast::ast::TSType, offset: usize, line_offsets: &[usize]) -> Value {
+fn convert_ts_type(
+    arena: &ParseArena,
+    ts_type: &oxc_ast::ast::TSType,
+    offset: usize,
+    line_offsets: &[usize],
+) -> Value {
     use oxc_ast::ast::TSType;
 
     let span = ts_type.span();
@@ -3179,12 +3415,8 @@ fn convert_ts_type(ts_type: &oxc_ast::ast::TSType, offset: usize, line_offsets: 
     // Build a `{ type, start, end, loc }` object the rest of the arms extend.
     let base = |type_name: &str| -> Map<String, Value> {
         let mut obj = Map::new();
-        obj.insert("type".to_string(), Value::String(type_name.to_string()));
-        obj.insert("start".to_string(), Value::Number((start as i64).into()));
-        obj.insert("end".to_string(), Value::Number((end as i64).into()));
-        if let Some(loc) = create_loc(start, end, line_offsets) {
-            obj.insert("loc".to_string(), loc);
-        }
+        obj.set_field("type", Value::String(type_name.to_string()));
+        push_span_fields(&mut obj, start, end, line_offsets);
         obj
     };
 
@@ -3226,14 +3458,14 @@ fn convert_ts_type(ts_type: &oxc_ast::ast::TSType, offset: usize, line_offsets: 
         // ---- references -----------------------------------------------------
         TSType::TSTypeReference(type_ref) => {
             let mut obj = base("TSTypeReference");
-            obj.insert(
-                "typeName".to_string(),
+            obj.set_field(
+                "typeName",
                 convert_ts_type_name_adjusted(&type_ref.type_name, offset, line_offsets),
             );
             if let Some(args) = &type_ref.type_arguments {
-                obj.insert(
-                    "typeArguments".to_string(),
-                    convert_ts_type_param_instantiation(args, offset, line_offsets),
+                obj.set_field(
+                    "typeArguments",
+                    convert_ts_type_param_instantiation(arena, args, offset, line_offsets),
                 );
             }
             Value::Object(obj)
@@ -3245,59 +3477,50 @@ fn convert_ts_type(ts_type: &oxc_ast::ast::TSType, offset: usize, line_offsets: 
             let members: Vec<Value> = lit
                 .members
                 .iter()
-                .map(|m| convert_ts_signature(m, offset, line_offsets))
+                .map(|m| convert_ts_signature(arena, m, offset, line_offsets))
                 .collect();
-            obj.insert("members".to_string(), Value::Array(members));
+            obj.set_field("members", Value::Array(members));
             Value::Object(obj)
         }
 
         // ---- unions / intersections ----------------------------------------
         TSType::TSUnionType(u) => {
             let mut obj = base("TSUnionType");
-            let types: Vec<Value> = u
-                .types
-                .iter()
-                .map(|t| convert_ts_type(t, offset, line_offsets))
-                .collect();
-            obj.insert("types".to_string(), Value::Array(types));
+            let types: Vec<Value> =
+                u.types.iter().map(|t| convert_ts_type(arena, t, offset, line_offsets)).collect();
+            obj.set_field("types", Value::Array(types));
             Value::Object(obj)
         }
         TSType::TSIntersectionType(i) => {
             let mut obj = base("TSIntersectionType");
-            let types: Vec<Value> = i
-                .types
-                .iter()
-                .map(|t| convert_ts_type(t, offset, line_offsets))
-                .collect();
-            obj.insert("types".to_string(), Value::Array(types));
+            let types: Vec<Value> =
+                i.types.iter().map(|t| convert_ts_type(arena, t, offset, line_offsets)).collect();
+            obj.set_field("types", Value::Array(types));
             Value::Object(obj)
         }
 
         // ---- arrays / tuples ------------------------------------------------
         TSType::TSArrayType(a) => {
             let mut obj = base("TSArrayType");
-            obj.insert(
-                "elementType".to_string(),
-                convert_ts_type(&a.element_type, offset, line_offsets),
+            obj.set_field(
+                "elementType",
+                convert_ts_type(arena, &a.element_type, offset, line_offsets),
             );
             Value::Object(obj)
         }
         // ---- literal types: `'a'`, `403`, `true` ----------------------------
         TSType::TSLiteralType(l) => {
             let mut obj = base("TSLiteralType");
-            obj.insert(
-                "literal".to_string(),
-                convert_ts_literal(&l.literal, offset, line_offsets),
-            );
+            obj.set_field("literal", convert_ts_literal(&l.literal, offset, line_offsets));
             Value::Object(obj)
         }
 
         // ---- wrappers / operators ------------------------------------------
         TSType::TSParenthesizedType(p) => {
             let mut obj = base("TSParenthesizedType");
-            obj.insert(
-                "typeAnnotation".to_string(),
-                convert_ts_type(&p.type_annotation, offset, line_offsets),
+            obj.set_field(
+                "typeAnnotation",
+                convert_ts_type(arena, &p.type_annotation, offset, line_offsets),
             );
             Value::Object(obj)
         }
@@ -3310,22 +3533,90 @@ fn convert_ts_type(ts_type: &oxc_ast::ast::TSType, offset: usize, line_offsets: 
                 TSTypeOperatorOperator::Unique => "unique",
                 TSTypeOperatorOperator::Readonly => "readonly",
             };
-            obj.insert("operator".to_string(), Value::String(operator.to_string()));
-            obj.insert(
-                "typeAnnotation".to_string(),
-                convert_ts_type(&op.type_annotation, offset, line_offsets),
+            obj.set_field("operator", Value::String(operator.to_string()));
+            obj.set_field(
+                "typeAnnotation",
+                convert_ts_type(arena, &op.type_annotation, offset, line_offsets),
             );
             Value::Object(obj)
         }
         TSType::TSIndexedAccessType(ia) => {
             let mut obj = base("TSIndexedAccessType");
-            obj.insert(
-                "objectType".to_string(),
-                convert_ts_type(&ia.object_type, offset, line_offsets),
+            obj.set_field(
+                "objectType",
+                convert_ts_type(arena, &ia.object_type, offset, line_offsets),
             );
-            obj.insert(
-                "indexType".to_string(),
-                convert_ts_type(&ia.index_type, offset, line_offsets),
+            obj.set_field(
+                "indexType",
+                convert_ts_type(arena, &ia.index_type, offset, line_offsets),
+            );
+            Value::Object(obj)
+        }
+
+        // ---- function / constructor signature types -------------------------
+        // `(a: string) => void` / `new (a: string) => Foo`. Both share the same
+        // shape (generic type parameters, a flat `parameters` array with any
+        // `this` parameter prepended as a plain Identifier, and a `typeAnnotation`
+        // wrapping the return type) — svelte/compiler (acorn-typescript) keeps
+        // these as real nodes rather than collapsing them to `TSUnknownKeyword` (#1660).
+        TSType::TSFunctionType(f) => {
+            let mut obj = base("TSFunctionType");
+            if let Some(type_parameters) = &f.type_parameters {
+                obj.set_field(
+                    "typeParameters",
+                    convert_ts_type_parameter_declaration(
+                        arena,
+                        type_parameters,
+                        offset,
+                        line_offsets,
+                    ),
+                );
+            }
+            obj.set_field(
+                "parameters",
+                Value::Array(convert_ts_function_like_params(
+                    arena,
+                    f.this_param.as_deref(),
+                    &f.params,
+                    offset,
+                    line_offsets,
+                )),
+            );
+            obj.set_field(
+                "typeAnnotation",
+                convert_type_annotation_adjusted(arena, &f.return_type, offset, line_offsets),
+            );
+            Value::Object(obj)
+        }
+        TSType::TSConstructorType(c) => {
+            let mut obj = base("TSConstructorType");
+            // svelte/compiler always emits `abstract` (unlike `optional` / `readonly`
+            // elsewhere, which are omitted when false).
+            obj.set_field("abstract", Value::Bool(c.r#abstract));
+            if let Some(type_parameters) = &c.type_parameters {
+                obj.set_field(
+                    "typeParameters",
+                    convert_ts_type_parameter_declaration(
+                        arena,
+                        type_parameters,
+                        offset,
+                        line_offsets,
+                    ),
+                );
+            }
+            obj.set_field(
+                "parameters",
+                Value::Array(convert_ts_function_like_params(
+                    arena,
+                    None,
+                    &c.params,
+                    offset,
+                    line_offsets,
+                )),
+            );
+            obj.set_field(
+                "typeAnnotation",
+                convert_type_annotation_adjusted(arena, &c.return_type, offset, line_offsets),
             );
             Value::Object(obj)
         }
@@ -3337,10 +3628,123 @@ fn convert_ts_type(ts_type: &oxc_ast::ast::TSType, offset: usize, line_offsets: 
     }
 }
 
-/// Convert a member of a `TSTypeLiteral` / interface body. Currently models
-/// `TSPropertySignature` exactly (the common inline-props case); other
-/// signature kinds degrade to a span-bearing node.
+/// Convert a `TSTypeParameterDeclaration` (`<T, U extends V = W>`) into
+/// svelte/compiler's shape: `{ type: 'TSTypeParameterDeclaration', params }`,
+/// each param `{ type: 'TSTypeParameter', name: <string>, constraint?, default? }`.
+/// acorn-typescript stores `name` as a plain string (not an `Identifier` node)
+/// and omits `constraint`/`default` when absent.
+fn convert_ts_type_parameter_declaration(
+    arena: &ParseArena,
+    decl: &oxc_ast::ast::TSTypeParameterDeclaration,
+    offset: usize,
+    line_offsets: &[usize],
+) -> Value {
+    let start = offset + decl.span.start as usize;
+    let end = offset + decl.span.end as usize;
+    let mut obj = Map::new();
+    obj.set_field("type", Value::String("TSTypeParameterDeclaration".to_string()));
+    push_span_fields(&mut obj, start, end, line_offsets);
+    let params: Vec<Value> = decl
+        .params
+        .iter()
+        .map(|p| convert_ts_type_parameter(arena, p, offset, line_offsets))
+        .collect();
+    obj.set_field("params", Value::Array(params));
+    Value::Object(obj)
+}
+
+/// Convert a single `TSTypeParameter` (`T extends U = V`).
+fn convert_ts_type_parameter(
+    arena: &ParseArena,
+    param: &oxc_ast::ast::TSTypeParameter,
+    offset: usize,
+    line_offsets: &[usize],
+) -> Value {
+    let start = offset + param.span.start as usize;
+    let end = offset + param.span.end as usize;
+    let mut obj = Map::new();
+    obj.set_field("type", Value::String("TSTypeParameter".to_string()));
+    push_span_fields(&mut obj, start, end, line_offsets);
+    obj.set_field("name", Value::String(param.name.name.to_string()));
+    if let Some(constraint) = &param.constraint {
+        obj.set_field("constraint", convert_ts_type(arena, constraint, offset, line_offsets));
+    }
+    if let Some(default) = &param.default {
+        obj.set_field("default", convert_ts_type(arena, default, offset, line_offsets));
+    }
+    Value::Object(obj)
+}
+
+/// Convert a `TSFunctionType` / `TSConstructorType` parameter list into
+/// svelte/compiler's flat `parameters` array. acorn-typescript parses `this: T`
+/// as an ordinary parameter pattern (not a distinct node), so a `this` param is
+/// prepended as a plain `Identifier` named `"this"`.
+/// TSESTree models a TypeScript `this` parameter as an ordinary leading
+/// parameter named `this`, which is what rules indexing `params[0]` see.
+fn convert_this_param(
+    arena: &ParseArena,
+    this_param: &oxc_ast::ast::TSThisParameter,
+    offset: usize,
+    line_offsets: &[usize],
+) -> Value {
+    let start = offset + this_param.span.start as usize;
+    let end = offset + this_param.span.end as usize;
+    let mut obj = Map::new();
+    obj.set_field("type", Value::String("Identifier".to_string()));
+    push_span_fields(&mut obj, start, end, line_offsets);
+    obj.set_field("name", Value::String("this".to_string()));
+    if let Some(type_ann) = &this_param.type_annotation {
+        obj.set_field(
+            "typeAnnotation",
+            convert_type_annotation_adjusted(arena, type_ann, offset, line_offsets),
+        );
+    }
+    Value::Object(obj)
+}
+
+fn convert_ts_function_like_params(
+    arena: &ParseArena,
+    this_param: Option<&oxc_ast::ast::TSThisParameter>,
+    params: &oxc_ast::ast::FormalParameters,
+    offset: usize,
+    line_offsets: &[usize],
+) -> Vec<Value> {
+    let mut out = Vec::with_capacity(
+        this_param.is_some() as usize + params.items.len() + params.rest.is_some() as usize,
+    );
+
+    if let Some(this_param) = this_param {
+        out.push(convert_this_param(arena, this_param, offset, line_offsets));
+    }
+
+    for param in &params.items {
+        out.push(convert_formal_parameter(arena, param, offset, line_offsets).as_json().clone());
+    }
+
+    if let Some(rest) = &params.rest {
+        let start = offset + rest.span.start as usize;
+        let end = offset + rest.span.end as usize;
+        let argument =
+            convert_binding_pattern_for_param(arena, &rest.rest.argument, offset, line_offsets);
+        let mut obj = Map::new();
+        obj.set_field("type", Value::String("RestElement".to_string()));
+        push_span_fields(&mut obj, start, end, line_offsets);
+        obj.set_field("argument", argument);
+        if let Some(type_ann) = &rest.type_annotation {
+            obj.set_field(
+                "typeAnnotation",
+                convert_type_annotation_adjusted(arena, type_ann, offset, line_offsets),
+            );
+        }
+        out.push(Value::Object(obj));
+    }
+
+    out
+}
+
+/// Convert a member of a `TSTypeLiteral` / interface body.
 fn convert_ts_signature(
+    arena: &ParseArena,
     sig: &oxc_ast::ast::TSSignature,
     offset: usize,
     line_offsets: &[usize],
@@ -3353,57 +3757,141 @@ fn convert_ts_signature(
             let end = offset + prop.span.end as usize;
 
             let mut obj = Map::new();
-            obj.insert(
-                "type".to_string(),
-                Value::String("TSPropertySignature".to_string()),
-            );
-            obj.insert("start".to_string(), Value::Number((start as i64).into()));
-            obj.insert("end".to_string(), Value::Number((end as i64).into()));
-            if let Some(loc) = create_loc(start, end, line_offsets) {
-                obj.insert("loc".to_string(), loc);
-            }
-            obj.insert("computed".to_string(), Value::Bool(prop.computed));
+            obj.set_field("type", Value::String("TSPropertySignature".to_string()));
+            push_span_fields(&mut obj, start, end, line_offsets);
+            obj.set_field("computed", Value::Bool(prop.computed));
             // svelte/compiler omits `optional` / `readonly` when false.
             if prop.optional {
-                obj.insert("optional".to_string(), Value::Bool(true));
+                obj.set_field("optional", Value::Bool(true));
             }
             if prop.readonly {
-                obj.insert("readonly".to_string(), Value::Bool(true));
+                obj.set_field("readonly", Value::Bool(true));
             }
-            obj.insert(
-                "key".to_string(),
-                convert_ts_property_key(&prop.key, offset, line_offsets),
-            );
+            obj.set_field("key", convert_ts_property_key(&prop.key, offset, line_offsets));
             if let Some(type_ann) = &prop.type_annotation {
-                obj.insert(
-                    "typeAnnotation".to_string(),
-                    convert_type_annotation_adjusted(type_ann, offset, line_offsets),
+                obj.set_field(
+                    "typeAnnotation",
+                    convert_type_annotation_adjusted(arena, type_ann, offset, line_offsets),
                 );
             }
             Value::Object(obj)
         }
-        // Index / method / call / construct signatures: span-bearing node so
-        // the member is still addressable even though it isn't fully modelled.
-        _ => {
-            let span = sig.span();
-            let start = offset + span.start as usize;
-            let end = offset + span.end as usize;
-            let type_name = match sig {
-                TSSignature::TSIndexSignature(_) => "TSIndexSignature",
-                TSSignature::TSCallSignatureDeclaration(_) => "TSCallSignatureDeclaration",
-                TSSignature::TSConstructSignatureDeclaration(_) => {
-                    "TSConstructSignatureDeclaration"
-                }
-                TSSignature::TSMethodSignature(_) => "TSMethodSignature",
-                TSSignature::TSPropertySignature(_) => "TSPropertySignature",
-            };
+        TSSignature::TSMethodSignature(method) => {
+            use oxc_ast::ast::TSMethodSignatureKind;
+
+            let start = offset + method.span.start as usize;
+            let end = offset + method.span.end as usize;
             let mut obj = Map::new();
-            obj.insert("type".to_string(), Value::String(type_name.to_string()));
-            obj.insert("start".to_string(), Value::Number((start as i64).into()));
-            obj.insert("end".to_string(), Value::Number((end as i64).into()));
-            if let Some(loc) = create_loc(start, end, line_offsets) {
-                obj.insert("loc".to_string(), loc);
+            obj.set_field("type", Value::String("TSMethodSignature".to_string()));
+            push_span_fields(&mut obj, start, end, line_offsets);
+            obj.set_field("computed", Value::Bool(method.computed));
+            obj.set_field("key", convert_ts_property_key(&method.key, offset, line_offsets));
+            obj.set_field(
+                "kind",
+                Value::String(
+                    match method.kind {
+                        TSMethodSignatureKind::Method => "method",
+                        TSMethodSignatureKind::Get => "get",
+                        TSMethodSignatureKind::Set => "set",
+                    }
+                    .to_string(),
+                ),
+            );
+            obj.set_field(
+                "parameters",
+                Value::Array(convert_ts_function_like_params(
+                    arena,
+                    method.this_param.as_deref(),
+                    &method.params,
+                    offset,
+                    line_offsets,
+                )),
+            );
+            if method.optional {
+                obj.set_field("optional", Value::Bool(true));
             }
+            if let Some(parameters) = &method.type_parameters {
+                obj.set_field(
+                    "typeParameters",
+                    convert_ts_type_parameter_declaration(arena, parameters, offset, line_offsets),
+                );
+            }
+            if let Some(return_type) = &method.return_type {
+                obj.set_field(
+                    "typeAnnotation",
+                    convert_type_annotation_adjusted(arena, return_type, offset, line_offsets),
+                );
+            }
+            Value::Object(obj)
+        }
+        TSSignature::TSCallSignatureDeclaration(call) => {
+            let start = offset + call.span.start as usize;
+            let end = offset + call.span.end as usize;
+            let mut obj = Map::new();
+            obj.set_field("type", Value::String("TSCallSignatureDeclaration".to_string()));
+            push_span_fields(&mut obj, start, end, line_offsets);
+            obj.set_field(
+                "parameters",
+                Value::Array(convert_ts_function_like_params(
+                    arena,
+                    call.this_param.as_deref(),
+                    &call.params,
+                    offset,
+                    line_offsets,
+                )),
+            );
+            if let Some(parameters) = &call.type_parameters {
+                obj.set_field(
+                    "typeParameters",
+                    convert_ts_type_parameter_declaration(arena, parameters, offset, line_offsets),
+                );
+            }
+            if let Some(return_type) = &call.return_type {
+                obj.set_field(
+                    "typeAnnotation",
+                    convert_type_annotation_adjusted(arena, return_type, offset, line_offsets),
+                );
+            }
+            Value::Object(obj)
+        }
+        TSSignature::TSConstructSignatureDeclaration(constructor) => {
+            let start = offset + constructor.span.start as usize;
+            let end = offset + constructor.span.end as usize;
+            let mut obj = Map::new();
+            obj.set_field("type", Value::String("TSConstructSignatureDeclaration".to_string()));
+            push_span_fields(&mut obj, start, end, line_offsets);
+            obj.set_field(
+                "parameters",
+                Value::Array(convert_ts_function_like_params(
+                    arena,
+                    None,
+                    &constructor.params,
+                    offset,
+                    line_offsets,
+                )),
+            );
+            if let Some(parameters) = &constructor.type_parameters {
+                obj.set_field(
+                    "typeParameters",
+                    convert_ts_type_parameter_declaration(arena, parameters, offset, line_offsets),
+                );
+            }
+            if let Some(return_type) = &constructor.return_type {
+                obj.set_field(
+                    "typeAnnotation",
+                    convert_type_annotation_adjusted(arena, return_type, offset, line_offsets),
+                );
+            }
+            Value::Object(obj)
+        }
+        // Index signatures remain span-bearing until their parameter/modifier
+        // fields have an exact public-AST conversion.
+        TSSignature::TSIndexSignature(index) => {
+            let start = offset + index.span.start as usize;
+            let end = offset + index.span.end as usize;
+            let mut obj = Map::new();
+            obj.set_field("type", Value::String("TSIndexSignature".to_string()));
+            push_span_fields(&mut obj, start, end, line_offsets);
             Value::Object(obj)
         }
     }
@@ -3510,13 +3998,9 @@ fn convert_ts_literal(
 /// which the TS-type converters can't use directly).
 fn ts_identifier_value(name: &str, start: usize, end: usize, line_offsets: &[usize]) -> Value {
     let mut obj = Map::new();
-    obj.insert("type".to_string(), Value::String("Identifier".to_string()));
-    obj.insert("start".to_string(), Value::Number((start as i64).into()));
-    obj.insert("end".to_string(), Value::Number((end as i64).into()));
-    if let Some(loc) = create_loc(start, end, line_offsets) {
-        obj.insert("loc".to_string(), loc);
-    }
-    obj.insert("name".to_string(), Value::String(name.to_string()));
+    obj.set_field("type", Value::String("Identifier".to_string()));
+    push_span_fields(&mut obj, start, end, line_offsets);
+    obj.set_field("name", Value::String(name.to_string()));
     Value::Object(obj)
 }
 
@@ -3529,15 +4013,11 @@ fn ts_literal_value(
     line_offsets: &[usize],
 ) -> Value {
     let mut obj = Map::new();
-    obj.insert("type".to_string(), Value::String("Literal".to_string()));
-    obj.insert("start".to_string(), Value::Number((start as i64).into()));
-    obj.insert("end".to_string(), Value::Number((end as i64).into()));
-    if let Some(loc) = create_loc(start, end, line_offsets) {
-        obj.insert("loc".to_string(), loc);
-    }
-    obj.insert("value".to_string(), value);
+    obj.set_field("type", Value::String("Literal".to_string()));
+    push_span_fields(&mut obj, start, end, line_offsets);
+    obj.set_field("value", value);
     if let Some(raw) = raw {
-        obj.insert("raw".to_string(), Value::String(raw));
+        obj.set_field("raw", Value::String(raw));
     }
     Value::Object(obj)
 }
@@ -3548,15 +4028,14 @@ fn number_value(v: f64) -> Value {
     if v.fract() == 0.0 && v.is_finite() && v.abs() < 9.007_199_254_740_992e15 {
         Value::Number((v as i64).into())
     } else {
-        serde_json::Number::from_f64(v)
-            .map(Value::Number)
-            .unwrap_or(Value::Null)
+        serde_json::Number::from_f64(v).map(Value::Number).unwrap_or(Value::Null)
     }
 }
 
 /// Convert a `TSTypeParameterInstantiation` (`<A, B>`) into svelte/compiler's
 /// shape: `{ type: 'TSTypeParameterInstantiation', start, end, loc, params }`.
 fn convert_ts_type_param_instantiation(
+    arena: &ParseArena,
     args: &oxc_ast::ast::TSTypeParameterInstantiation,
     offset: usize,
     line_offsets: &[usize],
@@ -3564,43 +4043,29 @@ fn convert_ts_type_param_instantiation(
     let start = offset + args.span.start as usize;
     let end = offset + args.span.end as usize;
     let mut obj = Map::new();
-    obj.insert(
-        "type".to_string(),
-        Value::String("TSTypeParameterInstantiation".to_string()),
-    );
-    obj.insert("start".to_string(), Value::Number((start as i64).into()));
-    obj.insert("end".to_string(), Value::Number((end as i64).into()));
-    if let Some(loc) = create_loc(start, end, line_offsets) {
-        obj.insert("loc".to_string(), loc);
-    }
-    let params: Vec<Value> = args
-        .params
-        .iter()
-        .map(|t| convert_ts_type(t, offset, line_offsets))
-        .collect();
-    obj.insert("params".to_string(), Value::Array(params));
+    obj.set_field("type", Value::String("TSTypeParameterInstantiation".to_string()));
+    push_span_fields(&mut obj, start, end, line_offsets);
+    let params: Vec<Value> =
+        args.params.iter().map(|t| convert_ts_type(arena, t, offset, line_offsets)).collect();
+    obj.set_field("params", Value::Array(params));
     Value::Object(obj)
 }
 
 /// Create a TypeScript keyword type node.
 fn create_ts_keyword(type_name: &str, start: usize, end: usize, line_offsets: &[usize]) -> Value {
     let mut obj = Map::new();
-    obj.insert("type".to_string(), Value::String(type_name.to_string()));
-    obj.insert("start".to_string(), Value::Number((start as i64).into()));
-    obj.insert("end".to_string(), Value::Number((end as i64).into()));
-    if let Some(loc) = create_loc(start, end, line_offsets) {
-        obj.insert("loc".to_string(), loc);
-    }
+    obj.set_field("type", Value::String(type_name.to_string()));
+    push_span_fields(&mut obj, start, end, line_offsets);
     Value::Object(obj)
 }
 
 /// Convert an oxc Expression to our JSON-based Expression format.
-fn convert_expression(
+fn convert_expression<'a>(
     arena: &ParseArena,
     expr: &OxcExpression,
     offset: usize,
     line_offsets: &[usize],
-) -> Expression {
+) -> Expression<'a> {
     match expr {
         OxcExpression::Identifier(id) => {
             let start = offset + id.span.start as usize - 1; // -1 for the paren we added
@@ -3627,6 +4092,18 @@ fn convert_expression(
             let raw = num.raw.as_ref().map(|a| a.as_str()).unwrap_or("");
             create_numeric_literal(num.value, raw, start, end, line_offsets)
         }
+        OxcExpression::BigIntLiteral(big) => {
+            let start = offset + big.span.start as usize - 1;
+            let end = offset + big.span.end as usize - 1;
+            let raw = big.raw.as_ref().map(|a| a.as_str()).unwrap_or("");
+            create_literal(
+                LiteralValue::BigInt(big.value.as_str().into()),
+                raw,
+                start,
+                end,
+                line_offsets,
+            )
+        }
         OxcExpression::StringLiteral(str_lit) => {
             let start = offset + str_lit.span.start as usize - 1;
             let end = offset + str_lit.span.end as usize - 1;
@@ -3637,13 +4114,7 @@ fn convert_expression(
             let start = offset + bool_lit.span.start as usize - 1;
             let end = offset + bool_lit.span.end as usize - 1;
             let raw = if bool_lit.value { "true" } else { "false" };
-            create_literal(
-                LiteralValue::Bool(bool_lit.value),
-                raw,
-                start,
-                end,
-                line_offsets,
-            )
+            create_literal(LiteralValue::Bool(bool_lit.value), raw, start, end, line_offsets)
         }
         OxcExpression::NullLiteral(null_lit) => {
             let start = offset + null_lit.span.start as usize - 1;
@@ -3719,22 +4190,80 @@ fn convert_expression(
             let end = offset + seq.span.end as usize - 1;
             create_sequence_expression(arena, seq, start, end, offset, line_offsets)
         }
-        // TypeScript expression wrappers - unwrap and return the inner expression
-        // This matches Svelte's behavior of removing TypeScript syntax
+        // TypeScript assertion wrappers - preserve the wrapper node so the public
+        // `parse()` AST mirrors svelte/compiler (which keeps them); the TS stripper
+        // erases them at compile time. Template-path spans carry the `-1` synthetic
+        // paren adjustment, so the type-annotation blob uses base `offset - 1`.
         OxcExpression::TSAsExpression(ts_as) => {
-            convert_expression(arena, &ts_as.expression, offset, line_offsets)
+            let start = offset + ts_as.span.start as usize - 1;
+            let end = offset + ts_as.span.end as usize - 1;
+            let inner = convert_expression(arena, &ts_as.expression, offset, line_offsets);
+            let type_annotation =
+                convert_ts_type(arena, &ts_as.type_annotation, offset - 1, line_offsets);
+            Expression::from_node(JsNode::TSAsExpression {
+                start: start as u32,
+                end: end as u32,
+                loc: create_typed_loc(start, end, line_offsets),
+                expression: arena.alloc_js_node(expr_to_node(inner)),
+                type_annotation: Box::new(type_annotation),
+            })
         }
         OxcExpression::TSSatisfiesExpression(ts_satisfies) => {
-            convert_expression(arena, &ts_satisfies.expression, offset, line_offsets)
+            let start = offset + ts_satisfies.span.start as usize - 1;
+            let end = offset + ts_satisfies.span.end as usize - 1;
+            let inner = convert_expression(arena, &ts_satisfies.expression, offset, line_offsets);
+            let type_annotation =
+                convert_ts_type(arena, &ts_satisfies.type_annotation, offset - 1, line_offsets);
+            Expression::from_node(JsNode::TSSatisfiesExpression {
+                start: start as u32,
+                end: end as u32,
+                loc: create_typed_loc(start, end, line_offsets),
+                expression: arena.alloc_js_node(expr_to_node(inner)),
+                type_annotation: Box::new(type_annotation),
+            })
         }
         OxcExpression::TSNonNullExpression(ts_non_null) => {
-            convert_expression(arena, &ts_non_null.expression, offset, line_offsets)
+            let start = offset + ts_non_null.span.start as usize - 1;
+            let end = offset + ts_non_null.span.end as usize - 1;
+            let inner = convert_expression(arena, &ts_non_null.expression, offset, line_offsets);
+            Expression::from_node(JsNode::TSNonNullExpression {
+                start: start as u32,
+                end: end as u32,
+                loc: create_typed_loc(start, end, line_offsets),
+                expression: arena.alloc_js_node(expr_to_node(inner)),
+            })
         }
         OxcExpression::TSTypeAssertion(ts_assertion) => {
-            convert_expression(arena, &ts_assertion.expression, offset, line_offsets)
+            let start = offset + ts_assertion.span.start as usize - 1;
+            let end = offset + ts_assertion.span.end as usize - 1;
+            let inner = convert_expression(arena, &ts_assertion.expression, offset, line_offsets);
+            let type_annotation =
+                convert_ts_type(arena, &ts_assertion.type_annotation, offset - 1, line_offsets);
+            Expression::from_node(JsNode::TSTypeAssertion {
+                start: start as u32,
+                end: end as u32,
+                loc: create_typed_loc(start, end, line_offsets),
+                expression: arena.alloc_js_node(expr_to_node(inner)),
+                type_annotation: Box::new(type_annotation),
+            })
         }
         OxcExpression::TSInstantiationExpression(ts_inst) => {
-            convert_expression(arena, &ts_inst.expression, offset, line_offsets)
+            let start = offset + ts_inst.span.start as usize - 1;
+            let end = offset + ts_inst.span.end as usize - 1;
+            let inner = convert_expression(arena, &ts_inst.expression, offset, line_offsets);
+            let type_arguments = convert_ts_type_param_instantiation(
+                arena,
+                &ts_inst.type_arguments,
+                offset - 1,
+                line_offsets,
+            );
+            Expression::from_node(JsNode::TSInstantiationExpression {
+                start: start as u32,
+                end: end as u32,
+                loc: create_typed_loc(start, end, line_offsets),
+                expression: arena.alloc_js_node(expr_to_node(inner)),
+                type_arguments: Box::new(type_arguments),
+            })
         }
         OxcExpression::NewExpression(new_expr) => {
             let start = offset + new_expr.span.start as usize - 1;
@@ -3762,7 +4291,18 @@ fn convert_expression(
         OxcExpression::FunctionExpression(func) => {
             let start = offset + func.span.start as usize - 1;
             let end = offset + func.span.end as usize - 1;
-            create_function_expression(arena, func, start, end, offset, line_offsets)
+            let type_parameters =
+                function_expression_type_parameters(arena, func, offset, line_offsets);
+            create_function_expression(
+                arena,
+                func,
+                start,
+                end,
+                offset,
+                line_offsets,
+                type_parameters,
+                false,
+            )
         }
         OxcExpression::ClassExpression(class_expr) => {
             let start = offset + class_expr.span.start as usize - 1;
@@ -3825,9 +4365,18 @@ fn convert_expression(
                         line_offsets,
                     ))
                 }
-                oxc_ast::ast::ChainElement::TSNonNullExpression(ts_non_null) => expr_to_node(
-                    convert_expression(arena, &ts_non_null.expression, offset, line_offsets),
-                ),
+                oxc_ast::ast::ChainElement::TSNonNullExpression(ts_non_null) => {
+                    let inner_start = offset + ts_non_null.span.start as usize - 1;
+                    let inner_end = offset + ts_non_null.span.end as usize - 1;
+                    let inner =
+                        convert_expression(arena, &ts_non_null.expression, offset, line_offsets);
+                    JsNode::TSNonNullExpression {
+                        start: inner_start as u32,
+                        end: inner_end as u32,
+                        loc: create_typed_loc(inner_start, inner_end, line_offsets),
+                        expression: arena.alloc_js_node(expr_to_node(inner)),
+                    }
+                }
                 oxc_ast::ast::ChainElement::StaticMemberExpression(member) => {
                     let inner_start = offset + member.span.start as usize - 1;
                     let inner_end = offset + member.span.end as usize - 1;
@@ -3889,30 +4438,15 @@ fn convert_expression(
             let end = offset + tagged.span.end as usize - 1;
             create_tagged_template_expression(arena, tagged, start, end, offset, line_offsets)
         }
-        OxcExpression::MetaProperty(meta) => {
+        OxcExpression::ImportMeta(meta) => {
             let start = offset + meta.span.start as usize - 1;
             let end = offset + meta.span.end as usize - 1;
-            let meta_start = offset + meta.meta.span.start as usize - 1;
-            let meta_end = offset + meta.meta.span.end as usize - 1;
-            let prop_start = offset + meta.property.span.start as usize - 1;
-            let prop_end = offset + meta.property.span.end as usize - 1;
-            Expression::from_node(JsNode::MetaProperty {
-                start: start as u32,
-                end: end as u32,
-                loc: create_typed_loc(start, end, line_offsets),
-                meta: arena.alloc_js_node(expr_to_node(create_identifier(
-                    &meta.meta.name,
-                    meta_start,
-                    meta_end,
-                    line_offsets,
-                ))),
-                property: arena.alloc_js_node(expr_to_node(create_identifier(
-                    &meta.property.name,
-                    prop_start,
-                    prop_end,
-                    line_offsets,
-                ))),
-            })
+            create_meta_property(arena, "import", "meta", start, end, line_offsets)
+        }
+        OxcExpression::NewTarget(meta) => {
+            let start = offset + meta.span.start as usize - 1;
+            let end = offset + meta.span.end as usize - 1;
+            create_meta_property(arena, "new", "target", start, end, line_offsets)
         }
         OxcExpression::RegExpLiteral(regex) => {
             let start = offset + regex.span.start as usize - 1;
@@ -3930,23 +4464,59 @@ fn convert_expression(
     }
 }
 
-fn create_identifier(name: &str, start: usize, end: usize, line_offsets: &[usize]) -> Expression {
+// oxc 0.141 split the old `MetaProperty` expression into fieldless `ImportMeta`
+// / `NewTarget` nodes, so the `meta` / `property` identifier spans are
+// reconstructed from the whole-node span and the fixed keyword lengths.
+fn create_meta_property<'a>(
+    arena: &ParseArena,
+    meta_name: &str,
+    property_name: &str,
+    start: usize,
+    end: usize,
+    line_offsets: &[usize],
+) -> Expression<'a> {
+    Expression::from_node(JsNode::MetaProperty {
+        start: start as u32,
+        end: end as u32,
+        loc: create_typed_loc(start, end, line_offsets),
+        meta: arena.alloc_js_node(expr_to_node(create_identifier(
+            meta_name,
+            start,
+            start + meta_name.len(),
+            line_offsets,
+        ))),
+        property: arena.alloc_js_node(expr_to_node(create_identifier(
+            property_name,
+            end - property_name.len(),
+            end,
+            line_offsets,
+        ))),
+    })
+}
+
+fn create_identifier<'a>(
+    name: &str,
+    start: usize,
+    end: usize,
+    line_offsets: &[usize],
+) -> Expression<'a> {
     Expression::from_node(JsNode::Identifier {
         start: start as u32,
         end: end as u32,
         loc: create_typed_loc(start, end, line_offsets),
         name: CompactString::from(name),
+        optional: false,
         type_annotation: None,
     })
 }
 
 /// Create a PrivateIdentifier node (for class private fields like #count).
-fn create_private_identifier(
+fn create_private_identifier<'a>(
     name: &str,
     start: usize,
     end: usize,
     line_offsets: &[usize],
-) -> Expression {
+) -> Expression<'a> {
     Expression::from_node(JsNode::PrivateIdentifier {
         start: start as u32,
         end: end as u32,
@@ -3967,6 +4537,7 @@ fn create_identifier_for_binding(
         end: end as u32,
         loc: create_typed_loc_for_binding(start, end, line_offsets),
         name: CompactString::from(name),
+        optional: false,
         type_annotation: None,
     }
 }
@@ -3999,6 +4570,7 @@ fn create_identifier_for_binding_toplevel(
         end: end as u32,
         loc: create_typed_loc_for_binding_identifier(start, end, line_offsets),
         name: CompactString::from(name),
+        optional: false,
         type_annotation: None,
     }
 }
@@ -4059,40 +4631,59 @@ fn create_string_literal_for_binding(
 
 /// Create an identifier with character field in loc.
 /// Used for Svelte-level identifiers like snippet names.
-pub fn create_identifier_with_character(
+pub fn create_identifier_with_character<'a>(
     name: &str,
     start: usize,
     end: usize,
     line_offsets: &[usize],
-) -> Expression {
+) -> Expression<'a> {
     Expression::from_node(JsNode::Identifier {
         start: start as u32,
         end: end as u32,
         loc: create_typed_loc_with_character(start, end, line_offsets),
         name: CompactString::from(name),
+        optional: false,
         type_annotation: None,
     })
 }
 
+/// Re-emit an `Identifier`'s `loc` the way upstream's `Parser.read_identifier`
+/// builds it — from `locate-character`, so it carries `character`. Anything the
+/// JS parser produced keeps acorn's `{line, column}` and passes through.
+pub fn with_read_identifier_loc<'a>(
+    expr: Expression<'a>,
+    line_offsets: &[usize],
+) -> Expression<'a> {
+    if expr.node_type() != Some("Identifier") {
+        return expr;
+    }
+    let mut node = expr.as_node().into_owned();
+    if let JsNode::Identifier { start, end, loc, .. } = &mut node {
+        *loc = create_typed_loc_with_character(*start as usize, *end as usize, line_offsets);
+    }
+    Expression::from_node(node)
+}
+
 /// Create an identifier WITHOUT a loc field.
 /// Used for error recovery when parsing invalid expressions in loose mode.
-pub fn create_empty_identifier(name: &str, start: usize, end: usize) -> Expression {
+pub fn create_empty_identifier<'a>(name: &str, start: usize, end: usize) -> Expression<'a> {
     Expression::from_node(JsNode::Identifier {
         start: start as u32,
         end: end as u32,
         loc: None,
         name: CompactString::from(name),
+        optional: false,
         type_annotation: None,
     })
 }
 
-fn create_literal(
+fn create_literal<'a>(
     value: LiteralValue,
     raw: &str,
     start: usize,
     end: usize,
     line_offsets: &[usize],
-) -> Expression {
+) -> Expression<'a> {
     Expression::from_node(JsNode::Literal {
         start: start as u32,
         end: end as u32,
@@ -4103,13 +4694,13 @@ fn create_literal(
     })
 }
 
-fn create_numeric_literal(
+fn create_numeric_literal<'a>(
     value: f64,
     raw: &str,
     start: usize,
     end: usize,
     line_offsets: &[usize],
-) -> Expression {
+) -> Expression<'a> {
     Expression::from_node(JsNode::Literal {
         start: start as u32,
         end: end as u32,
@@ -4120,13 +4711,13 @@ fn create_numeric_literal(
     })
 }
 
-fn create_string_literal(
+fn create_string_literal<'a>(
     value: &str,
     raw: &str,
     start: usize,
     end: usize,
     line_offsets: &[usize],
-) -> Expression {
+) -> Expression<'a> {
     Expression::from_node(JsNode::Literal {
         start: start as u32,
         end: end as u32,
@@ -4137,7 +4728,7 @@ fn create_string_literal(
     })
 }
 
-fn create_binary_expression(
+fn create_binary_expression<'a>(
     arena: &ParseArena,
     left: &OxcExpression,
     operator: &oxc_ast::ast::BinaryOperator,
@@ -4146,7 +4737,7 @@ fn create_binary_expression(
     end: usize,
     offset: usize,
     line_offsets: &[usize],
-) -> Expression {
+) -> Expression<'a> {
     let left_expr = convert_expression(arena, left, offset, line_offsets);
     let right_expr = convert_expression(arena, right, offset, line_offsets);
 
@@ -4160,14 +4751,14 @@ fn create_binary_expression(
     })
 }
 
-fn create_logical_expression(
+fn create_logical_expression<'a>(
     arena: &ParseArena,
     logical: &oxc_ast::ast::LogicalExpression,
     start: usize,
     end: usize,
     offset: usize,
     line_offsets: &[usize],
-) -> Expression {
+) -> Expression<'a> {
     let left_expr = convert_expression(arena, &logical.left, offset, line_offsets);
     let right_expr = convert_expression(arena, &logical.right, offset, line_offsets);
 
@@ -4181,14 +4772,14 @@ fn create_logical_expression(
     })
 }
 
-fn create_unary_expression(
+fn create_unary_expression<'a>(
     arena: &ParseArena,
     unary: &oxc_ast::ast::UnaryExpression,
     start: usize,
     end: usize,
     offset: usize,
     line_offsets: &[usize],
-) -> Expression {
+) -> Expression<'a> {
     let argument = convert_expression(arena, &unary.argument, offset, line_offsets);
 
     Expression::from_node(JsNode::UnaryExpression {
@@ -4201,14 +4792,14 @@ fn create_unary_expression(
     })
 }
 
-fn create_conditional_expression(
+fn create_conditional_expression<'a>(
     arena: &ParseArena,
     cond: &oxc_ast::ast::ConditionalExpression,
     start: usize,
     end: usize,
     offset: usize,
     line_offsets: &[usize],
-) -> Expression {
+) -> Expression<'a> {
     let test = convert_expression(arena, &cond.test, offset, line_offsets);
     let consequent = convert_expression(arena, &cond.consequent, offset, line_offsets);
     let alternate = convert_expression(arena, &cond.alternate, offset, line_offsets);
@@ -4223,14 +4814,14 @@ fn create_conditional_expression(
     })
 }
 
-fn create_call_expression(
+fn create_call_expression<'a>(
     arena: &ParseArena,
     call: &oxc_ast::ast::CallExpression,
     start: usize,
     end: usize,
     offset: usize,
     line_offsets: &[usize],
-) -> Expression {
+) -> Expression<'a> {
     let callee = convert_expression(arena, &call.callee, offset, line_offsets);
 
     let args: Vec<JsNode> = call
@@ -4265,14 +4856,14 @@ fn create_call_expression(
     })
 }
 
-fn create_static_member_expression(
+fn create_static_member_expression<'a>(
     arena: &ParseArena,
     member: &oxc_ast::ast::StaticMemberExpression,
     start: usize,
     end: usize,
     offset: usize,
     line_offsets: &[usize],
-) -> Expression {
+) -> Expression<'a> {
     let object = convert_expression(arena, &member.object, offset, line_offsets);
 
     let prop_start = offset + member.property.span.start as usize - 1;
@@ -4288,6 +4879,7 @@ fn create_static_member_expression(
             end: prop_end as u32,
             loc: create_typed_loc(prop_start, prop_end, line_offsets),
             name: CompactString::from(member.property.name.as_str()),
+            optional: false,
             type_annotation: None,
         }),
         computed: false,
@@ -4295,14 +4887,14 @@ fn create_static_member_expression(
     })
 }
 
-fn create_computed_member_expression(
+fn create_computed_member_expression<'a>(
     arena: &ParseArena,
     member: &oxc_ast::ast::ComputedMemberExpression,
     start: usize,
     end: usize,
     offset: usize,
     line_offsets: &[usize],
-) -> Expression {
+) -> Expression<'a> {
     let object = convert_expression(arena, &member.object, offset, line_offsets);
     let property = convert_expression(arena, &member.expression, offset, line_offsets);
 
@@ -4317,14 +4909,14 @@ fn create_computed_member_expression(
     })
 }
 
-fn create_private_member_expression(
+fn create_private_member_expression<'a>(
     arena: &ParseArena,
     member: &oxc_ast::ast::PrivateFieldExpression,
     start: usize,
     end: usize,
     offset: usize,
     line_offsets: &[usize],
-) -> Expression {
+) -> Expression<'a> {
     let object = convert_expression(arena, &member.object, offset, line_offsets);
 
     let prop_start = offset + member.field.span.start as usize - 1;
@@ -4346,14 +4938,14 @@ fn create_private_member_expression(
     })
 }
 
-fn create_new_expression(
+fn create_new_expression<'a>(
     arena: &ParseArena,
     new_expr: &oxc_ast::ast::NewExpression,
     start: usize,
     end: usize,
     offset: usize,
     line_offsets: &[usize],
-) -> Expression {
+) -> Expression<'a> {
     let callee = convert_expression(arena, &new_expr.callee, offset, line_offsets);
 
     let args: Vec<JsNode> = new_expr
@@ -4387,14 +4979,20 @@ fn create_new_expression(
     })
 }
 
-fn create_function_expression(
+fn create_function_expression<'a>(
     arena: &ParseArena,
     func: &oxc_ast::ast::Function,
     start: usize,
     end: usize,
     offset: usize,
     line_offsets: &[usize],
-) -> Expression {
+    // Method values carry their generics on the wrapping MethodDefinition, not
+    // the inner function (acorn-typescript), so callers pass `None` there.
+    type_parameters: Option<Box<serde_json::Value>>,
+    // Object-method values keep their generics on the inner function but emit
+    // them after `body` (acorn-typescript), unlike declarations/expressions.
+    type_parameters_after_body: bool,
+) -> Expression<'a> {
     // id
     let id = func.id.as_ref().map(|id| {
         let id_start = offset + id.span.start as usize - 1;
@@ -4454,17 +5052,33 @@ fn create_function_expression(
         generator: func.generator,
         r#async: func.r#async,
         expression: false,
+        type_parameters,
+        type_parameters_after_body,
     })
 }
 
-fn create_class_expression(
+/// Convert an oxc `Function`'s generic type parameters into the opaque
+/// `TSTypeParameterDeclaration` blob, using the expression-context (`offset - 1`)
+/// span base. `None` when the function is non-generic.
+fn function_expression_type_parameters(
+    arena: &ParseArena,
+    func: &oxc_ast::ast::Function,
+    offset: usize,
+    line_offsets: &[usize],
+) -> Option<Box<serde_json::Value>> {
+    func.type_parameters.as_ref().map(|tp| {
+        Box::new(convert_ts_type_parameter_declaration(arena, tp, offset - 1, line_offsets))
+    })
+}
+
+fn create_class_expression<'a>(
     arena: &ParseArena,
     class_expr: &oxc_ast::ast::Class,
     start: usize,
     end: usize,
     offset: usize,
     line_offsets: &[usize],
-) -> Expression {
+) -> Expression<'a> {
     // id
     let id = class_expr.id.as_ref().map(|id| {
         let id_start = offset + id.span.start as usize - 1;
@@ -4478,7 +5092,8 @@ fn create_class_expression(
     });
 
     // superClass
-    let super_class = class_expr.super_class.as_ref().map(|sc| {
+    let super_class = class_expr.heritage.as_ref().map(|heritage| {
+        let sc = &heritage.expression;
         let super_expr = convert_expression(arena, sc, offset, line_offsets);
         arena.alloc_js_node(expr_to_node(super_expr))
     });
@@ -4496,26 +5111,20 @@ fn create_class_expression(
     })
 }
 
-fn create_tagged_template_expression(
+fn create_tagged_template_expression<'a>(
     arena: &ParseArena,
     tagged: &oxc_ast::ast::TaggedTemplateExpression,
     start: usize,
     end: usize,
     offset: usize,
     line_offsets: &[usize],
-) -> Expression {
+) -> Expression<'a> {
     let tag = convert_expression(arena, &tagged.tag, offset, line_offsets);
 
     let quasi_start = offset + tagged.quasi.span.start as usize - 1;
     let quasi_end = offset + tagged.quasi.span.end as usize - 1;
-    let quasi = create_template_literal(
-        arena,
-        &tagged.quasi,
-        quasi_start,
-        quasi_end,
-        offset,
-        line_offsets,
-    );
+    let quasi =
+        create_template_literal(arena, &tagged.quasi, quasi_start, quasi_end, offset, line_offsets);
 
     Expression::from_node(JsNode::TaggedTemplateExpression {
         start: start as u32,
@@ -4526,12 +5135,12 @@ fn create_tagged_template_expression(
     })
 }
 
-fn create_regex_literal(
+fn create_regex_literal<'a>(
     regex: &oxc_ast::ast::RegExpLiteral,
     start: usize,
     end: usize,
     line_offsets: &[usize],
-) -> Expression {
+) -> Expression<'a> {
     let pattern_str = regex.regex.pattern.text.to_string();
     let flags_str = regex.regex.flags.to_string();
 
@@ -4545,15 +5154,15 @@ fn create_regex_literal(
         start: start as u32,
         end: end as u32,
         loc: create_typed_loc(start, end, line_offsets),
-        value: LiteralValue::Regex(RegexValue {
+        value: LiteralValue::Regex(Box::new(RegexValue {
             pattern: CompactString::from(pattern_str),
             flags: CompactString::from(flags_str),
-        }),
+        })),
         raw: CompactString::from(raw),
-        regex: Some(RegexValue {
+        regex: Some(Box::new(RegexValue {
             pattern: CompactString::from(regex.regex.pattern.text.as_ref()),
             flags: CompactString::from(regex.regex.flags.to_string()),
-        }),
+        })),
     })
 }
 
@@ -4568,19 +5177,15 @@ fn convert_class_body_for_expr(
     let end = offset + body.span.end as usize - 1;
 
     let mut obj = Map::new();
-    obj.insert("type".to_string(), Value::String("ClassBody".to_string()));
-    obj.insert("start".to_string(), Value::Number((start as i64).into()));
-    obj.insert("end".to_string(), Value::Number((end as i64).into()));
-    if let Some(loc) = create_loc(start, end, line_offsets) {
-        obj.insert("loc".to_string(), loc);
-    }
+    obj.set_field("type", Value::String("ClassBody".to_string()));
+    push_span_fields(&mut obj, start, end, line_offsets);
 
     let body_elements: Vec<Value> = body
         .body
         .iter()
         .filter_map(|element| convert_class_element_for_expr(arena, element, offset, line_offsets))
         .collect();
-    obj.insert("body".to_string(), Value::Array(body_elements));
+    obj.set_field("body", Value::Array(body_elements));
 
     Value::Object(obj)
 }
@@ -4597,17 +5202,10 @@ fn convert_class_element_for_expr(
             let start = offset + method.span.start as usize - 1;
             let end = offset + method.span.end as usize - 1;
             let mut obj = Map::new();
-            obj.insert(
-                "type".to_string(),
-                Value::String("MethodDefinition".to_string()),
-            );
-            obj.insert("start".to_string(), Value::Number((start as i64).into()));
-            obj.insert("end".to_string(), Value::Number((end as i64).into()));
-            if let Some(loc) = create_loc(start, end, line_offsets) {
-                obj.insert("loc".to_string(), loc);
-            }
-            obj.insert("static".to_string(), Value::Bool(method.r#static));
-            obj.insert("computed".to_string(), Value::Bool(method.computed));
+            obj.set_field("type", Value::String("MethodDefinition".to_string()));
+            push_span_fields(&mut obj, start, end, line_offsets);
+            obj.set_field("static", Value::Bool(method.r#static));
+            obj.set_field("computed", Value::Bool(method.computed));
 
             // kind
             let kind = match method.kind {
@@ -4616,13 +5214,14 @@ fn convert_class_element_for_expr(
                 oxc_ast::ast::MethodDefinitionKind::Get => "get",
                 oxc_ast::ast::MethodDefinitionKind::Set => "set",
             };
-            obj.insert("kind".to_string(), Value::String(kind.to_string()));
+            obj.set_field("kind", Value::String(kind.to_string()));
 
             // key
             let key = convert_property_key_for_expr(arena, &method.key, offset, line_offsets);
-            obj.insert("key".to_string(), key.to_value());
+            obj.set_field("key", key.to_value());
 
-            // value (function expression)
+            // value (function expression). A method's generics live on the
+            // MethodDefinition (acorn-typescript), not the inner function.
             let value_start = offset + method.value.span.start as usize - 1;
             let value_end = offset + method.value.span.end as usize - 1;
             let value = create_function_expression(
@@ -4632,8 +5231,10 @@ fn convert_class_element_for_expr(
                 value_end,
                 offset,
                 line_offsets,
+                None,
+                false,
             );
-            obj.insert("value".to_string(), value.as_json().clone());
+            obj.set_field("value", value.as_json().clone());
 
             Some(Value::Object(obj))
         }
@@ -4641,28 +5242,21 @@ fn convert_class_element_for_expr(
             let start = offset + prop.span.start as usize - 1;
             let end = offset + prop.span.end as usize - 1;
             let mut obj = Map::new();
-            obj.insert(
-                "type".to_string(),
-                Value::String("PropertyDefinition".to_string()),
-            );
-            obj.insert("start".to_string(), Value::Number((start as i64).into()));
-            obj.insert("end".to_string(), Value::Number((end as i64).into()));
-            if let Some(loc) = create_loc(start, end, line_offsets) {
-                obj.insert("loc".to_string(), loc);
-            }
-            obj.insert("static".to_string(), Value::Bool(prop.r#static));
-            obj.insert("computed".to_string(), Value::Bool(prop.computed));
+            obj.set_field("type", Value::String("PropertyDefinition".to_string()));
+            push_span_fields(&mut obj, start, end, line_offsets);
+            obj.set_field("static", Value::Bool(prop.r#static));
+            obj.set_field("computed", Value::Bool(prop.computed));
 
             // key
             let key = convert_property_key_for_expr(arena, &prop.key, offset, line_offsets);
-            obj.insert("key".to_string(), key.to_value());
+            obj.set_field("key", key.to_value());
 
             // value
             if let Some(ref value) = prop.value {
                 let val = convert_expression(arena, value, offset, line_offsets);
-                obj.insert("value".to_string(), val.as_json().clone());
+                obj.set_field("value", val.as_json().clone());
             } else {
-                obj.insert("value".to_string(), Value::Null);
+                obj.set_field("value", Value::Null);
             }
 
             Some(Value::Object(obj))
@@ -4671,12 +5265,8 @@ fn convert_class_element_for_expr(
             let start = offset + static_block.span.start as usize - 1;
             let end = offset + static_block.span.end as usize - 1;
             let mut obj = Map::new();
-            obj.insert("type".to_string(), Value::String("StaticBlock".to_string()));
-            obj.insert("start".to_string(), Value::Number((start as i64).into()));
-            obj.insert("end".to_string(), Value::Number((end as i64).into()));
-            if let Some(loc) = create_loc(start, end, line_offsets) {
-                obj.insert("loc".to_string(), loc);
-            }
+            obj.set_field("type", Value::String("StaticBlock".to_string()));
+            push_span_fields(&mut obj, start, end, line_offsets);
 
             let body_statements: Vec<Value> = static_block
                 .body
@@ -4684,7 +5274,7 @@ fn convert_class_element_for_expr(
                 .filter_map(|stmt| convert_statement(arena, stmt, offset, line_offsets))
                 .map(|node| node.to_value())
                 .collect();
-            obj.insert("body".to_string(), Value::Array(body_statements));
+            obj.set_field("body", Value::Array(body_statements));
 
             Some(Value::Object(obj))
         }
@@ -4692,14 +5282,14 @@ fn convert_class_element_for_expr(
     }
 }
 
-fn create_array_expression(
+fn create_array_expression<'a>(
     arena: &ParseArena,
     arr: &oxc_ast::ast::ArrayExpression,
     start: usize,
     end: usize,
     offset: usize,
     line_offsets: &[usize],
-) -> Expression {
+) -> Expression<'a> {
     let elements: Vec<Option<JsNode>> = arr
         .elements
         .iter()
@@ -4718,12 +5308,7 @@ fn create_array_expression(
             oxc_ast::ast::ArrayExpressionElement::Elision(_) => None,
             _ => {
                 let expr = elem.to_expression();
-                Some(expr_to_node(convert_expression(
-                    arena,
-                    expr,
-                    offset,
-                    line_offsets,
-                )))
+                Some(expr_to_node(convert_expression(arena, expr, offset, line_offsets)))
             }
         })
         .collect();
@@ -4736,14 +5321,23 @@ fn create_array_expression(
     })
 }
 
-fn create_object_expression(
+/// Object-method values keep their generics on the inner `FunctionExpression`,
+/// but acorn-typescript serializes them *after* `body` (like arrows), not in the
+/// declaration/expression slot before `params`.
+fn mark_object_method_generics(node: &mut JsNode, is_method: bool) {
+    if is_method && let JsNode::FunctionExpression { type_parameters_after_body, .. } = node {
+        *type_parameters_after_body = true;
+    }
+}
+
+fn create_object_expression<'a>(
     arena: &ParseArena,
     obj_expr: &oxc_ast::ast::ObjectExpression,
     start: usize,
     end: usize,
     offset: usize,
     line_offsets: &[usize],
-) -> Expression {
+) -> Expression<'a> {
     let properties: Vec<JsNode> = obj_expr
         .properties
         .iter()
@@ -4754,6 +5348,8 @@ fn create_object_expression(
 
                 let key = convert_property_key_for_expr(arena, &p.key, offset, line_offsets);
                 let value = convert_expression(arena, &p.value, offset, line_offsets);
+                let mut value_node = expr_to_node(value);
+                mark_object_method_generics(&mut value_node, p.method);
 
                 let kind = match p.kind {
                     oxc_ast::ast::PropertyKind::Init => "init",
@@ -4766,7 +5362,7 @@ fn create_object_expression(
                     end: prop_end as u32,
                     loc: create_typed_loc(prop_start, prop_end, line_offsets),
                     key: arena.alloc_js_node(key),
-                    value: arena.alloc_js_node(expr_to_node(value)),
+                    value: arena.alloc_js_node(value_node),
                     kind: CompactString::from(kind),
                     method: p.method,
                     shorthand: p.shorthand,
@@ -4812,12 +5408,7 @@ fn convert_property_key_for_expr(
         oxc_ast::ast::PropertyKey::PrivateIdentifier(id) => {
             let start = offset + id.span.start as usize - 1;
             let end = offset + id.span.end as usize - 1;
-            expr_to_node(create_private_identifier(
-                &id.name,
-                start,
-                end,
-                line_offsets,
-            ))
+            expr_to_node(create_private_identifier(&id.name, start, end, line_offsets))
         }
         _ => {
             // For computed keys and other expressions
@@ -4831,16 +5422,19 @@ fn convert_property_key_for_expr(
     }
 }
 
-fn create_assignment_expression(
+fn create_assignment_expression<'a>(
     arena: &ParseArena,
     assign: &oxc_ast::ast::AssignmentExpression,
     start: usize,
     end: usize,
     offset: usize,
     line_offsets: &[usize],
-) -> Expression {
+) -> Expression<'a> {
     let operator = assignment_operator_to_str(&assign.operator);
-    let left = convert_assignment_target(arena, &assign.left, offset, line_offsets);
+    let left = match simple_assignment_lhs_inner(assign) {
+        Some(inner) => expr_to_node(convert_expression(arena, inner, offset, line_offsets)),
+        None => convert_assignment_target(arena, &assign.left, offset, line_offsets),
+    };
     let right = convert_expression(arena, &assign.right, offset, line_offsets);
 
     Expression::from_node(JsNode::AssignmentExpression {
@@ -4851,6 +5445,23 @@ fn create_assignment_expression(
         left: arena.alloc_js_node(left),
         right: arena.alloc_js_node(expr_to_node(right)),
     })
+}
+
+/// The expression a **plain `=`** LHS unwraps to when it carries TS assertion
+/// wrappers (`x! = 1` -> `x`), or `None` when the LHS must be kept as-is.
+///
+/// svelte/compiler gets this from acorn-typescript's `toAssignable`, which
+/// unwraps the wrapper but whose return value only `parseMaybeAssign` (the `=`
+/// case) uses. So a compound assignment (`x! += 1`), an update (`x!++`) and every
+/// nested destructuring position keep the wrapper, while a plain `=` loses it.
+fn simple_assignment_lhs_inner<'x>(
+    assign: &'x oxc_ast::ast::AssignmentExpression<'x>,
+) -> Option<&'x oxc_ast::ast::Expression<'x>> {
+    if assign.operator != oxc_ast::ast::AssignmentOperator::Assign {
+        return None;
+    }
+    let inner = assign.left.as_simple_assignment_target()?.get_expression()?.get_inner_expression();
+    Some(inner)
 }
 
 fn assignment_operator_to_str(op: &oxc_ast::ast::AssignmentOperator) -> &'static str {
@@ -5114,12 +5725,7 @@ fn convert_property_key_with_offset(
         oxc_ast::ast::PropertyKey::PrivateIdentifier(id) => {
             let start = offset + id.span.start as usize - 1;
             let end = offset + id.span.end as usize - 1;
-            expr_to_node(create_private_identifier(
-                &id.name,
-                start,
-                end,
-                line_offsets,
-            ))
+            expr_to_node(create_private_identifier(&id.name, start, end, line_offsets))
         }
         _ => {
             // For computed keys, try to get the expression
@@ -5190,21 +5796,94 @@ fn convert_assignment_target(
                 line_offsets,
             ))
         }
-        _ => {
-            // Fallback for other complex patterns (e.g., TSAsExpression, TSNonNullExpression)
-            JsNode::Null
-        }
+        _ => target
+            .as_simple_assignment_target()
+            .map(|simple| convert_ts_wrapper_target(arena, simple, offset, line_offsets))
+            .unwrap_or(JsNode::Null),
     }
 }
 
-fn create_update_expression(
+/// Rebuild a TS assertion wrapper (`x!`, `x as T`, `x satisfies T`, `<T>x`) that
+/// sits in an assignment-target position — `x!++`, `x! += 1`, `[x!] = …`. oxc
+/// models those as `SimpleAssignmentTarget` variants rather than `Expression`s,
+/// so they need their own conversion; dropping them (the old `JsNode::Null`)
+/// erased the whole target, and svelte/compiler keeps the wrapper there.
+/// Template-path spans carry the `-1` synthetic-paren adjustment, so the
+/// type-annotation blob uses base `offset - 1`, matching `convert_expression`.
+fn convert_ts_wrapper_target(
+    arena: &ParseArena,
+    target: &oxc_ast::ast::SimpleAssignmentTarget,
+    offset: usize,
+    line_offsets: &[usize],
+) -> JsNode {
+    use oxc_ast::ast::SimpleAssignmentTarget;
+
+    match target {
+        SimpleAssignmentTarget::TSAsExpression(ts_as) => {
+            let start = offset + ts_as.span.start as usize - 1;
+            let end = offset + ts_as.span.end as usize - 1;
+            let inner = convert_expression(arena, &ts_as.expression, offset, line_offsets);
+            let type_annotation =
+                convert_ts_type(arena, &ts_as.type_annotation, offset - 1, line_offsets);
+            JsNode::TSAsExpression {
+                start: start as u32,
+                end: end as u32,
+                loc: create_typed_loc(start, end, line_offsets),
+                expression: arena.alloc_js_node(expr_to_node(inner)),
+                type_annotation: Box::new(type_annotation),
+            }
+        }
+        SimpleAssignmentTarget::TSSatisfiesExpression(ts_satisfies) => {
+            let start = offset + ts_satisfies.span.start as usize - 1;
+            let end = offset + ts_satisfies.span.end as usize - 1;
+            let inner = convert_expression(arena, &ts_satisfies.expression, offset, line_offsets);
+            let type_annotation =
+                convert_ts_type(arena, &ts_satisfies.type_annotation, offset - 1, line_offsets);
+            JsNode::TSSatisfiesExpression {
+                start: start as u32,
+                end: end as u32,
+                loc: create_typed_loc(start, end, line_offsets),
+                expression: arena.alloc_js_node(expr_to_node(inner)),
+                type_annotation: Box::new(type_annotation),
+            }
+        }
+        SimpleAssignmentTarget::TSNonNullExpression(ts_non_null) => {
+            let start = offset + ts_non_null.span.start as usize - 1;
+            let end = offset + ts_non_null.span.end as usize - 1;
+            let inner = convert_expression(arena, &ts_non_null.expression, offset, line_offsets);
+            JsNode::TSNonNullExpression {
+                start: start as u32,
+                end: end as u32,
+                loc: create_typed_loc(start, end, line_offsets),
+                expression: arena.alloc_js_node(expr_to_node(inner)),
+            }
+        }
+        SimpleAssignmentTarget::TSTypeAssertion(ts_assertion) => {
+            let start = offset + ts_assertion.span.start as usize - 1;
+            let end = offset + ts_assertion.span.end as usize - 1;
+            let inner = convert_expression(arena, &ts_assertion.expression, offset, line_offsets);
+            let type_annotation =
+                convert_ts_type(arena, &ts_assertion.type_annotation, offset - 1, line_offsets);
+            JsNode::TSTypeAssertion {
+                start: start as u32,
+                end: end as u32,
+                loc: create_typed_loc(start, end, line_offsets),
+                expression: arena.alloc_js_node(expr_to_node(inner)),
+                type_annotation: Box::new(type_annotation),
+            }
+        }
+        _ => JsNode::Null,
+    }
+}
+
+fn create_update_expression<'a>(
     arena: &ParseArena,
     update: &oxc_ast::ast::UpdateExpression,
     start: usize,
     end: usize,
     offset: usize,
     line_offsets: &[usize],
-) -> Expression {
+) -> Expression<'a> {
     let operator = match update.operator {
         oxc_ast::ast::UpdateOperator::Increment => "++",
         oxc_ast::ast::UpdateOperator::Decrement => "--",
@@ -5222,14 +5901,14 @@ fn create_update_expression(
     })
 }
 
-fn create_sequence_expression(
+fn create_sequence_expression<'a>(
     arena: &ParseArena,
     seq: &oxc_ast::ast::SequenceExpression,
     start: usize,
     end: usize,
     offset: usize,
     line_offsets: &[usize],
-) -> Expression {
+) -> Expression<'a> {
     let expressions: Vec<JsNode> = seq
         .expressions
         .iter()
@@ -5298,31 +5977,24 @@ fn convert_simple_assignment_target(
                 line_offsets,
             ))
         }
-        _ => JsNode::Null,
+        _ => convert_ts_wrapper_target(arena, target, offset, line_offsets),
     }
 }
 
-fn create_arrow_function(
+fn create_arrow_function<'a>(
     arena: &ParseArena,
     arrow: &oxc_ast::ast::ArrowFunctionExpression,
     start: usize,
     end: usize,
     offset: usize,
     line_offsets: &[usize],
-) -> Expression {
+) -> Expression<'a> {
     // Convert params - pass offset - 1 because we wrapped content in parens for parsing
     let mut params: Vec<JsNode> = arrow
         .params
         .items
         .iter()
-        .map(|param| {
-            expr_to_node(convert_formal_parameter(
-                arena,
-                param,
-                offset - 1,
-                line_offsets,
-            ))
-        })
+        .map(|param| expr_to_node(convert_formal_parameter(arena, param, offset - 1, line_offsets)))
         .collect();
     // Handle rest parameter (`...args`) which is stored separately in OXC.
     if let Some(rest) = &arrow.params.rest {
@@ -5343,21 +6015,14 @@ fn create_arrow_function(
     }
 
     // Convert body - check if this is an expression body or block body
-    let body_node = if arrow.expression {
-        if let Some(oxc_ast::ast::Statement::ExpressionStatement(expr_stmt)) =
-            arrow.body.statements.first()
-        {
-            expr_to_node(convert_expression(
-                arena,
-                &expr_stmt.expression,
-                offset,
-                line_offsets,
-            ))
-        } else {
-            convert_arrow_body(arena, &arrow.body, offset, line_offsets)
-        }
-    } else {
-        convert_arrow_body(arena, &arrow.body, offset, line_offsets)
+    let body_node = match arrow.body.as_function_body() {
+        Some(block) => convert_arrow_body(arena, block, offset, line_offsets),
+        None => expr_to_node(convert_expression(
+            arena,
+            arrow.body.as_expression().expect("arrow body"),
+            offset,
+            line_offsets,
+        )),
     };
 
     Expression::from_node(JsNode::ArrowFunctionExpression {
@@ -5367,9 +6032,12 @@ fn create_arrow_function(
         id: None,
         params: arena.alloc_js_children(params),
         body: arena.alloc_js_node(body_node),
-        expression: arrow.expression,
+        expression: arrow.body.is_expression(),
         generator: false,
         r#async: arrow.r#async,
+        type_parameters: arrow.type_parameters.as_ref().map(|tp| {
+            Box::new(convert_ts_type_parameter_declaration(arena, tp, offset - 1, line_offsets))
+        }),
     })
 }
 
@@ -5384,9 +6052,16 @@ fn convert_arrow_body(
     let end = offset + body.span.end as usize - 1;
 
     let body_stmts: Vec<JsNode> = body
-        .statements
+        .directives
         .iter()
-        .filter_map(|stmt| convert_statement(arena, stmt, offset, line_offsets))
+        .map(|directive| {
+            convert_function_body_directive(arena, directive, offset, 1, line_offsets, false)
+        })
+        .chain(
+            body.statements
+                .iter()
+                .filter_map(|stmt| convert_statement(arena, stmt, offset, line_offsets)),
+        )
         .collect();
 
     JsNode::BlockStatement {
@@ -5394,6 +6069,52 @@ fn convert_arrow_body(
         end: end as u32,
         loc: create_typed_loc(start, end, line_offsets),
         body: arena.alloc_js_children(body_stmts),
+    }
+}
+
+/// OXC separates a function body's leading string-literal statements into
+/// `FunctionBody::directives`. ESTree (and upstream's acorn tree) exposes them
+/// as ordinary `ExpressionStatement`s, so every function-body conversion must
+/// prepend them before the remaining statements.
+fn convert_function_body_directive(
+    arena: &ParseArena,
+    directive: &oxc_ast::ast::Directive,
+    document_offset: usize,
+    parser_prefix_len: usize,
+    line_offsets: &[usize],
+    binding_loc: bool,
+) -> JsNode {
+    let start = document_offset + directive.span.start as usize - parser_prefix_len;
+    let end = document_offset + directive.span.end as usize - parser_prefix_len;
+    let expression_start =
+        document_offset + directive.expression.span.start as usize - parser_prefix_len;
+    let expression_end =
+        document_offset + directive.expression.span.end as usize - parser_prefix_len;
+    let raw = directive.expression.raw.as_ref().map(|raw| raw.as_str()).unwrap_or("");
+    let loc = if binding_loc {
+        create_typed_loc_for_binding(start, end, line_offsets)
+    } else {
+        create_typed_loc(start, end, line_offsets)
+    };
+    let expression_loc = if binding_loc {
+        create_typed_loc_for_binding(expression_start, expression_end, line_offsets)
+    } else {
+        create_typed_loc(expression_start, expression_end, line_offsets)
+    };
+    let expression = JsNode::Literal {
+        start: expression_start as u32,
+        end: expression_end as u32,
+        loc: expression_loc,
+        value: LiteralValue::String(CompactString::from(directive.expression.value.as_str())),
+        raw: CompactString::from(raw),
+        regex: None,
+    };
+
+    JsNode::ExpressionStatement {
+        start: start as u32,
+        end: end as u32,
+        loc,
+        expression: arena.alloc_js_node(expression),
     }
 }
 
@@ -5405,12 +6126,9 @@ fn convert_statement(
     line_offsets: &[usize],
 ) -> Option<JsNode> {
     match stmt {
-        oxc_ast::ast::Statement::VariableDeclaration(decl) => Some(convert_variable_declaration(
-            arena,
-            decl,
-            offset,
-            line_offsets,
-        )),
+        oxc_ast::ast::Statement::VariableDeclaration(decl) => {
+            Some(convert_variable_declaration(arena, decl, offset, line_offsets))
+        }
         oxc_ast::ast::Statement::ExpressionStatement(expr_stmt) => {
             let start = offset + expr_stmt.span.start as usize - 1;
             let end = offset + expr_stmt.span.end as usize - 1;
@@ -5508,9 +6226,8 @@ fn convert_statement(
             let end = offset + for_stmt.span.end as usize - 1;
 
             let init = for_stmt.init.as_ref().map(|init| match init {
-                oxc_ast::ast::ForStatementInit::VariableDeclaration(vd) => arena.alloc_js_node(
-                    convert_variable_declaration(arena, vd, offset, line_offsets),
-                ),
+                oxc_ast::ast::ForStatementInit::VariableDeclaration(vd) => arena
+                    .alloc_js_node(convert_variable_declaration(arena, vd, offset, line_offsets)),
                 _ => {
                     if let Some(expr) = init.as_expression() {
                         arena.alloc_js_node(expr_to_node(convert_expression(
@@ -5660,12 +6377,7 @@ fn convert_statement(
                 .items
                 .iter()
                 .map(|param| {
-                    expr_to_node(convert_formal_parameter(
-                        arena,
-                        param,
-                        offset - 1,
-                        line_offsets,
-                    ))
+                    expr_to_node(convert_formal_parameter(arena, param, offset - 1, line_offsets))
                 })
                 .collect();
             if let Some(rest) = &func_decl.params.rest {
@@ -5698,6 +6410,15 @@ fn convert_statement(
                 body,
                 generator: func_decl.generator,
                 r#async: func_decl.r#async,
+                expression: false,
+                type_parameters: func_decl.type_parameters.as_ref().map(|tp| {
+                    Box::new(convert_ts_type_parameter_declaration(
+                        arena,
+                        tp,
+                        offset - 1,
+                        line_offsets,
+                    ))
+                }),
             })
         }
         // Fallback to the program-context converter for other statement types
@@ -5764,12 +6485,7 @@ fn convert_variable_declarator(
 
     // Convert init
     let init = decl.init.as_ref().map(|expr| {
-        arena.alloc_js_node(expr_to_node(convert_expression(
-            arena,
-            expr,
-            offset,
-            line_offsets,
-        )))
+        arena.alloc_js_node(expr_to_node(convert_expression(arena, expr, offset, line_offsets)))
     });
 
     JsNode::VariableDeclarator {
@@ -5806,12 +6522,14 @@ fn convert_binding_pattern_for_decl_as_node(
                 // annotation blob verbatim (same as the Value form at
                 // `convert_binding_pattern_for_decl`).
                 let end = offset + type_ann.span.end as usize - 1;
-                let ta_value = convert_type_annotation_adjusted(type_ann, offset - 1, line_offsets);
+                let ta_value =
+                    convert_type_annotation_adjusted(arena, type_ann, offset - 1, line_offsets);
                 JsNode::Identifier {
                     start: start as u32,
                     end: end as u32,
                     loc: create_typed_loc(start, end, line_offsets),
                     name: CompactString::from(id.name.as_str()),
+                    optional: false,
                     type_annotation: Some(Box::new(ta_value)),
                 }
             } else {
@@ -5831,14 +6549,14 @@ fn convert_binding_pattern_for_decl_as_node(
     }
 }
 
-fn create_template_literal(
+fn create_template_literal<'a>(
     arena: &ParseArena,
     template: &oxc_ast::ast::TemplateLiteral,
     start: usize,
     end: usize,
     offset: usize,
     line_offsets: &[usize],
-) -> Expression {
+) -> Expression<'a> {
     let quasis: Vec<JsNode> = template
         .quasis
         .iter()
@@ -5853,11 +6571,7 @@ fn create_template_literal(
                 tail: quasi.tail,
                 value: TemplateElementValue {
                     raw: CompactString::from(quasi.value.raw.as_str()),
-                    cooked: quasi
-                        .value
-                        .cooked
-                        .as_ref()
-                        .map(|s| CompactString::from(s.as_str())),
+                    cooked: quasi.value.cooked.as_ref().map(|s| CompactString::from(s.as_str())),
                 },
             }
         })
@@ -5936,42 +6650,86 @@ fn update_operator_to_str(op: &oxc_ast::ast::UpdateOperator) -> &'static str {
     }
 }
 
+/// `Map::insert` without the per-call `key.to_string()`. ESTree objects here are
+/// built field by field interleaved with control flow, so this keeps each field
+/// on one line; `serde_json`'s `preserve_order` makes the call order the JSON
+/// key order.
+trait EstreeFieldExt {
+    fn set_field(&mut self, key: &str, value: Value);
+}
+
+impl EstreeFieldExt for Map<String, Value> {
+    fn set_field(&mut self, key: &str, value: Value) {
+        self.insert(key.to_string(), value);
+    }
+}
+
+/// Insert the ESTree span fields in acorn's emission order (`start`, `end`, then
+/// `loc` when line offsets are available). `serde_json`'s `preserve_order` makes
+/// that insertion order part of the JSON output contract.
+fn push_span_fields(
+    obj: &mut Map<String, Value>,
+    start: usize,
+    end: usize,
+    line_offsets: &[usize],
+) {
+    push_span_fields_with(obj, start, end, line_offsets, get_line_column);
+}
+
+/// `push_span_fields` for binding patterns, which use the empty-line-adjusted
+/// column calculation.
+fn push_binding_span_fields(
+    obj: &mut Map<String, Value>,
+    start: usize,
+    end: usize,
+    line_offsets: &[usize],
+) {
+    push_span_fields_with(obj, start, end, line_offsets, get_line_column_for_binding);
+}
+
+fn push_span_fields_with(
+    obj: &mut Map<String, Value>,
+    start: usize,
+    end: usize,
+    line_offsets: &[usize],
+    line_column: fn(usize, &[usize]) -> (u32, u32),
+) {
+    obj.set_field("start", Value::Number((start as i64).into()));
+    obj.set_field("end", Value::Number((end as i64).into()));
+    if let Some(loc) = create_loc_with(start, end, line_offsets, line_column) {
+        obj.set_field("loc", loc);
+    }
+}
+
 fn create_loc(start: usize, end: usize, line_offsets: &[usize]) -> Option<Value> {
+    create_loc_with(start, end, line_offsets, get_line_column)
+}
+
+fn create_loc_with(
+    start: usize,
+    end: usize,
+    line_offsets: &[usize],
+    line_column: fn(usize, &[usize]) -> (u32, u32),
+) -> Option<Value> {
     if line_offsets.is_empty() {
         return None;
     }
-    let start_loc = get_line_column(start, line_offsets);
-    let end_loc = get_line_column(end, line_offsets);
+    let point = |pos: usize| {
+        let (line, column) = line_column(pos, line_offsets);
+        let mut obj = Map::new();
+        obj.set_field("line", Value::Number((line as i64).into()));
+        obj.set_field("column", Value::Number((column as i64).into()));
+        Value::Object(obj)
+    };
 
     let mut loc = Map::new();
-
-    let mut start_obj = Map::new();
-    start_obj.insert(
-        "line".to_string(),
-        Value::Number((start_loc.0 as i64).into()),
-    );
-    start_obj.insert(
-        "column".to_string(),
-        Value::Number((start_loc.1 as i64).into()),
-    );
-
-    let mut end_obj = Map::new();
-    end_obj.insert("line".to_string(), Value::Number((end_loc.0 as i64).into()));
-    end_obj.insert(
-        "column".to_string(),
-        Value::Number((end_loc.1 as i64).into()),
-    );
-
-    loc.insert("start".to_string(), Value::Object(start_obj));
-    loc.insert("end".to_string(), Value::Object(end_obj));
-
+    loc.set_field("start", point(start));
+    loc.set_field("end", point(end));
     Some(Value::Object(loc))
 }
 
 fn get_line_column(pos: usize, line_offsets: &[usize]) -> (u32, u32) {
-    let line = line_offsets
-        .partition_point(|&offset| offset <= pos)
-        .saturating_sub(1);
+    let line = line_offsets.partition_point(|&offset| offset <= pos).saturating_sub(1);
     let line_start = line_offsets.get(line).copied().unwrap_or(0);
     let column = pos - line_start;
     ((line + 1) as u32, column as u32)
@@ -5981,9 +6739,7 @@ fn get_line_column(pos: usize, line_offsets: &[usize]) -> (u32, u32) {
 /// Svelte has a quirk where binding patterns on lines after empty lines
 /// use the empty line's offset for column calculation.
 fn get_line_column_for_binding(pos: usize, line_offsets: &[usize]) -> (u32, u32) {
-    let line = line_offsets
-        .partition_point(|&offset| offset <= pos)
-        .saturating_sub(1);
+    let line = line_offsets.partition_point(|&offset| offset <= pos).saturating_sub(1);
 
     // Check if this line immediately follows an empty line
     // An empty line has length 1 (just the newline character)
@@ -5991,11 +6747,7 @@ fn get_line_column_for_binding(pos: usize, line_offsets: &[usize]) -> (u32, u32)
         let current_line_start = line_offsets.get(line).copied().unwrap_or(0);
         let prev_line_start = line_offsets.get(line - 1).copied().unwrap_or(0);
         // If the previous line was empty (current - prev == 1), use prev as line_start
-        if current_line_start - prev_line_start == 1 {
-            prev_line_start
-        } else {
-            current_line_start
-        }
+        if current_line_start - prev_line_start == 1 { prev_line_start } else { current_line_start }
     } else {
         line_offsets.get(line).copied().unwrap_or(0)
     };
@@ -6007,35 +6759,7 @@ fn get_line_column_for_binding(pos: usize, line_offsets: &[usize]) -> (u32, u32)
 /// Create loc for binding patterns (complex patterns like ObjectPattern, ArrayPattern).
 /// Uses adjusted column calculation for empty lines, no character field.
 fn create_loc_for_binding(start: usize, end: usize, line_offsets: &[usize]) -> Option<Value> {
-    if line_offsets.is_empty() {
-        return None;
-    }
-    let start_loc = get_line_column_for_binding(start, line_offsets);
-    let end_loc = get_line_column_for_binding(end, line_offsets);
-
-    let mut loc = Map::new();
-
-    let mut start_obj = Map::new();
-    start_obj.insert(
-        "line".to_string(),
-        Value::Number((start_loc.0 as i64).into()),
-    );
-    start_obj.insert(
-        "column".to_string(),
-        Value::Number((start_loc.1 as i64).into()),
-    );
-
-    let mut end_obj = Map::new();
-    end_obj.insert("line".to_string(), Value::Number((end_loc.0 as i64).into()));
-    end_obj.insert(
-        "column".to_string(),
-        Value::Number((end_loc.1 as i64).into()),
-    );
-
-    loc.insert("start".to_string(), Value::Object(start_obj));
-    loc.insert("end".to_string(), Value::Object(end_obj));
-
-    Some(Value::Object(loc))
+    create_loc_with(start, end, line_offsets, get_line_column_for_binding)
 }
 
 // ============================================================================
@@ -6049,16 +6773,8 @@ fn create_typed_loc(start: usize, end: usize, line_offsets: &[usize]) -> Option<
     let start_lc = get_line_column(start, line_offsets);
     let end_lc = get_line_column(end, line_offsets);
     Some(Box::new(Loc {
-        start: SourcePosition {
-            line: start_lc.0,
-            column: start_lc.1,
-            character: None,
-        },
-        end: SourcePosition {
-            line: end_lc.0,
-            column: end_lc.1,
-            character: None,
-        },
+        start: SourcePosition { line: start_lc.0, column: start_lc.1, character: None },
+        end: SourcePosition { line: end_lc.0, column: end_lc.1, character: None },
     }))
 }
 
@@ -6078,11 +6794,7 @@ fn create_typed_loc_with_character(
             column: start_lc.1,
             character: Some(start as u32),
         },
-        end: SourcePosition {
-            line: end_lc.0,
-            column: end_lc.1,
-            character: Some(end as u32),
-        },
+        end: SourcePosition { line: end_lc.0, column: end_lc.1, character: Some(end as u32) },
     }))
 }
 
@@ -6097,16 +6809,8 @@ fn create_typed_loc_for_binding(
     let start_lc = get_line_column_for_binding(start, line_offsets);
     let end_lc = get_line_column_for_binding(end, line_offsets);
     Some(Box::new(Loc {
-        start: SourcePosition {
-            line: start_lc.0,
-            column: start_lc.1,
-            character: None,
-        },
-        end: SourcePosition {
-            line: end_lc.0,
-            column: end_lc.1,
-            character: None,
-        },
+        start: SourcePosition { line: start_lc.0, column: start_lc.1, character: None },
+        end: SourcePosition { line: end_lc.0, column: end_lc.1, character: None },
     }))
 }
 
@@ -6118,12 +6822,8 @@ fn create_typed_loc_for_binding_identifier(
     if line_offsets.is_empty() {
         return None;
     }
-    let start_line = line_offsets
-        .partition_point(|&offset| offset <= start)
-        .saturating_sub(1);
-    let end_line = line_offsets
-        .partition_point(|&offset| offset <= end)
-        .saturating_sub(1);
+    let start_line = line_offsets.partition_point(|&offset| offset <= start).saturating_sub(1);
+    let end_line = line_offsets.partition_point(|&offset| offset <= end).saturating_sub(1);
     let start_line_offset = line_offsets.get(start_line).copied().unwrap_or(0);
     let end_line_offset = line_offsets.get(end_line).copied().unwrap_or(0);
     Some(Box::new(Loc {
@@ -6151,17 +6851,31 @@ fn create_typed_loc_for_script(
     let start_lc = get_line_column(script_tag_start, doc_line_offsets);
     let end_lc = get_line_column(script_tag_end, doc_line_offsets);
     Some(Box::new(Loc {
-        start: SourcePosition {
-            line: start_lc.0,
-            column: start_lc.1,
-            character: None,
-        },
-        end: SourcePosition {
-            line: end_lc.0,
-            column: end_lc.1,
-            character: None,
-        },
+        start: SourcePosition { line: start_lc.0, column: start_lc.1, character: None },
+        end: SourcePosition { line: end_lc.0, column: end_lc.1, character: None },
     }))
+}
+
+/// Parameters for [`parse_program_with_error`], grouped into a struct to keep
+/// the function signature under clippy's argument-count lint.
+#[derive(Clone, Copy)]
+pub struct ProgramParseParams<'source, 'context> {
+    pub content: &'source str,
+    pub offset: usize,
+    pub line_offsets: &'context [usize],
+    /// Set to true if the script contains TypeScript.
+    pub is_typescript: bool,
+    /// Whether this is a component `<script>` rather than a standalone module.
+    /// Upstream passes the same flag to `acorn.parse`, which uses it to clear
+    /// `undefinedExports` — an exported name may be declared elsewhere in the
+    /// component, so only a module raises `Export 'x' is not defined`.
+    pub is_script: bool,
+    /// HTML comments that appeared before the script tag.
+    pub leading_comments: &'context [String],
+    /// Positions for loc calculation (Svelte uses locator(start) for
+    /// loc.start and locator(parser.index) for loc.end).
+    pub script_tag_start: usize,
+    pub script_tag_end: usize,
 }
 
 /// Parse a JavaScript program (script content) and return it as an Expression,
@@ -6171,75 +6885,789 @@ fn create_typed_loc_for_script(
 /// acorn.js). The recovered partial program is still returned so lenient
 /// callers (e.g. the profiling binary) can keep operating on a best-effort
 /// AST.
-///
-/// Set `is_typescript` to true if the script contains TypeScript.
-/// `leading_comments` are HTML comments that appeared before the script tag.
-/// `script_tag_start` and `script_tag_end` are positions for loc calculation
-/// (Svelte uses locator(start) for loc.start and locator(parser.index) for loc.end).
-#[allow(clippy::too_many_arguments)]
-pub fn parse_program_with_error(
+pub fn parse_program_with_error<'a>(
     arena: &ParseArena,
-    content: &str,
-    offset: usize,
-    line_offsets: &[usize],
-    is_typescript: bool,
-    leading_comments: &[String],
-    script_tag_start: usize,
-    script_tag_end: usize,
-) -> (Expression, Option<crate::error::ParseError>) {
+    params: ProgramParseParams,
+) -> (Expression<'a>, Option<crate::error::ParseError>) {
     with_oxc_allocator(|allocator| {
-        let source_type = if is_typescript {
-            SourceType::ts()
-        } else {
-            SourceType::mjs()
-        };
-        let parser = OxcParser::new(allocator, content, source_type);
-        let result = parser.parse();
+        let source_type = if params.is_typescript { SourceType::ts() } else { SourceType::mjs() };
+        let repaired = repair_ts_newline_import_assert(params.content, params.is_typescript);
+        let parse_source = repaired.as_deref().unwrap_or(params.content);
+        let mut result = OxcParser::new(allocator, parse_source, source_type).parse();
+        // A repair is byte-length preserving. Typed conversion and every later
+        // source slice must stay in the component's original coordinate space.
+        result.program.source_text = params.content;
+        convert_parsed_program(
+            arena,
+            &result.program,
+            &result.diagnostics,
+            &result.irregular_whitespaces,
+            params,
+        )
+    })
+}
 
+pub fn parse_program_retained_with_error<'ast, 'source>(
+    arena: &ParseArena,
+    params: ProgramParseParams<'source, '_>,
+) -> (
+    Expression<'ast>,
+    Option<crate::error::ParseError>,
+    crate::ast::oxc_program::RetainedProgram<'source>,
+) {
+    let retained = repair_ts_newline_import_assert(params.content, params.is_typescript)
+        .map_or_else(
+            || {
+                crate::ast::oxc_program::RetainedProgram::parse(
+                    params.content,
+                    params.is_typescript,
+                )
+            },
+            |repaired| {
+                crate::ast::oxc_program::RetainedProgram::parse_repaired(
+                    params.content,
+                    repaired,
+                    params.is_typescript,
+                )
+            },
+        );
+    let (program, parse_error) = convert_parsed_program(
+        arena,
+        retained.program(),
+        retained.diagnostics(),
+        retained.irregular_whitespaces(),
+        params,
+    );
+    (program, parse_error, retained)
+}
+
+/// TypeScript grammar rules OXC enforces that `acorn-typescript` — which upstream
+/// parses `lang="ts"` scripts with — does not, so upstream compiles these inputs
+/// and rsvelte must too. Each entry was confirmed against `svelte.compile`; the
+/// TS rules acorn-typescript *does* implement (1019, 1028, 1049, 1096, 1174,
+/// 1184, 1257, 1276, 2398, 2452, 2730, …) are deliberately absent.
+const ACORN_UNCHECKED_TS_GRAMMAR_RULES: [&str; 17] = [
+    "1015", // A parameter cannot have a question mark and an initializer
+    "1016", // A required parameter cannot follow an optional parameter
+    "1021", // An index signature must have a type annotation
+    "1038", // A 'declare' modifier cannot be used in an already ambient context
+    "1047", // A rest parameter cannot be optional
+    "1051", // A 'set' accessor cannot have an optional parameter
+    "1093", // Type annotation cannot appear on a constructor declaration
+    "1094", // An accessor cannot have type parameters
+    "1095", // A 'set' accessor cannot have a return type annotation
+    "1147", // Import declarations in a namespace cannot reference a module
+    "1194", // Export declarations are not permitted in a namespace
+    "1221", // Generators are not allowed in an ambient context
+    "1222", // An overload signature cannot be declared as a generator
+    "1263", // Declarations with initializers cannot also have definite assignment assertions
+    "1264", // Declarations with definite assignment assertions must also have type annotations
+    "2681", // A constructor cannot have a `this` parameter
+    "5085", // A tuple member cannot be both optional and rest
+];
+
+fn is_acorn_unchecked_ts_grammar_rule(diagnostic: &OxcDiagnostic) -> bool {
+    diagnostic.code.scope.as_deref() == Some("TS")
+        && diagnostic
+            .code
+            .number
+            .as_deref()
+            .is_some_and(|n| ACORN_UNCHECKED_TS_GRAMMAR_RULES.contains(&n))
+}
+
+/// `await` / `yield` inside a function's formal parameters — acorn's
+/// `checkYieldAwaitInDefaultParams`, which OXC does not implement, so every
+/// acorn boundary in this file has to ask for it.
+///
+/// A nested function *body* inside a parameter list is its own scope and is
+/// legal; a nested function's *parameters* are not, which is why the flag is
+/// carried into params and cleared only on a body.
+struct AwaitYieldInParams {
+    in_params: bool,
+    found: Option<(u32, &'static str)>,
+}
+
+impl AwaitYieldInParams {
+    fn record(&mut self, at: u32, message: &'static str) {
+        if self.found.is_none_or(|(prev, _)| at < prev) {
+            self.found = Some((at, message));
+        }
+    }
+
+    fn walk_params_then_body(
+        &mut self,
+        params: impl FnOnce(&mut Self),
+        body: impl FnOnce(&mut Self),
+    ) {
+        let outer = self.in_params;
+        self.in_params = true;
+        params(self);
+        self.in_params = false;
+        body(self);
+        self.in_params = outer;
+    }
+}
+
+impl<'a> oxc_ast_visit::Visit<'a> for AwaitYieldInParams {
+    fn visit_function(
+        &mut self,
+        func: &oxc_ast::ast::Function<'a>,
+        _flags: oxc_syntax::scope::ScopeFlags,
+    ) {
+        self.walk_params_then_body(
+            |v| oxc_ast_visit::walk::walk_formal_parameters(v, &func.params),
+            |v| {
+                if let Some(body) = &func.body {
+                    oxc_ast_visit::walk::walk_function_body(v, body);
+                }
+            },
+        );
+    }
+
+    fn visit_arrow_function_expression(
+        &mut self,
+        func: &oxc_ast::ast::ArrowFunctionExpression<'a>,
+    ) {
+        self.walk_params_then_body(
+            |v| oxc_ast_visit::walk::walk_formal_parameters(v, &func.params),
+            |v| oxc_ast_visit::walk::walk_arrow_function_body(v, &func.body),
+        );
+    }
+
+    fn visit_await_expression(&mut self, expr: &oxc_ast::ast::AwaitExpression<'a>) {
+        if self.in_params {
+            self.record(expr.span.start, "Await expression cannot be a default value");
+        }
+        oxc_ast_visit::walk::walk_await_expression(self, expr);
+    }
+
+    fn visit_yield_expression(&mut self, expr: &oxc_ast::ast::YieldExpression<'a>) {
+        if self.in_params {
+            self.record(expr.span.start, "Yield expression cannot be a default value");
+        }
+        oxc_ast_visit::walk::walk_yield_expression(self, expr);
+    }
+}
+
+/// The offset and acorn message for the first `await` / `yield` in a parameter
+/// list, or `None`. `source` gates the walk — neither keyword can occur without
+/// its own spelling.
+fn await_or_yield_in_params(program: &OxcProgram<'_>, source: &str) -> Option<(u32, &'static str)> {
+    if !source.contains("await") && !source.contains("yield") {
+        return None;
+    }
+    use oxc_ast_visit::Visit;
+    let mut scan = AwaitYieldInParams { in_params: false, found: None };
+    scan.visit_program(program);
+    scan.found
+}
+
+/// The earliest construct OXC accepts and acorn rejects, as `(offset, message)`.
+///
+/// acorn applies its restrictions uniformly because every fragment a component
+/// carries is parsed as an ES module and is therefore strict; OXC has no such
+/// pass, and additionally implements a wider grammar. acorn is single-pass and
+/// non-recovering, so it throws on the first violation it reaches and never sees
+/// any that follow — hence the earliest by position rather than all of them.
+///
+/// `is_typescript` gates the two acorn-typescript does not share: a decorator is
+/// legitimate TS, and so is a deprecated `assert` import clause.
+fn acorn_only_violation(
+    program: &OxcProgram<'_>,
+    content: &str,
+    is_typescript: bool,
+) -> Option<(u32, String)> {
+    use oxc_ast_visit::Visit;
+    struct Scan<'c> {
+        check_decorator: bool,
+        decorator_at: Option<u32>,
+        with_at: Option<u32>,
+        export_declare_global_at: Option<u32>,
+        check_ts_modifier: bool,
+        content: &'c str,
+        ts_modifier_at: Option<u32>,
+        super_at: Option<u32>,
+        await_at: Option<u32>,
+        super_allowed: bool,
+        next_function_is_method: bool,
+    }
+    impl Scan<'_> {
+        fn record_ts_modifier(&mut self, carries_modifier: bool, span: oxc_span::Span) {
+            if !self.check_ts_modifier || !carries_modifier {
+                return;
+            }
+            if let Some(at) = ts_class_modifier_stop(self.content, span.start)
+                && self.ts_modifier_at.is_none_or(|seen| at < seen)
+            {
+                self.ts_modifier_at = Some(at);
+            }
+        }
+    }
+    impl<'a> Visit<'a> for Scan<'_> {
+        fn visit_expression(&mut self, expr: &oxc_ast::ast::Expression<'a>) {
+            if let oxc_ast::ast::Expression::Super(super_expr) = expr
+                && !self.super_allowed
+                && self.super_at.is_none()
+            {
+                self.super_at = Some(super_expr.span.start);
+            }
+            oxc_ast_visit::walk::walk_expression(self, expr);
+        }
+        fn visit_identifier_reference(&mut self, ident: &oxc_ast::ast::IdentifierReference<'a>) {
+            let next = self.content[ident.span.end as usize..]
+                .bytes()
+                .find(|byte| !byte.is_ascii_whitespace());
+            if ident.name == "await"
+                && self.await_at.is_none()
+                && matches!(next, Some(b')' | b'.' | b'?'))
+            {
+                // Acorn reads `await` as the start of an AwaitExpression in a
+                // module and stops on the token immediately following it. OXC
+                // also represents the leading word of Svelte's valid
+                // `await expression` form as an identifier here, so only the
+                // bare/member continuations distinguish the acorn rejection.
+                self.await_at = Some(ident.span.end);
+            }
+        }
+        fn visit_function(
+            &mut self,
+            func: &oxc_ast::ast::Function<'a>,
+            flags: oxc_syntax::scope::ScopeFlags,
+        ) {
+            let saved = self.super_allowed;
+            self.super_allowed = std::mem::take(&mut self.next_function_is_method);
+            oxc_ast_visit::walk::walk_function(self, func, flags);
+            self.super_allowed = saved;
+        }
+        fn visit_object_property(&mut self, prop: &oxc_ast::ast::ObjectProperty<'a>) {
+            let saved = self.next_function_is_method;
+            self.next_function_is_method = prop.method;
+            oxc_ast_visit::walk::walk_object_property(self, prop);
+            self.next_function_is_method = saved;
+        }
+        fn visit_decorator(&mut self, dec: &oxc_ast::ast::Decorator<'a>) {
+            if self.check_decorator && self.decorator_at.is_none() {
+                self.decorator_at = Some(dec.span.start);
+            }
+        }
+        fn visit_with_statement(&mut self, stmt: &oxc_ast::ast::WithStatement<'a>) {
+            if self.with_at.is_none() {
+                self.with_at = Some(stmt.span.start);
+            }
+            oxc_ast_visit::walk::walk_with_statement(self, stmt);
+        }
+        // `export declare global { … }`: acorn wants an ambient declaration after
+        // `export declare`, and a global augmentation is not one.
+        fn visit_export_declaration(&mut self, export: &oxc_ast::ast::ExportDeclaration<'a>) {
+            if let oxc_ast::ast::Declaration::TSGlobalDeclaration(global) = &export.declaration
+                && self.export_declare_global_at.is_none()
+            {
+                self.export_declare_global_at = Some(global.span.start);
+            }
+            oxc_ast_visit::walk::walk_export_declaration(self, export);
+        }
+        fn visit_method_definition(&mut self, def: &oxc_ast::ast::MethodDefinition<'a>) {
+            self.record_ts_modifier(
+                def.accessibility.is_some()
+                    || def.r#override
+                    || def.r#type == oxc_ast::ast::MethodDefinitionType::TSAbstractMethodDefinition,
+                def.span,
+            );
+            let saved = self.next_function_is_method;
+            self.next_function_is_method = true;
+            oxc_ast_visit::walk::walk_method_definition(self, def);
+            self.next_function_is_method = saved;
+        }
+        fn visit_property_definition(&mut self, def: &oxc_ast::ast::PropertyDefinition<'a>) {
+            self.record_ts_modifier(
+                def.accessibility.is_some()
+                    || def.r#override
+                    || def.readonly
+                    || def.declare
+                    || def.r#type
+                        == oxc_ast::ast::PropertyDefinitionType::TSAbstractPropertyDefinition,
+                def.span,
+            );
+            oxc_ast_visit::walk::walk_property_definition(self, def);
+        }
+        fn visit_accessor_property(&mut self, def: &oxc_ast::ast::AccessorProperty<'a>) {
+            // acorn has no auto-accessor plugin, so `accessor` itself is the violation.
+            self.record_ts_modifier(true, def.span);
+            oxc_ast_visit::walk::walk_accessor_property(self, def);
+        }
+    }
+
+    let check_decorator = !is_typescript && content.contains('@');
+    let check_with = content.contains("with");
+    let check_ts_modifier = !is_typescript && content.contains("class");
+    let check_super = content.contains("super");
+    let check_await = content.contains("await");
+    let mut finder = Scan {
+        check_decorator,
+        decorator_at: None,
+        with_at: None,
+        export_declare_global_at: None,
+        check_ts_modifier,
+        content,
+        ts_modifier_at: None,
+        super_at: None,
+        await_at: None,
+        super_allowed: false,
+        next_function_is_method: false,
+    };
+    // The TypeScript-only rule below needs a token that is cheap to rule out, so
+    // a plain-JS script keeps the walk it had.
+    let check_ts_acorn = is_typescript && content.contains("global");
+    if check_decorator
+        || check_with
+        || check_ts_modifier
+        || check_ts_acorn
+        || check_super
+        || check_await
+    {
+        finder.visit_program(program);
+    }
+
+    [
+        finder.decorator_at.map(|at| (at, "Unexpected character '@'".to_string())),
+        finder.with_at.map(|at| {
+            (at, "'with' in strict mode\nhttps://svelte.dev/e/js_parse_error".to_string())
+        }),
+        finder.export_declare_global_at.map(|at| {
+            (at, "'export declare' must be followed by an ambient declaration.".to_string())
+        }),
+        await_or_yield_in_params(program, content).map(|(at, message)| (at, message.to_string())),
+        super::strict_mode::find_violation(program, content, is_typescript),
+        finder.ts_modifier_at.map(|at| (at, "Unexpected token".to_string())),
+        finder.super_at.map(|at| (at, "'super' keyword outside a method".to_string())),
+        finder.await_at.map(|at| (at, "Unexpected token".to_string())),
+    ]
+    .into_iter()
+    .flatten()
+    .min_by_key(|(at, _)| *at)
+}
+
+/// TypeScript-only class-member modifiers. OXC parses these in a plain-JS
+/// source too and reports nothing, so every acorn boundary has to ask.
+const TS_ONLY_CLASS_MODIFIERS: [&str; 8] =
+    ["public", "private", "protected", "readonly", "override", "declare", "abstract", "accessor"];
+
+/// Where acorn stops on such a member: it reads the modifier as the member's
+/// *name*, so the error lands on the token that could not follow it.
+///
+/// Only reached once OXC has already flagged the member, so the bytes from
+/// `from` are modifier keywords, whitespace and comments — never a string or a
+/// regex literal.
+fn ts_class_modifier_stop(content: &str, from: u32) -> Option<u32> {
+    let mut i = from as usize;
+    let mut seen_modifier = false;
+    loop {
+        loop {
+            i += content[i..].find(|c: char| !c.is_whitespace()).unwrap_or(content.len() - i);
+            let rest = &content[i..];
+            if let Some(body) = rest.strip_prefix("//") {
+                i += 2 + body.find('\n')?;
+            } else if let Some(body) = rest.strip_prefix("/*") {
+                i += 2 + body.find("*/")? + 2;
+            } else {
+                break;
+            }
+        }
+        if i >= content.len() {
+            return None;
+        }
+        if seen_modifier {
+            return Some(i as u32);
+        }
+        let word = content[i..]
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$'))
+            .unwrap_or(content.len() - i);
+        if word == 0 {
+            // A decorator's `@`, reported by the decorator arm instead.
+            return None;
+        }
+        seen_modifier = TS_ONLY_CLASS_MODIFIERS.contains(&&content[i..i + word]);
+        i += word;
+    }
+}
+
+/// OXC reports a missing semicolon at the INSERTION POINT — the end of the
+/// statement it just read — while acorn keeps reading and throws on the token
+/// that could not continue it. Move to that token, past whitespace and comments,
+/// and take acorn's wording with it.
+fn realign_missing_semicolon(content: &str, at: usize, message: &str) -> (usize, String) {
+    if !message.starts_with("Expected a semicolon or an implicit semicolon") {
+        return (at, acorn_diagnostic_message(message).to_string());
+    }
+    let bytes = content.as_bytes();
+    let mut i = at;
+    loop {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let rest = &bytes[i..];
+        if rest.starts_with(b"//") {
+            i += rest.iter().position(|&b| b == b'\n').unwrap_or(rest.len());
+        } else if rest.starts_with(b"/*") {
+            match content[i + 2..].find("*/") {
+                Some(end) => i += 2 + end + 2,
+                None => return (at, message.to_string()),
+            }
+        } else {
+            break;
+        }
+    }
+    if i >= bytes.len() {
+        return (at, message.to_string());
+    }
+    (i, "Unexpected token".to_string())
+}
+
+/// Translate diagnostics for grammar errors both parsers identify at the same
+/// byte but describe differently. Upstream forwards acorn's text verbatim.
+fn acorn_diagnostic_message(message: &str) -> &str {
+    match message {
+        "A 'return' statement can only be used within a function body." => {
+            "'return' outside of function"
+        }
+        "A rest element must be last in a destructuring pattern" => {
+            "Comma is not permitted after the rest element"
+        }
+        _ => message,
+    }
+}
+
+/// Recover acorn's diagnostic for reserved words in a destructuring binding.
+/// OXC reports the keyword itself for array patterns, but parses an object
+/// shorthand keyword as a property name and reports the missing `:` at the
+/// following delimiter. The latter therefore has to walk back to the property.
+fn acorn_binding_pattern_diagnostic(
+    content: &str,
+    message: &str,
+    reported: usize,
+    reported_end: usize,
+) -> Option<(usize, String)> {
+    if message == "A rest element must be last in a destructuring pattern" {
+        let at = skip_js_whitespace_and_comments(content, reported_end.min(content.len()));
+        return (content.as_bytes().get(at) == Some(&b','))
+            .then(|| (at, "Comma is not permitted after the rest element".to_string()));
+    }
+
+    let trimmed = content.trim_start_ws();
+    if trimmed.starts_with('[')
+        && let Some(rest) = message.strip_prefix("Identifier expected. '")
+        && let Some((word, _)) = rest.split_once("' is a reserved word")
+        && super::super::utils::is_reserved(word)
+    {
+        let at = reported.min(content.len());
+        return content
+            .get(at..)
+            .is_some_and(|tail| tail.starts_with(word))
+            .then(|| (at, "Unexpected token".to_string()));
+    }
+
+    if !trimmed.starts_with('{') || message != "Expected `:` but found `}`" {
+        return None;
+    }
+    let end = content[..reported.min(content.len())].trim_end_ws().len();
+    let start = content[..end]
+        .rfind(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '$')
+        .map_or(0, |at| at + 1);
+    let word = content.get(start..end)?;
+    let before = content[..start].trim_end_ws();
+    if !matches!(before.as_bytes().last(), Some(&b'{') | Some(&b','))
+        || !is_plain_ascii_identifier(word)
+        || !super::super::utils::is_reserved(word)
+    {
+        return None;
+    }
+    Some((start, format!("Unexpected keyword '{word}'")))
+}
+
+/// Return the next JavaScript token boundary after whitespace and comments.
+/// Binding-pattern diagnostics use this only after an OXC-labelled AST node,
+/// so a slash here can only begin trivia or be the next token.
+fn skip_js_whitespace_and_comments(content: &str, mut at: usize) -> usize {
+    loop {
+        at += content[at..]
+            .char_indices()
+            .find_map(|(offset, ch)| {
+                (!super::super::parser::is_js_whitespace(ch)).then_some(offset)
+            })
+            .unwrap_or(content.len() - at);
+
+        let tail = &content[at..];
+        if let Some(comment) = tail.strip_prefix("/*") {
+            let Some(end) = comment.find("*/") else {
+                return content.len();
+            };
+            at += 2 + end + 2;
+        } else if tail.starts_with("//") {
+            let Some(end) = tail.find('\n') else {
+                return content.len();
+            };
+            at += end + 1;
+        } else {
+            return at;
+        }
+    }
+}
+
+/// Repair the one import-attributes spelling acorn-typescript accepts and OXC
+/// rejects: `assert` after a line terminator. Replacing it with `with  ` keeps
+/// the byte length, every span, and the output spelling (upstream normalizes the
+/// deprecated clause to `with`) unchanged.
+///
+/// The candidate comes from OXC's *first* effective diagnostic, not a text scan:
+/// after ASI it reports the `{` following an `assert` expression statement.
+/// Re-parsing after each replacement proves the token was grammar, rather than
+/// the same bytes in a string, comment, regex, or unrelated identifier.
+pub(crate) fn repair_ts_newline_import_assert(
+    content: &str,
+    is_typescript: bool,
+) -> Option<String> {
+    if !is_typescript || !content.contains("assert") {
+        return None;
+    }
+
+    let mut repaired = content.to_string();
+    let mut changed = false;
+    loop {
+        let allocator = Allocator::default();
+        let parsed = OxcParser::new(&allocator, &repaired, SourceType::ts()).parse();
+        let Some(diagnostic) = parsed
+            .diagnostics
+            .iter()
+            .find(|diagnostic| !is_acorn_unchecked_ts_grammar_rule(diagnostic))
+        else {
+            return changed.then_some(repaired);
+        };
+        let Some(label) = diagnostic.labels.first() else {
+            return changed.then_some(repaired);
+        };
+        let reported = (label.offset() as usize).min(repaired.len());
+        let (brace, message) = realign_missing_semicolon(&repaired, reported, &diagnostic.message);
+        if message != "Unexpected token" || repaired.as_bytes().get(brace) != Some(&b'{') {
+            return changed.then_some(repaired);
+        }
+
+        // OXC labels the insertion point at the end of `assert`; the realigned
+        // brace is the useful fallback when only whitespace separates them.
+        // Trying both also admits a comment between the keyword and `{`.
+        let keyword = [reported, brace].into_iter().find_map(|end| {
+            let end = repaired[..end].trim_end().len();
+            let start = end.checked_sub("assert".len())?;
+            (&repaired[start..end] == "assert").then_some((start, end))
+        });
+        let Some((keyword_start, keyword_end)) = keyword else {
+            return changed.then_some(repaired);
+        };
+        if repaired.as_bytes()[..keyword_start]
+            .last()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'_' | b'$'))
+        {
+            return changed.then_some(repaired);
+        }
+
+        repaired.replace_range(keyword_start..keyword_end, "with  ");
+        changed = true;
+    }
+}
+
+/// The first standalone `word` in executable code inside `range`.
+///
+/// OXC's TS-in-JS diagnostics label the whole construct that it successfully
+/// parsed. Acorn never enters that grammar and stops at the TS token instead,
+/// so the label supplies a narrow, unambiguous search range. Strings, comments,
+/// templates and regular expressions must not donate a lookalike token.
+fn code_word_in(content: &str, word: &[u8], range: std::ops::Range<usize>) -> Option<usize> {
+    use crate::compiler::phases::phase3_transform::shared::js_scan::{code_bytes, is_ident_byte};
+    let bytes = content.as_bytes();
+    let end = range.end.min(bytes.len());
+    code_bytes(bytes).find_map(|(at, byte)| {
+        if at < range.start || at + word.len() > end || byte != word[0] {
+            return None;
+        }
+        let before = at.checked_sub(1).and_then(|i| bytes.get(i)).copied();
+        let after = bytes.get(at + word.len()).copied();
+        (bytes[at..].starts_with(word)
+            && before.is_none_or(|b| !is_ident_byte(b))
+            && after.is_none_or(|b| !is_ident_byte(b)))
+        .then_some(at)
+    })
+}
+
+/// A standalone `word` is the previous significant token before `at`.
+fn preceded_by_code_word(content: &str, word: &[u8], at: usize) -> Option<usize> {
+    use crate::compiler::phases::phase3_transform::shared::js_scan::code_bytes;
+    let mut from = 0;
+    let mut previous = None;
+    while let Some(found) = code_word_in(content, word, from..at) {
+        previous = Some(found);
+        from = found + word.len();
+    }
+    let found = previous?;
+    code_bytes(&content.as_bytes()[found + word.len()..at])
+        .all(|(_, byte)| byte.is_ascii_whitespace())
+        .then_some(found)
+}
+
+/// Reproduce where plain acorn stops on TypeScript syntax in a JavaScript
+/// program. OXC understands these constructs and consequently either labels
+/// their enclosing node or emits a TypeScript-aware message; upstream never
+/// enters that grammar and reports the first TS token as `Unexpected token`.
+fn realign_plain_js_typescript_diagnostic(
+    content: &str,
+    at: usize,
+    label_end: usize,
+    message: &str,
+) -> (usize, String) {
+    let range = at..label_end.max(at).min(content.len());
+    if code_word_in(content, b"enum", range.clone()) == Some(at) {
+        return (at, "The keyword 'enum' is reserved".to_string());
+    }
+    if message == "Unexpected token"
+        && let Some(interface) = preceded_by_code_word(content, b"interface", at)
+    {
+        return (interface, "The keyword 'interface' is reserved".to_string());
+    }
+    match message {
+        "Type assertion expressions can only be used in TypeScript files." => {
+            (code_word_in(content, b"as", range).unwrap_or(at), "Unexpected token".to_string())
+        }
+        "Type satisfaction expressions can only be used in TypeScript files." => (
+            code_word_in(content, b"satisfies", range).unwrap_or(at),
+            "Unexpected token".to_string(),
+        ),
+        "Expected function body" => {
+            use crate::compiler::phases::phase3_transform::shared::js_scan::code_bytes;
+            // OXC labels either an empty span or just the `function` keyword.
+            // Acorn instead stops at the return type annotation, which sits
+            // beyond both forms of label.
+            let colon = code_bytes(content.as_bytes())
+                .find_map(|(i, b)| (i >= range.start && b == b':').then_some(i))
+                .unwrap_or(at);
+            (colon, "Unexpected token".to_string())
+        }
+        "Unexpected JSX expression"
+        | "Expected `,` or `)` but found `:`"
+        | "Expected `,` or `)` but found `?`"
+        | "Expected `(` but found `<`"
+        | "Expected `from` but found `{`"
+        | "'implements' clauses can only be used in TypeScript files." => {
+            (at, "Unexpected token".to_string())
+        }
+        "Parameter modifiers can only be used in TypeScript files." => {
+            let word = content[at..]
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$'))
+                .next()
+                .unwrap_or_default();
+            (at, format!("The keyword '{word}' is reserved"))
+        }
+        _ => (at, message.to_string()),
+    }
+}
+
+/// The first offset oxc classified as irregular whitespace that ECMAScript does
+/// not admit as whitespace at all. oxc's `is_irregular_whitespace` spans
+/// `U+2000..=U+200B` and includes `U+0085`, while `WhiteSpace` is `Zs` plus the
+/// four fixed code points — so `U+200B` and `U+0085` parse here and are
+/// `Unexpected character` for acorn, and so for upstream. Keying on the spans
+/// the parser itself reports is what keeps a string literal or a comment
+/// containing one of them accepted, as upstream accepts it.
+fn first_non_ecmascript_whitespace(content: &str, irregular: &[oxc_span::Span]) -> Option<usize> {
+    irregular
+        .iter()
+        .filter_map(|span| {
+            let at = span.start as usize;
+            let ch = content.get(at..)?.chars().next()?;
+            (!super::super::parser::is_js_whitespace(ch)).then_some(at)
+        })
+        .min()
+}
+
+fn convert_parsed_program<'ast>(
+    arena: &ParseArena,
+    program: &OxcProgram<'_>,
+    diagnostics: &[OxcDiagnostic],
+    irregular_whitespaces: &[oxc_span::Span],
+    params: ProgramParseParams<'_, '_>,
+) -> (Expression<'ast>, Option<crate::error::ParseError>) {
+    let ProgramParseParams {
+        content,
+        offset,
+        line_offsets,
+        is_typescript,
+        is_script,
+        leading_comments,
+        script_tag_start,
+        script_tag_end,
+    } = params;
+    {
         // Mirror upstream acorn's throw-on-error behaviour: capture the first
         // parse error (acorn reports `err.pos` where it stopped consuming
         // input; OXC's first label is the closest equivalent).
-        let mut parse_error = result.diagnostics.first().map(|first_error| {
-            let pos = first_error
-                .labels
-                .first()
-                .map(|label| (label.offset() as usize).min(content.len()))
-                .unwrap_or(0)
-                + offset;
-            crate::error::ParseError::svelte(
-                "js_parse_error",
-                first_error.message.to_string(),
-                (pos, pos),
-            )
+        let reported_at = diagnostics.iter().find(|d| !is_acorn_unchecked_ts_grammar_rule(d)).map(
+            |first_error| {
+                let label = first_error.labels.first();
+                let at =
+                    label.map(|label| (label.offset() as usize).min(content.len())).unwrap_or(0);
+                let label_end = label
+                    .map(|label| at.saturating_add(label.len() as usize).min(content.len()))
+                    .unwrap_or(at);
+                let aligned = realign_missing_semicolon(content, at, &first_error.message);
+                if is_typescript {
+                    aligned
+                } else {
+                    // A TS declaration can first look like a missing semicolon
+                    // to OXC. Acorn still stops at the declaration keyword, so
+                    // the plain-JS pass must also see that intermediate result.
+                    realign_plain_js_typescript_diagnostic(
+                        content, aligned.0, label_end, &aligned.1,
+                    )
+                }
+            },
+        );
+        let mut reported_at = reported_at;
+        let mut parse_error = reported_at.as_ref().map(|(at, message)| {
+            let pos = at + offset;
+            crate::error::ParseError::svelte("js_parse_error", message.clone(), (pos, pos))
         });
 
-        // OXC accepts Stage-3 `@decorator` syntax even in plain JS; upstream's
-        // acorn (no decorator plugin) raises js_parse_error at the `@` token.
-        // A bare `@` is never legal JS outside decorators, so flag the first
-        // decorator's position. Gated on a cheap byte scan first.
-        if parse_error.is_none() && !is_typescript && content.contains('@') {
-            use oxc_ast_visit::Visit;
-            struct FindDecorator(Option<u32>);
-            impl<'a> Visit<'a> for FindDecorator {
-                fn visit_decorator(&mut self, dec: &oxc_ast::ast::Decorator<'a>) {
-                    if self.0.is_none() {
-                        self.0 = Some(dec.span.start);
-                    }
-                }
-            }
-            let mut finder = FindDecorator(None);
-            finder.visit_program(&result.program);
-            if let Some(at) = finder.0 {
+        if parse_error.is_none() {
+            // An early error needs the enclosing scope, so it comes from a
+            // `SemanticBuilder` run rather than from the walk; acorn checks both
+            // while parsing and stops at whichever comes first. This is the only
+            // caller that may run it — the per-expression paths above parse a
+            // fragment with no enclosing class or loop.
+            let earliest = [
+                acorn_only_violation(program, content, is_typescript),
+                super::early_errors::find_early_error(program, content, is_script),
+            ]
+            .into_iter()
+            .flatten()
+            .min_by_key(|(at, _)| *at);
+            if let Some((at, message)) = earliest {
                 let pos = at as usize + offset;
-                parse_error = Some(crate::error::ParseError::svelte(
-                    "js_parse_error",
-                    "Unexpected character '@'".to_string(),
-                    (pos, pos),
-                ));
+                reported_at = Some((at as usize, message.clone()));
+                parse_error =
+                    Some(crate::error::ParseError::svelte("js_parse_error", message, (pos, pos)));
             }
         }
 
-        let program = &result.program;
+        // acorn stops at the first thing it cannot read, so a character it does
+        // not accept as whitespace outranks any error further along the source.
+        if let Some(at) = first_non_ecmascript_whitespace(content, irregular_whitespaces)
+            && reported_at.as_ref().is_none_or(|(reported, _)| at < *reported)
+        {
+            let ch = content[at..].chars().next().unwrap_or('\u{fffd}');
+            let pos = at + offset;
+            parse_error = Some(crate::error::ParseError::svelte(
+                "js_parse_error",
+                format!("Unexpected character '{ch}'"),
+                (pos, pos),
+            ));
+        }
 
         // Calculate actual positions within the document
         let start = offset + program.span.start as usize;
@@ -6253,8 +7681,31 @@ pub fn parse_program_with_error(
         // Convert body statements and attach leading comments to each statement.
         // The official Svelte compiler (via acorn) attaches leadingComments to AST nodes.
         // OXC stores all comments at the program level, so we distribute them here.
-        let all_comments: Vec<_> = result.program.comments.iter().collect();
+        let all_comments: Vec<_> = program.comments.iter().collect();
         let has_comments = !all_comments.is_empty();
+
+        // The per-statement `to_value()` + comment-distribution + harvest pass
+        // below exists solely to populate `ignore_comment_map` from
+        // `svelte-ignore` leading comments. A comment that never contains the
+        // literal `svelte-ignore` can never match, so gate the whole (expensive,
+        // full-tree) slow path on the presence of at least one such comment and
+        // keep every other comment-bearing script on the typed fast path.
+        let has_ignore = all_comments.iter().any(|comment| {
+            let end = (comment.span.end as usize).min(content.len());
+            let start = comment.span.start as usize;
+            start <= end && content[start..end].contains("svelte-ignore")
+        });
+
+        // With capture on (the public `parse()` API and the parser fixtures) the
+        // walk below also has to record the comments on the nodes, which is what
+        // upstream's `add_comments` does — so it runs for capture as well, not
+        // only for a `svelte-ignore` harvest.
+        let capture = crate::ast::arena::comment_capture_active();
+        // Every script parse is handed the same `parser.root.comments` array
+        // upstream, and `read_script` passes no `index`, so comments recorded by
+        // an earlier parse are still in it and bind to this program's first
+        // statement. Snapshot before this script's own are appended.
+        let inherited = if capture { peek_expr_comments() } else { Vec::new() };
 
         // Mirror upstream `parser.root.comments`: forward every comment seen
         // by the script parser so it lands in `Root.comments`.
@@ -6278,13 +7729,7 @@ pub fn parse_program_with_error(
                     comment.span.start as usize,
                 );
             }
-            record_oxc_comment(
-                comment.kind,
-                value,
-                comment_start,
-                comment_end,
-                line_offsets,
-            );
+            record_oxc_comment(comment.kind, value, comment_start, comment_end, line_offsets);
         }
 
         // Build body as Vec<JsNode> (typed, no Value conversion needed for common case).
@@ -6298,70 +7743,86 @@ pub fn parse_program_with_error(
         // above, and codegen re-parses script text, so dropping the Raw wrapping changes no
         // output.
         let mut ignore_comment_map: Vec<(u32, Vec<CompactString>)> = Vec::new();
-        let body: Vec<JsNode> = if has_comments {
-            let mut comment_idx = 0;
+        // How many comments the walk consumed; the rest belong to the Program.
+        let mut claimed = 0usize;
+        // The comment list the walk sees: what earlier parses left behind,
+        // followed by this script's own.
+        let mut comment_entries: Vec<CommentEntry> = Vec::new();
+        let mut comment_values: Vec<Value> = Vec::new();
+        let walk =
+            (has_comments && has_ignore) || (capture && (has_comments || !inherited.is_empty()));
+        let body: Vec<JsNode> = if walk {
             let mut body_nodes: Vec<JsNode> = Vec::with_capacity(program.body.len());
 
-            // Pre-compute comment entries (absolute positions + Value) once, used for
-            // distributing comments onto nested statement bodies.
-            let comment_entries: Vec<CommentEntry> = all_comments
-                .iter()
-                .map(|comment| {
-                    let comment_start = offset + comment.span.start as usize;
-                    let comment_end = offset + comment.span.end as usize;
-                    CommentEntry {
-                        start: comment_start as u32,
-                        end: comment_end as u32,
-                        value: build_comment_value(comment, content, offset),
-                    }
-                })
-                .collect();
+            comment_entries.reserve(inherited.len() + all_comments.len());
+            for comment in &inherited {
+                comment_entries.push(CommentEntry {
+                    start: comment.start,
+                    text: comment.value.clone(),
+                    value: js_comment_value(comment),
+                });
+                comment_values.push(js_comment_value(comment));
+            }
+            for comment in all_comments.iter() {
+                let raw_text = content
+                    .get(comment.span.start as usize..comment.span.end as usize)
+                    .unwrap_or("");
+                comment_entries.push(CommentEntry {
+                    start: offset as u32 + comment.span.start,
+                    text: CompactString::from(extract_comment_value(raw_text, comment.kind)),
+                    value: build_comment_value(comment, content, offset),
+                });
+                if capture {
+                    comment_values.push(build_comment_value(comment, content, offset));
+                }
+            }
 
-            for stmt in program.body.iter() {
+            let mut attacher = CommentAttacher {
+                comments: &comment_entries,
+                next: 0,
+                content,
+                offset: offset as u32,
+                map: &mut ignore_comment_map,
+                captured: capture.then(std::collections::HashMap::default),
+            };
+            let last_index = program.body.len().saturating_sub(1);
+
+            for (index, stmt) in program.body.iter().enumerate() {
                 if let Some(stmt_node) =
                     convert_statement_for_program(arena, stmt, offset, line_offsets)
                 {
-                    let stmt_start = stmt.span().start;
-
-                    // Collect comments that appear before this statement (its own leading
-                    // comments).
-                    let mut stmt_leading = Vec::new();
-                    while comment_idx < all_comments.len()
-                        && all_comments[comment_idx].span.end <= stmt_start
-                    {
-                        let comment = all_comments[comment_idx];
-                        stmt_leading.push(build_comment_value(comment, content, offset));
-                        comment_idx += 1;
-                    }
-
-                    // Skip comments that are inside the statement
-                    while comment_idx < all_comments.len()
-                        && all_comments[comment_idx].span.start < stmt.span().end
-                    {
-                        comment_idx += 1;
-                    }
-
-                    // Reproduce the exact comment-attachment the old code used (own leading
-                    // comments + nested distribution) on a throwaway Value, then harvest
-                    // svelte-ignore texts into the map. The statement itself stays TYPED.
-                    if !stmt_leading.is_empty() || !comment_entries.is_empty() {
-                        let mut val = stmt_node.to_value();
-                        if !stmt_leading.is_empty()
-                            && let Value::Object(ref mut obj) = val
-                        {
-                            obj.insert("leadingComments".to_string(), Value::Array(stmt_leading));
-                        }
-                        distribute_comments_to_node(&mut val, &comment_entries);
-                        harvest_ignore_comments(&val, &mut ignore_comment_map);
-                    }
-
+                    attacher.visit(
+                        &stmt_node.to_value(),
+                        Some(ParentInfo {
+                            end: Some(end as u32),
+                            is_last_in_body: index == last_index,
+                        }),
+                    );
                     body_nodes.push(stmt_node);
+                } else {
+                    // Type-only statements have no typed node. Upstream binds the
+                    // comments in and before them to TS nodes whose subtree Phase 2
+                    // never visits, so they must not reach the next statement either.
+                    attacher.skip_past(offset as u32 + stmt.span().end);
+                }
+            }
+            claimed = attacher.next;
+            if let Some(captured) = attacher.captured.take() {
+                for ((node_type, start, end), (leading, trailing)) in captured {
+                    arena.record_node_comments(
+                        &node_type,
+                        start,
+                        end,
+                        (!leading.is_empty()).then_some(leading),
+                        (!trailing.is_empty()).then_some(trailing),
+                    );
                 }
             }
 
             body_nodes
         } else {
-            // No comments at all - fast path: keep everything as typed JsNode
+            // No comments, or comments but no `svelte-ignore` — fast path: keep
+            // everything as typed JsNode (the harvest pass would find nothing).
             program
                 .body
                 .iter()
@@ -6369,16 +7830,21 @@ pub fn parse_program_with_error(
                 .collect()
         };
 
-        // Build trailing comments (all JS comments stored on Program for backward compat)
-        let trailing_comments_val = if has_comments {
+        // Under capture this is upstream's "trailing comments after the root
+        // node" special case: only what no node claimed. Without capture the
+        // Program keeps carrying every comment, which is the shape Phase 2 /
+        // svelte2tsx / the linter have always read.
+        let trailing_comments_val = if capture {
+            (claimed < comment_values.len()).then(|| comment_values[claimed..].to_vec())
+        } else if !has_comments {
+            None
+        } else {
             Some(
                 all_comments
                     .iter()
                     .map(|comment| build_comment_value(comment, content, offset))
                     .collect(),
             )
-        } else {
-            None
         };
 
         // Build leading comments from HTML comments before script tag
@@ -6388,8 +7854,8 @@ pub fn parse_program_with_error(
                     .iter()
                     .map(|comment| {
                         let mut comment_obj = Map::new();
-                        comment_obj.insert("type".to_string(), Value::String("Line".to_string()));
-                        comment_obj.insert("value".to_string(), Value::String(comment.clone()));
+                        comment_obj.set_field("type", Value::String("Line".to_string()));
+                        comment_obj.set_field("value", Value::String(comment.clone()));
                         Value::Object(comment_obj)
                     })
                     .collect(),
@@ -6405,13 +7871,30 @@ pub fn parse_program_with_error(
                 loc,
                 body: arena.alloc_js_children(body),
                 source_type: CompactString::from("module"),
-                leading_comments: leading_comments_val,
-                trailing_comments: trailing_comments_val,
-                ignore_comment_map,
+                metadata: Box::new(crate::ast::typed_expr::ProgramMetadata {
+                    leading_comments: leading_comments_val,
+                    trailing_comments: trailing_comments_val,
+                    ignore_comment_map,
+                }),
             }),
             parse_error,
         )
-    })
+    }
+}
+
+/// The `{type, value, start, end}` shape upstream attaches to a node, built from
+/// an already-recorded `Root.comments` entry.
+fn js_comment_value(comment: &crate::ast::template::JsComment) -> Value {
+    let comment_type = match comment.kind {
+        crate::ast::template::JsCommentKind::Line => "Line",
+        crate::ast::template::JsCommentKind::Block => "Block",
+    };
+    let mut obj = Map::new();
+    obj.set_field("type", Value::String(comment_type.to_string()));
+    obj.set_field("value", Value::String(comment.value.to_string()));
+    obj.set_field("start", Value::Number((i64::from(comment.start)).into()));
+    obj.set_field("end", Value::Number((i64::from(comment.end)).into()));
+    Value::Object(obj)
 }
 
 /// Build a comment JSON value from an OXC comment.
@@ -6429,185 +7912,209 @@ fn build_comment_value(comment: &oxc_ast::ast::Comment, content: &str, offset: u
         match comment.kind {
             oxc_ast::ast::CommentKind::Line => raw.strip_prefix("//").unwrap_or(raw).to_string(),
             oxc_ast::ast::CommentKind::SingleLineBlock
-            | oxc_ast::ast::CommentKind::MultiLineBlock => raw
-                .strip_prefix("/*")
-                .and_then(|s| s.strip_suffix("*/"))
-                .unwrap_or(raw)
-                .to_string(),
+            | oxc_ast::ast::CommentKind::MultiLineBlock => {
+                raw.strip_prefix("/*").and_then(|s| s.strip_suffix("*/")).unwrap_or(raw).to_string()
+            }
         }
     } else {
         String::new()
     };
 
     let mut comment_obj = Map::new();
-    comment_obj.insert("type".to_string(), Value::String(comment_type.to_string()));
-    comment_obj.insert("value".to_string(), Value::String(comment_text));
-    comment_obj.insert(
-        "start".to_string(),
-        Value::Number((comment_start as i64).into()),
-    );
-    comment_obj.insert(
-        "end".to_string(),
-        Value::Number((comment_end as i64).into()),
-    );
+    comment_obj.set_field("type", Value::String(comment_type.to_string()));
+    comment_obj.set_field("value", Value::String(comment_text));
+    comment_obj.set_field("start", Value::Number((comment_start as i64).into()));
+    comment_obj.set_field("end", Value::Number((comment_end as i64).into()));
     Value::Object(comment_obj)
 }
 
-/// Walk a comment-annotated statement `Value` (after `distribute_comments_to_node`)
-/// and harvest every `svelte-ignore` leading-comment text into `map`, keyed by the
-/// owning node's absolute `start` offset.
-///
-/// Only `svelte-ignore` comments are kept (the sole Phase-2 consumer of statement-level
-/// `leadingComments`); a comment is a candidate when its value text — after leading
-/// whitespace — begins with `svelte-ignore` (a strict superset of the analyze-side
-/// `^\s*svelte-ignore\s` match, so nothing relevant is dropped and non-matching texts
-/// that survive simply extract to zero codes downstream).
-fn harvest_ignore_comments(node: &Value, map: &mut Vec<(u32, Vec<CompactString>)>) {
-    let Value::Object(obj) = node else {
-        return;
-    };
-
-    if let Some(Value::Array(comments)) = obj.get("leadingComments")
-        && let Some(start) = obj.get("start").and_then(|s| s.as_u64())
-    {
-        let kept: Vec<CompactString> = comments
-            .iter()
-            .filter_map(|c| c.get("value").and_then(|v| v.as_str()))
-            .filter(|v| v.trim_start().starts_with("svelte-ignore"))
-            .map(CompactString::from)
-            .collect();
-        if !kept.is_empty() {
-            map.push((start as u32, kept));
-        }
-    }
-
-    // Recurse into every nested object / array so nested `svelte-ignore` comments
-    // (attached by `distribute_comments_to_node`) are harvested too.
-    for value in obj.values() {
-        match value {
-            Value::Object(_) => harvest_ignore_comments(value, map),
-            Value::Array(items) => {
-                for item in items {
-                    harvest_ignore_comments(item, map);
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
-/// A pre-computed comment entry with positions extracted to avoid repeated Value lookups.
+/// A pre-computed comment entry: absolute start offset plus the comment text with
+/// its `//` / `/* */` delimiters stripped, and the ESTree object upstream's
+/// `add_comments` hands to a node (`{ type, value, start, end }`, no `loc`).
 struct CommentEntry {
     start: u32,
-    end: u32,
+    text: CompactString,
     value: Value,
 }
 
-/// Recursively walk a node and distribute comments to any nested statement bodies.
+/// What the walk needs to know about a node's parent to decide trailing-comment
+/// ownership, mirroring the `path.at(-1)` lookups in upstream `add_comments`.
+struct ParentInfo {
+    end: Option<u32>,
+    is_last_in_body: bool,
+}
+
+/// Port of `add_comments` from `phases/1-parse/acorn.js`, reduced to the only
+/// consumer rsvelte has for JS comment attachment: `svelte-ignore` suppression.
 ///
-/// This function operates entirely in-place: it never clones statement Values.
-/// Comments are attached by inserting `leadingComments` directly into existing
-/// statement Map objects via mutable references.
-/// Distribute comments to nested statement bodies. Returns `true` if any
-/// `leadingComments` field was actually inserted (i.e. the node was mutated).
-fn distribute_comments_to_node(node: &mut Value, comments: &[CommentEntry]) -> bool {
-    let Some(obj) = node.as_object_mut() else {
-        return false;
-    };
-    let mut modified = false;
+/// Upstream walks the ESTree tree generically and gives every comment to the first
+/// node (in pre-order) that starts after it, unless a preceding node claims it as a
+/// trailing comment first. Rather than materializing `leadingComments` we record the
+/// `svelte-ignore` texts directly, keyed by the owning node's absolute start offset —
+/// the key Phase 2 looks up while walking the typed AST.
+struct CommentAttacher<'a> {
+    comments: &'a [CommentEntry],
+    next: usize,
+    content: &'a str,
+    offset: u32,
+    map: &'a mut Vec<(u32, Vec<CompactString>)>,
+    /// `Some` on the public `parse()` path only: `(type, start, end) ->
+    /// (leadingComments, trailingComments)`, flushed into the arena's comment
+    /// side table so `JsNode`'s `Serialize` impl emits them. The compile path
+    /// leaves it `None` — codegen re-parses script text, so materialising them
+    /// there would cost every component and change no output.
+    captured:
+        Option<std::collections::HashMap<(CompactString, u32, u32), (Vec<Value>, Vec<Value>)>>,
+}
 
-    let node_type = obj
-        .get("type")
-        .and_then(|t| t.as_str())
-        .unwrap_or("")
-        .to_string();
+impl CommentAttacher<'_> {
+    fn visit(&mut self, node: &Value, parent: Option<ParentInfo>) {
+        let Some(obj) = node.as_object() else {
+            return;
+        };
+        let start = obj.get("start").and_then(|v| v.as_u64()).map(|v| v as u32);
+        let end = obj.get("end").and_then(|v| v.as_u64()).map(|v| v as u32);
+        let node_type = obj.get("type").and_then(|t| t.as_str());
 
-    // For nodes that contain statement bodies, distribute comments to those bodies.
-    // These are the fields that contain arrays of statements.
-    let body_fields: &[&str] = match node_type.as_str() {
-        "BlockStatement" | "Program" => &["body"],
-        "SwitchCase" => &["consequent"],
-        "SwitchStatement" => &["cases"],
-        "TryStatement" => &["block", "handler", "finalizer"],
-        _ => &[],
-    };
+        if let Some(start) = start {
+            while self.comments.get(self.next).is_some_and(|comment| comment.start < start) {
+                self.record_leading(node_type, start, end, self.next);
+                self.next += 1;
+            }
+        }
 
-    for &field in body_fields {
-        if let Some(stmts) = obj.get_mut(field).and_then(|v| v.as_array_mut()) {
-            let mut prev_end: u32 = 0;
-            for stmt in stmts.iter_mut() {
-                if let Some(stmt_obj) = stmt.as_object_mut() {
-                    // Check if this statement doesn't already have leadingComments
-                    if !stmt_obj.contains_key("leadingComments") {
-                        let stmt_start =
-                            stmt_obj.get("start").and_then(|s| s.as_u64()).unwrap_or(0) as u32;
+        // Only these parents let their last child swallow the comments that follow it.
+        let last_body_field = match node_type.unwrap_or("") {
+            "Program" | "BlockStatement" => Some("body"),
+            "ArrayExpression" => Some("elements"),
+            "ObjectExpression" => Some("properties"),
+            _ => None,
+        };
 
-                        // Use binary search to find the first comment that could be relevant
-                        // (comment.end > prev_end). Comments are sorted by position.
-                        let search_start = comments.partition_point(|c| c.end <= prev_end);
-
-                        let mut leading = Vec::new();
-                        for comment in &comments[search_start..] {
-                            // Once comment end exceeds statement start, no more matches
-                            if comment.end > stmt_start {
-                                break;
-                            }
-                            // Comment must start after previous statement end
-                            if comment.start >= prev_end {
-                                leading.push(comment.value.clone());
-                            }
-                        }
-
-                        if !leading.is_empty() {
-                            stmt_obj.insert("leadingComments".to_string(), Value::Array(leading));
-                            modified = true;
+        for (field, value) in obj {
+            if matches!(field.as_str(), "leadingComments" | "trailingComments" | "comments") {
+                continue;
+            }
+            match value {
+                Value::Object(_) if is_estree_node(value) => {
+                    self.visit(value, Some(ParentInfo { end, is_last_in_body: false }));
+                }
+                Value::Array(items) => {
+                    let last = items.len().saturating_sub(1);
+                    for (index, item) in items.iter().enumerate() {
+                        if is_estree_node(item) {
+                            self.visit(
+                                item,
+                                Some(ParentInfo {
+                                    end,
+                                    is_last_in_body: last_body_field == Some(field.as_str())
+                                        && index == last,
+                                }),
+                            );
                         }
                     }
-
-                    // Track prev_end for the next iteration
-                    prev_end = stmt_obj.get("end").and_then(|e| e.as_u64()).unwrap_or(0) as u32;
                 }
+                _ => {}
             }
+        }
+
+        self.claim_trailing(node_type, start, end, parent.as_ref());
+    }
+
+    fn capture(
+        &mut self,
+        node_type: Option<&str>,
+        start: Option<u32>,
+        end: Option<u32>,
+        index: usize,
+        leading: bool,
+    ) {
+        let (Some(node_type), Some(start), Some(end), Some(map)) =
+            (node_type, start, end, self.captured.as_mut())
+        else {
+            return;
+        };
+        let slot = map.entry((CompactString::from(node_type), start, end)).or_default();
+        let value = self.comments[index].value.clone();
+        if leading {
+            slot.0.push(value);
+        } else {
+            slot.1.push(value);
         }
     }
 
-    // Recurse into child nodes that might contain nested bodies.
-    // We use &str slices to avoid String allocations.
-    let child_fields: &[&str] = match node_type.as_str() {
-        "FunctionDeclaration" | "FunctionExpression" | "ArrowFunctionExpression" => &["body"],
-        "IfStatement" => &["consequent", "alternate"],
-        "ForStatement" | "ForInStatement" | "ForOfStatement" | "WhileStatement"
-        | "DoWhileStatement" => &["body"],
-        "TryStatement" => &["block", "handler", "finalizer"],
-        "CatchClause" => &["body"],
-        "WithStatement" => &["body"],
-        "LabeledStatement" => &["body"],
-        "SwitchStatement" => &["cases"],
-        "SwitchCase" => &["consequent"],
-        "BlockStatement" | "Program" => &["body"],
-        "ExportNamedDeclaration" | "ExportDefaultDeclaration" => &["declaration"],
-        "VariableDeclaration" => &["declarations"],
-        "ClassDeclaration" | "ClassExpression" => &["body"],
-        "ClassBody" => &["body"],
-        "MethodDefinition" | "PropertyDefinition" => &["value"],
-        _ => &[],
-    };
-
-    for &field in child_fields {
-        if let Some(child) = obj.get_mut(field) {
-            if child.is_array() {
-                if let Some(items) = child.as_array_mut() {
-                    for item in items {
-                        modified |= distribute_comments_to_node(item, comments);
-                    }
-                }
-            } else if child.is_object() {
-                modified |= distribute_comments_to_node(child, comments);
-            }
+    /// Discard every comment that starts before `end` without recording it.
+    fn skip_past(&mut self, end: u32) {
+        while self.comments.get(self.next).is_some_and(|comment| comment.start < end) {
+            self.next += 1;
         }
     }
 
-    modified
+    /// Let this node claim the comments that follow it, so they cannot become leading
+    /// comments of a later node.
+    fn claim_trailing(
+        &mut self,
+        node_type: Option<&str>,
+        start: Option<u32>,
+        end: Option<u32>,
+        parent: Option<&ParentInfo>,
+    ) {
+        let Some(comment) = self.comments.get(self.next) else {
+            return;
+        };
+        let parent_end = parent.and_then(|p| p.end);
+        if matches!((end, parent_end), (Some(e), Some(pe)) if e == pe) {
+            return;
+        }
+
+        if parent.is_some_and(|p| p.is_last_in_body) {
+            while let Some(comment) = self.comments.get(self.next) {
+                if parent_end.is_some_and(|pe| comment.start >= pe) {
+                    break;
+                }
+                self.capture(node_type, start, end, self.next, false);
+                self.next += 1;
+            }
+        } else if let Some(node_end) = end
+            && node_end <= comment.start
+            && self.is_separator_slice(node_end, comment.start)
+        {
+            self.capture(node_type, start, end, self.next, false);
+            self.next += 1;
+        }
+    }
+
+    /// `/^[,) \t]*$/` over the source between a node's end and a comment's start.
+    fn is_separator_slice(&self, from: u32, to: u32) -> bool {
+        let from = from.saturating_sub(self.offset) as usize;
+        let to = to.saturating_sub(self.offset) as usize;
+        self.content
+            .get(from..to)
+            .is_some_and(|slice| slice.chars().all(|c| matches!(c, ',' | ')' | ' ' | '\t')))
+    }
+
+    fn record_leading(
+        &mut self,
+        node_type: Option<&str>,
+        start: u32,
+        end: Option<u32>,
+        index: usize,
+    ) {
+        self.capture(node_type, Some(start), end, index, true);
+        let text = self.comments[index].text.clone();
+        if !text.trim_start_ws().starts_with("svelte-ignore") {
+            return;
+        }
+        match self.map.last_mut() {
+            Some(entry) if entry.0 == start => entry.1.push(text),
+            _ => self.map.push((start, vec![text])),
+        }
+    }
+}
+
+/// Zimmerframe treats any object carrying a string `type` as a node; mirror that.
+fn is_estree_node(value: &Value) -> bool {
+    value.as_object().and_then(|obj| obj.get("type")).is_some_and(|t| t.is_string())
 }
 
 /// Convert a statement to JSON value (for program context, no -1 offset adjustment).
@@ -6664,97 +8171,42 @@ fn convert_statement_for_program(
         oxc_ast::ast::Statement::FunctionDeclaration(func_decl) => {
             convert_function_declaration_as_node(arena, func_decl, offset, line_offsets)
         }
+        oxc_ast::ast::Statement::ExportDeclaration(export_decl) => {
+            Some(convert_export_named_as_node(
+                arena,
+                export_decl.span,
+                Some(&export_decl.declaration),
+                &[],
+                None,
+                // oxc derives this from the declaration instead of storing it.
+                export_decl.export_kind(),
+                offset,
+                line_offsets,
+            ))
+        }
         oxc_ast::ast::Statement::ExportNamedDeclaration(export_decl) => {
-            let start = offset + export_decl.span.start as usize;
-            let end = offset + export_decl.span.end as usize;
-            let loc = create_typed_loc(start, end, line_offsets);
-
-            // Handle declaration if present (e.g., export let x;)
-            let declaration = export_decl.declaration.as_ref().map(|decl| {
-                arena.alloc_js_node(convert_declaration_for_program_as_node(
-                    arena,
-                    decl,
-                    offset,
-                    line_offsets,
-                ))
-            });
-
-            // Handle specifiers
-            let specifiers: Vec<JsNode> = export_decl
-                .specifiers
-                .iter()
-                .map(|spec| {
-                    let spec_start = offset + spec.span.start as usize;
-                    let spec_end = offset + spec.span.end as usize;
-                    let spec_loc = create_typed_loc(spec_start, spec_end, line_offsets);
-
-                    let local_start = offset + spec.local.span().start as usize;
-                    let local_end = offset + spec.local.span().end as usize;
-                    let local_name = spec.local.name().as_str();
-                    let local = expr_to_node(create_identifier(
-                        local_name,
-                        local_start,
-                        local_end,
-                        line_offsets,
-                    ));
-
-                    let exported_start = offset + spec.exported.span().start as usize;
-                    let exported_end = offset + spec.exported.span().end as usize;
-                    let exported_name = spec.exported.name().as_str();
-                    let exported = expr_to_node(create_identifier(
-                        exported_name,
-                        exported_start,
-                        exported_end,
-                        line_offsets,
-                    ));
-
-                    let export_kind = if spec.export_kind == oxc_ast::ast::ImportOrExportKind::Type
-                    {
-                        Some(CompactString::from("type"))
-                    } else {
-                        None
-                    };
-
-                    JsNode::ExportSpecifier {
-                        start: spec_start as u32,
-                        end: spec_end as u32,
-                        loc: spec_loc,
-                        local: arena.alloc_js_node(local),
-                        exported: arena.alloc_js_node(exported),
-                        export_kind,
-                    }
-                })
-                .collect();
-
-            let export_kind = if export_decl.export_kind == oxc_ast::ast::ImportOrExportKind::Type {
-                Some(CompactString::from("type"))
-            } else {
-                None
-            };
-
-            let source = export_decl.source.as_ref().map(|source| {
-                let source_start = offset + source.span.start as usize;
-                let source_end = offset + source.span.end as usize;
-                let raw = source.raw.as_ref().map(|a| a.as_str()).unwrap_or("");
-                arena.alloc_js_node(expr_to_node(create_string_literal(
-                    &source.value,
-                    raw,
-                    source_start,
-                    source_end,
-                    line_offsets,
-                )))
-            });
-
-            Some(JsNode::ExportNamedDeclaration {
-                start: start as u32,
-                end: end as u32,
-                loc,
-                declaration,
-                specifiers: arena.alloc_js_children(specifiers),
-                source,
-                export_kind,
-                attributes: IdRange::empty(),
-            })
+            Some(convert_export_named_as_node(
+                arena,
+                export_decl.span,
+                None,
+                &export_decl.specifiers,
+                None,
+                export_decl.export_kind,
+                offset,
+                line_offsets,
+            ))
+        }
+        oxc_ast::ast::Statement::ExportFromDeclaration(export_decl) => {
+            Some(convert_export_named_as_node(
+                arena,
+                export_decl.span,
+                None,
+                &export_decl.specifiers,
+                Some(&export_decl.source),
+                export_decl.export_kind,
+                offset,
+                line_offsets,
+            ))
         }
         oxc_ast::ast::Statement::ExportDefaultDeclaration(export_decl) => {
             let start = offset + export_decl.span.start as usize;
@@ -6811,6 +8263,15 @@ fn convert_statement_for_program(
                         body: body_node,
                         generator: func_decl.generator,
                         r#async: func_decl.r#async,
+                        expression: false,
+                        type_parameters: func_decl.type_parameters.as_ref().map(|tp| {
+                            Box::new(convert_ts_type_parameter_declaration(
+                                arena,
+                                tp,
+                                offset,
+                                line_offsets,
+                            ))
+                        }),
                     }
                 }
                 oxc_ast::ast::ExportDefaultDeclarationKind::ClassDeclaration(class_decl)
@@ -6831,38 +8292,34 @@ fn convert_statement_for_program(
                     let class_start = offset + class_decl.span.start as usize;
                     let class_end = offset + class_decl.span.end as usize;
                     let mut class_obj = Map::new();
-                    class_obj.insert(
-                        "type".to_string(),
-                        Value::String("ClassDeclaration".to_string()),
-                    );
-                    class_obj.insert(
-                        "start".to_string(),
-                        Value::Number((class_start as i64).into()),
-                    );
-                    class_obj.insert("end".to_string(), Value::Number((class_end as i64).into()));
+                    class_obj.set_field("type", Value::String("ClassDeclaration".to_string()));
+                    class_obj.set_field("start", Value::Number((class_start as i64).into()));
+                    class_obj.set_field("end", Value::Number((class_end as i64).into()));
                     if let Some(loc) = create_loc(class_start, class_end, line_offsets) {
-                        class_obj.insert("loc".to_string(), loc);
+                        class_obj.set_field("loc", loc);
                     }
 
                     if let Some(id) = &class_decl.id {
                         let id_start = offset + id.span.start as usize;
                         let id_end = offset + id.span.end as usize;
                         let id_expr = create_identifier(&id.name, id_start, id_end, line_offsets);
-                        class_obj.insert("id".to_string(), id_expr.as_json().clone());
+                        class_obj.set_field("id", id_expr.as_json().clone());
                     } else {
-                        class_obj.insert("id".to_string(), Value::Null);
+                        class_obj.set_field("id", Value::Null);
                     }
 
-                    if let Some(super_class) = &class_decl.super_class {
+                    if let Some(super_class) =
+                        class_decl.heritage.as_ref().map(|heritage| &heritage.expression)
+                    {
                         let super_expr = convert_expression_for_program(
                             arena,
                             super_class,
                             offset,
                             line_offsets,
                         );
-                        class_obj.insert("superClass".to_string(), super_expr.as_json().clone());
+                        class_obj.set_field("superClass", super_expr.as_json().clone());
                     } else {
-                        class_obj.insert("superClass".to_string(), Value::Null);
+                        class_obj.set_field("superClass", Value::Null);
                     }
 
                     let body = convert_class_body_for_program(
@@ -6871,12 +8328,12 @@ fn convert_statement_for_program(
                         offset,
                         line_offsets,
                     );
-                    class_obj.insert("body".to_string(), body);
+                    class_obj.set_field("body", body);
 
                     JsNode::from_value(Value::Object(class_obj))
                 }
-                oxc_ast::ast::ExportDefaultDeclarationKind::TSInterfaceDeclaration(_) => {
-                    JsNode::Null
+                oxc_ast::ast::ExportDefaultDeclarationKind::TSInterfaceDeclaration(decl) => {
+                    convert_ts_interface_declaration_as_node(arena, decl, offset, line_offsets)
                 }
                 _ => {
                     if let Some(expr) = export_decl.declaration.as_expression() {
@@ -6983,9 +8440,9 @@ fn convert_statement_for_program(
                 body: arena.alloc_js_children(body),
             })
         }
-        oxc_ast::ast::Statement::ClassDeclaration(class_decl) => Some(
-            convert_class_declaration_as_node(arena, class_decl, offset, line_offsets),
-        ),
+        oxc_ast::ast::Statement::ClassDeclaration(class_decl) => {
+            Some(convert_class_declaration_as_node(arena, class_decl, offset, line_offsets))
+        }
         oxc_ast::ast::Statement::ReturnStatement(ret_stmt) => {
             let start = offset + ret_stmt.span.start as usize;
             let end = offset + ret_stmt.span.end as usize;
@@ -7000,12 +8457,7 @@ fn convert_statement_for_program(
                 )))
             });
 
-            Some(JsNode::ReturnStatement {
-                start: start as u32,
-                end: end as u32,
-                loc,
-                argument,
-            })
+            Some(JsNode::ReturnStatement { start: start as u32, end: end as u32, loc, argument })
         }
         oxc_ast::ast::Statement::ForStatement(for_stmt) => {
             let start = offset + for_stmt.span.start as usize;
@@ -7288,12 +8740,7 @@ fn convert_statement_for_program(
                 )))
             });
 
-            Some(JsNode::BreakStatement {
-                start: start as u32,
-                end: end as u32,
-                loc,
-                label,
-            })
+            Some(JsNode::BreakStatement { start: start as u32, end: end as u32, loc, label })
         }
         oxc_ast::ast::Statement::ContinueStatement(continue_stmt) => {
             let start = offset + continue_stmt.span.start as usize;
@@ -7311,12 +8758,7 @@ fn convert_statement_for_program(
                 )))
             });
 
-            Some(JsNode::ContinueStatement {
-                start: start as u32,
-                end: end as u32,
-                loc,
-                label,
-            })
+            Some(JsNode::ContinueStatement { start: start as u32, end: end as u32, loc, label })
         }
         oxc_ast::ast::Statement::SwitchStatement(switch_stmt) => {
             let start = offset + switch_stmt.span.start as usize;
@@ -7433,90 +8875,278 @@ fn convert_statement_for_program(
             let end = offset + empty_stmt.span.end as usize;
             let loc = create_typed_loc(start, end, line_offsets);
 
-            Some(JsNode::EmptyStatement {
-                start: start as u32,
-                end: end as u32,
-                loc,
-            })
+            Some(JsNode::EmptyStatement { start: start as u32, end: end as u32, loc })
         }
         oxc_ast::ast::Statement::DebuggerStatement(debugger_stmt) => {
             let start = offset + debugger_stmt.span.start as usize;
             let end = offset + debugger_stmt.span.end as usize;
             let loc = create_typed_loc(start, end, line_offsets);
 
-            Some(JsNode::DebuggerStatement {
-                start: start as u32,
-                end: end as u32,
-                loc,
-            })
+            Some(JsNode::DebuggerStatement { start: start as u32, end: end as u32, loc })
         }
         // TypeScript enum declarations - emit as TSEnumDeclaration so remove_typescript_nodes can detect them
         oxc_ast::ast::Statement::TSEnumDeclaration(enum_decl) => {
             let start = offset + enum_decl.span.start as usize;
             let end = offset + enum_decl.span.end as usize;
             let loc = create_typed_loc(start, end, line_offsets);
-            Some(JsNode::TSEnumDeclaration {
-                start: start as u32,
-                end: end as u32,
-                loc,
-            })
+            Some(JsNode::TSEnumDeclaration { start: start as u32, end: end as u32, loc })
+        }
+        oxc_ast::ast::Statement::TSTypeAliasDeclaration(decl) => {
+            Some(convert_ts_type_alias_declaration_as_node(arena, decl, offset, line_offsets))
+        }
+        oxc_ast::ast::Statement::TSInterfaceDeclaration(decl) => {
+            Some(convert_ts_interface_declaration_as_node(arena, decl, offset, line_offsets))
         }
 
         // TypeScript module/namespace declarations - emit so remove_typescript_nodes can detect them
-        oxc_ast::ast::Statement::TSModuleDeclaration(module_decl) => {
-            // `declare module`, `declare global`, `declare namespace` etc. are
-            // type-only and must be stripped.
-            if module_decl.declare {
-                let start = offset + module_decl.span.start as usize;
-                let end = offset + module_decl.span.end as usize;
-                return Some(JsNode::EmptyStatement {
-                    start: start as u32,
-                    end: end as u32,
-                    loc: create_typed_loc(start, end, line_offsets),
-                });
-            }
-            let start = offset + module_decl.span.start as usize;
-            let end = offset + module_decl.span.end as usize;
-            let loc = create_typed_loc(start, end, line_offsets);
-
-            // Include body so remove_typescript_nodes can check for non-type nodes
-            let body = module_decl.body.as_ref().and_then(|body| {
-                match body {
-                    oxc_ast::ast::TSModuleDeclarationBody::TSModuleBlock(block) => {
-                        let block_body: Vec<JsNode> = block
-                            .body
-                            .iter()
-                            .filter_map(|stmt| {
-                                convert_statement_for_program(arena, stmt, offset, line_offsets)
-                            })
-                            .collect();
-                        // Structure: node.body = { body: [...statements...] }
-                        // TSModuleDeclaration body is a wrapper with inner body
-                        Some(arena.alloc_js_node(JsNode::BlockStatement {
-                            start: start as u32,
-                            end: end as u32,
-                            loc: loc.clone(),
-                            body: arena.alloc_js_children(block_body),
-                        }))
-                    }
-                    oxc_ast::ast::TSModuleDeclarationBody::TSModuleDeclaration(_inner) => {
-                        // Nested module declaration - just include empty body
-                        None
-                    }
-                }
-            });
-
-            Some(JsNode::TSModuleDeclaration {
-                start: start as u32,
-                end: end as u32,
-                loc,
-                body,
-            })
+        oxc_ast::ast::Statement::TSExternalModuleDeclaration(module_decl) => {
+            Some(convert_ts_module_declaration_as_node(
+                arena,
+                module_decl.span,
+                module_decl.body.as_deref(),
+                offset,
+                line_offsets,
+            ))
+        }
+        oxc_ast::ast::Statement::TSNamespaceDeclaration(module_decl) => {
+            Some(convert_ts_namespace_as_node(arena, module_decl, offset, line_offsets))
+        }
+        oxc_ast::ast::Statement::TSGlobalDeclaration(module_decl) => {
+            Some(convert_ts_module_declaration_as_node(
+                arena,
+                module_decl.span,
+                Some(&module_decl.body),
+                offset,
+                line_offsets,
+            ))
         }
 
         // Add more statement types as needed
         _ => None,
     }
+}
+
+/// Build the node for a `namespace N { … }` / `module N { … }`.
+///
+/// A dotted name is the source spelling of `namespace N { namespace M { … } }`,
+/// so it is nested here and the strip reaches the innermost body through the
+/// same recursion. Official crashes on the dotted form instead
+/// (`upstream_issues/3568-svelte-dotted-namespace-crash.md`); this is rsvelte's
+/// deliberate reading, pinned by `tests/ts_export_type_only_declaration.rs`.
+fn convert_ts_namespace_as_node(
+    arena: &ParseArena,
+    module_decl: &oxc_ast::ast::TSNamespaceDeclaration<'_>,
+    offset: usize,
+    line_offsets: &[usize],
+) -> JsNode {
+    match &module_decl.body {
+        oxc_ast::ast::TSNamespaceDeclarationBody::TSModuleBlock(block) => {
+            convert_ts_module_declaration_as_node(
+                arena,
+                module_decl.span,
+                Some(block),
+                offset,
+                line_offsets,
+            )
+        }
+        oxc_ast::ast::TSNamespaceDeclarationBody::TSNamespaceDeclaration(inner) => {
+            let start = offset + module_decl.span.start as usize;
+            let end = offset + module_decl.span.end as usize;
+            let inner_start = offset + inner.span.start as usize;
+            let inner_end = offset + inner.span.end as usize;
+            let inner_node = convert_ts_namespace_as_node(arena, inner, offset, line_offsets);
+            let body = arena.alloc_js_node(JsNode::BlockStatement {
+                start: inner_start as u32,
+                end: inner_end as u32,
+                loc: create_typed_loc(inner_start, inner_end, line_offsets),
+                body: arena.alloc_js_children(vec![inner_node]),
+            });
+            JsNode::TSModuleDeclaration {
+                start: start as u32,
+                end: end as u32,
+                loc: create_typed_loc(start, end, line_offsets),
+                body: Some(body),
+            }
+        }
+    }
+}
+
+fn convert_ts_type_alias_declaration_as_node(
+    arena: &ParseArena,
+    decl: &oxc_ast::ast::TSTypeAliasDeclaration<'_>,
+    offset: usize,
+    line_offsets: &[usize],
+) -> JsNode {
+    let start = offset + decl.span.start as usize;
+    let end = offset + decl.span.end as usize;
+    let mut obj = Map::new();
+    obj.set_field("type", Value::String("TSTypeAliasDeclaration".to_string()));
+    push_span_fields(&mut obj, start, end, line_offsets);
+    obj.set_field(
+        "id",
+        ts_identifier_value(
+            &decl.id.name,
+            offset + decl.id.span.start as usize,
+            offset + decl.id.span.end as usize,
+            line_offsets,
+        ),
+    );
+    if let Some(parameters) = &decl.type_parameters {
+        obj.set_field(
+            "typeParameters",
+            convert_ts_type_parameter_declaration(arena, parameters, offset, line_offsets),
+        );
+    }
+    obj.set_field(
+        "typeAnnotation",
+        convert_ts_type(arena, &decl.type_annotation, offset, line_offsets),
+    );
+    if decl.declare {
+        obj.set_field("declare", Value::Bool(true));
+    }
+    JsNode::TSTypeAliasDeclaration {
+        start: start as u32,
+        end: end as u32,
+        value: Box::new(Value::Object(obj)),
+    }
+}
+
+fn convert_ts_interface_declaration_as_node(
+    arena: &ParseArena,
+    decl: &oxc_ast::ast::TSInterfaceDeclaration<'_>,
+    offset: usize,
+    line_offsets: &[usize],
+) -> JsNode {
+    let start = offset + decl.span.start as usize;
+    let end = offset + decl.span.end as usize;
+    let mut obj = Map::new();
+    obj.set_field("type", Value::String("TSInterfaceDeclaration".to_string()));
+    push_span_fields(&mut obj, start, end, line_offsets);
+    obj.set_field(
+        "id",
+        ts_identifier_value(
+            &decl.id.name,
+            offset + decl.id.span.start as usize,
+            offset + decl.id.span.end as usize,
+            line_offsets,
+        ),
+    );
+    if let Some(parameters) = &decl.type_parameters {
+        obj.set_field(
+            "typeParameters",
+            convert_ts_type_parameter_declaration(arena, parameters, offset, line_offsets),
+        );
+    }
+    // Interface heritage is uncommon in the comment residue, but keeping the
+    // expressions here makes the declaration structurally walkable rather than
+    // dropping the whole `extends` branch.
+    let extends: Vec<Value> = decl
+        .extends
+        .iter()
+        .map(|heritage| {
+            let mut heritage_obj = Map::new();
+            let heritage_start = offset + heritage.span.start as usize;
+            let heritage_end = offset + heritage.span.end as usize;
+            heritage_obj
+                .set_field("type", Value::String("TSExpressionWithTypeArguments".to_string()));
+            push_span_fields(&mut heritage_obj, heritage_start, heritage_end, line_offsets);
+            heritage_obj.set_field(
+                "expression",
+                convert_ts_type_name_adjusted(&heritage.type_name, offset, line_offsets),
+            );
+            if let Some(arguments) = &heritage.type_arguments {
+                heritage_obj.set_field(
+                    "typeParameters",
+                    convert_ts_type_param_instantiation(arena, arguments, offset, line_offsets),
+                );
+            }
+            Value::Object(heritage_obj)
+        })
+        .collect();
+    if !extends.is_empty() {
+        obj.set_field("extends", Value::Array(extends));
+    }
+
+    let body_start = offset + decl.body.span.start as usize;
+    let body_end = offset + decl.body.span.end as usize;
+    let mut body = Map::new();
+    body.set_field("type", Value::String("TSInterfaceBody".to_string()));
+    push_span_fields(&mut body, body_start, body_end, line_offsets);
+    body.set_field(
+        "body",
+        Value::Array(
+            decl.body
+                .body
+                .iter()
+                .map(|member| convert_ts_signature(arena, member, offset, line_offsets))
+                .collect(),
+        ),
+    );
+    obj.set_field("body", Value::Object(body));
+    if decl.declare {
+        obj.set_field("declare", Value::Bool(true));
+    }
+
+    JsNode::TSInterfaceDeclaration {
+        start: start as u32,
+        end: end as u32,
+        value: Box::new(Value::Object(obj)),
+    }
+}
+
+/// Build the `TSModuleDeclaration` node `remove_typescript_nodes` inspects.
+/// `declare` is deliberately not consulted: upstream's visitor keys only on
+/// whether the module has a body, so `declare module "x" { … }` has to reach it.
+fn convert_ts_module_declaration_as_node(
+    arena: &ParseArena,
+    span: oxc_span::Span,
+    block: Option<&oxc_ast::ast::TSModuleBlock>,
+    offset: usize,
+    line_offsets: &[usize],
+) -> JsNode {
+    let start = offset + span.start as usize;
+    let end = offset + span.end as usize;
+    let loc = create_typed_loc(start, end, line_offsets);
+
+    let body = block.map(|block| {
+        let block_body: Vec<JsNode> = block
+            .body
+            .iter()
+            .filter_map(|stmt| {
+                if let Some(node) = convert_statement_for_program(arena, stmt, offset, line_offsets)
+                {
+                    return Some(node);
+                }
+                // The typed program has no variant for these two (issue #3681), so
+                // `convert_statement_for_program` drops them — but upstream's visitor
+                // leaves both in place, which makes the namespace non-type. Only
+                // these two stand in: most of what it drops (a type alias, say) IS
+                // type-only and must keep stripping to empty.
+                if !matches!(
+                    stmt,
+                    oxc_ast::ast::Statement::TSImportEqualsDeclaration(_)
+                        | oxc_ast::ast::Statement::ExportAllDeclaration(_)
+                ) {
+                    return None;
+                }
+                let start = offset + stmt.span().start as usize;
+                let end = offset + stmt.span().end as usize;
+                Some(JsNode::DebuggerStatement {
+                    start: start as u32,
+                    end: end as u32,
+                    loc: create_typed_loc(start, end, line_offsets),
+                })
+            })
+            .collect();
+        arena.alloc_js_node(JsNode::BlockStatement {
+            start: start as u32,
+            end: end as u32,
+            loc: loc.clone(),
+            body: arena.alloc_js_children(block_body),
+        })
+    });
+
+    JsNode::TSModuleDeclaration { start: start as u32, end: end as u32, loc, body }
 }
 
 /// Convert a Declaration to JSON value (for program context).
@@ -7575,6 +9205,10 @@ fn convert_function_declaration_as_node(
         body: body_node,
         generator: func_decl.generator,
         r#async: func_decl.r#async,
+        expression: false,
+        type_parameters: func_decl.type_parameters.as_ref().map(|tp| {
+            Box::new(convert_ts_type_parameter_declaration(arena, tp, offset, line_offsets))
+        }),
     })
 }
 
@@ -7601,7 +9235,8 @@ fn convert_class_declaration_as_node(
     });
 
     // superClass
-    let super_class = class_decl.super_class.as_ref().map(|super_class| {
+    let super_class = class_decl.heritage.as_ref().map(|heritage| {
+        let super_class = &heritage.expression;
         let super_class_value =
             convert_expression_for_program(arena, super_class, offset, line_offsets);
         arena.alloc_js_node(expr_to_node(super_class_value))
@@ -7630,11 +9265,7 @@ fn convert_class_declaration_as_node(
             .map(|dec| {
                 let dec_start = offset + dec.span.start as usize;
                 let dec_end = offset + dec.span.end as usize;
-                JsNode::Decorator {
-                    start: dec_start as u32,
-                    end: dec_end as u32,
-                    loc: None,
-                }
+                JsNode::Decorator { start: dec_start as u32, end: dec_end as u32, loc: None }
             })
             .collect();
         arena.alloc_js_children(decorator_nodes)
@@ -7701,12 +9332,51 @@ fn convert_declaration_for_program_as_node(
         {
             convert_class_declaration_as_node(arena, class_decl, offset, line_offsets)
         }
-        _ => JsNode::from_value(convert_declaration_for_program(
+        // `export namespace N { … }` / `export module M { … }` — upstream walks
+        // through the export into the declaration, so the module node has to
+        // survive the wrapper.
+        Declaration::TSExternalModuleDeclaration(module_decl) => {
+            convert_ts_module_declaration_as_node(
+                arena,
+                module_decl.span,
+                module_decl.body.as_deref(),
+                offset,
+                line_offsets,
+            )
+        }
+        Declaration::TSNamespaceDeclaration(module_decl) => {
+            convert_ts_namespace_as_node(arena, module_decl, offset, line_offsets)
+        }
+        Declaration::TSGlobalDeclaration(module_decl) => convert_ts_module_declaration_as_node(
             arena,
-            decl,
+            module_decl.span,
+            Some(&module_decl.body),
             offset,
             line_offsets,
-        )),
+        ),
+        Declaration::TSTypeAliasDeclaration(decl) => {
+            convert_ts_type_alias_declaration_as_node(arena, decl, offset, line_offsets)
+        }
+        Declaration::TSInterfaceDeclaration(decl) => {
+            convert_ts_interface_declaration_as_node(arena, decl, offset, line_offsets)
+        }
+        // `export import x = require('m')` has value export-kind in oxc, but
+        // upstream's TypeScript visitor still removes the declaration before
+        // legacy component exports are counted. Represent only the declaration
+        // inside the export as empty so the wrapper follows the existing
+        // strip_export_named_declaration_typed path. The unexported spelling is
+        // deliberately untouched: what either compiler should print for it is
+        // an upstream question (both currently emit invalid JavaScript).
+        Declaration::TSImportEqualsDeclaration(decl) => {
+            let start = offset + decl.span.start as usize;
+            let end = offset + decl.span.end as usize;
+            JsNode::EmptyStatement {
+                start: start as u32,
+                end: end as u32,
+                loc: create_typed_loc(start, end, line_offsets),
+            }
+        }
+        _ => JsNode::from_value(convert_declaration_for_program(arena, decl, offset, line_offsets)),
     }
 }
 
@@ -7721,15 +9391,8 @@ fn convert_declaration_for_program(
             let start = offset + var_decl.span.start as usize;
             let end = offset + var_decl.span.end as usize;
             let mut obj = Map::new();
-            obj.insert(
-                "type".to_string(),
-                Value::String("VariableDeclaration".to_string()),
-            );
-            obj.insert("start".to_string(), Value::Number((start as i64).into()));
-            obj.insert("end".to_string(), Value::Number((end as i64).into()));
-            if let Some(loc) = create_loc(start, end, line_offsets) {
-                obj.insert("loc".to_string(), loc);
-            }
+            obj.set_field("type", Value::String("VariableDeclaration".to_string()));
+            push_span_fields(&mut obj, start, end, line_offsets);
 
             let declarations: Vec<Value> = var_decl
                 .declarations
@@ -7739,7 +9402,7 @@ fn convert_declaration_for_program(
                 })
                 .map(|n| n.to_value())
                 .collect();
-            obj.insert("declarations".to_string(), Value::Array(declarations));
+            obj.set_field("declarations", Value::Array(declarations));
 
             let kind = match var_decl.kind {
                 oxc_ast::ast::VariableDeclarationKind::Var => "var",
@@ -7748,11 +9411,11 @@ fn convert_declaration_for_program(
                 oxc_ast::ast::VariableDeclarationKind::Using => "using",
                 oxc_ast::ast::VariableDeclarationKind::AwaitUsing => "await using",
             };
-            obj.insert("kind".to_string(), Value::String(kind.to_string()));
+            obj.set_field("kind", Value::String(kind.to_string()));
 
             // declare field for TypeScript `declare const/let/var`
             if var_decl.declare {
-                obj.insert("declare".to_string(), Value::Bool(true));
+                obj.set_field("declare", Value::Bool(true));
             }
 
             Value::Object(obj)
@@ -7762,57 +9425,43 @@ fn convert_declaration_for_program(
             if func_decl.r#type == oxc_ast::ast::FunctionType::TSDeclareFunction {
                 // Return an EmptyStatement so remove_typescript_nodes can handle it
                 let mut empty_obj = Map::new();
-                empty_obj.insert(
-                    "type".to_string(),
-                    Value::String("EmptyStatement".to_string()),
-                );
+                empty_obj.set_field("type", Value::String("EmptyStatement".to_string()));
                 return Value::Object(empty_obj);
             }
             // Filter out function overload signatures (no body)
             if func_decl.body.is_none() {
                 let mut empty_obj = Map::new();
-                empty_obj.insert(
-                    "type".to_string(),
-                    Value::String("EmptyStatement".to_string()),
-                );
+                empty_obj.set_field("type", Value::String("EmptyStatement".to_string()));
                 return Value::Object(empty_obj);
             }
             let start = offset + func_decl.span.start as usize;
             let end = offset + func_decl.span.end as usize;
             let mut obj = Map::new();
-            obj.insert(
-                "type".to_string(),
-                Value::String("FunctionDeclaration".to_string()),
-            );
-            obj.insert("start".to_string(), Value::Number((start as i64).into()));
-            obj.insert("end".to_string(), Value::Number((end as i64).into()));
-            if let Some(loc) = create_loc(start, end, line_offsets) {
-                obj.insert("loc".to_string(), loc);
-            }
+            obj.set_field("type", Value::String("FunctionDeclaration".to_string()));
+            push_span_fields(&mut obj, start, end, line_offsets);
 
             if let Some(id) = &func_decl.id {
                 let id_start = offset + id.span.start as usize;
                 let id_end = offset + id.span.end as usize;
                 let id_expr = create_identifier(&id.name, id_start, id_end, line_offsets);
-                obj.insert("id".to_string(), id_expr.as_json().clone());
+                obj.set_field("id", id_expr.as_json().clone());
             } else {
-                obj.insert("id".to_string(), Value::Null);
+                obj.set_field("id", Value::Null);
             }
 
-            obj.insert("generator".to_string(), Value::Bool(func_decl.generator));
-            obj.insert("async".to_string(), Value::Bool(func_decl.r#async));
+            obj.set_field("generator", Value::Bool(func_decl.generator));
+            obj.set_field("async", Value::Bool(func_decl.r#async));
 
             // Convert params
             let mut params: Vec<Value> = func_decl
-                .params
-                .items
-                .iter()
-                .map(|param| {
-                    convert_formal_parameter(arena, param, offset, line_offsets)
-                        .as_json()
-                        .clone()
-                })
+                .this_param
+                .as_deref()
+                .map(|p| convert_this_param(arena, p, offset, line_offsets))
+                .into_iter()
                 .collect();
+            params.extend(func_decl.params.items.iter().map(|param| {
+                convert_formal_parameter(arena, param, offset, line_offsets).as_json().clone()
+            }));
             if let Some(rest) = &func_decl.params.rest {
                 let rest_start = offset + rest.span.start as usize;
                 let rest_end = offset + rest.span.end as usize;
@@ -7823,27 +9472,24 @@ fn convert_declaration_for_program(
                     line_offsets,
                 );
                 let mut rest_obj = Map::new();
-                rest_obj.insert("type".to_string(), Value::String("RestElement".to_string()));
-                rest_obj.insert(
-                    "start".to_string(),
-                    Value::Number((rest_start as i64).into()),
-                );
-                rest_obj.insert("end".to_string(), Value::Number((rest_end as i64).into()));
+                rest_obj.set_field("type", Value::String("RestElement".to_string()));
+                rest_obj.set_field("start", Value::Number((rest_start as i64).into()));
+                rest_obj.set_field("end", Value::Number((rest_end as i64).into()));
                 if let Some(loc) = create_loc(rest_start, rest_end, line_offsets) {
-                    rest_obj.insert("loc".to_string(), loc);
+                    rest_obj.set_field("loc", loc);
                 }
-                rest_obj.insert("argument".to_string(), argument);
+                rest_obj.set_field("argument", argument);
                 params.push(Value::Object(rest_obj));
             }
-            obj.insert("params".to_string(), Value::Array(params));
+            obj.set_field("params", Value::Array(params));
 
             // Convert body
             if let Some(body) = &func_decl.body {
                 let body_value =
                     convert_function_body_for_program(arena, body, offset, line_offsets);
-                obj.insert("body".to_string(), body_value);
+                obj.set_field("body", body_value);
             } else {
-                obj.insert("body".to_string(), Value::Null);
+                obj.set_field("body", Value::Null);
             }
 
             Value::Object(obj)
@@ -7852,41 +9498,33 @@ fn convert_declaration_for_program(
             let start = offset + class_decl.span.start as usize;
             let end = offset + class_decl.span.end as usize;
             let mut obj = Map::new();
-            obj.insert(
-                "type".to_string(),
-                Value::String("ClassDeclaration".to_string()),
-            );
-            obj.insert("start".to_string(), Value::Number((start as i64).into()));
-            obj.insert("end".to_string(), Value::Number((end as i64).into()));
-            if let Some(loc) = create_loc(start, end, line_offsets) {
-                obj.insert("loc".to_string(), loc);
-            }
+            obj.set_field("type", Value::String("ClassDeclaration".to_string()));
+            push_span_fields(&mut obj, start, end, line_offsets);
 
             if let Some(id) = &class_decl.id {
                 let id_start = offset + id.span.start as usize;
                 let id_end = offset + id.span.end as usize;
                 let id_expr = create_identifier(&id.name, id_start, id_end, line_offsets);
-                obj.insert("id".to_string(), id_expr.as_json().clone());
+                obj.set_field("id", id_expr.as_json().clone());
             } else {
-                obj.insert("id".to_string(), Value::Null);
+                obj.set_field("id", Value::Null);
             }
 
             // superClass
-            if let Some(super_class) = &class_decl.super_class {
+            if let Some(super_class) =
+                class_decl.heritage.as_ref().map(|heritage| &heritage.expression)
+            {
                 let super_class_value =
                     convert_expression_for_program(arena, super_class, offset, line_offsets);
-                obj.insert(
-                    "superClass".to_string(),
-                    super_class_value.as_json().clone(),
-                );
+                obj.set_field("superClass", super_class_value.as_json().clone());
             } else {
-                obj.insert("superClass".to_string(), Value::Null);
+                obj.set_field("superClass", Value::Null);
             }
 
             // body (ClassBody)
             let body_value =
                 convert_class_body_for_program(arena, &class_decl.body, offset, line_offsets);
-            obj.insert("body".to_string(), body_value);
+            obj.set_field("body", body_value);
 
             Value::Object(obj)
         }
@@ -7895,65 +9533,12 @@ fn convert_declaration_for_program(
             let start = offset + enum_decl.span.start as usize;
             let end = offset + enum_decl.span.end as usize;
             let mut obj = Map::new();
-            obj.insert(
-                "type".to_string(),
-                Value::String("TSEnumDeclaration".to_string()),
-            );
-            obj.insert("start".to_string(), Value::Number((start as i64).into()));
-            obj.insert("end".to_string(), Value::Number((end as i64).into()));
-            if let Some(loc) = create_loc(start, end, line_offsets) {
-                obj.insert("loc".to_string(), loc);
-            }
+            obj.set_field("type", Value::String("TSEnumDeclaration".to_string()));
+            push_span_fields(&mut obj, start, end, line_offsets);
             Value::Object(obj)
         }
-        // TypeScript module/namespace declarations
-        oxc_ast::ast::Declaration::TSModuleDeclaration(module_decl) => {
-            // `declare module`, `declare global`, `declare namespace` etc. are
-            // type-only and must be stripped from output. Emit an EmptyStatement
-            // so remove_typescript_nodes can filter it out.
-            if module_decl.declare {
-                let mut empty_obj = Map::new();
-                empty_obj.insert(
-                    "type".to_string(),
-                    Value::String("EmptyStatement".to_string()),
-                );
-                return Value::Object(empty_obj);
-            }
-            let start = offset + module_decl.span.start as usize;
-            let end = offset + module_decl.span.end as usize;
-            let mut obj = Map::new();
-            obj.insert(
-                "type".to_string(),
-                Value::String("TSModuleDeclaration".to_string()),
-            );
-            obj.insert("start".to_string(), Value::Number((start as i64).into()));
-            obj.insert("end".to_string(), Value::Number((end as i64).into()));
-            if let Some(loc) = create_loc(start, end, line_offsets) {
-                obj.insert("loc".to_string(), loc);
-            }
-
-            // Include body for non-type node detection
-            if let Some(ref body) = module_decl.body {
-                match body {
-                    oxc_ast::ast::TSModuleDeclarationBody::TSModuleBlock(block) => {
-                        let block_body: Vec<Value> = block
-                            .body
-                            .iter()
-                            .filter_map(|stmt| {
-                                convert_statement_for_program(arena, stmt, offset, line_offsets)
-                            })
-                            .map(|n| n.to_value())
-                            .collect();
-                        let mut block_obj = Map::new();
-                        block_obj.insert("body".to_string(), Value::Array(block_body));
-                        obj.insert("body".to_string(), Value::Object(block_obj));
-                    }
-                    oxc_ast::ast::TSModuleDeclarationBody::TSModuleDeclaration(_inner) => {}
-                }
-            }
-
-            Value::Object(obj)
-        }
+        // TypeScript module / namespace declarations are handled by the typed
+        // `convert_ts_module_declaration_as_node` before this function is reached.
         _ => Value::Null,
     }
 }
@@ -8107,70 +9692,59 @@ fn convert_variable_declarator_for_program(
         let ts_end = type_annotation.span.end as usize + offset;
 
         let mut ts_obj = Map::new();
-        ts_obj.insert(
-            "type".to_string(),
-            Value::String("TSTypeAnnotation".to_string()),
-        );
-        ts_obj.insert("start".to_string(), Value::Number((ts_start as i64).into()));
-        ts_obj.insert("end".to_string(), Value::Number((ts_end as i64).into()));
-        if let Some(loc) = create_loc(ts_start, ts_end, line_offsets) {
-            ts_obj.insert("loc".to_string(), loc);
-        }
-        let type_value = convert_ts_type(&type_annotation.type_annotation, offset, line_offsets);
-        ts_obj.insert("typeAnnotation".to_string(), type_value);
+        ts_obj.set_field("type", Value::String("TSTypeAnnotation".to_string()));
+        push_span_fields(&mut ts_obj, ts_start, ts_end, line_offsets);
+        let type_value =
+            convert_ts_type(arena, &type_annotation.type_annotation, offset, line_offsets);
+        ts_obj.set_field("typeAnnotation", type_value);
         let ts_value = Value::Object(ts_obj);
 
         match id_pattern {
-            JsNode::Identifier {
-                start: id_start,
-                name,
-                ..
-            } => arena.alloc_js_node(JsNode::Identifier {
-                start: id_start,
-                end: ts_end as u32,
-                loc: create_typed_loc(id_start as usize, ts_end, line_offsets),
-                name,
-                type_annotation: Some(Box::new(ts_value)),
-            }),
+            JsNode::Identifier { start: id_start, name, .. } => {
+                arena.alloc_js_node(JsNode::Identifier {
+                    start: id_start,
+                    end: ts_end as u32,
+                    loc: create_typed_loc(id_start as usize, ts_end, line_offsets),
+                    name,
+                    optional: false,
+                    type_annotation: Some(Box::new(ts_value)),
+                })
+            }
             // Annotated destructuring declarator id (`let { a }: T` / `let [ a ]: T`):
             // keep the pattern typed and carry the TS annotation as an opaque
             // boundary blob (mirrors the Identifier branch above). The outer
             // `end`/`loc` extend to cover the annotation; the pattern's own
             // children keep their original spans — byte-identical to the former
             // `JsNode::Raw(to_value + typeAnnotation/end/loc override)` shape.
-            JsNode::ObjectPattern {
-                start: p_start,
-                properties,
-                ..
-            } => arena.alloc_js_node(JsNode::ObjectPattern {
-                start: p_start,
-                end: ts_end as u32,
-                loc: create_typed_loc(p_start as usize, ts_end, line_offsets),
-                properties,
-                type_annotation: Some(Box::new(ts_value)),
-            }),
-            JsNode::ArrayPattern {
-                start: p_start,
-                elements,
-                ..
-            } => arena.alloc_js_node(JsNode::ArrayPattern {
-                start: p_start,
-                end: ts_end as u32,
-                loc: create_typed_loc(p_start as usize, ts_end, line_offsets),
-                elements,
-                type_annotation: Some(Box::new(ts_value)),
-            }),
+            JsNode::ObjectPattern { start: p_start, properties, .. } => {
+                arena.alloc_js_node(JsNode::ObjectPattern {
+                    start: p_start,
+                    end: ts_end as u32,
+                    loc: create_typed_loc(p_start as usize, ts_end, line_offsets),
+                    properties,
+                    type_annotation: Some(Box::new(ts_value)),
+                })
+            }
+            JsNode::ArrayPattern { start: p_start, elements, .. } => {
+                arena.alloc_js_node(JsNode::ArrayPattern {
+                    start: p_start,
+                    end: ts_end as u32,
+                    loc: create_typed_loc(p_start as usize, ts_end, line_offsets),
+                    elements,
+                    type_annotation: Some(Box::new(ts_value)),
+                })
+            }
             other => {
                 let mut id_value = other.to_value();
                 if let Value::Object(ref mut id_obj) = id_value {
-                    id_obj.insert("typeAnnotation".to_string(), ts_value);
-                    id_obj.insert("end".to_string(), Value::Number((ts_end as i64).into()));
+                    id_obj.set_field("typeAnnotation", ts_value);
+                    id_obj.set_field("end", Value::Number((ts_end as i64).into()));
                     if let Some(loc) = create_loc(
                         id_obj.get("start").and_then(|v| v.as_i64()).unwrap_or(0) as usize,
                         ts_end,
                         line_offsets,
                     ) {
-                        id_obj.insert("loc".to_string(), loc);
+                        id_obj.set_field("loc", loc);
                     }
                 }
                 arena.alloc_js_node(JsNode::from_value(id_value))
@@ -8196,12 +9770,12 @@ fn convert_variable_declarator_for_program(
 }
 
 /// Convert an expression for program context (no -1 offset adjustment).
-fn convert_expression_for_program(
+fn convert_expression_for_program<'a>(
     arena: &ParseArena,
     expr: &OxcExpression,
     offset: usize,
     line_offsets: &[usize],
-) -> Expression {
+) -> Expression<'a> {
     // For program context, we use the raw offset without -1 adjustment
     match expr {
         OxcExpression::Identifier(id) => {
@@ -8215,6 +9789,18 @@ fn convert_expression_for_program(
             let raw = num.raw.as_ref().map(|a| a.as_str()).unwrap_or("");
             create_numeric_literal(num.value, raw, start, end, line_offsets)
         }
+        OxcExpression::BigIntLiteral(big) => {
+            let start = offset + big.span.start as usize;
+            let end = offset + big.span.end as usize;
+            let raw = big.raw.as_ref().map(|a| a.as_str()).unwrap_or("");
+            create_literal(
+                LiteralValue::BigInt(big.value.as_str().into()),
+                raw,
+                start,
+                end,
+                line_offsets,
+            )
+        }
         OxcExpression::StringLiteral(str_lit) => {
             let start = offset + str_lit.span.start as usize;
             let end = offset + str_lit.span.end as usize;
@@ -8225,13 +9811,7 @@ fn convert_expression_for_program(
             let start = offset + bool_lit.span.start as usize;
             let end = offset + bool_lit.span.end as usize;
             let raw = if bool_lit.value { "true" } else { "false" };
-            create_literal(
-                LiteralValue::Bool(bool_lit.value),
-                raw,
-                start,
-                end,
-                line_offsets,
-            )
+            create_literal(LiteralValue::Bool(bool_lit.value), raw, start, end, line_offsets)
         }
         OxcExpression::NullLiteral(null_lit) => {
             let start = offset + null_lit.span.start as usize;
@@ -8344,6 +9924,8 @@ fn convert_expression_for_program(
                         let key = convert_property_key(arena, &p.key, offset, line_offsets);
                         let value =
                             convert_expression_for_program(arena, &p.value, offset, line_offsets);
+                        let mut value_node = expr_to_node(value);
+                        mark_object_method_generics(&mut value_node, p.method);
                         let kind = match p.kind {
                             oxc_ast::ast::PropertyKind::Init => "init",
                             oxc_ast::ast::PropertyKind::Get => "get",
@@ -8357,7 +9939,7 @@ fn convert_expression_for_program(
                             shorthand: p.shorthand,
                             computed: p.computed,
                             key: arena.alloc_js_node(key),
-                            value: arena.alloc_js_node(expr_to_node(value)),
+                            value: arena.alloc_js_node(value_node),
                             kind: CompactString::from(kind),
                         }
                     }
@@ -8396,7 +9978,9 @@ fn convert_expression_for_program(
                 .params
                 .items
                 .iter()
-                .map(|param| convert_binding_pattern(arena, &param.pattern, offset, line_offsets))
+                .map(|param| {
+                    expr_to_node(convert_formal_parameter(arena, param, offset, line_offsets))
+                })
                 .collect();
             if let Some(rest) = &arrow.params.rest {
                 let rest_start = offset + rest.span.start as usize;
@@ -8414,18 +9998,16 @@ fn convert_expression_for_program(
             // For expression-body arrows (`(x) => x + 1`), emit the inner expression
             // directly as the body (without a BlockStatement wrapper). Otherwise emit
             // the full BlockStatement body.
-            let body_node = if arrow.expression
-                && let Some(oxc_ast::ast::Statement::ExpressionStatement(es)) =
-                    arrow.body.statements.first()
-            {
-                expr_to_node(convert_expression_for_program(
+            let body_node = match arrow.body.as_function_body() {
+                Some(block) => {
+                    convert_function_body_for_program_as_node(arena, block, offset, line_offsets)
+                }
+                None => expr_to_node(convert_expression_for_program(
                     arena,
-                    &es.expression,
+                    arrow.body.as_expression().expect("arrow body"),
                     offset,
                     line_offsets,
-                ))
-            } else {
-                convert_function_body_for_program_as_node(arena, &arrow.body, offset, line_offsets)
+                )),
             };
 
             Expression::from_node(JsNode::ArrowFunctionExpression {
@@ -8433,16 +10015,28 @@ fn convert_expression_for_program(
                 end: end as u32,
                 loc: create_typed_loc(start, end, line_offsets),
                 id: None,
-                expression: arrow.expression,
+                expression: arrow.body.is_expression(),
                 generator: false,
                 r#async: arrow.r#async,
                 params: arena.alloc_js_children(params),
                 body: arena.alloc_js_node(body_node),
+                type_parameters: arrow.type_parameters.as_ref().map(|tp| {
+                    Box::new(convert_ts_type_parameter_declaration(arena, tp, offset, line_offsets))
+                }),
             })
         }
-        OxcExpression::FunctionExpression(func) => Expression::from_node(
-            convert_function_expression_for_program_as_node(arena, func, offset, line_offsets),
-        ),
+        OxcExpression::FunctionExpression(func) => {
+            let type_parameters =
+                program_function_expression_type_parameters(arena, func, offset, line_offsets);
+            Expression::from_node(convert_function_expression_for_program_as_node(
+                arena,
+                func,
+                offset,
+                line_offsets,
+                type_parameters,
+                false,
+            ))
+        }
         OxcExpression::StaticMemberExpression(member) => {
             let start = offset + member.span.start as usize;
             let end = offset + member.span.end as usize;
@@ -8529,8 +10123,14 @@ fn convert_expression_for_program(
             let start = offset + assign.span.start as usize;
             let end = offset + assign.span.end as usize;
 
-            let left =
-                convert_assignment_target_for_program(arena, &assign.left, offset, line_offsets);
+            let left = match simple_assignment_lhs_inner(assign) {
+                Some(inner) => {
+                    expr_to_node(convert_expression_for_program(arena, inner, offset, line_offsets))
+                }
+                None => {
+                    convert_assignment_target_for_program(arena, &assign.left, offset, line_offsets)
+                }
+            };
             let right = convert_expression_for_program(arena, &assign.right, offset, line_offsets);
             let operator = assignment_operator_to_str(&assign.operator);
 
@@ -8618,7 +10218,8 @@ fn convert_expression_for_program(
                 )))
             });
 
-            let super_class = class_expr.super_class.as_ref().map(|sc| {
+            let super_class = class_expr.heritage.as_ref().map(|heritage| {
+                let sc = &heritage.expression;
                 arena.alloc_js_node(expr_to_node(convert_expression_for_program(
                     arena,
                     sc,
@@ -8700,12 +10301,7 @@ fn convert_expression_for_program(
                 .expressions
                 .iter()
                 .map(|expr| {
-                    expr_to_node(convert_expression_for_program(
-                        arena,
-                        expr,
-                        offset,
-                        line_offsets,
-                    ))
+                    expr_to_node(convert_expression_for_program(arena, expr, offset, line_offsets))
                 })
                 .collect();
 
@@ -8808,12 +10404,7 @@ fn convert_expression_for_program(
                 .expressions
                 .iter()
                 .map(|expr| {
-                    expr_to_node(convert_expression_for_program(
-                        arena,
-                        expr,
-                        offset,
-                        line_offsets,
-                    ))
+                    expr_to_node(convert_expression_for_program(arena, expr, offset, line_offsets))
                 })
                 .collect();
 
@@ -8893,12 +10484,20 @@ fn convert_expression_for_program(
                     }
                 }
                 oxc_ast::ast::ChainElement::TSNonNullExpression(ts_non_null) => {
-                    expr_to_node(convert_expression_for_program(
+                    let inner_start = offset + ts_non_null.span.start as usize;
+                    let inner_end = offset + ts_non_null.span.end as usize;
+                    let inner = convert_expression_for_program(
                         arena,
                         &ts_non_null.expression,
                         offset,
                         line_offsets,
-                    ))
+                    );
+                    JsNode::TSNonNullExpression {
+                        start: inner_start as u32,
+                        end: inner_end as u32,
+                        loc: create_typed_loc(inner_start, inner_end, line_offsets),
+                        expression: arena.alloc_js_node(expr_to_node(inner)),
+                    }
                 }
                 oxc_ast::ast::ChainElement::StaticMemberExpression(member) => {
                     let inner_start = offset + member.span.start as usize;
@@ -9016,12 +10615,7 @@ fn convert_expression_for_program(
                 .expressions
                 .iter()
                 .map(|expr| {
-                    expr_to_node(convert_expression_for_program(
-                        arena,
-                        expr,
-                        offset,
-                        line_offsets,
-                    ))
+                    expr_to_node(convert_expression_for_program(arena, expr, offset, line_offsets))
                 })
                 .collect();
 
@@ -9050,51 +10644,113 @@ fn convert_expression_for_program(
         OxcExpression::ParenthesizedExpression(paren) => {
             convert_expression_for_program(arena, &paren.expression, offset, line_offsets)
         }
-        // TypeScript expression wrappers - unwrap and return the inner expression
+        // TypeScript assertion wrappers - preserve the wrapper node so the public
+        // `parse()` AST mirrors svelte/compiler; the TS stripper erases them at
+        // compile time. Program-path spans use the raw `offset` (no paren shift).
         OxcExpression::TSAsExpression(ts_as) => {
-            convert_expression_for_program(arena, &ts_as.expression, offset, line_offsets)
-        }
-        OxcExpression::TSSatisfiesExpression(ts_satisfies) => {
-            convert_expression_for_program(arena, &ts_satisfies.expression, offset, line_offsets)
-        }
-        OxcExpression::TSNonNullExpression(ts_non_null) => {
-            convert_expression_for_program(arena, &ts_non_null.expression, offset, line_offsets)
-        }
-        OxcExpression::TSTypeAssertion(ts_assertion) => {
-            convert_expression_for_program(arena, &ts_assertion.expression, offset, line_offsets)
-        }
-        OxcExpression::TSInstantiationExpression(ts_inst) => {
-            convert_expression_for_program(arena, &ts_inst.expression, offset, line_offsets)
-        }
-        OxcExpression::MetaProperty(meta) => {
-            // `import.meta` / `new.target`. Without this arm the fallback
-            // below turns the node into a placeholder `Identifier("unknown")`,
-            // which Phase 2's `is_safe_identifier` then misclassifies as a
-            // safe global — `import.meta.glob(...)` must set `needs_context`
-            // (upstream: a non-Identifier base is never "safe").
-            let start = offset + meta.span.start as usize;
-            let end = offset + meta.span.end as usize;
-            let meta_start = offset + meta.meta.span.start as usize;
-            let meta_end = offset + meta.meta.span.end as usize;
-            let prop_start = offset + meta.property.span.start as usize;
-            let prop_end = offset + meta.property.span.end as usize;
-            Expression::from_node(JsNode::MetaProperty {
+            let start = offset + ts_as.span.start as usize;
+            let end = offset + ts_as.span.end as usize;
+            let inner =
+                convert_expression_for_program(arena, &ts_as.expression, offset, line_offsets);
+            let type_annotation =
+                convert_ts_type(arena, &ts_as.type_annotation, offset, line_offsets);
+            Expression::from_node(JsNode::TSAsExpression {
                 start: start as u32,
                 end: end as u32,
                 loc: create_typed_loc(start, end, line_offsets),
-                meta: arena.alloc_js_node(expr_to_node(create_identifier(
-                    &meta.meta.name,
-                    meta_start,
-                    meta_end,
-                    line_offsets,
-                ))),
-                property: arena.alloc_js_node(expr_to_node(create_identifier(
-                    &meta.property.name,
-                    prop_start,
-                    prop_end,
-                    line_offsets,
-                ))),
+                expression: arena.alloc_js_node(expr_to_node(inner)),
+                type_annotation: Box::new(type_annotation),
             })
+        }
+        OxcExpression::TSSatisfiesExpression(ts_satisfies) => {
+            let start = offset + ts_satisfies.span.start as usize;
+            let end = offset + ts_satisfies.span.end as usize;
+            let inner = convert_expression_for_program(
+                arena,
+                &ts_satisfies.expression,
+                offset,
+                line_offsets,
+            );
+            let type_annotation =
+                convert_ts_type(arena, &ts_satisfies.type_annotation, offset, line_offsets);
+            Expression::from_node(JsNode::TSSatisfiesExpression {
+                start: start as u32,
+                end: end as u32,
+                loc: create_typed_loc(start, end, line_offsets),
+                expression: arena.alloc_js_node(expr_to_node(inner)),
+                type_annotation: Box::new(type_annotation),
+            })
+        }
+        OxcExpression::TSNonNullExpression(ts_non_null) => {
+            let start = offset + ts_non_null.span.start as usize;
+            let end = offset + ts_non_null.span.end as usize;
+            let inner = convert_expression_for_program(
+                arena,
+                &ts_non_null.expression,
+                offset,
+                line_offsets,
+            );
+            Expression::from_node(JsNode::TSNonNullExpression {
+                start: start as u32,
+                end: end as u32,
+                loc: create_typed_loc(start, end, line_offsets),
+                expression: arena.alloc_js_node(expr_to_node(inner)),
+            })
+        }
+        OxcExpression::TSTypeAssertion(ts_assertion) => {
+            let start = offset + ts_assertion.span.start as usize;
+            let end = offset + ts_assertion.span.end as usize;
+            let inner = convert_expression_for_program(
+                arena,
+                &ts_assertion.expression,
+                offset,
+                line_offsets,
+            );
+            let type_annotation =
+                convert_ts_type(arena, &ts_assertion.type_annotation, offset, line_offsets);
+            Expression::from_node(JsNode::TSTypeAssertion {
+                start: start as u32,
+                end: end as u32,
+                loc: create_typed_loc(start, end, line_offsets),
+                expression: arena.alloc_js_node(expr_to_node(inner)),
+                type_annotation: Box::new(type_annotation),
+            })
+        }
+        OxcExpression::TSInstantiationExpression(ts_inst) => {
+            let start = offset + ts_inst.span.start as usize;
+            let end = offset + ts_inst.span.end as usize;
+            let inner =
+                convert_expression_for_program(arena, &ts_inst.expression, offset, line_offsets);
+            let type_arguments = convert_ts_type_param_instantiation(
+                arena,
+                &ts_inst.type_arguments,
+                offset,
+                line_offsets,
+            );
+            Expression::from_node(JsNode::TSInstantiationExpression {
+                start: start as u32,
+                end: end as u32,
+                loc: create_typed_loc(start, end, line_offsets),
+                expression: arena.alloc_js_node(expr_to_node(inner)),
+                type_arguments: Box::new(type_arguments),
+            })
+        }
+        OxcExpression::ImportMeta(meta) => {
+            // `import.meta`. Without this arm the fallback below turns the node
+            // into a placeholder `Identifier("unknown")`, which Phase 2's
+            // `is_safe_identifier` then misclassifies as a safe global —
+            // `import.meta.glob(...)` must set `needs_context` (upstream: a
+            // non-Identifier base is never "safe").
+            let start = offset + meta.span.start as usize;
+            let end = offset + meta.span.end as usize;
+            create_meta_property(arena, "import", "meta", start, end, line_offsets)
+        }
+        OxcExpression::NewTarget(meta) => {
+            // `new.target`; see the `import.meta` arm above for why the fallback
+            // placeholder is not acceptable here.
+            let start = offset + meta.span.start as usize;
+            let end = offset + meta.span.end as usize;
+            create_meta_property(arena, "new", "target", start, end, line_offsets)
         }
         _ => {
             // Fallback for unsupported expression types
@@ -9117,12 +10773,8 @@ fn convert_class_body_for_program(
     let end = offset + body.span.end as usize;
 
     let mut obj = Map::new();
-    obj.insert("type".to_string(), Value::String("ClassBody".to_string()));
-    obj.insert("start".to_string(), Value::Number((start as i64).into()));
-    obj.insert("end".to_string(), Value::Number((end as i64).into()));
-    if let Some(loc) = create_loc(start, end, line_offsets) {
-        obj.insert("loc".to_string(), loc);
-    }
+    obj.set_field("type", Value::String("ClassBody".to_string()));
+    push_span_fields(&mut obj, start, end, line_offsets);
 
     let body_elements: Vec<Value> = body
         .body
@@ -9131,7 +10783,7 @@ fn convert_class_body_for_program(
             convert_class_element_for_program(arena, element, offset, line_offsets)
         })
         .collect();
-    obj.insert("body".to_string(), Value::Array(body_elements));
+    obj.set_field("body", Value::Array(body_elements));
 
     Value::Object(obj)
 }
@@ -9217,11 +10869,15 @@ fn convert_class_element_for_program_as_node(
                 oxc_ast::ast::MethodDefinitionKind::Set => "set",
             };
             let key = convert_property_key(arena, &method.key, offset, line_offsets);
+            // A method's generics live on the MethodDefinition, not the inner
+            // function (acorn-typescript), so the inner function gets `None`.
             let value = convert_function_expression_for_program_as_node(
                 arena,
                 &method.value,
                 offset,
                 line_offsets,
+                None,
+                false,
             );
             TypedClassElem::Node(JsNode::MethodDefinition {
                 start: start as u32,
@@ -9279,7 +10935,9 @@ fn convert_class_element_for_program_as_node(
         // AccessorProperty: the Value path emits a `PropertyDefinition` with an
         // `accessor: true` field that the typed variant can't carry.
         oxc_ast::ast::ClassElement::AccessorProperty(_) => TypedClassElem::Bail,
-        // StaticBlock and TS-only members are dropped by the Value path (`_ => None`).
+        // No typed variant carries a static block; the Value blob emits it.
+        oxc_ast::ast::ClassElement::StaticBlock(_) => TypedClassElem::Bail,
+        // TS-only members are dropped by the Value path (`_ => None`).
         _ => TypedClassElem::Skip,
     }
 }
@@ -9300,17 +10958,10 @@ fn convert_class_element_for_program(
             let start = offset + method.span.start as usize;
             let end = offset + method.span.end as usize;
             let mut obj = Map::new();
-            obj.insert(
-                "type".to_string(),
-                Value::String("MethodDefinition".to_string()),
-            );
-            obj.insert("start".to_string(), Value::Number((start as i64).into()));
-            obj.insert("end".to_string(), Value::Number((end as i64).into()));
-            if let Some(loc) = create_loc(start, end, line_offsets) {
-                obj.insert("loc".to_string(), loc);
-            }
-            obj.insert("static".to_string(), Value::Bool(method.r#static));
-            obj.insert("computed".to_string(), Value::Bool(method.computed));
+            obj.set_field("type", Value::String("MethodDefinition".to_string()));
+            push_span_fields(&mut obj, start, end, line_offsets);
+            obj.set_field("static", Value::Bool(method.r#static));
+            obj.set_field("computed", Value::Bool(method.computed));
 
             // kind
             let kind = match method.kind {
@@ -9319,16 +10970,16 @@ fn convert_class_element_for_program(
                 oxc_ast::ast::MethodDefinitionKind::Get => "get",
                 oxc_ast::ast::MethodDefinitionKind::Set => "set",
             };
-            obj.insert("kind".to_string(), Value::String(kind.to_string()));
+            obj.set_field("kind", Value::String(kind.to_string()));
 
             // key
             let key = convert_property_key(arena, &method.key, offset, line_offsets);
-            obj.insert("key".to_string(), key.to_value());
+            obj.set_field("key", key.to_value());
 
             // value (function expression)
             let value =
                 convert_function_expression_for_program(arena, &method.value, offset, line_offsets);
-            obj.insert("value".to_string(), value);
+            obj.set_field("value", value);
 
             Some(Value::Object(obj))
         }
@@ -9340,33 +10991,26 @@ fn convert_class_element_for_program(
             let start = offset + prop.span.start as usize;
             let end = offset + prop.span.end as usize;
             let mut obj = Map::new();
-            obj.insert(
-                "type".to_string(),
-                Value::String("PropertyDefinition".to_string()),
-            );
-            obj.insert("start".to_string(), Value::Number((start as i64).into()));
-            obj.insert("end".to_string(), Value::Number((end as i64).into()));
-            if let Some(loc) = create_loc(start, end, line_offsets) {
-                obj.insert("loc".to_string(), loc);
-            }
-            obj.insert("static".to_string(), Value::Bool(prop.r#static));
-            obj.insert("computed".to_string(), Value::Bool(prop.computed));
+            obj.set_field("type", Value::String("PropertyDefinition".to_string()));
+            push_span_fields(&mut obj, start, end, line_offsets);
+            obj.set_field("static", Value::Bool(prop.r#static));
+            obj.set_field("computed", Value::Bool(prop.computed));
 
             // key
             let key = convert_property_key(arena, &prop.key, offset, line_offsets);
-            obj.insert("key".to_string(), key.to_value());
+            obj.set_field("key", key.to_value());
 
             // value
             if let Some(ref value) = prop.value {
                 let val = convert_expression_for_program(arena, value, offset, line_offsets);
-                obj.insert("value".to_string(), val.as_json().clone());
+                obj.set_field("value", val.as_json().clone());
             } else {
-                obj.insert("value".to_string(), Value::Null);
+                obj.set_field("value", Value::Null);
             }
 
             // TypeScript: declare field (for `declare bar: string;` in class)
             if prop.declare {
-                obj.insert("declare".to_string(), Value::Bool(true));
+                obj.set_field("declare", Value::Bool(true));
             }
 
             Some(Value::Object(obj))
@@ -9377,28 +11021,38 @@ fn convert_class_element_for_program(
             let start = offset + prop.span.start as usize;
             let end = offset + prop.span.end as usize;
             let mut obj = Map::new();
-            obj.insert(
-                "type".to_string(),
-                Value::String("PropertyDefinition".to_string()),
-            );
-            obj.insert("start".to_string(), Value::Number((start as i64).into()));
-            obj.insert("end".to_string(), Value::Number((end as i64).into()));
-            if let Some(loc) = create_loc(start, end, line_offsets) {
-                obj.insert("loc".to_string(), loc);
-            }
-            obj.insert("accessor".to_string(), Value::Bool(true));
-            obj.insert("static".to_string(), Value::Bool(prop.r#static));
-            obj.insert("computed".to_string(), Value::Bool(prop.computed));
+            obj.set_field("type", Value::String("PropertyDefinition".to_string()));
+            push_span_fields(&mut obj, start, end, line_offsets);
+            obj.set_field("accessor", Value::Bool(true));
+            obj.set_field("static", Value::Bool(prop.r#static));
+            obj.set_field("computed", Value::Bool(prop.computed));
 
             let key = convert_property_key(arena, &prop.key, offset, line_offsets);
-            obj.insert("key".to_string(), key.to_value());
+            obj.set_field("key", key.to_value());
 
             if let Some(ref value) = prop.value {
                 let val = convert_expression_for_program(arena, value, offset, line_offsets);
-                obj.insert("value".to_string(), val.as_json().clone());
+                obj.set_field("value", val.as_json().clone());
             } else {
-                obj.insert("value".to_string(), Value::Null);
+                obj.set_field("value", Value::Null);
             }
+
+            Some(Value::Object(obj))
+        }
+        oxc_ast::ast::ClassElement::StaticBlock(static_block) => {
+            let start = offset + static_block.span.start as usize;
+            let end = offset + static_block.span.end as usize;
+            let mut obj = Map::new();
+            obj.set_field("type", Value::String("StaticBlock".to_string()));
+            push_span_fields(&mut obj, start, end, line_offsets);
+
+            let body_statements: Vec<Value> = static_block
+                .body
+                .iter()
+                .filter_map(|stmt| convert_statement_for_program(arena, stmt, offset, line_offsets))
+                .map(|node| node.to_value())
+                .collect();
+            obj.set_field("body", Value::Array(body_statements));
 
             Some(Value::Object(obj))
         }
@@ -9416,56 +11070,45 @@ fn convert_function_expression_for_program(
     let start = offset + func.span.start as usize;
     let end = offset + func.span.end as usize;
     let mut obj = Map::new();
-    obj.insert(
-        "type".to_string(),
-        Value::String("FunctionExpression".to_string()),
-    );
-    obj.insert("start".to_string(), Value::Number((start as i64).into()));
-    obj.insert("end".to_string(), Value::Number((end as i64).into()));
-    if let Some(loc) = create_loc(start, end, line_offsets) {
-        obj.insert("loc".to_string(), loc);
-    }
-    obj.insert("id".to_string(), Value::Null);
-    obj.insert("generator".to_string(), Value::Bool(func.generator));
-    obj.insert("async".to_string(), Value::Bool(func.r#async));
+    obj.set_field("type", Value::String("FunctionExpression".to_string()));
+    push_span_fields(&mut obj, start, end, line_offsets);
+    obj.set_field("id", Value::Null);
+    obj.set_field("generator", Value::Bool(func.generator));
+    obj.set_field("async", Value::Bool(func.r#async));
 
     // params
     let mut params: Vec<Value> = func
-        .params
-        .items
-        .iter()
-        .map(|param| {
-            convert_formal_parameter(arena, param, offset, line_offsets)
-                .as_json()
-                .clone()
-        })
+        .this_param
+        .as_deref()
+        .map(|p| convert_this_param(arena, p, offset, line_offsets))
+        .into_iter()
         .collect();
+    params.extend(func.params.items.iter().map(|param| {
+        convert_formal_parameter(arena, param, offset, line_offsets).as_json().clone()
+    }));
     if let Some(rest) = &func.params.rest {
         let rest_start = offset + rest.span.start as usize;
         let rest_end = offset + rest.span.end as usize;
         let argument =
             convert_binding_pattern_for_param(arena, &rest.rest.argument, offset, line_offsets);
         let mut rest_obj = Map::new();
-        rest_obj.insert("type".to_string(), Value::String("RestElement".to_string()));
-        rest_obj.insert(
-            "start".to_string(),
-            Value::Number((rest_start as i64).into()),
-        );
-        rest_obj.insert("end".to_string(), Value::Number((rest_end as i64).into()));
+        rest_obj.set_field("type", Value::String("RestElement".to_string()));
+        rest_obj.set_field("start", Value::Number((rest_start as i64).into()));
+        rest_obj.set_field("end", Value::Number((rest_end as i64).into()));
         if let Some(loc) = create_loc(rest_start, rest_end, line_offsets) {
-            rest_obj.insert("loc".to_string(), loc);
+            rest_obj.set_field("loc", loc);
         }
-        rest_obj.insert("argument".to_string(), argument);
+        rest_obj.set_field("argument", argument);
         params.push(Value::Object(rest_obj));
     }
-    obj.insert("params".to_string(), Value::Array(params));
+    obj.set_field("params", Value::Array(params));
 
     // body
     if let Some(ref body) = func.body {
         let body_value = convert_function_body_for_program(arena, body, offset, line_offsets);
-        obj.insert("body".to_string(), body_value);
+        obj.set_field("body", body_value);
     } else {
-        obj.insert("body".to_string(), Value::Null);
+        obj.set_field("body", Value::Null);
     }
 
     Value::Object(obj)
@@ -9484,17 +11127,29 @@ fn convert_function_expression_for_program_as_node(
     func: &oxc_ast::ast::Function,
     offset: usize,
     line_offsets: &[usize],
+    // `None` for method values (their generics live on the wrapper node).
+    type_parameters: Option<Box<serde_json::Value>>,
+    // Object-method values keep their generics on the inner function but emit
+    // them after `body` (acorn-typescript), unlike declarations/expressions.
+    type_parameters_after_body: bool,
 ) -> JsNode {
     let start = offset + func.span.start as usize;
     let end = offset + func.span.end as usize;
 
     // params
     let mut params: Vec<JsNode> = func
-        .params
-        .items
-        .iter()
-        .map(|param| expr_to_node(convert_formal_parameter(arena, param, offset, line_offsets)))
+        .this_param
+        .as_deref()
+        .map(|p| {
+            expr_to_node(Expression::from_json(convert_this_param(arena, p, offset, line_offsets)))
+        })
+        .into_iter()
         .collect();
+    params.extend(
+        func.params.items.iter().map(|param| {
+            expr_to_node(convert_formal_parameter(arena, param, offset, line_offsets))
+        }),
+    );
     if let Some(rest) = &func.params.rest {
         let rest_start = offset + rest.span.start as usize;
         let rest_end = offset + rest.span.end as usize;
@@ -9532,7 +11187,23 @@ fn convert_function_expression_for_program_as_node(
         generator: func.generator,
         r#async: func.r#async,
         expression: false,
+        type_parameters,
+        type_parameters_after_body,
     }
+}
+
+/// Convert an oxc `Function`'s generic type parameters into the opaque
+/// `TSTypeParameterDeclaration` blob, using the program-context (`offset`) span
+/// base. `None` when the function is non-generic.
+fn program_function_expression_type_parameters(
+    arena: &ParseArena,
+    func: &oxc_ast::ast::Function,
+    offset: usize,
+    line_offsets: &[usize],
+) -> Option<Box<serde_json::Value>> {
+    func.type_parameters
+        .as_ref()
+        .map(|tp| Box::new(convert_ts_type_parameter_declaration(arena, tp, offset, line_offsets)))
 }
 
 /// Convert a function body (statement or expression) to JSON value.
@@ -9546,23 +11217,24 @@ fn convert_function_body_for_program(
     let end = offset + body.span.end as usize;
 
     let mut obj = Map::new();
-    obj.insert(
-        "type".to_string(),
-        Value::String("BlockStatement".to_string()),
-    );
-    obj.insert("start".to_string(), Value::Number((start as i64).into()));
-    obj.insert("end".to_string(), Value::Number((end as i64).into()));
-    if let Some(loc) = create_loc(start, end, line_offsets) {
-        obj.insert("loc".to_string(), loc);
-    }
+    obj.set_field("type", Value::String("BlockStatement".to_string()));
+    push_span_fields(&mut obj, start, end, line_offsets);
 
     let statements: Vec<Value> = body
-        .statements
+        .directives
         .iter()
-        .filter_map(|stmt| convert_statement_for_program(arena, stmt, offset, line_offsets))
-        .map(|n| n.to_value())
+        .map(|directive| {
+            convert_function_body_directive(arena, directive, offset, 0, line_offsets, false)
+                .to_value()
+        })
+        .chain(
+            body.statements
+                .iter()
+                .filter_map(|stmt| convert_statement_for_program(arena, stmt, offset, line_offsets))
+                .map(|n| n.to_value()),
+        )
         .collect();
-    obj.insert("body".to_string(), Value::Array(statements));
+    obj.set_field("body", Value::Array(statements));
 
     Value::Object(obj)
 }
@@ -9578,11 +11250,16 @@ fn convert_function_body_for_program_as_node(
     let end = offset + body.span.end as usize;
     let loc = create_typed_loc(start, end, line_offsets);
 
-    let statements: Vec<JsNode> = body
-        .statements
-        .iter()
-        .filter_map(|stmt| convert_statement_for_program(arena, stmt, offset, line_offsets))
-        .collect();
+    let statements: Vec<JsNode> =
+        body.directives
+            .iter()
+            .map(|directive| {
+                convert_function_body_directive(arena, directive, offset, 0, line_offsets, false)
+            })
+            .chain(body.statements.iter().filter_map(|stmt| {
+                convert_statement_for_program(arena, stmt, offset, line_offsets)
+            }))
+            .collect();
 
     JsNode::BlockStatement {
         start: start as u32,
@@ -9673,8 +11350,7 @@ fn convert_array_pattern(
         .elements
         .iter()
         .map(|elem| {
-            elem.as_ref()
-                .map(|pat| convert_binding_pattern(arena, pat, offset, line_offsets))
+            elem.as_ref().map(|pat| convert_binding_pattern(arena, pat, offset, line_offsets))
         })
         .collect();
 
@@ -9829,10 +11505,95 @@ fn convert_assignment_target_for_program(
                 optional: member.optional,
             }
         }
-        _ => {
-            // For other complex patterns (e.g., TSAsExpression, TSNonNullExpression)
-            JsNode::Null
+        _ => target
+            .as_simple_assignment_target()
+            .map(|simple| {
+                convert_ts_wrapper_target_for_program(arena, simple, offset, line_offsets)
+            })
+            .unwrap_or(JsNode::Null),
+    }
+}
+
+/// `convert_ts_wrapper_target` for the program path (no `-1` paren adjustment).
+fn convert_ts_wrapper_target_for_program(
+    arena: &ParseArena,
+    target: &oxc_ast::ast::SimpleAssignmentTarget,
+    offset: usize,
+    line_offsets: &[usize],
+) -> JsNode {
+    use oxc_ast::ast::SimpleAssignmentTarget;
+
+    match target {
+        SimpleAssignmentTarget::TSAsExpression(ts_as) => {
+            let start = offset + ts_as.span.start as usize;
+            let end = offset + ts_as.span.end as usize;
+            let inner =
+                convert_expression_for_program(arena, &ts_as.expression, offset, line_offsets);
+            let type_annotation =
+                convert_ts_type(arena, &ts_as.type_annotation, offset, line_offsets);
+            JsNode::TSAsExpression {
+                start: start as u32,
+                end: end as u32,
+                loc: create_typed_loc(start, end, line_offsets),
+                expression: arena.alloc_js_node(expr_to_node(inner)),
+                type_annotation: Box::new(type_annotation),
+            }
         }
+        SimpleAssignmentTarget::TSSatisfiesExpression(ts_satisfies) => {
+            let start = offset + ts_satisfies.span.start as usize;
+            let end = offset + ts_satisfies.span.end as usize;
+            let inner = convert_expression_for_program(
+                arena,
+                &ts_satisfies.expression,
+                offset,
+                line_offsets,
+            );
+            let type_annotation =
+                convert_ts_type(arena, &ts_satisfies.type_annotation, offset, line_offsets);
+            JsNode::TSSatisfiesExpression {
+                start: start as u32,
+                end: end as u32,
+                loc: create_typed_loc(start, end, line_offsets),
+                expression: arena.alloc_js_node(expr_to_node(inner)),
+                type_annotation: Box::new(type_annotation),
+            }
+        }
+        SimpleAssignmentTarget::TSNonNullExpression(ts_non_null) => {
+            let start = offset + ts_non_null.span.start as usize;
+            let end = offset + ts_non_null.span.end as usize;
+            let inner = convert_expression_for_program(
+                arena,
+                &ts_non_null.expression,
+                offset,
+                line_offsets,
+            );
+            JsNode::TSNonNullExpression {
+                start: start as u32,
+                end: end as u32,
+                loc: create_typed_loc(start, end, line_offsets),
+                expression: arena.alloc_js_node(expr_to_node(inner)),
+            }
+        }
+        SimpleAssignmentTarget::TSTypeAssertion(ts_assertion) => {
+            let start = offset + ts_assertion.span.start as usize;
+            let end = offset + ts_assertion.span.end as usize;
+            let inner = convert_expression_for_program(
+                arena,
+                &ts_assertion.expression,
+                offset,
+                line_offsets,
+            );
+            let type_annotation =
+                convert_ts_type(arena, &ts_assertion.type_annotation, offset, line_offsets);
+            JsNode::TSTypeAssertion {
+                start: start as u32,
+                end: end as u32,
+                loc: create_typed_loc(start, end, line_offsets),
+                expression: arena.alloc_js_node(expr_to_node(inner)),
+                type_annotation: Box::new(type_annotation),
+            }
+        }
+        _ => JsNode::Null,
     }
 }
 
@@ -10099,7 +11860,7 @@ fn convert_simple_assignment_target_for_program(
                 optional: member.optional,
             }
         }
-        _ => JsNode::Null,
+        _ => convert_ts_wrapper_target_for_program(arena, target, offset, line_offsets),
     }
 }
 
@@ -10189,17 +11950,15 @@ fn convert_property_key(
         oxc_ast::ast::PropertyKey::PrivateIdentifier(id) => {
             let start = offset + id.span.start as usize;
             let end = offset + id.span.end as usize;
-            expr_to_node(create_private_identifier(
-                &id.name,
-                start,
-                end,
-                line_offsets,
-            ))
+            expr_to_node(create_private_identifier(&id.name, start, end, line_offsets))
         }
         _ => {
-            // For computed keys, try to get the expression
+            // A computed key is program-path like its siblings above: reaching for
+            // `convert_expression` would subtract the paren a template expression
+            // is wrapped in but a script is not, putting the whole subtree one
+            // byte early.
             if let Some(expr) = key.as_expression() {
-                expr_to_node(convert_expression(arena, expr, offset, line_offsets))
+                expr_to_node(convert_expression_for_program(arena, expr, offset, line_offsets))
             } else {
                 JsNode::Null
             }
@@ -10209,47 +11968,131 @@ fn convert_property_key(
 
 /// Parse a binding pattern (for {#each} context).
 /// This parses patterns like `item`, `{ name }`, `[a, b]`, etc.
-pub fn parse_binding_pattern(
+fn is_plain_ascii_identifier(s: &str) -> bool {
+    let mut bytes = s.bytes();
+    match bytes.next() {
+        Some(b) if b.is_ascii_alphabetic() || b == b'_' || b == b'$' => {}
+        _ => return false,
+    }
+    bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'$')
+}
+
+/// Apply the strict-mode binding-name restrictions that upstream's acorn
+/// parser enforces while reading a template pattern.
+///
+/// A bare reserved word is rejected by Svelte's `read_identifier`, while
+/// `eval` / `arguments` nested in a destructuring pattern reach acorn's
+/// assignment-pattern path and therefore use its "Assigning to …" wording.
+pub fn validate_template_binding_pattern(
+    content: &str,
+    offset: usize,
+    ts: bool,
+) -> Result<(), crate::error::ParseError> {
+    let trimmed = content.trim_ws();
+    let leading_ws = content.len() - content.trim_start_ws().len();
+    let start = offset + leading_ws;
+
+    if is_plain_ascii_identifier(trimmed) && super::super::utils::is_reserved(trimmed) {
+        return Err(crate::error::ParseError::svelte(
+            "unexpected_reserved_word",
+            format!("'{}' is a reserved word in JavaScript and cannot be used here", trimmed),
+            (start, start),
+        ));
+    }
+
+    if !(trimmed.starts_with('{') || trimmed.starts_with('['))
+        || (!trimmed.contains("arguments") && !trimmed.contains("eval"))
+    {
+        return Ok(());
+    }
+
+    let source_type = if ts { SourceType::ts() } else { SourceType::mjs() };
+    with_oxc_allocator(|allocator| {
+        let wrapped = wrap_for_parse("let ", trimmed, "= null");
+        let result = OxcParser::new(allocator, &wrapped, source_type).parse();
+        if !result.diagnostics.is_empty() {
+            return Ok(());
+        }
+
+        if let Some((at, message)) =
+            super::strict_mode::find_violation(&result.program, &wrapped, ts)
+            && let Some(name) = message
+                .strip_prefix("Binding ")
+                .and_then(|message| message.strip_suffix(" in strict mode"))
+            && matches!(name, "eval" | "arguments")
+        {
+            let at = start + at as usize - 4;
+            return Err(crate::error::ParseError::svelte(
+                "js_parse_error",
+                format!("Assigning to {name} in strict mode"),
+                (at, at),
+            ));
+        }
+
+        Ok(())
+    })
+}
+
+pub fn parse_binding_pattern<'a>(
     arena: &ParseArena,
     content: &str,
     offset: usize,
     line_offsets: &[usize],
-) -> Result<Expression, crate::error::ParseError> {
-    // Check for reserved words in simple identifier contexts
-    // (e.g., {#each cases as case} where "case" is a reserved word)
-    let trimmed = content.trim();
-    if !trimmed.is_empty()
-        && !trimmed.starts_with('{')
-        && !trimmed.starts_with('[')
-        && super::super::utils::is_reserved(trimmed)
-    {
-        return Err(crate::error::ParseError::svelte(
-            "unexpected_reserved_word",
-            format!(
-                "'{}' is a reserved word in JavaScript and cannot be used here",
-                trimmed
-            ),
-            (offset, offset),
-        ));
+    ts: bool,
+) -> Result<Expression<'a>, crate::error::ParseError> {
+    let trimmed = content.trim_ws();
+    validate_template_binding_pattern(content, offset, ts)?;
+
+    // `{#each xs as item}` / `{#await p then v}` bind a bare identifier in the
+    // vast majority of cases; skip the `let … = null` wrap + full JS parse.
+    if is_plain_ascii_identifier(trimmed) {
+        let start = offset + (content.len() - content.trim_start_ws().len());
+        let end = start + trimmed.len();
+        return Ok(Expression::from_node(create_identifier_for_binding_toplevel(
+            trimmed,
+            start,
+            end,
+            line_offsets,
+        )));
     }
 
     with_oxc_allocator(|allocator| {
-        let source_type = SourceType::mjs();
+        // The component's mode, not JavaScript: a default value inside the
+        // pattern (`{#each xs as { a = y as T }}`) is an expression, and
+        // upstream's `read_pattern` parses it with the same `parser.ts` every
+        // other template expression gets.
+        let source_type = if ts { SourceType::ts() } else { SourceType::mjs() };
 
         let wrapped = format!("let {} = null", content);
         let parser = OxcParser::new(allocator, &wrapped, source_type);
         let result = parser.parse();
 
         if !result.diagnostics.is_empty() {
-            let trimmed = content.trim();
+            let trimmed = content.trim_ws();
             if trimmed.starts_with('{') || trimmed.starts_with('[') {
                 let err = &result.diagnostics[0];
                 let msg = format!("{}", err);
-                let clean_msg = msg.split('\n').next().unwrap_or(&msg).trim().to_string();
+                let clean_msg = msg.split('\n').next().unwrap_or(&msg).trim_ws().to_string();
+                let (reported, reported_end) = err.labels.first().map_or((0, 0), |label| {
+                    let start = label.offset() as usize;
+                    let end = start + label.len() as usize;
+                    (start.saturating_sub(4), end.saturating_sub(4))
+                });
+                if let Some((at, message)) =
+                    acorn_binding_pattern_diagnostic(content, &clean_msg, reported, reported_end)
+                {
+                    let at = offset + at;
+                    return Err(crate::error::ParseError::svelte(
+                        "js_parse_error",
+                        message,
+                        (at, at),
+                    ));
+                }
+                let clean_msg = acorn_diagnostic_message(&clean_msg);
                 let err_pos = offset;
                 return Err(crate::error::ParseError::svelte(
                     "js_parse_error",
-                    &clean_msg,
+                    clean_msg,
                     (err_pos, err_pos),
                 ));
             }
@@ -10262,33 +12105,35 @@ pub fn parse_binding_pattern(
             if let oxc_ast::ast::BindingPattern::BindingIdentifier(id) = &decl.id {
                 let start = offset + id.span.start as usize - 4;
                 let end = offset + id.span.end as usize - 4;
-                return Ok(Expression::from_node(
-                    create_identifier_for_binding_toplevel(&id.name, start, end, line_offsets),
-                ));
+                return Ok(Expression::from_node(create_identifier_for_binding_toplevel(
+                    &id.name,
+                    start,
+                    end,
+                    line_offsets,
+                )));
             }
 
-            return Ok(Expression::from_json(
-                convert_binding_pattern_with_adjustment(arena, &decl.id, offset, 4, line_offsets),
-            ));
+            return Ok(Expression::from_node(convert_binding_pattern_with_adjustment(
+                arena,
+                &decl.id,
+                offset,
+                4,
+                line_offsets,
+            )));
         }
 
         // Fallback: return as simple identifier
-        let trimmed = content.trim();
+        let trimmed = content.trim_ws();
         let name = if let Some(colon_pos) = trimmed.find(':') {
             if !trimmed.starts_with('{') && !trimmed.starts_with('[') {
-                trimmed[..colon_pos].trim()
+                trimmed[..colon_pos].trim_ws()
             } else {
                 trimmed
             }
         } else {
             trimmed
         };
-        Ok(create_identifier(
-            name,
-            offset,
-            offset + name.len(),
-            line_offsets,
-        ))
+        Ok(create_identifier(name, offset, offset + name.len(), line_offsets))
     })
 }
 
@@ -10300,13 +12145,13 @@ fn convert_binding_pattern_with_adjustment(
     doc_offset: usize,
     prefix_len: usize,
     line_offsets: &[usize],
-) -> Value {
+) -> JsNode {
     match pattern {
         oxc_ast::ast::BindingPattern::BindingIdentifier(id) => {
             // Position in document = doc_offset + (span_pos - prefix_len)
             let start = doc_offset + id.span.start as usize - prefix_len;
             let end = doc_offset + id.span.end as usize - prefix_len;
-            create_identifier_for_binding(&id.name, start, end, line_offsets).to_value()
+            create_identifier_for_binding(&id.name, start, end, line_offsets)
         }
         oxc_ast::ast::BindingPattern::ObjectPattern(obj_pat) => {
             convert_object_pattern_with_adjustment(
@@ -10344,22 +12189,11 @@ fn convert_object_pattern_with_adjustment(
     doc_offset: usize,
     prefix_len: usize,
     line_offsets: &[usize],
-) -> Value {
+) -> JsNode {
     let start = doc_offset + obj_pat.span.start as usize - prefix_len;
     let end = doc_offset + obj_pat.span.end as usize - prefix_len;
 
-    let mut obj = Map::new();
-    obj.insert(
-        "type".to_string(),
-        Value::String("ObjectPattern".to_string()),
-    );
-    obj.insert("start".to_string(), Value::Number((start as i64).into()));
-    obj.insert("end".to_string(), Value::Number((end as i64).into()));
-    if let Some(loc) = create_loc_for_binding(start, end, line_offsets) {
-        obj.insert("loc".to_string(), loc);
-    }
-
-    let mut properties: Vec<Value> = obj_pat
+    let mut properties: Vec<JsNode> = obj_pat
         .properties
         .iter()
         .map(|prop| {
@@ -10375,35 +12209,46 @@ fn convert_object_pattern_with_adjustment(
 
     // Handle rest element if present (e.g., `...others` in `{ foo, ...others }`)
     if let Some(rest) = &obj_pat.rest {
-        let rest_start = doc_offset + rest.span.start as usize - prefix_len;
-        let rest_end = doc_offset + rest.span.end as usize - prefix_len;
-
-        let mut rest_obj = Map::new();
-        rest_obj.insert("type".to_string(), Value::String("RestElement".to_string()));
-        rest_obj.insert(
-            "start".to_string(),
-            Value::Number((rest_start as i64).into()),
-        );
-        rest_obj.insert("end".to_string(), Value::Number((rest_end as i64).into()));
-        if let Some(loc) = create_loc_for_binding(rest_start, rest_end, line_offsets) {
-            rest_obj.insert("loc".to_string(), loc);
-        }
-        rest_obj.insert(
-            "argument".to_string(),
-            convert_binding_pattern_with_adjustment(
-                arena,
-                &rest.argument,
-                doc_offset,
-                prefix_len,
-                line_offsets,
-            ),
-        );
-        properties.push(Value::Object(rest_obj));
+        properties.push(rest_element_with_adjustment(
+            arena,
+            rest,
+            doc_offset,
+            prefix_len,
+            line_offsets,
+        ));
     }
 
-    obj.insert("properties".to_string(), Value::Array(properties));
+    JsNode::ObjectPattern {
+        start: start as u32,
+        end: end as u32,
+        loc: create_typed_loc_for_binding(start, end, line_offsets),
+        properties: alloc_deser_children(properties),
+        type_annotation: None,
+    }
+}
 
-    Value::Object(obj)
+/// `...rest` inside an object or array pattern.
+fn rest_element_with_adjustment(
+    arena: &ParseArena,
+    rest: &oxc_ast::ast::BindingRestElement,
+    doc_offset: usize,
+    prefix_len: usize,
+    line_offsets: &[usize],
+) -> JsNode {
+    let start = doc_offset + rest.span.start as usize - prefix_len;
+    let end = doc_offset + rest.span.end as usize - prefix_len;
+    JsNode::RestElement {
+        start: start as u32,
+        end: end as u32,
+        loc: create_typed_loc_for_binding(start, end, line_offsets),
+        argument: alloc_deser_node(convert_binding_pattern_with_adjustment(
+            arena,
+            &rest.argument,
+            doc_offset,
+            prefix_len,
+            line_offsets,
+        )),
+    }
 }
 
 fn convert_array_pattern_with_adjustment(
@@ -10412,67 +12257,44 @@ fn convert_array_pattern_with_adjustment(
     doc_offset: usize,
     prefix_len: usize,
     line_offsets: &[usize],
-) -> Value {
+) -> JsNode {
     let start = doc_offset + arr_pat.span.start as usize - prefix_len;
     let end = doc_offset + arr_pat.span.end as usize - prefix_len;
 
-    let mut obj = Map::new();
-    obj.insert(
-        "type".to_string(),
-        Value::String("ArrayPattern".to_string()),
-    );
-    obj.insert("start".to_string(), Value::Number((start as i64).into()));
-    obj.insert("end".to_string(), Value::Number((end as i64).into()));
-    if let Some(loc) = create_loc_for_binding(start, end, line_offsets) {
-        obj.insert("loc".to_string(), loc);
-    }
-
-    let mut elements: Vec<Value> = arr_pat
+    let mut elements: Vec<Option<JsNode>> = arr_pat
         .elements
         .iter()
-        .map(|elem| match elem {
-            Some(pat) => convert_binding_pattern_with_adjustment(
-                arena,
-                pat,
-                doc_offset,
-                prefix_len,
-                line_offsets,
-            ),
-            None => Value::Null,
+        .map(|elem| {
+            elem.as_ref().map(|pat| {
+                convert_binding_pattern_with_adjustment(
+                    arena,
+                    pat,
+                    doc_offset,
+                    prefix_len,
+                    line_offsets,
+                )
+            })
         })
         .collect();
 
     // Add rest element if present
     if let Some(rest) = &arr_pat.rest {
-        let rest_start = doc_offset + rest.span.start as usize - prefix_len;
-        let rest_end = doc_offset + rest.span.end as usize - prefix_len;
-
-        let mut rest_obj = Map::new();
-        rest_obj.insert("type".to_string(), Value::String("RestElement".to_string()));
-        rest_obj.insert(
-            "start".to_string(),
-            Value::Number((rest_start as i64).into()),
-        );
-        rest_obj.insert("end".to_string(), Value::Number((rest_end as i64).into()));
-        if let Some(loc) = create_loc_for_binding(rest_start, rest_end, line_offsets) {
-            rest_obj.insert("loc".to_string(), loc);
-        }
-        rest_obj.insert(
-            "argument".to_string(),
-            convert_binding_pattern_with_adjustment(
-                arena,
-                &rest.argument,
-                doc_offset,
-                prefix_len,
-                line_offsets,
-            ),
-        );
-        elements.push(Value::Object(rest_obj));
+        elements.push(Some(rest_element_with_adjustment(
+            arena,
+            rest,
+            doc_offset,
+            prefix_len,
+            line_offsets,
+        )));
     }
 
-    obj.insert("elements".to_string(), Value::Array(elements));
-
-    Value::Object(obj)
+    JsNode::ArrayPattern {
+        start: start as u32,
+        end: end as u32,
+        loc: create_typed_loc_for_binding(start, end, line_offsets),
+        elements,
+        type_annotation: None,
+    }
 }
 
 fn convert_assignment_pattern_with_adjustment(
@@ -10481,44 +12303,35 @@ fn convert_assignment_pattern_with_adjustment(
     doc_offset: usize,
     prefix_len: usize,
     line_offsets: &[usize],
-) -> Value {
+) -> JsNode {
     let start = doc_offset + assign_pat.span.start as usize - prefix_len;
     let end = doc_offset + assign_pat.span.end as usize - prefix_len;
 
-    let mut obj = Map::new();
-    obj.insert(
-        "type".to_string(),
-        Value::String("AssignmentPattern".to_string()),
-    );
-    obj.insert("start".to_string(), Value::Number((start as i64).into()));
-    obj.insert("end".to_string(), Value::Number((end as i64).into()));
-    if let Some(loc) = create_loc_for_binding(start, end, line_offsets) {
-        obj.insert("loc".to_string(), loc);
-    }
-
-    obj.insert(
-        "left".to_string(),
-        convert_binding_pattern_with_adjustment(
-            arena,
-            &assign_pat.left,
-            doc_offset,
-            prefix_len,
-            line_offsets,
-        ),
-    );
+    let left = alloc_deser_node(convert_binding_pattern_with_adjustment(
+        arena,
+        &assign_pat.left,
+        doc_offset,
+        prefix_len,
+        line_offsets,
+    ));
 
     // For the right side (expression), we need to adjust positions too
     // Using the expression converter with adjusted offset
-    let right = convert_expression_with_adjustment(
+    let right = alloc_deser_node(child_node_from_value(convert_expression_with_adjustment(
         arena,
         &assign_pat.right,
         doc_offset,
         prefix_len,
         line_offsets,
-    );
-    obj.insert("right".to_string(), right);
+    )));
 
-    Value::Object(obj)
+    JsNode::AssignmentPattern {
+        start: start as u32,
+        end: end as u32,
+        loc: create_typed_loc_for_binding(start, end, line_offsets),
+        left,
+        right,
+    }
 }
 
 fn convert_binding_property_with_adjustment(
@@ -10527,43 +12340,36 @@ fn convert_binding_property_with_adjustment(
     doc_offset: usize,
     prefix_len: usize,
     line_offsets: &[usize],
-) -> Value {
+) -> JsNode {
     let start = doc_offset + prop.span.start as usize - prefix_len;
     let end = doc_offset + prop.span.end as usize - prefix_len;
 
-    let mut obj = Map::new();
-    obj.insert("type".to_string(), Value::String("Property".to_string()));
-    obj.insert("start".to_string(), Value::Number((start as i64).into()));
-    obj.insert("end".to_string(), Value::Number((end as i64).into()));
-    if let Some(loc) = create_loc_for_binding(start, end, line_offsets) {
-        obj.insert("loc".to_string(), loc);
-    }
-    obj.insert("method".to_string(), Value::Bool(false));
-    obj.insert("shorthand".to_string(), Value::Bool(prop.shorthand));
-    obj.insert("computed".to_string(), Value::Bool(prop.computed));
-    obj.insert("kind".to_string(), Value::String("init".to_string()));
-
-    // Convert key
-    let key = convert_property_key_with_adjustment(
+    let key = alloc_deser_node(convert_property_key_with_adjustment(
         arena,
         &prop.key,
         doc_offset,
         prefix_len,
         line_offsets,
-    );
-    obj.insert("key".to_string(), key);
-
-    // Convert value
-    let value = convert_binding_pattern_with_adjustment(
+    ));
+    let value = alloc_deser_node(convert_binding_pattern_with_adjustment(
         arena,
         &prop.value,
         doc_offset,
         prefix_len,
         line_offsets,
-    );
-    obj.insert("value".to_string(), value);
+    ));
 
-    Value::Object(obj)
+    JsNode::Property {
+        start: start as u32,
+        end: end as u32,
+        loc: create_typed_loc_for_binding(start, end, line_offsets),
+        key,
+        value,
+        kind: CompactString::from("init"),
+        method: false,
+        shorthand: prop.shorthand,
+        computed: prop.computed,
+    }
 }
 
 fn convert_property_key_with_adjustment(
@@ -10572,31 +12378,28 @@ fn convert_property_key_with_adjustment(
     doc_offset: usize,
     prefix_len: usize,
     line_offsets: &[usize],
-) -> Value {
+) -> JsNode {
     match key {
         oxc_ast::ast::PropertyKey::StaticIdentifier(id) => {
             let start = doc_offset + id.span.start as usize - prefix_len;
             let end = doc_offset + id.span.end as usize - prefix_len;
-            create_identifier_for_binding(&id.name, start, end, line_offsets).to_value()
+            create_identifier_for_binding(&id.name, start, end, line_offsets)
         }
         oxc_ast::ast::PropertyKey::PrivateIdentifier(id) => {
             let start = doc_offset + id.span.start as usize - prefix_len;
             let end = doc_offset + id.span.end as usize - prefix_len;
-            create_private_identifier_for_binding(&id.name, start, end, line_offsets).to_value()
+            create_private_identifier_for_binding(&id.name, start, end, line_offsets)
         }
-        _ => {
-            if let Some(expr) = key.as_expression() {
-                convert_expression_with_adjustment(
-                    arena,
-                    expr,
-                    doc_offset,
-                    prefix_len,
-                    line_offsets,
-                )
-            } else {
-                Value::Null
-            }
-        }
+        _ => match key.as_expression() {
+            Some(expr) => child_node_from_value(convert_expression_with_adjustment(
+                arena,
+                expr,
+                doc_offset,
+                prefix_len,
+                line_offsets,
+            )),
+            None => JsNode::Null,
+        },
     }
 }
 
@@ -10627,6 +12430,19 @@ fn convert_expression_with_adjustment(
             let end = doc_offset + lit.span.end as usize - prefix_len;
             let raw = lit.raw.as_ref().map(|a| a.as_str()).unwrap_or("");
             create_numeric_literal_for_binding(lit.value, raw, start, end, line_offsets).to_value()
+        }
+        OxcExpression::BigIntLiteral(lit) => {
+            let start = doc_offset + lit.span.start as usize - prefix_len;
+            let end = doc_offset + lit.span.end as usize - prefix_len;
+            let raw = lit.raw.as_ref().map(|a| a.as_str()).unwrap_or("");
+            create_literal_for_binding(
+                LiteralValue::BigInt(lit.value.as_str().into()),
+                raw,
+                start,
+                end,
+                line_offsets,
+            )
+            .to_value()
         }
         OxcExpression::StringLiteral(lit) => {
             let start = doc_offset + lit.span.start as usize - prefix_len;
@@ -10683,28 +12499,73 @@ fn convert_expression_with_adjustment(
                 line_offsets,
             )
         }
-        // TypeScript expression wrappers - unwrap and return the inner expression
-        OxcExpression::TSAsExpression(ts_as) => convert_expression_with_adjustment(
-            arena,
-            &ts_as.expression,
-            doc_offset,
-            prefix_len,
-            line_offsets,
-        ),
-        OxcExpression::TSSatisfiesExpression(ts_satisfies) => convert_expression_with_adjustment(
-            arena,
-            &ts_satisfies.expression,
-            doc_offset,
-            prefix_len,
-            line_offsets,
-        ),
-        OxcExpression::TSNonNullExpression(ts_non_null) => convert_expression_with_adjustment(
-            arena,
-            &ts_non_null.expression,
-            doc_offset,
-            prefix_len,
-            line_offsets,
-        ),
+        // TypeScript assertion wrappers - preserve the wrapper (Value shape) so
+        // binding-pattern defaults (`let { x = y as const } = …`) mirror
+        // svelte/compiler; the TS stripper erases them at compile time. The
+        // type-annotation base is `doc_offset - prefix_len` (same as the span math
+        // below), so `base + type_span = doc_offset + type_span - prefix_len`.
+        OxcExpression::TSAsExpression(ts_as) => {
+            let start = doc_offset + ts_as.span.start as usize - prefix_len;
+            let end = doc_offset + ts_as.span.end as usize - prefix_len;
+            let inner = convert_expression_with_adjustment(
+                arena,
+                &ts_as.expression,
+                doc_offset,
+                prefix_len,
+                line_offsets,
+            );
+            let type_annotation = convert_ts_type(
+                arena,
+                &ts_as.type_annotation,
+                doc_offset - prefix_len,
+                line_offsets,
+            );
+            ts_assertion_value(
+                "TSAsExpression",
+                start,
+                end,
+                inner,
+                Some(type_annotation),
+                line_offsets,
+            )
+        }
+        OxcExpression::TSSatisfiesExpression(ts_satisfies) => {
+            let start = doc_offset + ts_satisfies.span.start as usize - prefix_len;
+            let end = doc_offset + ts_satisfies.span.end as usize - prefix_len;
+            let inner = convert_expression_with_adjustment(
+                arena,
+                &ts_satisfies.expression,
+                doc_offset,
+                prefix_len,
+                line_offsets,
+            );
+            let type_annotation = convert_ts_type(
+                arena,
+                &ts_satisfies.type_annotation,
+                doc_offset - prefix_len,
+                line_offsets,
+            );
+            ts_assertion_value(
+                "TSSatisfiesExpression",
+                start,
+                end,
+                inner,
+                Some(type_annotation),
+                line_offsets,
+            )
+        }
+        OxcExpression::TSNonNullExpression(ts_non_null) => {
+            let start = doc_offset + ts_non_null.span.start as usize - prefix_len;
+            let end = doc_offset + ts_non_null.span.end as usize - prefix_len;
+            let inner = convert_expression_with_adjustment(
+                arena,
+                &ts_non_null.expression,
+                doc_offset,
+                prefix_len,
+                line_offsets,
+            );
+            ts_assertion_value("TSNonNullExpression", start, end, inner, None, line_offsets)
+        }
         OxcExpression::TSTypeAssertion(ts_assertion) => convert_expression_with_adjustment(
             arena,
             &ts_assertion.expression,
@@ -10738,18 +12599,11 @@ fn convert_expression_with_adjustment(
             );
             let operator = binary_operator_to_str(&bin.operator);
             let mut obj = Map::new();
-            obj.insert(
-                "type".to_string(),
-                Value::String("BinaryExpression".to_string()),
-            );
-            obj.insert("start".to_string(), Value::Number((start as i64).into()));
-            obj.insert("end".to_string(), Value::Number((end as i64).into()));
-            if let Some(loc) = create_loc_for_binding(start, end, line_offsets) {
-                obj.insert("loc".to_string(), loc);
-            }
-            obj.insert("left".to_string(), left);
-            obj.insert("operator".to_string(), Value::String(operator.to_string()));
-            obj.insert("right".to_string(), right);
+            obj.set_field("type", Value::String("BinaryExpression".to_string()));
+            push_binding_span_fields(&mut obj, start, end, line_offsets);
+            obj.set_field("left", left);
+            obj.set_field("operator", Value::String(operator.to_string()));
+            obj.set_field("right", right);
             Value::Object(obj)
         }
         OxcExpression::UnaryExpression(unary) => {
@@ -10764,18 +12618,11 @@ fn convert_expression_with_adjustment(
             );
             let operator = unary_operator_to_str(&unary.operator);
             let mut obj = Map::new();
-            obj.insert(
-                "type".to_string(),
-                Value::String("UnaryExpression".to_string()),
-            );
-            obj.insert("start".to_string(), Value::Number((start as i64).into()));
-            obj.insert("end".to_string(), Value::Number((end as i64).into()));
-            if let Some(loc) = create_loc_for_binding(start, end, line_offsets) {
-                obj.insert("loc".to_string(), loc);
-            }
-            obj.insert("operator".to_string(), Value::String(operator.to_string()));
-            obj.insert("prefix".to_string(), Value::Bool(true));
-            obj.insert("argument".to_string(), argument);
+            obj.set_field("type", Value::String("UnaryExpression".to_string()));
+            push_binding_span_fields(&mut obj, start, end, line_offsets);
+            obj.set_field("operator", Value::String(operator.to_string()));
+            obj.set_field("prefix", Value::Bool(true));
+            obj.set_field("argument", argument);
             Value::Object(obj)
         }
         OxcExpression::LogicalExpression(log) => {
@@ -10797,18 +12644,11 @@ fn convert_expression_with_adjustment(
             );
             let operator = logical_operator_to_str(&log.operator);
             let mut obj = Map::new();
-            obj.insert(
-                "type".to_string(),
-                Value::String("LogicalExpression".to_string()),
-            );
-            obj.insert("start".to_string(), Value::Number((start as i64).into()));
-            obj.insert("end".to_string(), Value::Number((end as i64).into()));
-            if let Some(loc) = create_loc_for_binding(start, end, line_offsets) {
-                obj.insert("loc".to_string(), loc);
-            }
-            obj.insert("left".to_string(), left);
-            obj.insert("operator".to_string(), Value::String(operator.to_string()));
-            obj.insert("right".to_string(), right);
+            obj.set_field("type", Value::String("LogicalExpression".to_string()));
+            push_binding_span_fields(&mut obj, start, end, line_offsets);
+            obj.set_field("left", left);
+            obj.set_field("operator", Value::String(operator.to_string()));
+            obj.set_field("right", right);
             Value::Object(obj)
         }
         OxcExpression::ConditionalExpression(cond) => {
@@ -10836,18 +12676,11 @@ fn convert_expression_with_adjustment(
                 line_offsets,
             );
             let mut obj = Map::new();
-            obj.insert(
-                "type".to_string(),
-                Value::String("ConditionalExpression".to_string()),
-            );
-            obj.insert("start".to_string(), Value::Number((start as i64).into()));
-            obj.insert("end".to_string(), Value::Number((end as i64).into()));
-            if let Some(loc) = create_loc_for_binding(start, end, line_offsets) {
-                obj.insert("loc".to_string(), loc);
-            }
-            obj.insert("test".to_string(), test);
-            obj.insert("consequent".to_string(), consequent);
-            obj.insert("alternate".to_string(), alternate);
+            obj.set_field("type", Value::String("ConditionalExpression".to_string()));
+            push_binding_span_fields(&mut obj, start, end, line_offsets);
+            obj.set_field("test", test);
+            obj.set_field("consequent", consequent);
+            obj.set_field("alternate", alternate);
             Value::Object(obj)
         }
         OxcExpression::StaticMemberExpression(member) => {
@@ -10870,19 +12703,12 @@ fn convert_expression_with_adjustment(
             )
             .to_value();
             let mut obj = Map::new();
-            obj.insert(
-                "type".to_string(),
-                Value::String("MemberExpression".to_string()),
-            );
-            obj.insert("start".to_string(), Value::Number((start as i64).into()));
-            obj.insert("end".to_string(), Value::Number((end as i64).into()));
-            if let Some(loc) = create_loc_for_binding(start, end, line_offsets) {
-                obj.insert("loc".to_string(), loc);
-            }
-            obj.insert("object".to_string(), object);
-            obj.insert("property".to_string(), property);
-            obj.insert("computed".to_string(), Value::Bool(false));
-            obj.insert("optional".to_string(), Value::Bool(member.optional));
+            obj.set_field("type", Value::String("MemberExpression".to_string()));
+            push_binding_span_fields(&mut obj, start, end, line_offsets);
+            obj.set_field("object", object);
+            obj.set_field("property", property);
+            obj.set_field("computed", Value::Bool(false));
+            obj.set_field("optional", Value::Bool(member.optional));
             Value::Object(obj)
         }
         OxcExpression::ComputedMemberExpression(member) => {
@@ -10903,19 +12729,12 @@ fn convert_expression_with_adjustment(
                 line_offsets,
             );
             let mut obj = Map::new();
-            obj.insert(
-                "type".to_string(),
-                Value::String("MemberExpression".to_string()),
-            );
-            obj.insert("start".to_string(), Value::Number((start as i64).into()));
-            obj.insert("end".to_string(), Value::Number((end as i64).into()));
-            if let Some(loc) = create_loc_for_binding(start, end, line_offsets) {
-                obj.insert("loc".to_string(), loc);
-            }
-            obj.insert("object".to_string(), object);
-            obj.insert("property".to_string(), property);
-            obj.insert("computed".to_string(), Value::Bool(true));
-            obj.insert("optional".to_string(), Value::Bool(member.optional));
+            obj.set_field("type", Value::String("MemberExpression".to_string()));
+            push_binding_span_fields(&mut obj, start, end, line_offsets);
+            obj.set_field("object", object);
+            obj.set_field("property", property);
+            obj.set_field("computed", Value::Bool(true));
+            obj.set_field("optional", Value::Bool(member.optional));
             Value::Object(obj)
         }
         OxcExpression::PrivateFieldExpression(member) => {
@@ -10935,51 +12754,31 @@ fn convert_expression_with_adjustment(
             let prop_start = doc_offset + member.field.span.start as usize - prefix_len;
             let prop_end = doc_offset + member.field.span.end as usize - prefix_len;
             let mut prop = Map::new();
-            prop.insert(
-                "type".to_string(),
-                Value::String("PrivateIdentifier".to_string()),
-            );
-            prop.insert(
-                "start".to_string(),
-                Value::Number((prop_start as i64).into()),
-            );
-            prop.insert("end".to_string(), Value::Number((prop_end as i64).into()));
+            prop.set_field("type", Value::String("PrivateIdentifier".to_string()));
+            prop.set_field("start", Value::Number((prop_start as i64).into()));
+            prop.set_field("end", Value::Number((prop_end as i64).into()));
             if let Some(loc) = create_loc_for_binding(prop_start, prop_end, line_offsets) {
-                prop.insert("loc".to_string(), loc);
+                prop.set_field("loc", loc);
             }
-            prop.insert(
-                "name".to_string(),
-                Value::String(member.field.name.as_str().to_string()),
-            );
+            prop.set_field("name", Value::String(member.field.name.as_str().to_string()));
             let mut obj = Map::new();
-            obj.insert(
-                "type".to_string(),
-                Value::String("MemberExpression".to_string()),
-            );
-            obj.insert("start".to_string(), Value::Number((start as i64).into()));
-            obj.insert("end".to_string(), Value::Number((end as i64).into()));
-            if let Some(loc) = create_loc_for_binding(start, end, line_offsets) {
-                obj.insert("loc".to_string(), loc);
-            }
-            obj.insert("object".to_string(), object);
-            obj.insert("property".to_string(), Value::Object(prop));
-            obj.insert("computed".to_string(), Value::Bool(false));
-            obj.insert("optional".to_string(), Value::Bool(member.optional));
+            obj.set_field("type", Value::String("MemberExpression".to_string()));
+            push_binding_span_fields(&mut obj, start, end, line_offsets);
+            obj.set_field("object", object);
+            obj.set_field("property", Value::Object(prop));
+            obj.set_field("computed", Value::Bool(false));
+            obj.set_field("optional", Value::Bool(member.optional));
             Value::Object(obj)
         }
         OxcExpression::ObjectExpression(_obj_expr) => {
             // Use the full convert_expression for complex objects
             let adjusted_offset = doc_offset.wrapping_sub(prefix_len).wrapping_add(1);
-            convert_expression(arena, expr, adjusted_offset, line_offsets)
-                .as_json()
-                .clone()
+            convert_expression(arena, expr, adjusted_offset, line_offsets).as_json().clone()
         }
         OxcExpression::ArrayExpression(_arr_expr) => {
             // Use the full convert_expression for arrays
             let adjusted_offset = doc_offset.wrapping_sub(prefix_len).wrapping_add(1);
-            convert_expression(arena, expr, adjusted_offset, line_offsets)
-                .as_json()
-                .clone()
+            convert_expression(arena, expr, adjusted_offset, line_offsets).as_json().clone()
         }
         OxcExpression::UpdateExpression(update) => {
             let start = doc_offset + update.span.start as usize - prefix_len;
@@ -11002,18 +12801,11 @@ fn convert_expression_with_adjustment(
             };
             let operator = update_operator_to_str(&update.operator);
             let mut obj = Map::new();
-            obj.insert(
-                "type".to_string(),
-                Value::String("UpdateExpression".to_string()),
-            );
-            obj.insert("start".to_string(), Value::Number((start as i64).into()));
-            obj.insert("end".to_string(), Value::Number((end as i64).into()));
-            if let Some(loc) = create_loc_for_binding(start, end, line_offsets) {
-                obj.insert("loc".to_string(), loc);
-            }
-            obj.insert("operator".to_string(), Value::String(operator.to_string()));
-            obj.insert("prefix".to_string(), Value::Bool(update.prefix));
-            obj.insert("argument".to_string(), argument);
+            obj.set_field("type", Value::String("UpdateExpression".to_string()));
+            push_binding_span_fields(&mut obj, start, end, line_offsets);
+            obj.set_field("operator", Value::String(operator.to_string()));
+            obj.set_field("prefix", Value::Bool(update.prefix));
+            obj.set_field("argument", argument);
             Value::Object(obj)
         }
         OxcExpression::NullLiteral(lit) => {
@@ -11025,17 +12817,13 @@ fn convert_expression_with_adjustment(
         OxcExpression::NewExpression(_) | OxcExpression::FunctionExpression(_) => {
             // Delegate to full convert_expression
             let adjusted_offset = doc_offset.wrapping_sub(prefix_len).wrapping_add(1);
-            convert_expression(arena, expr, adjusted_offset, line_offsets)
-                .as_json()
-                .clone()
+            convert_expression(arena, expr, adjusted_offset, line_offsets).as_json().clone()
         }
         _ => {
             // Fallback for other expressions - delegate to the full convert_expression
             // with proper offset adjustment
             let adjusted_offset = doc_offset.wrapping_sub(prefix_len).wrapping_add(1);
-            convert_expression(arena, expr, adjusted_offset, line_offsets)
-                .as_json()
-                .clone()
+            convert_expression(arena, expr, adjusted_offset, line_offsets).as_json().clone()
         }
     }
 }
@@ -11050,15 +12838,8 @@ fn create_template_literal_with_adjustment(
     line_offsets: &[usize],
 ) -> Value {
     let mut obj = Map::new();
-    obj.insert(
-        "type".to_string(),
-        Value::String("TemplateLiteral".to_string()),
-    );
-    obj.insert("start".to_string(), Value::Number((start as i64).into()));
-    obj.insert("end".to_string(), Value::Number((end as i64).into()));
-    if let Some(loc) = create_loc_for_binding(start, end, line_offsets) {
-        obj.insert("loc".to_string(), loc);
-    }
+    obj.set_field("type", Value::String("TemplateLiteral".to_string()));
+    push_binding_span_fields(&mut obj, start, end, line_offsets);
 
     // Convert quasis
     let quasis: Vec<Value> = template
@@ -11069,24 +12850,14 @@ fn create_template_literal_with_adjustment(
             let q_end = doc_offset + quasi.span.end as usize - prefix_len;
 
             let mut q_obj = Map::new();
-            q_obj.insert(
-                "type".to_string(),
-                Value::String("TemplateElement".to_string()),
-            );
-            q_obj.insert("start".to_string(), Value::Number((q_start as i64).into()));
-            q_obj.insert("end".to_string(), Value::Number((q_end as i64).into()));
-            if let Some(loc) = create_loc_for_binding(q_start, q_end, line_offsets) {
-                q_obj.insert("loc".to_string(), loc);
-            }
-            q_obj.insert("tail".to_string(), Value::Bool(quasi.tail));
+            q_obj.set_field("type", Value::String("TemplateElement".to_string()));
+            push_binding_span_fields(&mut q_obj, q_start, q_end, line_offsets);
+            q_obj.set_field("tail", Value::Bool(quasi.tail));
 
             let mut value_obj = Map::new();
-            value_obj.insert(
-                "raw".to_string(),
-                Value::String(quasi.value.raw.to_string()),
-            );
-            value_obj.insert(
-                "cooked".to_string(),
+            value_obj.set_field("raw", Value::String(quasi.value.raw.to_string()));
+            value_obj.set_field(
+                "cooked",
                 quasi
                     .value
                     .cooked
@@ -11094,12 +12865,12 @@ fn create_template_literal_with_adjustment(
                     .map(|s| Value::String(s.to_string()))
                     .unwrap_or(Value::Null),
             );
-            q_obj.insert("value".to_string(), Value::Object(value_obj));
+            q_obj.set_field("value", Value::Object(value_obj));
 
             Value::Object(q_obj)
         })
         .collect();
-    obj.insert("quasis".to_string(), Value::Array(quasis));
+    obj.set_field("quasis", Value::Array(quasis));
 
     // Convert expressions
     let expressions: Vec<Value> = template
@@ -11109,7 +12880,7 @@ fn create_template_literal_with_adjustment(
             convert_expression_with_adjustment(arena, expr, doc_offset, prefix_len, line_offsets)
         })
         .collect();
-    obj.insert("expressions".to_string(), Value::Array(expressions));
+    obj.set_field("expressions", Value::Array(expressions));
 
     Value::Object(obj)
 }
@@ -11124,15 +12895,8 @@ fn create_call_expression_with_adjustment(
     line_offsets: &[usize],
 ) -> Value {
     let mut obj = Map::new();
-    obj.insert(
-        "type".to_string(),
-        Value::String("CallExpression".to_string()),
-    );
-    obj.insert("start".to_string(), Value::Number((start as i64).into()));
-    obj.insert("end".to_string(), Value::Number((end as i64).into()));
-    if let Some(loc) = create_loc_for_binding(start, end, line_offsets) {
-        obj.insert("loc".to_string(), loc);
-    }
+    obj.set_field("type", Value::String("CallExpression".to_string()));
+    push_binding_span_fields(&mut obj, start, end, line_offsets);
 
     let callee = convert_expression_with_adjustment(
         arena,
@@ -11141,7 +12905,7 @@ fn create_call_expression_with_adjustment(
         prefix_len,
         line_offsets,
     );
-    obj.insert("callee".to_string(), callee);
+    obj.set_field("callee", callee);
 
     let args: Vec<Value> = call
         .arguments
@@ -11158,19 +12922,13 @@ fn create_call_expression_with_adjustment(
                     line_offsets,
                 );
                 let mut spread_obj = Map::new();
-                spread_obj.insert(
-                    "type".to_string(),
-                    Value::String("SpreadElement".to_string()),
-                );
-                spread_obj.insert(
-                    "start".to_string(),
-                    Value::Number((spread_start as i64).into()),
-                );
-                spread_obj.insert("end".to_string(), Value::Number((spread_end as i64).into()));
+                spread_obj.set_field("type", Value::String("SpreadElement".to_string()));
+                spread_obj.set_field("start", Value::Number((spread_start as i64).into()));
+                spread_obj.set_field("end", Value::Number((spread_end as i64).into()));
                 if let Some(loc) = create_loc_for_binding(spread_start, spread_end, line_offsets) {
-                    spread_obj.insert("loc".to_string(), loc);
+                    spread_obj.set_field("loc", loc);
                 }
-                spread_obj.insert("argument".to_string(), inner);
+                spread_obj.set_field("argument", inner);
                 Value::Object(spread_obj)
             }
             _ => {
@@ -11185,8 +12943,8 @@ fn create_call_expression_with_adjustment(
             }
         })
         .collect();
-    obj.insert("arguments".to_string(), Value::Array(args));
-    obj.insert("optional".to_string(), Value::Bool(call.optional));
+    obj.set_field("arguments", Value::Array(args));
+    obj.set_field("optional", Value::Bool(call.optional));
 
     Value::Object(obj)
 }
@@ -11201,19 +12959,12 @@ fn create_arrow_function_with_adjustment(
     line_offsets: &[usize],
 ) -> Value {
     let mut obj = Map::new();
-    obj.insert(
-        "type".to_string(),
-        Value::String("ArrowFunctionExpression".to_string()),
-    );
-    obj.insert("start".to_string(), Value::Number((start as i64).into()));
-    obj.insert("end".to_string(), Value::Number((end as i64).into()));
-    if let Some(loc) = create_loc_for_binding(start, end, line_offsets) {
-        obj.insert("loc".to_string(), loc);
-    }
-    obj.insert("id".to_string(), Value::Null);
-    obj.insert("expression".to_string(), Value::Bool(arrow.expression));
-    obj.insert("generator".to_string(), Value::Bool(false));
-    obj.insert("async".to_string(), Value::Bool(arrow.r#async));
+    obj.set_field("type", Value::String("ArrowFunctionExpression".to_string()));
+    push_binding_span_fields(&mut obj, start, end, line_offsets);
+    obj.set_field("id", Value::Null);
+    obj.set_field("expression", Value::Bool(arrow.body.is_expression()));
+    obj.set_field("generator", Value::Bool(false));
+    obj.set_field("async", Value::Bool(arrow.r#async));
 
     // Convert params: iterate items and handle rest separately.
     // `with_adjustment` callers operate on the doc_offset/prefix_len coordinate
@@ -11239,29 +12990,53 @@ fn create_arrow_function_with_adjustment(
             line_offsets,
         );
         let mut rest_obj = Map::new();
-        rest_obj.insert("type".to_string(), Value::String("RestElement".to_string()));
-        rest_obj.insert(
-            "start".to_string(),
-            Value::Number((rest_start as i64).into()),
-        );
-        rest_obj.insert("end".to_string(), Value::Number((rest_end as i64).into()));
+        rest_obj.set_field("type", Value::String("RestElement".to_string()));
+        rest_obj.set_field("start", Value::Number((rest_start as i64).into()));
+        rest_obj.set_field("end", Value::Number((rest_end as i64).into()));
         if let Some(loc) = create_loc_for_binding(rest_start, rest_end, line_offsets) {
-            rest_obj.insert("loc".to_string(), loc);
+            rest_obj.set_field("loc", loc);
         }
-        rest_obj.insert("argument".to_string(), argument);
+        rest_obj.set_field("argument", argument);
         params.push(Value::Object(rest_obj));
     }
-    obj.insert("params".to_string(), Value::Array(params));
+    obj.set_field("params", Value::Array(params));
 
-    // Convert body - arrow.expression indicates if body is expression or block statement
-    let body = convert_function_body_with_adjustment(
-        arena,
-        &arrow.body,
-        doc_offset,
-        prefix_len,
-        line_offsets,
-    );
-    obj.insert("body".to_string(), body);
+    // A concise body keeps the historical `BlockStatement`/`ExpressionStatement`
+    // wrapper oxc used to synthesise, so downstream span arithmetic is unchanged.
+    let body = match arrow.body.as_function_body() {
+        Some(block) => convert_function_body_with_adjustment(
+            arena,
+            block,
+            doc_offset,
+            prefix_len,
+            line_offsets,
+        ),
+        None => {
+            let expr = arrow.body.as_expression().expect("arrow body");
+            let span = expr.span();
+            let expr_start = doc_offset + span.start as usize - prefix_len;
+            let expr_end = doc_offset + span.end as usize - prefix_len;
+            let mut stmt = Map::new();
+            stmt.set_field("type", Value::String("ExpressionStatement".to_string()));
+            push_binding_span_fields(&mut stmt, expr_start, expr_end, line_offsets);
+            stmt.set_field(
+                "expression",
+                convert_expression_with_adjustment(
+                    arena,
+                    expr,
+                    doc_offset,
+                    prefix_len,
+                    line_offsets,
+                ),
+            );
+            let mut block = Map::new();
+            block.set_field("type", Value::String("BlockStatement".to_string()));
+            push_binding_span_fields(&mut block, expr_start, expr_end, line_offsets);
+            block.set_field("body", Value::Array(vec![Value::Object(stmt)]));
+            Value::Object(block)
+        }
+    };
+    obj.set_field("body", body);
 
     Value::Object(obj)
 }
@@ -11277,24 +13052,28 @@ fn convert_function_body_with_adjustment(
     let end = doc_offset + body.span.end as usize - prefix_len;
 
     let mut obj = Map::new();
-    obj.insert(
-        "type".to_string(),
-        Value::String("BlockStatement".to_string()),
-    );
-    obj.insert("start".to_string(), Value::Number((start as i64).into()));
-    obj.insert("end".to_string(), Value::Number((end as i64).into()));
-    if let Some(loc) = create_loc_for_binding(start, end, line_offsets) {
-        obj.insert("loc".to_string(), loc);
-    }
+    obj.set_field("type", Value::String("BlockStatement".to_string()));
+    push_binding_span_fields(&mut obj, start, end, line_offsets);
 
     let statements: Vec<Value> = body
-        .statements
+        .directives
         .iter()
-        .filter_map(|stmt| {
-            convert_statement_with_adjustment(arena, stmt, doc_offset, prefix_len, line_offsets)
+        .map(|directive| {
+            convert_function_body_directive(
+                arena,
+                directive,
+                doc_offset,
+                prefix_len,
+                line_offsets,
+                true,
+            )
+            .to_value()
         })
+        .chain(body.statements.iter().filter_map(|stmt| {
+            convert_statement_with_adjustment(arena, stmt, doc_offset, prefix_len, line_offsets)
+        }))
         .collect();
-    obj.insert("body".to_string(), Value::Array(statements));
+    obj.set_field("body", Value::Array(statements));
 
     Value::Object(obj)
 }
@@ -11312,19 +13091,12 @@ fn convert_statement_with_adjustment(
             let end = doc_offset + ret.span.end as usize - prefix_len;
 
             let mut obj = Map::new();
-            obj.insert(
-                "type".to_string(),
-                Value::String("ReturnStatement".to_string()),
-            );
-            obj.insert("start".to_string(), Value::Number((start as i64).into()));
-            obj.insert("end".to_string(), Value::Number((end as i64).into()));
-            if let Some(loc) = create_loc_for_binding(start, end, line_offsets) {
-                obj.insert("loc".to_string(), loc);
-            }
+            obj.set_field("type", Value::String("ReturnStatement".to_string()));
+            push_binding_span_fields(&mut obj, start, end, line_offsets);
 
             if let Some(arg) = &ret.argument {
-                obj.insert(
-                    "argument".to_string(),
+                obj.set_field(
+                    "argument",
                     convert_expression_with_adjustment(
                         arena,
                         arg,
@@ -11334,7 +13106,7 @@ fn convert_statement_with_adjustment(
                     ),
                 );
             } else {
-                obj.insert("argument".to_string(), Value::Null);
+                obj.set_field("argument", Value::Null);
             }
 
             Some(Value::Object(obj))
@@ -11344,17 +13116,10 @@ fn convert_statement_with_adjustment(
             let end = doc_offset + expr_stmt.span.end as usize - prefix_len;
 
             let mut obj = Map::new();
-            obj.insert(
-                "type".to_string(),
-                Value::String("ExpressionStatement".to_string()),
-            );
-            obj.insert("start".to_string(), Value::Number((start as i64).into()));
-            obj.insert("end".to_string(), Value::Number((end as i64).into()));
-            if let Some(loc) = create_loc_for_binding(start, end, line_offsets) {
-                obj.insert("loc".to_string(), loc);
-            }
-            obj.insert(
-                "expression".to_string(),
+            obj.set_field("type", Value::String("ExpressionStatement".to_string()));
+            push_binding_span_fields(&mut obj, start, end, line_offsets);
+            obj.set_field(
+                "expression",
                 convert_expression_with_adjustment(
                     arena,
                     &expr_stmt.expression,
@@ -11370,9 +13135,242 @@ fn convert_statement_with_adjustment(
     }
 }
 
+/// Rebuild the ESTree `ExportNamedDeclaration` shape from the three oxc
+/// statements it was split into (`export <decl>`, `export {..}`, `export {..} from`).
+#[allow(clippy::too_many_arguments)]
+fn convert_export_named_as_node(
+    arena: &ParseArena,
+    span: oxc_span::Span,
+    decl: Option<&oxc_ast::ast::Declaration>,
+    spec_list: &[oxc_ast::ast::ExportSpecifier],
+    src: Option<&oxc_ast::ast::StringLiteral>,
+    kind: oxc_ast::ast::ImportOrExportKind,
+    offset: usize,
+    line_offsets: &[usize],
+) -> JsNode {
+    let start = offset + span.start as usize;
+    let end = offset + span.end as usize;
+    let loc = create_typed_loc(start, end, line_offsets);
+    let declaration = decl.map(|decl| {
+        arena.alloc_js_node(convert_declaration_for_program_as_node(
+            arena,
+            decl,
+            offset,
+            line_offsets,
+        ))
+    });
+    let specifiers: Vec<JsNode> = spec_list
+        .iter()
+        .map(|spec| {
+            let spec_start = offset + spec.span.start as usize;
+            let spec_end = offset + spec.span.end as usize;
+            let spec_loc = create_typed_loc(spec_start, spec_end, line_offsets);
+
+            let local_start = offset + spec.local.span().start as usize;
+            let local_end = offset + spec.local.span().end as usize;
+            let local_name = spec.local.name().as_str();
+            let local =
+                expr_to_node(create_identifier(local_name, local_start, local_end, line_offsets));
+
+            let exported_start = offset + spec.exported.span().start as usize;
+            let exported_end = offset + spec.exported.span().end as usize;
+            let exported_name = spec.exported.name().as_str();
+            let exported = expr_to_node(create_identifier(
+                exported_name,
+                exported_start,
+                exported_end,
+                line_offsets,
+            ));
+
+            let export_kind = if spec.export_kind == oxc_ast::ast::ImportOrExportKind::Type {
+                Some(CompactString::from("type"))
+            } else {
+                None
+            };
+
+            JsNode::ExportSpecifier {
+                start: spec_start as u32,
+                end: spec_end as u32,
+                loc: spec_loc,
+                local: arena.alloc_js_node(local),
+                exported: arena.alloc_js_node(exported),
+                export_kind,
+            }
+        })
+        .collect();
+
+    let export_kind = if kind == oxc_ast::ast::ImportOrExportKind::Type {
+        Some(CompactString::from("type"))
+    } else {
+        None
+    };
+
+    let source = src.map(|source| {
+        let source_start = offset + source.span.start as usize;
+        let source_end = offset + source.span.end as usize;
+        let raw = source.raw.as_ref().map(|a| a.as_str()).unwrap_or("");
+        arena.alloc_js_node(expr_to_node(create_string_literal(
+            &source.value,
+            raw,
+            source_start,
+            source_end,
+            line_offsets,
+        )))
+    });
+
+    JsNode::ExportNamedDeclaration {
+        start: start as u32,
+        end: end as u32,
+        loc,
+        declaration,
+        specifiers: arena.alloc_js_children(specifiers),
+        source,
+        export_kind,
+        attributes: IdRange::empty(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    /// Upstream reaches `eat(close)` only when acorn RETURNED an expression, so
+    /// leftover input is a missing close token and anything else is a
+    /// `js_parse_error`. OXC labels a construct it consumed and then rejected
+    /// (`42 = nope`) the same way it labels a token it could not read (`a b`),
+    /// so both directions are pinned here.
+    #[test]
+    fn trailing_token_offset_matches_acorns_stop() {
+        // (source, js stop, ts stop)
+        let cases: &[(&str, Option<usize>, Option<usize>)] = &[
+            // Consumed and then rejected: acorn throws `Assigning to rvalue`.
+            ("42 = nope", None, None),
+            ("1 + 2 = 3", None, None),
+            ("a, 42 = b", None, None),
+            // A token acorn cannot consume after a complete expression.
+            ("a b", Some(2), Some(2)),
+            ("a bcd", Some(2), Some(2)),
+            ("foo();", Some(5), Some(5)),
+            ("foo() bar", Some(6), Some(6)),
+            ("x.y = 1 z", Some(8), Some(8)),
+            // TypeScript-only syntax stops acorn at the TS token in JS mode and
+            // parses in TS mode.
+            ("y as string", Some(2), None),
+            ("y as unknown as string", Some(2), None),
+            ("y satisfies string", Some(2), None),
+            ("y!", Some(1), None),
+            ("y!.k", Some(1), None),
+            // Broken before any complete expression exists.
+            ("a +", None, None),
+            ("a,", None, None),
+            ("a,,b", None, None),
+            ("<string>y", None, None),
+            ("f<string>()", None, None),
+            ("((a: string) => a)(\"\")", None, None),
+        ];
+        for (source, js, ts) in cases {
+            assert_eq!(trailing_token_offset(source, false), *js, "js: `{source}`");
+            assert_eq!(trailing_token_offset(source, true), *ts, "ts: `{source}`");
+        }
+
+        // OXC recovers a type annotation in a JavaScript parse. Acorn returns
+        // the complete `src` expression and leaves the colon for Svelte's
+        // close-token check.
+        assert_eq!(trailing_token_offset("src: string;", false), Some(3));
+    }
+
     use super::*;
+
+    #[test]
+    fn recovered_expression_uses_acorns_strict_mode_error() {
+        assert_eq!(
+            check_js_parse_error_with_pos(r"'abc\251def'", false),
+            Some(("Octal literal in strict mode".to_string(), 4))
+        );
+    }
+
+    #[test]
+    fn program_uses_acorns_top_level_return_error() {
+        let source = "return () => {};";
+        let arena = ParseArena::new();
+        let line_offsets = super::super::super::compute_line_offsets(source, false);
+        let (_, error) = parse_program_with_error(
+            &arena,
+            ProgramParseParams {
+                content: source,
+                offset: 0,
+                line_offsets: &line_offsets,
+                is_typescript: false,
+                is_script: false,
+                leading_comments: &[],
+                script_tag_start: 0,
+                script_tag_end: source.len(),
+            },
+        );
+        let Some(crate::error::ParseError::SvelteError { message, .. }) = error else {
+            panic!("expected a Svelte parse error");
+        };
+        assert_eq!(message, "'return' outside of function");
+    }
+
+    #[test]
+    fn incomplete_let_statement_uses_acorns_reserved_word_error() {
+        assert_eq!(
+            check_js_statement_parse_error("  let ", false),
+            Some(("The keyword 'let' is reserved".to_string(), 2))
+        );
+    }
+
+    #[test]
+    fn binding_rest_comma_uses_acorns_error() {
+        for source in [
+            "{ animal, features: { ...rest, eyes } }",
+            "{ animal, features: { ...rest /* comma, in comment */, eyes } }",
+        ] {
+            let arena = ParseArena::new();
+            let line_offsets = super::super::super::compute_line_offsets(source, false);
+            let Err(crate::error::ParseError::SvelteError { message, span, .. }) =
+                parse_binding_pattern(&arena, source, 10, &line_offsets, false)
+            else {
+                panic!("expected a Svelte parse error");
+            };
+            assert_eq!(message, "Comma is not permitted after the rest element");
+            let comma = source.rfind(", eyes").unwrap();
+            assert_eq!(span, (10 + comma, 10 + comma));
+        }
+    }
+
+    #[test]
+    fn reserved_binding_words_use_acorns_contextual_errors() {
+        for (source, expected_message, expected_at) in
+            [("[case]", "Unexpected token", 1), ("{ case }", "Unexpected keyword 'case'", 2)]
+        {
+            let arena = ParseArena::new();
+            let line_offsets = super::super::super::compute_line_offsets(source, false);
+            let Err(crate::error::ParseError::SvelteError { message, span, .. }) =
+                parse_binding_pattern(&arena, source, 10, &line_offsets, false)
+            else {
+                panic!("expected a Svelte parse error for {source}");
+            };
+            assert_eq!(message, expected_message, "{source}");
+            assert_eq!(span, (10 + expected_at, 10 + expected_at), "{source}");
+        }
+    }
+
+    #[test]
+    fn malformed_object_expression_uses_acorns_unexpected_token_message() {
+        assert_eq!(
+            check_js_parse_error_with_pos("{a + b}", false).map(|error| error.0),
+            Some("Unexpected token".to_string())
+        );
+    }
+
+    #[test]
+    fn plain_js_snippet_type_annotation_uses_acorns_message() {
+        assert_eq!(
+            check_params_parse_error("error: App.Error", false),
+            Some(("Unexpected token".to_string(), 5))
+        );
+        assert_eq!(check_params_parse_error("error: App.Error", true), None);
+    }
 
     #[test]
     fn test_parse_destructuring_assignment() {
@@ -11391,15 +13389,105 @@ mod tests {
             println!("End: {:?}", e.end());
         }
 
-        assert!(
-            expr.is_some(),
-            "Should successfully parse destructuring assignment"
-        );
+        assert!(expr.is_some(), "Should successfully parse destructuring assignment");
         let e = expr.unwrap();
-        assert_eq!(
-            e.node_type(),
-            Some("AssignmentExpression"),
-            "Should be AssignmentExpression"
+        assert_eq!(e.node_type(), Some("AssignmentExpression"), "Should be AssignmentExpression");
+    }
+
+    /// The ASCII gates here are fast-path filters, so rejecting a non-ASCII
+    /// identifier must cost only a fallback — never a wrong parse.
+    #[test]
+    fn non_ascii_identifiers_fall_back_and_still_parse() {
+        let arena = ParseArena::new();
+        let line_offsets = vec![0];
+        for src in ["名前", "שם", "café", "名前.foo"] {
+            let expr = parse_expression_with_typescript(&arena, src, 0, &line_offsets, false);
+            let e = expr.unwrap_or_else(|| panic!("`{src}` should parse"));
+            let expected = if src.contains('.') { "MemberExpression" } else { "Identifier" };
+            assert_eq!(e.node_type(), Some(expected), "`{src}`");
+        }
+    }
+
+    /// Guards the direction of the fix: a byte gate that admitted every
+    /// `>= 0x80` byte would swallow U+3000 (JavaScript whitespace) into the
+    /// identifier and hand back an `Identifier` instead of a `BinaryExpression`.
+    #[test]
+    fn ascii_gate_does_not_swallow_non_ascii_whitespace() {
+        let arena = ParseArena::new();
+        let line_offsets = vec![0];
+        for src in ["名前\u{3000}+ 1", "名前\u{00a0}+ 1"] {
+            let expr = parse_expression_with_typescript(&arena, src, 0, &line_offsets, false);
+            let e = expr.unwrap_or_else(|| panic!("`{src}` should parse"));
+            assert_eq!(e.node_type(), Some("BinaryExpression"), "`{src}`");
+        }
+    }
+
+    fn assert_leading_string_statements(arena: &ParseArena, block: &JsNode) {
+        let JsNode::BlockStatement { body, .. } = block else {
+            panic!("expected a block body");
+        };
+        let statements = arena.get_js_children(*body);
+        assert_eq!(statements.len(), 3);
+
+        for (statement, expected_value, expected_raw) in
+            [(&statements[0], "first", "'first'"), (&statements[1], "sec\\ond", "\"sec\\\\ond\"")]
+        {
+            let JsNode::ExpressionStatement { expression, .. } = statement else {
+                panic!("expected a leading string expression statement");
+            };
+            let JsNode::Literal { value, raw, .. } = arena.get_js_node(*expression) else {
+                panic!("expected a string literal");
+            };
+            assert_eq!(value, &LiteralValue::String(expected_value.into()));
+            assert_eq!(raw.as_str(), expected_raw);
+        }
+    }
+
+    #[test]
+    fn function_body_directives_remain_expression_statements() {
+        let arrow_source = "() => { 'first'; \"sec\\\\ond\"; work(); }";
+        let arrow_arena = ParseArena::new();
+        let arrow_line_offsets = super::super::super::compute_line_offsets(arrow_source, false);
+        let arrow = parse_expression_with_typescript(
+            &arrow_arena,
+            arrow_source,
+            0,
+            &arrow_line_offsets,
+            false,
+        )
+        .expect("arrow should parse");
+        let arrow_node = arrow.as_node();
+        let JsNode::ArrowFunctionExpression { body, .. } = arrow_node.as_ref() else {
+            panic!("expected an arrow");
+        };
+        assert_leading_string_statements(&arrow_arena, arrow_arena.get_js_node(*body));
+
+        let program_source = "function f() { 'first'; \"sec\\\\ond\"; work(); }";
+        let program_arena = ParseArena::new();
+        let program_line_offsets = super::super::super::compute_line_offsets(program_source, false);
+        let (program, error) = parse_program_with_error(
+            &program_arena,
+            ProgramParseParams {
+                content: program_source,
+                offset: 0,
+                line_offsets: &program_line_offsets,
+                is_typescript: false,
+                is_script: false,
+                leading_comments: &[],
+                script_tag_start: 0,
+                script_tag_end: program_source.len(),
+            },
         );
+        assert!(error.is_none());
+        let program_node = program.as_node();
+        let JsNode::Program { body, .. } = program_node.as_ref() else {
+            panic!("expected a program");
+        };
+        let [JsNode::FunctionDeclaration { body: Some(function_body), .. }] =
+            program_arena.get_js_children(*body)
+        else {
+            panic!("expected one function declaration");
+        };
+        assert_leading_string_statements(&program_arena, program_arena.get_js_node(*function_body));
     }
 }

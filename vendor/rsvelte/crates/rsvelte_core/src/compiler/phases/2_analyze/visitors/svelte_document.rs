@@ -18,46 +18,73 @@ pub fn visit(
 ) -> Result<(), AnalysisError> {
     // Check for duplicate
     if context.has_svelte_document {
-        return Err(errors::svelte_meta_duplicate("svelte:document"));
+        return Err(
+            errors::svelte_meta_duplicate("svelte:document").at(document.start, document.start)
+        );
     }
     context.has_svelte_document = true;
 
     // Validate placement (must be at top level)
-    if context.is_inside_element_or_block() {
-        return Err(errors::svelte_meta_invalid_placement("svelte:document"));
+    if !context.in_root_fragment {
+        return Err(errors::svelte_meta_invalid_placement("svelte:document")
+            .at(document.start, document.start));
     }
 
     // svelte:document cannot have children
     if !document.fragment.nodes.is_empty() {
-        return Err(AnalysisError::validation(
-            "svelte_meta_invalid_content",
-            "<svelte:document> cannot have children",
-        ));
+        let (start, _) = document.fragment.nodes.first().unwrap().span();
+        let (_, end) = document.fragment.nodes.last().unwrap().span();
+        return Err(errors::svelte_meta_invalid_content("svelte:document").at(start, end));
     }
 
-    // Validate attributes - check for invalid ones
+    // Upstream runs this whole loop before `context.next()` descends into any
+    // attribute, so "does this element take arbitrary attributes at all" is
+    // answered ahead of every per-directive rule below.
+    for attr in &document.attributes {
+        let span = match attr {
+            Attribute::SpreadAttribute(spread) => Some((spread.start, spread.end)),
+            Attribute::Attribute(a) if !super::shared::utils::is_event_attribute(a) => {
+                Some((a.start, a.end))
+            }
+            _ => None,
+        };
+        if let Some((start, end)) = span {
+            return Err(errors::illegal_element_attribute("svelte:document").at(start, end));
+        }
+    }
+
+    // The target rule needs the attribute list, which the mutable loop below holds.
+    for attr in &document.attributes {
+        if let Attribute::BindDirective(bind) = attr {
+            bind_directive::validate_binding_target(bind, "svelte:document", &document.attributes)?;
+        }
+    }
+
     for attr in &mut document.attributes {
         match attr {
             Attribute::BindDirective(bind) => {
-                bind_directive::visit_with_svelte_element(bind, "svelte:document", context)?;
+                bind_directive::visit_with_svelte_element(bind, context)?;
             }
             Attribute::OnDirective(on) => {
                 on_directive::visit(on, context)?;
             }
-            Attribute::LetDirective(_) => {
+            Attribute::StyleDirective(style_dir) => {
+                super::style_directive::visit(style_dir, context)?;
+            }
+            Attribute::LetDirective(let_dir) => {
                 // let: directives are NOT allowed on svelte:document
-                return Err(errors::let_directive_invalid_placement());
+                return Err(
+                    errors::let_directive_invalid_placement().at(let_dir.start, let_dir.end)
+                );
             }
-            Attribute::SpreadAttribute(_) => {
-                // Spread attributes are NOT allowed on svelte:document
-                return Err(errors::illegal_element_attribute("svelte:document"));
-            }
-            // Regular-attribute handler expressions drive `needs_context` (see
+            // Event-attribute handler expressions drive `needs_context` (see
             // svelte_window for the rationale).
             Attribute::Attribute(a) => {
                 super::attribute::visit_attribute_value_expressions(&mut a.value, context)?;
             }
-            _ => {}
+            other => {
+                super::shared::attribute::walk_remaining_attribute_expressions(other, context)?;
+            }
         }
     }
 

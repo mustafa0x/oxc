@@ -20,7 +20,10 @@ use crate::compiler::phases::phase2_analyze::AnalysisError;
 /// component state.
 ///
 /// Corresponds to `KeyBlock(node, context)` in KeyBlock.js.
-pub fn visit(block: &mut KeyBlock, context: &mut VisitorContext) -> Result<(), AnalysisError> {
+pub fn visit<'a, 'b: 'a>(
+    block: &mut KeyBlock<'b>,
+    context: &mut VisitorContext<'a>,
+) -> Result<(), AnalysisError> {
     // Check if inside a textarea (logic blocks not allowed)
     if context.element_ancestors.iter().any(|a| a == "textarea") {
         return Err(errors::block_invalid_placement("{#key ...}"));
@@ -54,35 +57,32 @@ pub fn visit(block: &mut KeyBlock, context: &mut VisitorContext) -> Result<(), A
         context.parse_arena,
     );
 
-    // Clear is_direct_child_of_component since children of control flow blocks
+    // Clear direct_component_parent since children of control flow blocks
     // are not direct children of a component
-    let was_direct_child = context.is_direct_child_of_component;
+    let was_direct_child = context.direct_component_parent;
     let was_direct_snippet = context.is_direct_child_of_snippet;
-    context.is_direct_child_of_component = false;
+    context.direct_component_parent = super::DirectComponentParent::None;
     context.is_direct_child_of_snippet = false;
 
     // Push fragment owner type for const_tag placement validation
-    context
-        .fragment_owner_stack
-        .push(super::FragmentOwnerType::KeyBlock);
+    context.fragment_owner_stack.push(super::FragmentOwnerType::KeyBlock);
 
-    // Visit the fragment
+    // The fragment has its own scope in the scope builder, so the visitor has to
+    // enter it too — otherwise a lexical lookup from inside the block never
+    // reaches a binding declared there.
+    let old_scope = context.scope;
+    if let Some(&key_scope) = context.analysis.root.template_scope_map.get(&block.start) {
+        context.scope = key_scope;
+    }
     fragment::analyze(&mut block.fragment, context)?;
+    context.scope = old_scope;
 
     // Pop fragment owner type
     context.fragment_owner_stack.pop();
 
-    // Restore is_direct_child_of_component
-    context.is_direct_child_of_component = was_direct_child;
+    // Restore direct_component_parent
+    context.direct_component_parent = was_direct_child;
     context.is_direct_child_of_snippet = was_direct_snippet;
 
     Ok(())
-}
-
-/// Alias for visit function.
-pub fn visit_key_block(
-    block: &mut KeyBlock,
-    context: &mut VisitorContext,
-) -> Result<(), AnalysisError> {
-    visit(block, context)
 }

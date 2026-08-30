@@ -4,8 +4,6 @@
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
-use std::cell::RefCell;
-use std::rc::Rc;
 
 /// The root scope container for a component.
 #[derive(Debug, Default)]
@@ -37,6 +35,24 @@ pub struct ScopeRoot {
     /// Key: start position of the template node
     /// Value: scope index in all_scopes
     pub template_scope_map: FxHashMap<u32, usize>,
+    /// Scope indices of `{:else}` fragments, keyed by their `{#if}`'s start
+    /// position. An if-block owns two scopes, and its alternate has no start
+    /// offset of its own — keying it by the block's *end* would collide with the
+    /// start of a sibling that follows `{/if}` with no whitespace (and, since
+    /// `update_if_block_ends` gives every `{:else if}` in a chain the same end,
+    /// with the other links of the chain), so the alternates live in their own
+    /// map under the enclosing block's unique start.
+    pub if_alternate_scope_map: FxHashMap<u32, usize>,
+    /// Scope owned by the root template fragment.
+    pub root_fragment_scope_index: usize,
+    /// Scope indices of `{:else}` fragments, keyed by their `{#each}`'s start
+    /// position. Upstream's `EachBlock` visitor walks the body's *nodes* with
+    /// the each scope but visits the fallback as a `Fragment`, so only the
+    /// fallback reaches the `Fragment` visitor's `scope.child(...)` — which is
+    /// why `{@const it = 1}` duplicates the item binding in the body and merely
+    /// shadows it in the fallback. Keyed like `if_alternate_scope_map` and for
+    /// the same reason: the fallback has no start offset of its own.
+    pub each_fallback_scope_map: FxHashMap<u32, usize>,
     /// Scope indices created for `{#snippet …}` bodies. Snippet bodies become
     /// separate functions in the generated output, so template declarations
     /// (`{@const}` / `{const}` / `{let}`) made inside one snippet are NOT
@@ -45,11 +61,28 @@ pub struct ScopeRoot {
     /// bindings to lexically reachable scopes (mirrors upstream
     /// `scope.evaluate`, which resolves identifiers through the scope chain).
     pub snippet_scope_indices: FxHashSet<usize>,
+    /// Binding indices resolved from template expressions while scopes are
+    /// built. Unlike `Binding::references`, this is available before the
+    /// analysis visitors run, which is needed for diagnostics whose precedence
+    /// depends on upstream's already-complete scope reference graph.
+    pub(crate) preanalysis_template_references: FxHashSet<usize>,
     /// All declaration names from all scopes, used for unique name generation.
     /// Mirrors the `conflicts` set in the official Svelte compiler's ScopeRoot.
     /// Every `declare()` call adds the name here.
-    /// Wrapped in Rc<RefCell<...>> so that Memoizer can share without cloning.
-    pub conflicts: Rc<RefCell<FxHashSet<String>>>,
+    /// Phase 3 clones this seed into transform-local mutable state.
+    pub conflicts: FxHashSet<String>,
+    /// Maps binding name -> indices into `bindings`, in push order. Every
+    /// `bindings.push(...)` site has a matching entry appended here (see
+    /// `push_binding`), so name-based lookups that would otherwise be an
+    /// O(bindings) linear scan (`bindings.iter().position/any(|b| b.name == ...)`)
+    /// can instead go through this map and scan only same-named entries.
+    pub bindings_by_name: FxHashMap<String, SmallVec<[u32; 1]>>,
+    /// Lazily built map from a reference's source start offset to the binding
+    /// index it resolved to during analysis. Phase 3 never switches its scope
+    /// for template blocks, so a name-based lookup there picks an outer binding
+    /// whenever a template declaration shadows one; this map replays the
+    /// scope-correct resolution Phase 2 already performed.
+    pub(crate) reference_bindings: std::cell::OnceCell<FxHashMap<u32, u32>>,
 }
 
 impl ScopeRoot {
@@ -63,9 +96,44 @@ impl ScopeRoot {
             function_scope_map: FxHashMap::default(),
             each_block_collection_infos: Vec::new(),
             template_scope_map: FxHashMap::default(),
+            if_alternate_scope_map: FxHashMap::default(),
+            root_fragment_scope_index: 0,
+            each_fallback_scope_map: FxHashMap::default(),
             snippet_scope_indices: FxHashSet::default(),
-            conflicts: Rc::new(RefCell::new(FxHashSet::default())),
+            preanalysis_template_references: FxHashSet::default(),
+            conflicts: FxHashSet::default(),
+            bindings_by_name: FxHashMap::default(),
+            reference_bindings: std::cell::OnceCell::new(),
         }
+    }
+
+    /// Resolve the binding that the reference starting at `start` was bound to
+    /// during analysis, verifying the name matches so a stale/synthesized span
+    /// falls back to the caller's name-based lookup.
+    pub fn binding_at_reference(&self, name: &str, start: u32) -> Option<&Binding> {
+        let map = self.reference_bindings.get_or_init(|| {
+            let mut map: FxHashMap<u32, u32> = FxHashMap::default();
+            for (idx, binding) in self.bindings.iter().enumerate() {
+                for reference in &binding.references {
+                    map.insert(reference.start, idx as u32);
+                }
+            }
+            map
+        });
+        let binding = self.bindings.get(*map.get(&start)? as usize)?;
+        (binding.name == name).then_some(binding)
+    }
+
+    /// Push a binding and record its index in `bindings_by_name`, keeping the
+    /// name-lookup index in sync with `bindings`. This is the single insertion
+    /// point for `bindings.push` outside of `ScopeBuilder` (which maintains its
+    /// own copy of the same map during the initial scope-building pass; see
+    /// `ScopeBuilder::declare_binding`).
+    pub fn push_binding(&mut self, binding: Binding) -> usize {
+        let idx = self.bindings.len();
+        self.bindings_by_name.entry(binding.name.clone()).or_default().push(idx as u32);
+        self.bindings.push(binding);
+        idx
     }
 
     /// Look up a binding by name starting from a specific scope and walking up the parent chain.
@@ -123,6 +191,19 @@ impl ScopeRoot {
             }
         }
         false
+    }
+
+    /// Look up the first binding (in declaration order) with the given name
+    /// whose `declaration_start` equals `start`. Position-based lookup used to
+    /// disambiguate same-named bindings declared in different (e.g. sibling
+    /// block) scopes. Goes through `bindings_by_name` so only same-named
+    /// bindings are scanned.
+    pub fn find_binding_by_declaration_start(&self, name: &str, start: u32) -> Option<usize> {
+        self.bindings_by_name.get(name).and_then(|idxs| {
+            idxs.iter()
+                .map(|&i| i as usize)
+                .find(|&i| self.bindings[i].declaration_start == Some(start))
+        })
     }
 
     /// Look up a binding by name, searching all scopes.
@@ -254,6 +335,71 @@ pub enum MutationKind {
     PropertyMutation,
 }
 
+/// True for the global function keypaths whose results upstream `scope.evaluate`
+/// types as NUMBER or STRING (always defined): every `Math.*`, `Number` /
+/// `Number.*`, `String` / `String.from*`, and `BigInt`. Mirrors the `globals`
+/// table in `2-analyze/scope.js`.
+///
+/// `has_spread_argument` is a parameter rather than a caller-side `&&` because
+/// upstream's guard is part of the same condition (`scope.js:509-512`) and half
+/// the call sites here had forgotten it.
+pub(crate) fn is_known_defined_global_call(keypath: &str, has_spread_argument: bool) -> bool {
+    if has_spread_argument {
+        return false;
+    }
+    // Upstream's `globals` table, name for name: one outside it evaluates to
+    // UNKNOWN, so a near-miss like `Math.nope()` must not read as known.
+    matches!(
+        keypath,
+        "BigInt"
+            | "Number"
+            | "Number.isInteger"
+            | "Number.isFinite"
+            | "Number.isNaN"
+            | "Number.isSafeInteger"
+            | "Number.parseFloat"
+            | "Number.parseInt"
+            | "String"
+            | "String.fromCharCode"
+            | "String.fromCodePoint"
+            | "Math.min"
+            | "Math.max"
+            | "Math.random"
+            | "Math.floor"
+            | "Math.f16round"
+            | "Math.round"
+            | "Math.abs"
+            | "Math.acos"
+            | "Math.asin"
+            | "Math.atan"
+            | "Math.atan2"
+            | "Math.ceil"
+            | "Math.cos"
+            | "Math.sin"
+            | "Math.tan"
+            | "Math.exp"
+            | "Math.log"
+            | "Math.pow"
+            | "Math.sqrt"
+            | "Math.clz32"
+            | "Math.imul"
+            | "Math.sign"
+            | "Math.log10"
+            | "Math.log2"
+            | "Math.log1p"
+            | "Math.expm1"
+            | "Math.cosh"
+            | "Math.sinh"
+            | "Math.tanh"
+            | "Math.acosh"
+            | "Math.asinh"
+            | "Math.atanh"
+            | "Math.trunc"
+            | "Math.fround"
+            | "Math.cbrt"
+    )
+}
+
 /// A variable binding.
 #[derive(Debug, Clone)]
 pub struct Binding {
@@ -271,6 +417,11 @@ pub struct Binding {
     pub scope_index: usize,
     /// Initial value expression (if any)
     pub initial: Option<String>,
+    /// Source span of the initializer upstream keeps in `binding.initial` as a
+    /// NODE. `initial` above is a literal's raw text for some shapes and a JSON
+    /// dump for the rest, so a consumer that has to print the expression needs
+    /// the source instead.
+    pub initial_span: Option<(u32, u32)>,
     /// JSON of the initializer AST for a non-literal but potentially compile-time
     /// "known" initializer (template literals with interpolations). Separate from
     /// `initial` (which feeds `is_prop_source`); used only by reactive-state eval.
@@ -288,12 +439,20 @@ pub struct Binding {
     /// compiler's behavior where snippet blocks (declared with DeclarationKind::Function) are
     /// NOT considered functions since their initial type is SnippetBlock.
     pub initial_is_function: bool,
+    /// Whether this binding is a function declaration WITH a body. TypeScript
+    /// lets a name carry any number of body-less overload signatures, so the
+    /// duplicate check has to be about implementations rather than about the
+    /// `function` keyword.
+    pub is_function_implementation: bool,
     /// The AST node type of the initial value expression (e.g., "BinaryExpression", "Literal").
     /// Used by should_proxy() to determine if an identifier's initial value needs deep reactivity.
     pub initial_node_type: Option<String>,
     /// When the initial value is an Identifier, stores its name (e.g., "undefined").
     /// Used by should_proxy() to check if the initial value is `undefined`.
     pub initial_identifier_name: Option<String>,
+    /// When the initial value is a rune CALL (`$host()`, `$state(0)`, …), the
+    /// callee keypath — upstream's `get_rune(declaration.initial, scope)`.
+    pub init_rune: Option<String>,
     /// Instance-level declarations may follow (or contain) a top-level `await`. In these cases,
     /// any reads that occur in the template must wait for the corresponding promise to resolve
     /// otherwise the initial value will not have been assigned.
@@ -337,6 +496,11 @@ pub struct Binding {
     /// `exclude_props = ["foo"]`, meaning `others.foo` should NOT become `$$props.foo`
     /// but `others.bar` should become `$$props.bar`.
     pub exclude_props: Vec<String>,
+    /// Memoized `serde_json::from_str` of [`Binding::initial`] and
+    /// [`Binding::init_expr_json`]. Both strings are written during analysis and
+    /// only read during transform, so the parse result cannot go stale.
+    initial_json: std::cell::OnceCell<Option<Box<serde_json::Value>>>,
+    init_expr_json_parsed: std::cell::OnceCell<Option<Box<serde_json::Value>>>,
 }
 
 /// A blocker expression representing `$$promises[n]`.
@@ -369,6 +533,10 @@ pub struct BindingReference {
     pub is_export_specifier: bool,
 }
 
+fn parse_json_field(s: Option<&str>) -> Option<Box<serde_json::Value>> {
+    serde_json::from_str::<serde_json::Value>(s?).ok().map(Box::new)
+}
+
 impl Binding {
     /// Create a new binding.
     pub fn new(name: String, kind: BindingKind, scope_index: usize) -> Self {
@@ -380,11 +548,14 @@ impl Binding {
             mutated: false,
             scope_index,
             initial: None,
+            initial_span: None,
             init_expr_json: None,
             initial_is_defined: false,
             initial_is_function: false,
+            is_function_implementation: false,
             initial_node_type: None,
             initial_identifier_name: None,
+            init_rune: None,
             references: SmallVec::new(),
             mutations: SmallVec::new(),
             prop_alias: None,
@@ -398,6 +569,8 @@ impl Binding {
             import_source: None,
             is_default_import: false,
             exclude_props: Vec::new(),
+            initial_json: std::cell::OnceCell::new(),
+            init_expr_json_parsed: std::cell::OnceCell::new(),
         }
     }
 
@@ -416,11 +589,14 @@ impl Binding {
             mutated: false,
             scope_index,
             initial: None,
+            initial_span: None,
             init_expr_json: None,
             initial_is_defined: false,
             initial_is_function: false,
+            is_function_implementation: false,
             initial_node_type: None,
             initial_identifier_name: None,
+            init_rune: None,
             references: SmallVec::new(),
             mutations: SmallVec::new(),
             prop_alias: None,
@@ -434,7 +610,22 @@ impl Binding {
             import_source: None,
             is_default_import: false,
             exclude_props: Vec::new(),
+            initial_json: std::cell::OnceCell::new(),
+            init_expr_json_parsed: std::cell::OnceCell::new(),
         }
+    }
+
+    /// [`Binding::initial`] parsed as JSON, or `None` when it is absent or is
+    /// raw source text rather than an AST node. Parsed at most once per binding.
+    pub fn initial_json(&self) -> Option<&serde_json::Value> {
+        self.initial_json.get_or_init(|| parse_json_field(self.initial.as_deref())).as_deref()
+    }
+
+    /// [`Binding::init_expr_json`] parsed as JSON. Parsed at most once per binding.
+    pub fn init_expr_json_parsed(&self) -> Option<&serde_json::Value> {
+        self.init_expr_json_parsed
+            .get_or_init(|| parse_json_field(self.init_expr_json.as_deref()))
+            .as_deref()
     }
 
     /// Returns true if this binding has been updated (reassigned or mutated)
@@ -588,10 +779,7 @@ impl BindingKind {
 
     /// Returns true if this binding is a rune-based binding ($state, $derived, etc.)
     pub fn is_rune(&self) -> bool {
-        matches!(
-            self,
-            BindingKind::State | BindingKind::RawState | BindingKind::Derived
-        )
+        matches!(self, BindingKind::State | BindingKind::RawState | BindingKind::Derived)
     }
 }
 
@@ -611,11 +799,6 @@ pub struct Reference {
 impl Reference {
     /// Create a new reference.
     pub fn new(name: String, start: usize, end: usize) -> Self {
-        Self {
-            name,
-            binding_index: None,
-            start,
-            end,
-        }
+        Self { name, binding_index: None, start, end }
     }
 }

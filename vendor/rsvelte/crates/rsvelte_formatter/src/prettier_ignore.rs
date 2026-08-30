@@ -12,7 +12,7 @@
 use rsvelte_core::ast::template::TemplateNode;
 
 /// Returns `true` when `node` is an `<!-- prettier-ignore -->` comment.
-pub(crate) fn is_prettier_ignore_comment(node: &TemplateNode) -> bool {
+pub fn is_prettier_ignore_comment(node: &TemplateNode) -> bool {
     matches!(node, TemplateNode::Comment(c) if c.data.trim() == "prettier-ignore")
 }
 
@@ -22,7 +22,7 @@ pub(crate) fn is_prettier_ignore_comment(node: &TemplateNode) -> bool {
 ///
 /// A whitespace-only `Text` node between the comment and the target is
 /// transparent and does not break the "immediately preceding" relationship.
-pub(crate) fn preceded_by_prettier_ignore(nodes: &[TemplateNode], i: usize) -> bool {
+pub fn preceded_by_prettier_ignore(nodes: &[TemplateNode], i: usize) -> bool {
     if i == 0 {
         return false;
     }
@@ -42,5 +42,5 @@ pub(crate) fn preceded_by_prettier_ignore(nodes: &[TemplateNode], i: usize) -> b
 }
 
 fn is_whitespace_only_text(node: &TemplateNode) -> bool {
-    matches!(node, TemplateNode::Text(t) if crate::is_blank_text(t.data.as_str()))
+    matches!(node, TemplateNode::Text(t) if crate::is_blank_text(t.data.as_ref()))
 }

@@ -10,13 +10,7 @@ use crate::compiler::phases::phase2_analyze::AnalysisError;
 
 /// Visit a property definition (typed JsNode path).
 pub fn visit_typed(node: &JsNode, context: &mut VisitorContext) -> Result<(), AnalysisError> {
-    if let JsNode::PropertyDefinition {
-        key,
-        value,
-        computed,
-        ..
-    } = node
-    {
+    if let JsNode::PropertyDefinition { key, value, computed, .. } = node {
         let arena = context.parse_arena;
 
         // Visit the value expression if it exists

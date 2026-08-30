@@ -18,8 +18,8 @@ use super::resolve::{build_global_ignore_matchers, is_ignored};
 #[cfg(feature = "napi")]
 use crate::core::JsConfigLoaderCb;
 use crate::core::{
-    ConfigResolver, ExternalPluginSupport, FormatStrategy, NestedConfigCtx, ResolveOutcome,
-    classify_file_kind_with_external_support, resolve_file_scope_config,
+    ConfigResolver, FormatStrategy, NestedConfigCtx, ResolveOutcome, classify_file_kind,
+    resolve_file_scope_config,
 };
 
 /// Orchestrates file discovery with nested config and ignore handling.
@@ -51,7 +51,6 @@ pub struct ScopedWalker {
     paths: Vec<PathBuf>,
     glob_patterns: Vec<String>,
     exclude_patterns: Vec<String>,
-    external_plugin_support: ExternalPluginSupport,
 }
 
 impl ScopedWalker {
@@ -210,7 +209,6 @@ impl ScopedWalker {
                 let Some(strategy) = resolve_format_strategy(
                     Arc::from(file.as_path()),
                     &config_resolver,
-                    &self.external_plugin_support,
                     tx_error,
                     &self.cwd,
                 ) else {
@@ -263,7 +261,6 @@ impl ScopedWalker {
                 tx_error: tx_error.clone(),
                 fatal_error: Arc::clone(&fatal_error),
             },
-            self.external_plugin_support.clone(),
         );
 
         // Surface any fatal error encountered inside the parallel walk, abort
@@ -379,7 +376,6 @@ fn walk_and_stream(
     filters: WalkFilters,
     config_state: WalkConfigState,
     sinks: WalkSinks,
-    external_plugin_support: ExternalPluginSupport,
 ) {
     let Some(first_path) = target_paths.first() else {
         return;
@@ -424,13 +420,7 @@ fn walk_and_stream(
         true
     });
 
-    let mut builder = WalkVisitorBuilder {
-        cwd: Arc::from(cwd),
-        filters,
-        config_state,
-        sinks,
-        external_plugin_support,
-    };
+    let mut builder = WalkVisitorBuilder { cwd: Arc::from(cwd), filters, config_state, sinks };
 
     // Git-related settings come from the shared helper to align with Oxlint.
     // NOTE: Prettier only reads `.gitignore` in the cwd and does not respect `.git/info/exclude`.
@@ -449,7 +439,6 @@ struct WalkVisitorBuilder {
     filters: WalkFilters,
     config_state: WalkConfigState,
     sinks: WalkSinks,
-    external_plugin_support: ExternalPluginSupport,
 }
 
 impl<'s> ignore::ParallelVisitorBuilder<'s> for WalkVisitorBuilder {
@@ -459,7 +448,6 @@ impl<'s> ignore::ParallelVisitorBuilder<'s> for WalkVisitorBuilder {
             filters: self.filters.clone(),
             config_state: self.config_state.clone(),
             sinks: self.sinks.clone(),
-            external_plugin_support: self.external_plugin_support.clone(),
             scope_cache: FxHashMap::default(),
         })
     }
@@ -470,7 +458,6 @@ struct WalkVisitor {
     filters: WalkFilters,
     config_state: WalkConfigState,
     sinks: WalkSinks,
-    external_plugin_support: ExternalPluginSupport,
     /// Visitor-local cache: parent dir → (resolved scope, parent_ignored flag).
     scope_cache: FxHashMap<PathBuf, (Arc<ConfigResolver>, bool)>,
 }
@@ -613,13 +600,9 @@ impl WalkVisitor {
         {
             return ignore::WalkState::Continue;
         }
-        let Some(strategy) = resolve_format_strategy(
-            Arc::from(path),
-            resolver,
-            &self.external_plugin_support,
-            &self.sinks.tx_error,
-            &self.cwd,
-        ) else {
+        let Some(strategy) =
+            resolve_format_strategy(Arc::from(path), resolver, &self.sinks.tx_error, &self.cwd)
+        else {
             return ignore::WalkState::Continue;
         };
 
@@ -688,21 +671,20 @@ impl ignore::ParallelVisitor for WalkVisitor {
 
 /// Classify `path`, resolve its scope, and return the format strategy if any.
 ///
-/// `None` means "not a formatting target"; resolve errors
+/// `None` means "not a formatting target" or "missing plugin"; resolve errors
 /// are reported via `tx_error` and also yield `None` so callers can move on
 /// to the next file.
 #[expect(clippy::needless_pass_by_value)] // caller has no further use for `path`
 fn resolve_format_strategy(
     path: Arc<Path>,
     resolver: &ConfigResolver,
-    external_plugin_support: &ExternalPluginSupport,
     tx_error: &DiagnosticSender,
     cwd: &Path,
 ) -> Option<FormatStrategy> {
-    let kind =
-        classify_file_kind_with_external_support(Arc::clone(&path), external_plugin_support)?;
+    let kind = classify_file_kind(Arc::clone(&path))?;
     match resolver.resolve(kind) {
         Ok(ResolveOutcome::Format(strategy)) => Some(strategy),
+        Ok(ResolveOutcome::MissingPlugin(_)) => None,
         Err(err) => {
             // Report a per-file config resolve error via the diagnostic channel.
             let diagnostics = DiagnosticService::wrap_diagnostics(
@@ -785,7 +767,6 @@ mod tests_scope_resolution {
                 walk_target_roots: Arc::from(vec![walk_root.to_path_buf()]),
             },
             sinks: WalkSinks { tx_entry, tx_error, fatal_error: Arc::new(OnceLock::new()) },
-            external_plugin_support: ExternalPluginSupport::default(),
             scope_cache: FxHashMap::default(),
         }
     }

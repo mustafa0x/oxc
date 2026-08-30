@@ -1,27 +1,26 @@
 //! `<style>` block formatting.
 //!
-//! `rsvelte_formatter` doesn't ship its own CSS engine. Instead it
-//! exposes a callback on [`crate::FormatOptions::style_formatter`] that
-//! receives the body and the lang (`css` / `scss` / `less` / ...). The
-//! `rsvelte-fmt` CLI wires this up to spawn
-//! `oxfmt --stdin-filepath style.<lang>`, so CSS formatting goes through
-//! the same engine `oxfmt` uses for standalone files.
+//! `rsvelte_formatter` exposes a callback on
+//! [`crate::FormatOptions::style_formatter`] that receives the body and the lang
+//! (`css` / `scss` / `less` / ...). The `rsvelte-fmt` CLI uses the in-process
+//! [`crate::native_style_formatter`] by default and swaps in a standalone
+//! `oxfmt --stdin-filepath style.<lang>` callback under `--no-native-css`.
 //!
 //! When no callback is set the style body is left verbatim.
 
 use rsvelte_core::ast::css::StyleSheet;
 use rsvelte_core::ast::template::{Fragment, TemplateNode};
-use unicode_width::UnicodeWidthStr;
 
 use crate::error::FormatError;
 use crate::options::FormatOptions;
+use crate::width::{VisualWidth, tab_width};
 
 /// Format the content of `<style>` elements that appear *inside* the markup
 /// (e.g. a nested `<div><style>…</style></div>` or a `<style>` in
 /// `<svelte:head>`) — the top-level component `<style>` is hoisted into
 /// `root.css` and handled by [`collect_style_edit`]. Each nested style's raw CSS
 /// is formatted through the same callback and re-indented to the element's depth.
-pub(crate) fn collect_nested_style_edits(
+pub fn collect_nested_style_edits(
     source: &str,
     fragment: &Fragment,
     options: &FormatOptions,
@@ -54,16 +53,16 @@ fn walk_nested_style(
                 }
             }
             TemplateNode::RegularElement(e) => {
-                walk_nested_style(source, &e.fragment, d, options, edits)?
+                walk_nested_style(source, &e.fragment, d, options, edits)?;
             }
             TemplateNode::Component(c) => {
-                walk_nested_style(source, &c.fragment, d, options, edits)?
+                walk_nested_style(source, &c.fragment, d, options, edits)?;
             }
             TemplateNode::TitleElement(t) => {
-                walk_nested_style(source, &t.fragment, d, options, edits)?
+                walk_nested_style(source, &t.fragment, d, options, edits)?;
             }
             TemplateNode::SlotElement(s) => {
-                walk_nested_style(source, &s.fragment, d, options, edits)?
+                walk_nested_style(source, &s.fragment, d, options, edits)?;
             }
             TemplateNode::SvelteHead(s)
             | TemplateNode::SvelteBody(s)
@@ -73,13 +72,13 @@ fn walk_nested_style(
             | TemplateNode::SvelteOptions(s)
             | TemplateNode::SvelteSelf(s)
             | TemplateNode::SvelteWindow(s) => {
-                walk_nested_style(source, &s.fragment, d, options, edits)?
+                walk_nested_style(source, &s.fragment, d, options, edits)?;
             }
             TemplateNode::SvelteComponent(c) => {
-                walk_nested_style(source, &c.fragment, d, options, edits)?
+                walk_nested_style(source, &c.fragment, d, options, edits)?;
             }
             TemplateNode::SvelteElement(e) => {
-                walk_nested_style(source, &e.fragment, d, options, edits)?
+                walk_nested_style(source, &e.fragment, d, options, edits)?;
             }
             TemplateNode::IfBlock(blk) => {
                 walk_nested_style(source, &blk.consequent, d, options, edits)?;
@@ -99,10 +98,10 @@ fn walk_nested_style(
                 }
             }
             TemplateNode::KeyBlock(blk) => {
-                walk_nested_style(source, &blk.fragment, d, options, edits)?
+                walk_nested_style(source, &blk.fragment, d, options, edits)?;
             }
             TemplateNode::SnippetBlock(blk) => {
-                walk_nested_style(source, &blk.body, d, options, edits)?
+                walk_nested_style(source, &blk.body, d, options, edits)?;
             }
             _ => {}
         }
@@ -151,16 +150,21 @@ fn format_nested_style(
     };
     let width = css_width(options, &body_indent);
     let dedented = dedent(body);
-    let formatted = formatter(&dedented, "css", width).map_err(FormatError::StyleFormat)?;
-    let reindented = reindent(&formatted, &body_indent);
+    let css_output = formatter(&dedented, "css", width).map_err(FormatError::StyleFormat)?;
+    let reindented =
+        restore_comment_adjacent_selector_indent(body, reindent(&css_output, &body_indent));
     let spliced = format!("\n{reindented}\n{tag_indent}");
-    edits.push((start + open_end as u32, start + close_start as u32, spliced));
+    edits.push((
+        start + crate::source_offset(open_end),
+        start + crate::source_offset(close_start),
+        spliced,
+    ));
     Ok(())
 }
 
 /// Push one edit replacing the `<style>` body with the formatter
 /// callback's output. No-op when no callback is configured.
-pub(crate) fn collect_style_edit(
+pub fn collect_style_edit(
     source: &str,
     css: &StyleSheet,
     options: &FormatOptions,
@@ -180,10 +184,7 @@ pub(crate) fn collect_style_edit(
     // oracle leaves their bodies byte-for-byte verbatim. Emit no edit so the
     // raw body is preserved exactly. Brace-based dialects (scss, less, postcss)
     // fall through to the formatter callback below, which oxfmt formats.
-    if matches!(
-        lang.to_ascii_lowercase().as_str(),
-        "sass" | "stylus" | "styl"
-    ) {
+    if matches!(lang.to_ascii_lowercase().as_str(), "sass" | "stylus" | "styl") {
         return Ok(());
     }
 
@@ -210,8 +211,9 @@ pub(crate) fn collect_style_edit(
     };
     let width = css_width(options, &body_indent);
     let dedented = dedent(body);
-    let formatted = formatter(&dedented, &lang, width).map_err(FormatError::StyleFormat)?;
-    let reindented = reindent(&formatted, &body_indent);
+    let css_output = formatter(&dedented, &lang, width).map_err(FormatError::StyleFormat)?;
+    let reindented =
+        restore_comment_adjacent_selector_indent(body, reindent(&css_output, &body_indent));
     let spliced = format!("\n{reindented}\n{tag_indent}");
 
     edits.push((css.content.start, css.content.end, spliced));
@@ -225,11 +227,7 @@ fn leading_indent(source: &str, pos: u32) -> &str {
     let pos = pos as usize;
     let line_start = source[..pos].rfind('\n').map_or(0, |i| i + 1);
     let seg = &source[line_start..pos];
-    if seg.bytes().all(|b| b == b' ' || b == b'\t') {
-        seg
-    } else {
-        ""
-    }
+    if seg.bytes().all(|b| b == b' ' || b == b'\t') { seg } else { "" }
 }
 
 /// One indent level as configured (a tab, or N spaces).
@@ -255,8 +253,7 @@ fn indent_unit(options: &FormatOptions) -> String {
 /// gets a usable width.
 fn css_width(options: &FormatOptions, body_indent: &str) -> usize {
     let full = options.js.line_width.value() as usize;
-    full.saturating_sub(UnicodeWidthStr::width(body_indent))
-        .max(20)
+    full.saturating_sub(body_indent.visual_width(tab_width(options))).max(20)
 }
 
 fn dedent(s: &str) -> String {
@@ -265,14 +262,10 @@ fn dedent(s: &str) -> String {
     let mut min_indent = usize::MAX;
     for (l, &c) in lines.iter().zip(&cont) {
         if !c && !l.trim().is_empty() {
-            min_indent = min_indent.min(l.len() - l.trim_start().len());
+            min_indent = min_indent.min(leading_ascii_ws(l));
         }
     }
-    let min_indent = if min_indent == usize::MAX {
-        0
-    } else {
-        min_indent
-    };
+    let min_indent = if min_indent == usize::MAX { 0 } else { min_indent };
     let mut out = Vec::with_capacity(lines.len());
     for (l, &c) in lines.iter().zip(&cont) {
         if c {
@@ -280,20 +273,162 @@ fn dedent(s: &str) -> String {
         } else if l.trim().is_empty() {
             out.push(String::new());
         } else {
-            out.push(l[min_indent..].to_string());
+            out.push(l.get(min_indent..).unwrap_or(l).to_string());
         }
     }
     out.join("\n")
 }
 
+/// Byte length of a line's leading indentation, counting only ASCII space and
+/// tab. A multi-byte Unicode whitespace char (e.g. U+00A0) never contributes,
+/// so the returned offset always lands on a char boundary — slicing at it can't
+/// split a code point (`str::trim_start` would strip such chars and yield a
+/// byte length that slices mid-character).
+fn leading_ascii_ws(l: &str) -> usize {
+    l.bytes().take_while(|&b| b == b' ' || b == b'\t').count()
+}
+
+/// prettier-plugin-svelte keeps the source indentation from a block comment
+/// between comma-separated selectors through the selector that opens the rule.
+/// The standalone CSS printer normalizes those lines, so restore only that
+/// lexical prelude after formatting. Matching by content occurrence prevents a
+/// repeated selector in an earlier rule from receiving the later rule's indent.
+fn restore_comment_adjacent_selector_indent(source: &str, formatted: String) -> String {
+    let lines: Vec<&str> = source.lines().collect();
+    let mut preserve = vec![false; lines.len()];
+    let bytes = source.as_bytes();
+    let mut line = 0;
+    let mut quote = None;
+    let mut escaped = false;
+    let mut in_comment = false;
+    let mut paren_depth = 0_u32;
+    let mut bracket_depth = 0_u32;
+    let mut first_code = None;
+    let mut comma_line = None;
+    let mut comment_line = None;
+    let mut i = 0;
+
+    while i < bytes.len() {
+        let byte = bytes[i];
+        if byte == b'\n' {
+            line += 1;
+        }
+
+        if in_comment {
+            if byte == b'*' && bytes.get(i + 1) == Some(&b'/') {
+                in_comment = false;
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+
+        if let Some(delimiter) = quote {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == delimiter {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+
+        if byte == b'/' && bytes.get(i + 1) == Some(&b'*') {
+            if comma_line.is_some() && comment_line.is_none() {
+                comment_line = Some(line);
+            }
+            in_comment = true;
+            i += 2;
+            continue;
+        }
+
+        if !byte.is_ascii_whitespace() && first_code.is_none() {
+            first_code = Some(byte);
+        }
+
+        match byte {
+            b'\'' | b'"' => quote = Some(byte),
+            b'(' => paren_depth += 1,
+            b')' => paren_depth = paren_depth.saturating_sub(1),
+            b'[' => bracket_depth += 1,
+            b']' => bracket_depth = bracket_depth.saturating_sub(1),
+            b',' if paren_depth == 0 && bracket_depth == 0 => comma_line = Some(line),
+            b'{' if paren_depth == 0 && bracket_depth == 0 => {
+                if first_code != Some(b'@')
+                    && let (Some(comma), Some(comment)) = (comma_line, comment_line)
+                {
+                    let start = if comment > comma { comment } else { comment + 1 };
+                    for keep in preserve.iter_mut().take(line + 1).skip(start) {
+                        *keep = true;
+                    }
+                }
+                first_code = None;
+                comma_line = None;
+                comment_line = None;
+            }
+            b'}' | b';' if paren_depth == 0 && bracket_depth == 0 => {
+                first_code = None;
+                comma_line = None;
+                comment_line = None;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    let mut source_occurrences = std::collections::HashMap::new();
+    let preserved: Vec<(&str, usize, &str)> = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            let content = line.trim_start();
+            let occurrence = source_occurrences.entry(content).or_insert(0_usize);
+            let current = *occurrence;
+            *occurrence += 1;
+            preserve[index].then_some((content, current, &line[..leading_ascii_ws(line)]))
+        })
+        .collect();
+    if preserved.is_empty() {
+        return formatted;
+    }
+
+    let mut restored = String::with_capacity(formatted.len());
+    let mut formatted_occurrences = std::collections::HashMap::new();
+    for line in formatted.split_inclusive('\n') {
+        let without_lf = line.strip_suffix('\n').unwrap_or(line);
+        let content = without_lf.strip_suffix('\r').unwrap_or(without_lf);
+        let newline = &line[content.len()..];
+        let trimmed = content.trim_start();
+        let occurrence = formatted_occurrences.entry(trimmed).or_insert(0_usize);
+        let current = *occurrence;
+        *occurrence += 1;
+        if let Some((_, _, indent)) = preserved
+            .iter()
+            .find(|(selector, ordinal, _)| trimmed == *selector && current == *ordinal)
+        {
+            restored.push_str(indent);
+            restored.push_str(trimmed);
+            restored.push_str(newline);
+        } else {
+            restored.push_str(line);
+        }
+    }
+    restored
+}
+
 /// Prefix every non-empty line of `s` with `indent`, dropping any trailing
-/// newline (the splice adds its own surrounding newlines). Lines inside a
-/// multi-line `/* … */` comment are left verbatim (the inverse of `dedent`).
+/// newline (the splice adds its own surrounding newlines).
+///
+/// Lines inside a multi-line `/* … */` comment are left verbatim (the inverse of `dedent`).
 ///
 /// Exposed for the `rsvelte-fmt` CLI: its batched `<style>` path collects raw
 /// bodies during the format pass (returning a placeholder) and formats them in
 /// one oxfmt call afterwards, so it must re-indent the formatted CSS with the
 /// *same* routine the single-file/stdin path uses here to stay byte-identical.
+#[must_use]
 pub fn reindent(s: &str, indent: &str) -> String {
     let trimmed = s.trim_end_matches('\n');
     let cont = comment_continuation_flags(trimmed);
@@ -361,4 +496,44 @@ fn detect_lang(css: &StyleSheet) -> String {
         }
     }
     "css".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{dedent, restore_comment_adjacent_selector_indent};
+
+    #[test]
+    fn dedent_handles_multibyte_leading_whitespace() {
+        // Line 1 has two ASCII spaces; line 2 has one space then U+00A0 (a
+        // two-byte code point). The old measurement used `str::trim_start`,
+        // which strips the U+00A0 as whitespace, so line 2's indent came back as
+        // three bytes and min_indent as two — and `l[2..]` on line 2 sliced the
+        // middle of U+00A0 and panicked. Counting only ASCII space/tab keeps
+        // min_indent at one, a valid char boundary on both lines.
+        let out = dedent("  a\n \u{a0}b");
+        assert_eq!(out, " a\n\u{a0}b");
+    }
+
+    #[test]
+    fn restores_source_indent_after_a_commented_selector_separator() {
+        let source = "  .a,\n\t/* c */\n\t.b {\n    color: red;\n  }";
+        let formatted = "  .a,\n  /* c */\n  .b {\n    color: red;\n  }".to_string();
+        assert_eq!(
+            restore_comment_adjacent_selector_indent(source, formatted),
+            "  .a,\n\t/* c */\n\t.b {\n    color: red;\n  }"
+        );
+    }
+
+    #[test]
+    fn does_not_restore_declaration_comments_or_an_earlier_duplicate_selector() {
+        let source =
+            "  .b { color: red, /* value */ blue; }\n  .a,\n\t/* c */\n\t.b { color: red; }";
+        let formatted =
+            "  .b {\n    color: red, /* value */ blue;\n  }\n  .a,\n  /* c */\n  .b { color: red; }\n"
+                .to_string();
+        assert_eq!(
+            restore_comment_adjacent_selector_indent(source, formatted),
+            "  .b {\n    color: red, /* value */ blue;\n  }\n  .a,\n\t/* c */\n\t.b { color: red; }\n"
+        );
+    }
 }

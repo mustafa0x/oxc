@@ -95,11 +95,15 @@ fn visit_const_tag_sync<'a>(node: &ConstTag, state: &mut ServerTransformState<'a
     let init = match span(declarator, "init") {
         Some((s, e)) => {
             let mut init_expr = state.reparse_slice(s, e);
-            super::super::read_wrap::wrap_reads(
+            state.wrap_reads_in_place(&mut init_expr);
+            // Re-parsing the source slice bypasses `visit_expr`, so the runes
+            // it lowers have to be lowered here too or they reach the output
+            // verbatim and throw at render.
+            super::super::script::lower_effect_value_runes_expr(
                 &mut init_expr,
                 state.b,
-                state.analysis,
-                state.analysis.root.instance_scope_index,
+                state.options.dev,
+                state.source,
             );
             Some(init_expr)
         }
@@ -127,15 +131,14 @@ fn try_async_const<'a>(node: &ConstTag, state: &mut ServerTransformState<'a>) ->
     // (Svelte 5.56.4 `start: start + 2`), so `node.declaration.start()` would
     // wrongly include `const ` in the `<lhs> = <rhs>` split.
     let decl_json = node.declaration.as_json();
-    let Some((start, end)) = decl_json
-        .get("declarations")
-        .and_then(|d| d.as_array())
-        .and_then(|d| d.first())
-        .and_then(|declarator| {
-            let s = declarator.get("start").and_then(|n| n.as_u64())? as usize;
-            let e = declarator.get("end").and_then(|n| n.as_u64())? as usize;
-            Some((s, e))
-        })
+    let Some((start, end)) =
+        decl_json.get("declarations").and_then(|d| d.as_array()).and_then(|d| d.first()).and_then(
+            |declarator| {
+                let s = declarator.get("start").and_then(|n| n.as_u64())? as usize;
+                let e = declarator.get("end").and_then(|n| n.as_u64())? as usize;
+                Some((s, e))
+            },
+        )
     else {
         return false;
     };
@@ -201,11 +204,8 @@ fn add_async_const<'a>(
 ) {
     if state.async_consts.is_none() {
         let name = state.next_promises_name();
-        state.async_consts = Some(AsyncConstsGroup {
-            name,
-            thunks: Vec::new(),
-            let_decls: Vec::new(),
-        });
+        state.async_consts =
+            Some(AsyncConstsGroup { name, thunks: Vec::new(), let_decls: Vec::new() });
     }
 
     let declared_names = extract_declared_names(lhs);
@@ -214,28 +214,20 @@ fn add_async_const<'a>(
     // fragment body can prepend them ahead of the `var promises = run([...])`).
     for name in &declared_names {
         let let_stmt = state.b.let_id(name, None);
-        state
-            .async_consts
-            .as_mut()
-            .unwrap()
-            .let_decls
-            .push(let_stmt);
+        state.async_consts.as_mut().unwrap().let_decls.push(let_stmt);
     }
 
     // Leading blocker wait thunk(s) — a different-group dependency must resolve
     // before this thunk's assignment runs.
     if blockers.len() == 1 {
+        state.async_consts.as_mut().unwrap().thunks.push((format!("() => {}", blockers[0]), false));
+    } else if blockers.len() > 1 {
         state
             .async_consts
             .as_mut()
             .unwrap()
             .thunks
-            .push((format!("() => {}", blockers[0]), false));
-    } else if blockers.len() > 1 {
-        state.async_consts.as_mut().unwrap().thunks.push((
-            format!("() => Promise.all([{}])", blockers.join(", ")),
-            false,
-        ));
+            .push((format!("() => Promise.all([{}])", blockers.join(", ")), false));
     }
 
     // The assignment thunk. An awaited RHS routes through `$.save` (writing the
@@ -306,11 +298,7 @@ pub(super) fn find_assignment_eq(decl: &str) -> Option<usize> {
 /// Declared binding names from a const LHS (simple identifier or destructuring).
 pub(super) fn extract_declared_names(lhs: &str) -> Vec<String> {
     let trimmed = lhs.trim();
-    if !trimmed.is_empty()
-        && trimmed
-            .chars()
-            .all(|c| c.is_alphanumeric() || c == '_' || c == '$')
-    {
+    if !trimmed.is_empty() && trimmed.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '$') {
         return vec![trimmed.to_string()];
     }
     extract_identifiers_from_expr(lhs)

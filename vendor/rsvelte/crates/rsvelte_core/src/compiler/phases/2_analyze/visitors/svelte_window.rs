@@ -18,41 +18,65 @@ pub fn visit(
 ) -> Result<(), AnalysisError> {
     // Check for duplicate
     if context.has_svelte_window {
-        return Err(errors::svelte_meta_duplicate("svelte:window"));
+        return Err(errors::svelte_meta_duplicate("svelte:window").at(window.start, window.start));
     }
     context.has_svelte_window = true;
 
     // Validate placement (must be at top level)
-    if context.is_inside_element_or_block() {
-        return Err(errors::svelte_meta_invalid_placement("svelte:window"));
+    if !context.in_root_fragment {
+        return Err(
+            errors::svelte_meta_invalid_placement("svelte:window").at(window.start, window.start)
+        );
     }
 
     // svelte:window cannot have children
     if !window.fragment.nodes.is_empty() {
-        return Err(AnalysisError::validation(
-            "svelte_meta_invalid_content",
-            "<svelte:window> cannot have children",
-        ));
+        let (start, _) = window.fragment.nodes.first().unwrap().span();
+        let (_, end) = window.fragment.nodes.last().unwrap().span();
+        return Err(errors::svelte_meta_invalid_content("svelte:window").at(start, end));
     }
 
-    // Validate attributes - check for invalid ones
+    // Upstream runs this whole loop before `context.next()` descends into any
+    // attribute, so "does this element take arbitrary attributes at all" is
+    // answered ahead of every per-directive rule below.
+    for attr in &window.attributes {
+        let span = match attr {
+            Attribute::SpreadAttribute(spread) => Some((spread.start, spread.end)),
+            Attribute::Attribute(a) if !super::shared::utils::is_event_attribute(a) => {
+                Some((a.start, a.end))
+            }
+            _ => None,
+        };
+        if let Some((start, end)) = span {
+            return Err(errors::illegal_element_attribute("svelte:window").at(start, end));
+        }
+    }
+
+    // The target rule needs the attribute list, which the mutable loop below holds.
+    for attr in &window.attributes {
+        if let Attribute::BindDirective(bind) = attr {
+            bind_directive::validate_binding_target(bind, "svelte:window", &window.attributes)?;
+        }
+    }
+
     for attr in &mut window.attributes {
         match attr {
             Attribute::BindDirective(bind) => {
-                bind_directive::visit_with_svelte_element(bind, "svelte:window", context)?;
+                bind_directive::visit_with_svelte_element(bind, context)?;
             }
             Attribute::OnDirective(on) => {
                 on_directive::visit(on, context)?;
             }
-            Attribute::LetDirective(_) => {
+            Attribute::StyleDirective(style_dir) => {
+                super::style_directive::visit(style_dir, context)?;
+            }
+            Attribute::LetDirective(let_dir) => {
                 // let: directives are NOT allowed on svelte:window
-                return Err(errors::let_directive_invalid_placement());
+                return Err(
+                    errors::let_directive_invalid_placement().at(let_dir.start, let_dir.end)
+                );
             }
-            Attribute::SpreadAttribute(_) => {
-                // Spread attributes are NOT allowed on svelte:window
-                return Err(errors::illegal_element_attribute("svelte:window"));
-            }
-            // Regular attributes (e.g. `onkeydown={(e) => …}`) carry expressions
+            // Event attributes (e.g. `onkeydown={(e) => …}`) carry expressions
             // that must be analysed — a non-safe call inside them (e.g. an imported
             // `goto(...)`) sets `needs_context`, driving the `$.push`/`$.pop`
             // component-context emission. Previously these were ignored, so a
@@ -60,7 +84,9 @@ pub fn visit(
             Attribute::Attribute(a) => {
                 super::attribute::visit_attribute_value_expressions(&mut a.value, context)?;
             }
-            _ => {}
+            other => {
+                super::shared::attribute::walk_remaining_attribute_expressions(other, context)?;
+            }
         }
     }
 

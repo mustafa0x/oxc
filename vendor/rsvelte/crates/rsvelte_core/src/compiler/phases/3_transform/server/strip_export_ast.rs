@@ -55,10 +55,7 @@ pub(crate) fn strip_export_from_declarations_ast(script: &str) -> Option<String>
         &STRIP_EXPORT_ALLOC,
         script,
         SourceType::mjs(),
-        ParseOptions {
-            allow_return_outside_function: true,
-            ..ParseOptions::default()
-        },
+        ParseOptions { allow_return_outside_function: true, ..ParseOptions::default() },
         // These edits never nest (each removes a 7-byte keyword prefix at a
         // distinct declaration start), so skip the containment check.
         false,
@@ -88,10 +85,8 @@ impl StripExportCollector {
 }
 
 impl<'ast> Visit<'ast> for StripExportCollector {
-    fn visit_export_named_declaration(&mut self, export: &ExportNamedDeclaration<'ast>) {
-        if let Some(decl) = &export.declaration
-            && Self::should_strip(decl)
-        {
+    fn visit_export_declaration(&mut self, export: &ExportDeclaration<'ast>) {
+        if Self::should_strip(&export.declaration) {
             // Remove exactly the `export ` prefix (7 bytes) at the start of the
             // export declaration, mirroring `strip_prefix("export ")`.
             self.edits.push((
@@ -100,7 +95,7 @@ impl<'ast> Visit<'ast> for StripExportCollector {
                 String::new(),
             ));
         }
-        walk::walk_export_named_declaration(self, export);
+        walk::walk_export_declaration(self, export);
     }
 }
 
@@ -134,10 +129,7 @@ mod tests {
 
     #[test]
     fn strips_export_class() {
-        assert_eq!(
-            strip_export_from_declarations_ast("export class C {}").unwrap(),
-            "class C {}"
-        );
+        assert_eq!(strip_export_from_declarations_ast("export class C {}").unwrap(), "class C {}");
     }
 
     #[test]

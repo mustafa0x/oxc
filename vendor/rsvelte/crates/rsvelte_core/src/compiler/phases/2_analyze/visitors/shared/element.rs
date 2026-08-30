@@ -10,7 +10,7 @@ use super::attribute::{
     get_attribute_expression, is_expression_attribute, validate_attribute, validate_attribute_name,
     validate_slot_attribute,
 };
-use crate::ast::template::{Attribute, RegularElement};
+use crate::ast::template::Attribute;
 use crate::compiler::phases::phase2_analyze::{errors, warnings};
 use regex::Regex;
 use std::sync::LazyLock;
@@ -45,15 +45,18 @@ fn get_react_attribute_correction(name: &str) -> Option<&'static str> {
 /// Validate an element and its attributes.
 ///
 /// Corresponds to `validate_element` in the JavaScript implementation.
+/// Takes the attribute list rather than the element, because upstream runs this
+/// from both `RegularElement` and `SvelteElement` and the body reads nothing else.
 pub fn validate_element(
-    node: &RegularElement,
+    attributes: &[Attribute],
     context: &mut VisitorContext,
 ) -> Result<(), AnalysisError> {
     let mut has_animate_directive = false;
     let mut in_transition: Option<usize> = None;
     let mut out_transition: Option<usize> = None;
 
-    for (idx, attribute) in node.attributes.iter().enumerate() {
+    for (idx, attribute) in attributes.iter().enumerate() {
+        let (attr_start, attr_end) = attribute.span();
         match attribute {
             Attribute::Attribute(attr) => {
                 let is_expression = is_expression_attribute(attr);
@@ -90,7 +93,16 @@ pub fn validate_element(
                                 }
 
                                 if !is_parenthesized {
-                                    return Err(errors::attribute_invalid_sequence_expression());
+                                    let error = errors::attribute_invalid_sequence_expression();
+                                    let error = match expression_tag
+                                        .expression
+                                        .start()
+                                        .zip(expression_tag.expression.end())
+                                    {
+                                        Some((start, end)) => error.at(start, end),
+                                        None => error,
+                                    };
+                                    return Err(error);
                                 }
                             }
                         }
@@ -99,12 +111,12 @@ pub fn validate_element(
 
                 // Check for illegal characters in attribute name
                 if REGEX_ILLEGAL_ATTRIBUTE_CHARACTER.is_match(&attr.name) {
-                    return Err(errors::attribute_invalid_name(&attr.name));
+                    return Err(errors::attribute_invalid_name(&attr.name).at(attr_start, attr_end));
                 }
 
                 // Check for event handlers
                 if attr.name.starts_with("on") && attr.name.len() > 2 && !is_expression {
-                    return Err(errors::attribute_invalid_event_handler());
+                    return Err(errors::attribute_invalid_event_handler().at(attr_start, attr_end));
                 }
 
                 // Check for global event reference
@@ -119,7 +131,10 @@ pub fn validate_element(
                     && name == attr.name
                     && context.analysis.root.find_binding_any_scope(name).is_none()
                 {
-                    context.emit_warning(warnings::attribute_global_event_reference(&attr.name));
+                    context.emit_warning(
+                        warnings::attribute_global_event_reference(&attr.name)
+                            .at(attr_start, attr_end),
+                    );
                 }
 
                 // Validate slot attribute
@@ -129,7 +144,7 @@ pub fn validate_element(
 
                 // Warn about 'is' attribute
                 if attr.name == "is" {
-                    context.emit_warning(warnings::attribute_avoid_is());
+                    context.emit_warning(warnings::attribute_avoid_is().at(attr_start, attr_end));
                 }
 
                 // Check for React-style attributes
@@ -138,7 +153,8 @@ pub fn validate_element(
                         super::super::super::warnings::attribute_invalid_property_name(
                             &attr.name,
                             correct_name,
-                        ),
+                        )
+                        .at(attr_start, attr_end),
                     );
                 }
 
@@ -147,24 +163,33 @@ pub fn validate_element(
             Attribute::AnimateDirective(_directive) => {
                 // Check that we're directly inside an EachBlock using the each_block_stack
                 // The top of the stack should be Some(EachBlockContext) if we're a direct child
-                match context.each_block_stack.last() {
+                // Reference: shared/element.js L93 — the test is on the element's
+                // immediate parent, so a block between it and the `{#each}` counts
+                // (`each_block_stack` is only cleared by an intervening element).
+                let parent_is_each = matches!(
+                    context.fragment_owner_stack.last(),
+                    Some(super::super::FragmentOwnerType::EachBlock)
+                );
+                match context.each_block_stack.last().filter(|_| parent_is_each) {
                     Some(Some(each_ctx)) => {
                         if !each_ctx.has_key {
-                            return Err(errors::animation_missing_key());
+                            return Err(errors::animation_missing_key().at(attr_start, attr_end));
                         }
 
                         if each_ctx.child_count > 1 {
-                            return Err(errors::animation_invalid_placement());
+                            return Err(
+                                errors::animation_invalid_placement().at(attr_start, attr_end)
+                            );
                         }
                     }
                     _ => {
                         // Not directly inside an EachBlock (either outside or nested in another element)
-                        return Err(errors::animation_invalid_placement());
+                        return Err(errors::animation_invalid_placement().at(attr_start, attr_end));
                     }
                 }
 
                 if has_animate_directive {
-                    return Err(errors::animation_duplicate());
+                    return Err(errors::animation_duplicate().at(attr_start, attr_end));
                 } else {
                     has_animate_directive = true;
                 }
@@ -182,14 +207,10 @@ pub fn validate_element(
                 if let Some(existing_idx) = existing {
                     // Get the existing directive to determine conflict type
                     if let Some(Attribute::TransitionDirective(existing_dir)) =
-                        node.attributes.get(existing_idx)
+                        attributes.get(existing_idx)
                     {
                         let a = if existing_dir.intro {
-                            if existing_dir.outro {
-                                "transition"
-                            } else {
-                                "in"
-                            }
+                            if existing_dir.outro { "transition" } else { "in" }
                         } else {
                             "out"
                         };
@@ -201,9 +222,9 @@ pub fn validate_element(
                         };
 
                         if a == b {
-                            return Err(errors::transition_duplicate(a));
+                            return Err(errors::transition_duplicate(a).at(attr_start, attr_end));
                         } else {
-                            return Err(errors::transition_conflict(a, b));
+                            return Err(errors::transition_conflict(a, b).at(attr_start, attr_end));
                         }
                     }
                 }
@@ -227,12 +248,11 @@ pub fn validate_element(
                             EVENT_MODIFIERS[..EVENT_MODIFIERS.len() - 1].join(", "),
                             EVENT_MODIFIERS.last().unwrap()
                         );
-                        return Err(AnalysisError::validation(
+                        return Err(AnalysisError::validation_at(
                             "event_handler_invalid_modifier",
-                            format!(
-                                "Invalid event modifier '{}'. Valid modifiers are: {}",
-                                modifier, list
-                            ),
+                            format!("Valid event modifiers are {}", list),
+                            attr_start,
+                            attr_end,
                         ));
                     }
 
@@ -243,12 +263,14 @@ pub fn validate_element(
                     }
 
                     if has_passive_modifier && !conflicting_passive_modifier.is_empty() {
-                        return Err(AnalysisError::validation(
+                        return Err(AnalysisError::validation_at(
                             "event_handler_invalid_modifier_combination",
                             format!(
                                 "The 'passive' and '{}' modifiers cannot be used together",
                                 conflicting_passive_modifier
                             ),
+                            attr_start,
+                            attr_end,
                         ));
                     }
                 }
@@ -260,4 +282,172 @@ pub fn validate_element(
     }
 
     Ok(())
+}
+
+/// What the CSS matcher needs to know about one element's attribute list.
+#[derive(Default)]
+pub struct CssAttributeFacts {
+    pub classes: rustc_hash::FxHashSet<String>,
+    pub id: Option<String>,
+    pub static_attributes: Vec<(String, Option<String>)>,
+    pub dynamic_attribute_names: rustc_hash::FxHashSet<String>,
+    pub has_spread: bool,
+    pub has_class_directive: bool,
+    pub class_directive_names: rustc_hash::FxHashSet<String>,
+    pub has_style_directive: bool,
+}
+
+/// Upstream's `attribute_matches` reads `node.attributes` for a `RegularElement` and a
+/// `SvelteElement` alike, so both must contribute the same facts — a dynamic element that
+/// records only its classes is invisible to every other attribute selector.
+pub fn collect_css_attribute_facts(
+    attributes: &[Attribute],
+    context: &mut VisitorContext,
+) -> CssAttributeFacts {
+    use crate::ast::template::{AttributeValue, AttributeValuePart};
+    use crate::compiler::phases::phase2_analyze::css;
+
+    let mut facts = CssAttributeFacts::default();
+
+    for attr in attributes {
+        match attr {
+            Attribute::Attribute(attr_node) => {
+                match &attr_node.value {
+                    AttributeValue::True(_) => {
+                        facts.static_attributes.push((attr_node.name.to_string(), None));
+                    }
+                    AttributeValue::Sequence(parts) => {
+                        let mut all_static = true;
+                        let mut value = String::new();
+                        for part in parts {
+                            if let AttributeValuePart::Text(text) = part {
+                                value.push_str(&text.data);
+                            } else {
+                                all_static = false;
+                                break;
+                            }
+                        }
+                        if all_static {
+                            facts.static_attributes.push((attr_node.name.to_string(), Some(value)));
+                        } else {
+                            let mut all_resolved = true;
+                            let mut computed_values: Vec<String> = vec![String::new()];
+                            for part in parts {
+                                match part {
+                                    AttributeValuePart::Text(text) => {
+                                        for v in &mut computed_values {
+                                            v.push_str(&text.data);
+                                        }
+                                    }
+                                    AttributeValuePart::ExpressionTag(expr_tag) => {
+                                        if let Some(possible_vals) = css::get_possible_values_expr(
+                                            &expr_tag.expression,
+                                            false,
+                                        ) {
+                                            if possible_vals.len() > 20 {
+                                                all_resolved = false;
+                                                break;
+                                            }
+                                            let prev = std::mem::take(&mut computed_values);
+                                            for pv in &prev {
+                                                for ev in &possible_vals {
+                                                    computed_values.push(format!("{pv}{ev}"));
+                                                }
+                                            }
+                                            if computed_values.len() > 100 {
+                                                all_resolved = false;
+                                                break;
+                                            }
+                                        } else {
+                                            all_resolved = false;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            if all_resolved && !computed_values.is_empty() {
+                                for value in &computed_values {
+                                    facts
+                                        .static_attributes
+                                        .push((attr_node.name.to_string(), Some(value.clone())));
+                                }
+                            } else {
+                                facts.dynamic_attribute_names.insert(attr_node.name.to_string());
+                            }
+                        }
+                    }
+                    AttributeValue::Expression(expr_tag) => {
+                        if let Some(possible_values) =
+                            css::get_possible_values_expr(&expr_tag.expression, false)
+                        {
+                            for value in &possible_values {
+                                facts
+                                    .static_attributes
+                                    .push((attr_node.name.to_string(), Some(value.to_string())));
+                            }
+                        } else {
+                            facts.dynamic_attribute_names.insert(attr_node.name.to_string());
+                        }
+                    }
+                }
+
+                match attr_node.name.as_str() {
+                    "class" => match css::possible_class_names(&attr_node.value) {
+                        Some(class_names) => {
+                            for class_name in class_names {
+                                context.analysis.css.used_classes.insert(class_name.clone());
+                                facts.classes.insert(class_name);
+                            }
+                        }
+                        None => context.analysis.css.has_dynamic_classes = true,
+                    },
+                    "id" => match &attr_node.value {
+                        AttributeValue::Sequence(parts) => {
+                            let has_dynamic_part = parts
+                                .iter()
+                                .any(|p| matches!(p, AttributeValuePart::ExpressionTag(_)));
+                            if has_dynamic_part {
+                                context.analysis.css.has_dynamic_ids = true;
+                            } else {
+                                for part in parts {
+                                    if let AttributeValuePart::Text(text) = part {
+                                        let id = text.data.trim();
+                                        if !id.is_empty() {
+                                            context.analysis.css.used_ids.insert(id.to_string());
+                                            facts.id = Some(id.to_string());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        AttributeValue::Expression(_) => {
+                            context.analysis.css.has_dynamic_ids = true;
+                        }
+                        _ => {}
+                    },
+                    _ => {}
+                }
+            }
+            Attribute::SpreadAttribute(_) => {
+                facts.has_spread = true;
+            }
+            Attribute::BindDirective(bind) => {
+                facts.dynamic_attribute_names.insert(bind.name.to_string());
+            }
+            Attribute::ClassDirective(class_dir) => {
+                facts.has_class_directive = true;
+                facts.class_directive_names.insert(class_dir.name.to_string());
+                context.analysis.css.used_classes.insert(class_dir.name.to_string());
+                // `class:name` matches `.name` exactly under upstream's `~=` rule, so the
+                // directive name is a class this element can carry.
+                facts.classes.insert(class_dir.name.to_string());
+            }
+            Attribute::StyleDirective(_) => {
+                facts.has_style_directive = true;
+            }
+            _ => {}
+        }
+    }
+
+    facts
 }

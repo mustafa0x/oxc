@@ -28,15 +28,13 @@ use crate::compiler::phases::phase3_transform::server::ast::ServerTransformState
 use super::shared::{TemplateEntry, build_template, process_children};
 
 /// Visit a `<title>…</title>` element.
-pub fn visit_title_element<'a>(node: &TitleElement, state: &mut ServerTransformState<'a>) {
+pub fn visit_title_element<'a>(node: &TitleElement<'a>, state: &mut ServerTransformState<'a>) {
     let b = state.b;
 
     // Build the title body in an isolated template buffer seeded with the
     // `<title>` opener (mirrors upstream's `const template = [b.literal('<title>')]`).
     let saved = std::mem::take(&mut state.template);
-    state
-        .template
-        .push(TemplateEntry::Literal("<title>".to_string()));
+    state.template.push(TemplateEntry::Literal("<title>".to_string()));
     // Upstream's `TitleElement` calls `process_children` directly on the raw
     // fragment nodes WITHOUT running `clean_nodes`, so the title's inner
     // whitespace is preserved verbatim. rsvelte's `process_children` cleans
@@ -46,9 +44,7 @@ pub fn visit_title_element<'a>(node: &TitleElement, state: &mut ServerTransformS
     state.preserve_whitespace = true;
     process_children(&node.fragment.nodes, None, "html", state);
     state.preserve_whitespace = saved_preserve;
-    state
-        .template
-        .push(TemplateEntry::Literal("</title>".to_string()));
+    state.template.push(TemplateEntry::Literal("</title>".to_string()));
     let inner = std::mem::replace(&mut state.template, saved);
     let body_stmts = build_template(inner, state);
 

@@ -510,6 +510,7 @@ impl DisableDirectivesBuilder {
         }
     }
 
+    #[cfg(any(feature = "svelte-rsvelte-backend", test))]
     pub fn build_raw_comments(
         mut self,
         source_text: &str,
@@ -588,8 +589,8 @@ impl DisableDirectivesBuilder {
             // `comment.span` is the full outer span (including `//` or `/* */` delimiters).
             // It is used as the diagnostic span.
             let outer_span = comment.span;
-            let text_source = comment_span.source_text(source_text);
-            let text = text_source.trim_start();
+            let comment_span = comment.content_span.unwrap_or(outer_span);
+            let text = comment.text.trim_start();
             let Some((directive_prefix, directive_kind, rule_list_text)) =
                 self.match_directive(text)
             else {
@@ -599,7 +600,8 @@ impl DisableDirectivesBuilder {
             // Pre-compute the fix span for this directive comment:
             // - whole line (incl. leading whitespace + newline) if the comment is alone on the line
             // - outer comment span (incl. `//` / `/* */` delimiters) otherwise
-            let comment_fix_span = Self::compute_comment_fix_span(comment, source_text);
+            let comment_fix_span =
+                Self::compute_comment_fix_span_from_span(outer_span, source_text);
 
             let rule_names = Self::collect_rule_names(rule_list_text);
             let rule_list_start = comment_span.end - rule_list_text.len() as u32;

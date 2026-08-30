@@ -57,23 +57,7 @@ fn transform_with(allocator: &Allocator, expr: &str) -> Option<String> {
     // top-level ExpressionStatement and top-level `await` is allowed in a
     // module. TS source type keeps `as`/`satisfies` casts parseable.
     let source_type = SourceType::ts().with_module(true);
-    let parsed = Parser::new(allocator, expr, source_type)
-        .with_options(ParseOptions {
-            // The expression alone may sit outside any function; permit a
-            // stray `return`/`await` rather than bailing to the textual path.
-            allow_return_outside_function: true,
-            ..ParseOptions::default()
-        })
-        .parse();
-    if !parsed.diagnostics.is_empty() {
-        return None;
-    }
-
-    let mut collector = AwaitCollector {
-        function_depth: 0,
-        awaits: Vec::new(),
-    };
-    collector.visit_program(&parsed.program);
+    let mut collector = collect_awaits(allocator, expr, source_type)?;
     if collector.awaits.is_empty() {
         return None;
     }
@@ -103,7 +87,32 @@ pub(crate) fn contains_top_level_await(expr: &str) -> Option<bool> {
 
 fn contains_with(allocator: &Allocator, expr: &str) -> Option<bool> {
     let source_type = SourceType::ts().with_module(true);
+    Some(!collect_awaits(allocator, expr, source_type)?.awaits.is_empty())
+}
+
+fn collect_awaits(
+    allocator: &Allocator,
+    expr: &str,
+    source_type: SourceType,
+) -> Option<AwaitCollector> {
     let parsed = Parser::new(allocator, expr, source_type)
+        .with_options(ParseOptions {
+            allow_return_outside_function: true,
+            ..ParseOptions::default()
+        })
+        .parse();
+    if parsed.diagnostics.is_empty() {
+        let mut collector = AwaitCollector { function_depth: 0, awaits: Vec::new() };
+        collector.visit_program(&parsed.program);
+        return Some(collector);
+    }
+
+    // A leading object literal is parsed as a block at program level. Retry
+    // in parentheses so object-valued attributes use the AST path as well;
+    // otherwise the textual fallback mistakes awaits inside concise async
+    // arrows for awaits in the surrounding expression.
+    let wrapped = format!("({expr})");
+    let parsed = Parser::new(allocator, &wrapped, source_type)
         .with_options(ParseOptions {
             allow_return_outside_function: true,
             ..ParseOptions::default()
@@ -112,12 +121,15 @@ fn contains_with(allocator: &Allocator, expr: &str) -> Option<bool> {
     if !parsed.diagnostics.is_empty() {
         return None;
     }
-    let mut collector = AwaitCollector {
-        function_depth: 0,
-        awaits: Vec::new(),
-    };
+    let mut collector = AwaitCollector { function_depth: 0, awaits: Vec::new() };
     collector.visit_program(&parsed.program);
-    Some(!collector.awaits.is_empty())
+    for span in &mut collector.awaits {
+        span.0 = span.0.checked_sub(1)?;
+        span.1 = span.1.checked_sub(1)?;
+        span.2 = span.2.checked_sub(1)?;
+        span.3 = span.3.checked_sub(1)?;
+    }
+    Some(collector)
 }
 
 /// Emit `source[lo..hi]`, wrapping each top-level `await` operand within the
@@ -168,12 +180,7 @@ impl<'a> Visit<'a> for AwaitCollector {
     fn visit_await_expression(&mut self, await_expr: &AwaitExpression<'a>) {
         if self.function_depth == 0 {
             let arg = await_expr.argument.span();
-            self.awaits.push((
-                await_expr.span.start,
-                await_expr.span.end,
-                arg.start,
-                arg.end,
-            ));
+            self.awaits.push((await_expr.span.start, await_expr.span.end, arg.start, arg.end));
         }
         // Walk the operand so a nested `await` inside it is collected too; the
         // recursive emit relies on having every await span available.
@@ -194,20 +201,29 @@ mod tests {
     #[test]
     fn contains_top_level_await_ignores_nested_function() {
         // The await belongs to a nested arrow's async region, not the top level.
-        assert_eq!(
-            contains_top_level_await("fn(async () => await inner())"),
-            Some(false)
-        );
+        assert_eq!(contains_top_level_await("fn(async () => await inner())"), Some(false));
         // But a top-level await alongside a nested one still counts.
-        assert_eq!(
-            contains_top_level_await("await outer(async () => await inner())"),
-            Some(true)
-        );
+        assert_eq!(contains_top_level_await("await outer(async () => await inner())"), Some(true));
     }
 
     #[test]
     fn contains_top_level_await_unparseable_is_none() {
         assert_eq!(contains_top_level_await("await ((("), None);
+    }
+
+    #[test]
+    fn object_literal_distinguishes_nested_and_top_level_await() {
+        assert_eq!(
+            contains_top_level_await(r#"{ "data-x": (async () => await p)() }"#),
+            Some(false)
+        );
+        assert_eq!(contains_top_level_await(r#"{ "data-x": await p }"#), Some(true));
+    }
+
+    #[test]
+    fn object_literal_await_uses_original_source_offsets() {
+        let got = transform_await_to_save_ast(r#"{ "data-x": await p }"#).unwrap();
+        assert_eq!(got, r#"{ "data-x": (await $.save(p))() }"#);
     }
 
     #[test]
@@ -248,10 +264,7 @@ mod tests {
     fn await_inside_nested_arrow_is_left_alone() {
         // The arrow's await belongs to a different async scope.
         let got = transform_await_to_save_ast("await fn(async () => await inner())");
-        assert_eq!(
-            got.unwrap(),
-            "(await $.save(fn(async () => await inner())))()"
-        );
+        assert_eq!(got.unwrap(), "(await $.save(fn(async () => await inner())))()");
     }
 
     #[test]

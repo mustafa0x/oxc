@@ -4,9 +4,6 @@
 //!
 //! Corresponds to Svelte's `2-analyze/visitors/` directory.
 
-// Allow dead code for stub implementations that will be integrated later
-#![allow(dead_code)]
-
 pub mod shared;
 
 // Script visitor
@@ -51,7 +48,6 @@ mod render_tag;
 mod animate_directive;
 mod bind_directive;
 mod class_directive;
-mod let_directive;
 mod on_directive;
 mod style_directive;
 mod transition_directive;
@@ -62,7 +58,6 @@ mod attribute;
 mod spread_attribute;
 
 // JavaScript visitors
-mod arrow_function_expression;
 mod assignment_expression;
 mod await_expression;
 mod call_expression;
@@ -70,7 +65,6 @@ mod class_body;
 mod class_declaration;
 mod export_default_declaration;
 mod export_named_declaration;
-mod export_specifier;
 mod expression_statement;
 mod function_declaration;
 mod function_expression;
@@ -85,21 +79,8 @@ mod template_element;
 mod update_expression;
 mod variable_declarator;
 
-// Re-exports
-pub use await_block::visit_await_block;
-pub use component::visit as visit_component;
-pub use each_block::visit_each_block;
-pub use expression_tag::visit_expression_tag;
-pub use fragment::visit_fragment;
-pub use if_block::visit_if_block;
-pub use key_block::visit_key_block;
-pub use regular_element::visit_regular_element;
-pub use render_tag::visit_render_tag;
-pub use snippet_block::visit_snippet_block;
-pub use text::visit_text;
-
 use super::AnalysisError;
-use super::types::{ComponentAnalysis, CssDomElement, DomStructure, SiblingCertainty};
+use super::types::{ComponentAnalysis, CssDomElement};
 use crate::ast::arena::ParseArena;
 use crate::ast::template::{Root, TemplateNode};
 
@@ -166,10 +147,7 @@ impl JsPathEntry {
     /// The Value will be lazily materialized only if `as_value()` or `Deref` is called.
     #[inline]
     pub fn new_typed(node: &crate::ast::typed_expr::JsNode) -> Self {
-        Self::TypedNode {
-            node: node as *const _,
-            cached_value: std::cell::UnsafeCell::new(None),
-        }
+        Self::TypedNode { node: node as *const _, cached_value: std::cell::UnsafeCell::new(None) }
     }
 
     /// Get a reference to the underlying `Value`.
@@ -366,7 +344,7 @@ pub struct VisitorContext<'a> {
     /// The parse arena used to resolve JsNodeId and IdRange references.
     pub parse_arena: &'a ParseArena,
     /// The path of nodes from root to current (Svelte template nodes).
-    pub path: Vec<&'a TemplateNode>,
+    pub path: Vec<&'a TemplateNode<'a>>,
     /// JavaScript AST node path (for expressions in scripts).
     /// Uses `JsPathEntry` (a raw pointer wrapper) to avoid expensive deep clones.
     /// SAFETY: Pointers are always valid because walk_js_node pushes a pointer
@@ -375,6 +353,15 @@ pub struct VisitorContext<'a> {
     /// Information about the current expression/directive/block value being analyzed.
     /// Set to Some(metadata) when visiting an expression, directive value, or block condition.
     pub expression: Option<*mut crate::ast::template::ExpressionMetadata>,
+    /// While walking a `bind:` expression, the `function_depth` at which an
+    /// `await` suspends. Upstream installs `state.expression` for the whole bind
+    /// expression — and, for a `{get, set}` pair, for the get/set function
+    /// *bodies*, jumping across the function that would otherwise reset it
+    /// (`BindDirective.js` L157-170) — so a deeper function does not suspend.
+    pub bind_await_depth: Option<usize>,
+    /// Set by the `AwaitExpression` visitor when `bind_await_depth` matched, so
+    /// the bind visitor can raise `illegal_await_expression`.
+    pub bind_has_await: bool,
     /// Parent element name (for validation).
     /// Tag name of parent element. None if parent is svelte:element, #snippet, component or root.
     pub parent_element: Option<String>,
@@ -401,8 +388,19 @@ pub struct VisitorContext<'a> {
     pub element_depth: usize,
     /// Depth inside control flow blocks (for placement validation).
     pub block_depth: usize,
+    /// Depth of the ancestors upstream's `SvelteSelf` visitor accepts as a parent —
+    /// `{#if}`, `{#each}`, `{#snippet}` and a `Component`, so neither an `{#await}`
+    /// nor a `<svelte:component>` counts.
+    pub svelte_self_parent_depth: usize,
     /// Depth inside component elements (for placement validation).
     pub component_depth: usize,
+    /// Whether the fragment being analysed is the component's root fragment.
+    /// Upstream's root-only meta tags are rejected on `parent.type !== 'Root'`
+    /// alone, which no depth counter reproduces — each one is maintained by a
+    /// hand-written list of the containers that increment it.
+    pub in_root_fragment: bool,
+    /// Set by the caller of the root fragment's `analyze`, consumed by it.
+    pub next_fragment_is_root: bool,
     /// Whether we've seen svelte:window.
     pub has_svelte_window: bool,
     /// Whether we've seen svelte:body.
@@ -429,6 +427,9 @@ pub struct VisitorContext<'a> {
     /// within a template expression are NOT suspending and must not trigger
     /// the `experimental_async` / `legacy_await_invalid` errors.
     pub in_template_function: bool,
+    /// Whether a template expression is inside a non-arrow function that owns
+    /// an `arguments` binding. Arrow functions inherit this from their parent.
+    pub in_template_arguments_function: bool,
     /// Stack of ignored warning codes.
     /// Each entry is a set of warning codes that should be ignored at that nesting level.
     /// Corresponds to ignore_stack in Svelte's state.js.
@@ -454,10 +455,10 @@ pub struct VisitorContext<'a> {
     /// it checks if its direct parent is an EachBlock by checking the top of this stack.
     /// When entering an element, we push None to indicate we're no longer directly in the EachBlock.
     pub each_block_stack: Vec<Option<EachBlockContext>>,
-    /// Tracks if we're directly inside a component (for svelte:fragment validation).
-    /// This is set to true when entering a Component/SvelteComponent, and reset to false
-    /// when entering any other element type.
-    pub is_direct_child_of_component: bool,
+    /// Which component-like node is the immediate parent, if any. Set when
+    /// entering a Component / `<svelte:component>` / `<svelte:self>`, and reset
+    /// when entering any other element or block.
+    pub direct_component_parent: DirectComponentParent,
     /// True while analyzing the *direct* children of a `{#snippet}` body. Mirrors
     /// upstream's `context.path.at(-2)?.type === 'SnippetBlock'` check in
     /// `validate_slot_attribute`: a `slot="…"` text attribute on an element whose
@@ -486,14 +487,53 @@ pub struct VisitorContext<'a> {
     /// Used to prevent `identifier::visit` from setting `has_direct_template_read`
     /// for bind:this references, since bind:this has special non_reactive_update logic.
     pub in_bind_this: bool,
+    /// Undo log of temporary shadowing inserts into `analysis.root.scope.declarations`
+    /// made while walking a function/arrow body. Each entry is `(name, previous)` where
+    /// `previous` is the binding index the name mapped to before the insert (or `None` if
+    /// the name was absent). The function-body walker records a length marker on entry and,
+    /// on exit, pops entries back to that marker in LIFO order to reverse exactly the
+    /// declarations added during that scope — replacing a full clone/restore of the map.
+    pub decl_undo_log: Vec<(String, Option<usize>)>,
+}
+
+/// Which component-like node, if any, is the immediate parent of the node being
+/// visited. Upstream reads two different sets off this position and they are not
+/// the same: `<svelte:fragment>` is legal only under `Component` /
+/// `SvelteComponent` (`SvelteFragment.js`), while `validate_slot_attribute`'s
+/// owner set also holds `SvelteSelf` and `SvelteElement`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DirectComponentParent {
+    /// Anything that owns no slots — a plain element, a block, the root.
+    #[default]
+    None,
+    /// `<Foo>` or `<svelte:component>` — also the only legal `<svelte:fragment>`
+    /// parents.
+    Component,
+    /// `<svelte:self>` or `<svelte:element>`: a slot owner that `SvelteFragment.js`
+    /// does not name.
+    SlotOwnerOnly,
+}
+
+impl DirectComponentParent {
+    /// Whether a `slot="…"` on a direct child has a component owner here.
+    pub fn owns_slots(self) -> bool {
+        self != DirectComponentParent::None
+    }
+
+    /// Whether a `<svelte:fragment>` may sit directly inside.
+    pub fn hosts_svelte_fragment(self) -> bool {
+        self == DirectComponentParent::Component
+    }
 }
 
 /// Type of ancestor that can "own" a slot attribute.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SlotOwnerType {
-    /// A component (Component, SvelteComponent, SvelteSelf, SvelteElement)
+    /// A component (Component, SvelteComponent, SvelteSelf)
     Component,
-    /// A custom element (RegularElement with hyphen in name)
+    /// An owner a `slot` attribute may sit under at any depth — a custom
+    /// element, or `<svelte:element>`, which upstream finds as the owner but
+    /// then does not test against its component list.
     CustomElement,
 }
 
@@ -507,8 +547,12 @@ pub enum FragmentOwnerType {
     RegularElement,
     /// Inside a RegularElement with a slot attribute
     RegularElementWithSlot,
-    /// Inside a Component (or SvelteComponent, SvelteSelf)
+    /// Inside a Component (or SvelteComponent)
     Component,
+    /// Inside a `<svelte:self>`. Upstream's `{@const}` placement rule names
+    /// `Component` and `SvelteComponent` and stops there, so this cannot share
+    /// the variant above even though the two behave alike elsewhere.
+    SvelteSelf,
     /// Inside an IfBlock branch
     IfBlock,
     /// Inside an EachBlock body or fallback
@@ -556,6 +600,8 @@ impl<'a> VisitorContext<'a> {
             path: Vec::new(),
             js_path: Vec::new(),
             expression: None,
+            bind_await_depth: None,
+            bind_has_await: false,
             parent_element: None,
             function_depth: 0,
             derived_function_depth: 0,
@@ -568,7 +614,10 @@ impl<'a> VisitorContext<'a> {
             dom_element_stack: Vec::new(),
             element_depth: 0,
             block_depth: 0,
+            svelte_self_parent_depth: 0,
             component_depth: 0,
+            in_root_fragment: false,
+            next_fragment_is_root: false,
             has_svelte_window: false,
             has_svelte_body: false,
             has_svelte_document: false,
@@ -578,24 +627,21 @@ impl<'a> VisitorContext<'a> {
             uses_event_attributes: false,
             in_expression_tag: false,
             in_template_function: false,
+            in_template_arguments_function: false,
             ignore_stack: Vec::new(),
             script_ignore_comments: rustc_hash::FxHashMap::default(),
             element_ancestors: Vec::new(),
             block_depth_at_element: Vec::new(),
             each_block_stack: Vec::new(),
-            is_direct_child_of_component: false,
+            direct_component_parent: DirectComponentParent::None,
             is_direct_child_of_snippet: false,
             slot_owner_ancestors: Vec::new(),
             fragment_owner_stack: vec![FragmentOwnerType::Root],
             current_template_scope: 0,
             in_const_tag: false,
             in_bind_this: false,
+            decl_undo_log: Vec::new(),
         }
-    }
-
-    /// Check if currently inside an element or block (for placement validation).
-    pub fn is_inside_element_or_block(&self) -> bool {
-        self.element_depth > 0 || self.block_depth > 0 || self.component_depth > 0
     }
 
     /// Add a DOM element to the structure and return its index.
@@ -608,6 +654,14 @@ impl<'a> VisitorContext<'a> {
     /// Get the current parent element index (if any).
     pub fn current_parent_idx(&self) -> Option<usize> {
         self.dom_element_stack.last().copied()
+    }
+
+    /// Name of the innermost enclosing `{#snippet}`, if any.
+    pub fn current_snippet_name(&self) -> Option<String> {
+        self.fragment_owner_stack.iter().rev().find_map(|o| match o {
+            FragmentOwnerType::SnippetBlock(_, name) => Some(name.clone()),
+            _ => None,
+        })
     }
 
     /// Push ignore codes onto the stack.
@@ -635,6 +689,20 @@ impl<'a> VisitorContext<'a> {
             current_ignores.contains(code)
         } else {
             false
+        }
+    }
+
+    /// The ancestor context the a11y checker consults.
+    pub fn a11y_ancestors(&self) -> shared::a11y::A11yAncestors<'_> {
+        shared::a11y::A11yAncestors {
+            names: &self.element_ancestors,
+            // `element_ancestors` is cleared at a `<svelte:element>` boundary, so
+            // an owner on the stack with no name left means the nearest element
+            // ancestor is the dynamic one.
+            inside_dynamic_element: self
+                .fragment_owner_stack
+                .iter()
+                .any(|owner| matches!(owner, FragmentOwnerType::SvelteElement)),
         }
     }
 
@@ -669,24 +737,28 @@ pub fn analyze_template(
     analysis: &mut ComponentAnalysis,
     parse_arena: &ParseArena,
 ) -> Result<(), AnalysisError> {
-    // Read the instance scope index before borrowing `analysis` into the context,
-    // so we can initialize context.scope to the correct starting scope.
-    // The scope builder visits the template while current_scope = instance_scope_index,
-    // so template-root declarations land in that scope; the visitor must mirror it to
-    // ensure lexical scope-chain lookups (e.g. render-tag binding resolution) are correct.
-    let instance_scope_index = analysis.root.instance_scope_index;
+    // Read the root fragment's scope before borrowing `analysis` into the context.
+    // The scope builder visits the template inside it, so template-root
+    // declarations land there; the visitor must mirror it or a lexical
+    // scope-chain lookup (render-tag binding resolution) rejects them as
+    // declared in a non-ancestor scope.
+    let root_fragment_scope_index = analysis.root.root_fragment_scope_index;
     let mut context = VisitorContext::new(analysis, parse_arena);
-    context.scope = instance_scope_index;
+    context.scope = root_fragment_scope_index;
+    context.next_fragment_is_root = true;
     fragment::analyze(&mut ast.fragment, &mut context)?;
-
-    // Build sibling relationships for CSS sibling combinator detection
-    build_sibling_relationships(&mut context.analysis.css.dom_structure);
+    snippet_block::promote_mutual_snippet_hoists(&mut ast.fragment.nodes, &mut context);
 
     // Check for mixed event handler syntaxes (on:event and onevent mixed)
     if let Some(ref event_name) = context.event_directive_node
         && context.uses_event_attributes
     {
-        return Err(super::errors::mixed_event_handler_syntaxes(event_name));
+        let error = super::errors::mixed_event_handler_syntaxes(event_name);
+        // Upstream attributes this to the first `on:` directive on an element
+        return Err(match &context.analysis.event_directive_node {
+            Some(info) => error.at(info.start, info.end),
+            None => error,
+        });
     }
 
     Ok(())
@@ -708,11 +780,11 @@ pub fn analyze_template(
 /// its run. None of the path readers traverse the alias's mutated subtrees,
 /// so the only observable property they rely on — the enum discriminant —
 /// stays valid.
-pub fn visit_node(
-    node: &mut TemplateNode,
-    context: &mut VisitorContext,
+pub fn visit_node<'a, 'b: 'a>(
+    node: &mut TemplateNode<'b>,
+    context: &mut VisitorContext<'a>,
 ) -> Result<(), AnalysisError> {
-    let node_ptr: *const TemplateNode = node as *const _;
+    let node_ptr: *const TemplateNode<'b> = node as *const _;
     // SAFETY: see this function's doc comment — `node_ptr` aliases `node` for the
     // duration of the inner visit and is popped before `node` is used again; path
     // readers only rely on the enum discriminant, which stays valid.
@@ -749,67 +821,4 @@ pub fn visit_node(
     };
     context.path.pop();
     result
-}
-
-/// Build sibling relationships for CSS sibling combinator detection.
-/// This populates possible_prev_adjacent, possible_next_adjacent,
-/// possible_prev_general, and possible_next_general fields in CssDomElement.
-fn build_sibling_relationships(dom_structure: &mut DomStructure) {
-    // Group elements by their parent
-    let mut parent_children: rustc_hash::FxHashMap<Option<usize>, Vec<usize>> =
-        rustc_hash::FxHashMap::default();
-
-    for (idx, element) in dom_structure.elements.iter().enumerate() {
-        parent_children
-            .entry(element.parent_idx)
-            .or_default()
-            .push(idx);
-    }
-
-    // For each parent, build sibling relationships among its children
-    for children_indices in parent_children.values() {
-        if children_indices.len() < 2 {
-            continue; // No siblings if only one child
-        }
-
-        // Build adjacent sibling relationships (+ combinator)
-        for i in 0..children_indices.len() {
-            let current_idx = children_indices[i];
-
-            // Previous adjacent sibling
-            if i > 0 {
-                let prev_idx = children_indices[i - 1];
-                dom_structure.elements[current_idx]
-                    .possible_prev_adjacent
-                    .push((prev_idx, SiblingCertainty::Definite));
-            }
-
-            // Next adjacent sibling
-            if i < children_indices.len() - 1 {
-                let next_idx = children_indices[i + 1];
-                dom_structure.elements[current_idx]
-                    .possible_next_adjacent
-                    .push((next_idx, SiblingCertainty::Definite));
-            }
-        }
-
-        // Build general sibling relationships (~ combinator)
-        for i in 0..children_indices.len() {
-            let current_idx = children_indices[i];
-
-            // All previous siblings
-            for &prev_idx in children_indices.iter().take(i) {
-                dom_structure.elements[current_idx]
-                    .possible_prev_general
-                    .push((prev_idx, SiblingCertainty::Definite));
-            }
-
-            // All next siblings
-            for &next_idx in children_indices.iter().skip(i + 1) {
-                dom_structure.elements[current_idx]
-                    .possible_next_general
-                    .push((next_idx, SiblingCertainty::Definite));
-            }
-        }
-    }
 }

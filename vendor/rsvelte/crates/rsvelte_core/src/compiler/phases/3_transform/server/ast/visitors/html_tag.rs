@@ -38,16 +38,21 @@ use super::shared::{
 /// Visit a `{@html expr}` tag.
 pub fn visit_html_tag<'a>(tag: &HtmlTag, state: &mut ServerTransformState<'a>) {
     let expr_text = state.expr_source(&tag.expression).map(|s| s.to_string());
-    let blocker_indices: Vec<usize> = expr_text
-        .as_deref()
-        .map(|t| expr_text_blockers(state, t))
-        .unwrap_or_default();
+    let blocker_indices: Vec<usize> =
+        expr_text.as_deref().map(|t| expr_text_blockers(state, t)).unwrap_or_default();
     let has_await = expr_text.as_deref().is_some_and(text_has_await);
 
     // 写经 `is_async()` = `has_await || has_blockers()`.
     if !has_await && blocker_indices.is_empty() {
         // Sync path: interpolate `$.html(expr)` into the surrounding push.
-        let visited = state.visit_expr(&tag.expression);
+        let mut visited = state.visit_expr_claiming(&tag.expression);
+        if let (Some(start), Some(end)) = (tag.expression.start(), tag.expression.end()) {
+            state.place_template_expression_comments(
+                (tag.start + 7, tag.end - 1),
+                (start, end),
+                &mut visited,
+            );
+        }
         let html = state.b.call("$.html", vec![visited]);
         state.template.push(TemplateEntry::Template {
             quasis: vec![String::new(), String::new()],
@@ -59,11 +64,18 @@ pub fn visit_html_tag<'a>(tag: &HtmlTag, state: &mut ServerTransformState<'a>) {
     // Async path. `context.visit(node.expression)` → `$.save`-wrap any inline
     // await when the html-tag is a direct child of an element (the
     // `AwaitExpression` parent-walk gate, mirrored by `in_element_children`).
-    let visited = if has_await && state.in_element_children {
+    let mut visited = if has_await && state.in_element_children {
         save_wrap_expr_text(state, expr_text.as_deref().unwrap_or(""))
     } else {
-        state.visit_expr(&tag.expression)
+        state.visit_expr_claiming(&tag.expression)
     };
+    if let (Some(start), Some(end)) = (tag.expression.start(), tag.expression.end()) {
+        state.place_template_expression_comments(
+            (tag.start + 7, tag.end - 1),
+            (start, end),
+            &mut visited,
+        );
+    }
     let b = state.b;
     let html = b.call("$.html", vec![visited]);
     let push = b.stmt(b.call("$$renderer.push", vec![html]));

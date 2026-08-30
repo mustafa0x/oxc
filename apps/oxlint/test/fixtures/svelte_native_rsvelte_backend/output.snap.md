@@ -21,7 +21,7 @@
    `----
 
 Found 1 warning and 1 error.
-Finished in Xms on 2 files with 95 rules using X threads.
+Finished in Xms on 2 files with 96 rules using X threads.
 ```
 
 # stderr

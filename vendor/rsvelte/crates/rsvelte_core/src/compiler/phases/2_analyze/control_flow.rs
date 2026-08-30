@@ -9,6 +9,63 @@ use super::types::{DomStructure, SiblingCertainty};
 use crate::ast::template::{Attribute, Fragment, TemplateNode};
 use rustc_hash::FxHashMap;
 
+pub fn stylesheet_has_sibling_combinator(stylesheet: &crate::ast::css::StyleSheet) -> bool {
+    let mut pending: Vec<&serde_json::Value> = stylesheet.children.iter().collect();
+    while let Some(value) = pending.pop() {
+        match value {
+            serde_json::Value::Object(object) => {
+                if object.get("type").and_then(serde_json::Value::as_str) == Some("Combinator")
+                    && object
+                        .get("name")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|name| matches!(name, "+" | "~"))
+                {
+                    return true;
+                }
+                pending.extend(object.values());
+            }
+            serde_json::Value::Array(values) => pending.extend(values),
+            _ => {}
+        }
+    }
+    false
+}
+
+pub fn supports_static_sibling_relationships(fragment: &Fragment) -> bool {
+    let mut pending = vec![fragment];
+    while let Some(fragment) = pending.pop() {
+        for node in &fragment.nodes {
+            match node {
+                TemplateNode::RegularElement(element) => pending.push(&element.fragment),
+                TemplateNode::Text(_)
+                | TemplateNode::Comment(_)
+                | TemplateNode::ExpressionTag(_)
+                | TemplateNode::ConstTag(_)
+                | TemplateNode::DebugTag(_) => {}
+                _ => return false,
+            }
+        }
+    }
+    true
+}
+
+/// State carried through one sibling walk.
+struct Walk<'a> {
+    node_to_dom_idx: &'a FxHashMap<NodePtr, usize>,
+    snippets: &'a SnippetSites<'a>,
+    /// Snippets already left through their render sites, so a snippet rendered
+    /// from inside itself terminates.
+    seen: rustc_hash::FxHashSet<NodePtr>,
+    /// Snippets already descended into for edge elements. Upstream keeps this set
+    /// separate: it is shared down a `loop_child` chain but starts empty at each
+    /// nested-sibling call made from the element walk.
+    nested_seen: rustc_hash::FxHashSet<NodePtr>,
+    /// Set when the walk stopped at something it cannot enumerate — a snippet
+    /// whose render sites did not resolve, or a render tag naming no known
+    /// snippet. The result is then a subset of the real siblings.
+    incomplete: bool,
+}
+
 /// Node existence values, mirroring Svelte's NODE_DEFINITELY_EXISTS / NODE_PROBABLY_EXISTS.
 const NODE_DEFINITELY_EXISTS: u8 = 1;
 const NODE_PROBABLY_EXISTS: u8 = 2;
@@ -27,6 +84,21 @@ fn node_ptr(node: &TemplateNode) -> NodePtr {
     node as *const TemplateNode as usize
 }
 
+/// The snippet a `{@render name(...)}` renders, when the callee is a plain name.
+fn render_tag_callee_name(render_tag: &crate::ast::template::RenderTag) -> Option<String> {
+    let expr = render_tag.expression.as_json();
+    let expr = if expr.get("type").and_then(|t| t.as_str()) == Some("ChainExpression") {
+        expr.get("expression").unwrap_or(expr)
+    } else {
+        expr
+    };
+    let callee = expr.get("callee")?;
+    if callee.get("type").and_then(|t| t.as_str()) != Some("Identifier") {
+        return None;
+    }
+    callee.get("name").and_then(|n| n.as_str()).map(String::from)
+}
+
 /// Build sibling relationships for all elements in the DOM structure.
 ///
 /// This function implements the same algorithm as the official Svelte compiler's
@@ -38,41 +110,73 @@ pub fn build_sibling_relationships(dom_structure: &mut DomStructure, root_fragme
     let mut element_paths: FxHashMap<usize, Vec<PathEntry>> = FxHashMap::default();
     let mut dom_idx_counter: usize = 0;
 
+    let mut snippets = SnippetSites::default();
     collect_elements_and_paths(
         root_fragment,
         &mut node_to_dom_idx,
         &mut element_paths,
         &mut dom_idx_counter,
         vec![],
+        &mut snippets,
     );
+    snippets.resolve();
 
     // Second pass: for each element, compute possible siblings using AST walk.
     let num_elements = dom_structure.elements.len();
     for dom_idx in 0..num_elements {
         if let Some(path) = element_paths.get(&dom_idx) {
-            // Find previous siblings (backward direction)
-            let prev_adj =
-                get_possible_element_siblings(path, Direction::Backward, true, &node_to_dom_idx);
-            let prev_gen =
-                get_possible_element_siblings(path, Direction::Backward, false, &node_to_dom_idx);
-
-            // Find next siblings (forward direction)
-            let next_adj =
-                get_possible_element_siblings(path, Direction::Forward, true, &node_to_dom_idx);
-            let next_gen =
-                get_possible_element_siblings(path, Direction::Forward, false, &node_to_dom_idx);
+            let mut incomplete = false;
+            let mut run = |direction, adjacent_only| {
+                let mut walk = Walk {
+                    node_to_dom_idx: &node_to_dom_idx,
+                    snippets: &snippets,
+                    seen: rustc_hash::FxHashSet::default(),
+                    nested_seen: rustc_hash::FxHashSet::default(),
+                    incomplete: false,
+                };
+                let map = get_possible_element_siblings(path, direction, adjacent_only, &mut walk);
+                incomplete |= walk.incomplete;
+                map
+            };
+            let prev_adj = run(Direction::Backward, true);
+            let prev_gen = run(Direction::Backward, false);
+            let next_adj = run(Direction::Forward, true);
+            let next_gen = run(Direction::Forward, false);
 
             // Convert results to the DomStructure format
             dom_structure.elements[dom_idx].possible_prev_adjacent = convert_results(&prev_adj);
             dom_structure.elements[dom_idx].possible_prev_general = convert_results(&prev_gen);
             dom_structure.elements[dom_idx].possible_next_adjacent = convert_results(&next_adj);
             dom_structure.elements[dom_idx].possible_next_general = convert_results(&next_gen);
+            dom_structure.elements[dom_idx].sibling_walk_incomplete = incomplete;
         }
     }
 
     // Third pass: mark elements that are adjacent to opaque boundaries
     // (slots, render tags, components). This is used for :global(X) + Y detection.
     mark_opaque_boundary_adjacency(dom_structure, root_fragment, &node_to_dom_idx);
+}
+
+pub fn build_static_sibling_relationships(dom_structure: &mut DomStructure) {
+    let mut previous_by_parent: FxHashMap<Option<usize>, usize> = FxHashMap::default();
+    for current_idx in 0..dom_structure.elements.len() {
+        let parent_idx = dom_structure.elements[current_idx].parent_idx;
+        if let Some(previous_idx) = previous_by_parent.insert(parent_idx, current_idx) {
+            dom_structure.elements[current_idx]
+                .possible_prev_adjacent
+                .push((previous_idx, SiblingCertainty::Definite));
+            dom_structure.elements[current_idx]
+                .possible_prev_general
+                .push((previous_idx, SiblingCertainty::Definite));
+            dom_structure.elements[previous_idx]
+                .possible_next_adjacent
+                .push((current_idx, SiblingCertainty::Definite));
+            dom_structure.elements[previous_idx]
+                .possible_next_general
+                .push((current_idx, SiblingCertainty::Definite));
+        }
+    }
+    dom_structure.general_siblings_linked = true;
 }
 
 /// Convert results map to Vec of (dom_idx, certainty) pairs.
@@ -95,24 +199,59 @@ fn convert_results(results: &FxHashMap<usize, u8>) -> Vec<(usize, SiblingCertain
 #[derive(Clone)]
 struct PathEntry<'a> {
     /// The fragment containing the node
-    fragment: &'a Fragment,
+    fragment: &'a Fragment<'a>,
     /// The index of the node within the fragment
     index: usize,
 }
 
+/// Where a `{#snippet}` body is rendered from, so the sibling walk can leave it the
+/// way upstream does — through `SnippetBlock.metadata.sites` — instead of stopping.
+#[derive(Default)]
+struct SnippetSites<'a> {
+    /// Declared snippets, by name.
+    decls: FxHashMap<String, &'a TemplateNode<'a>>,
+    /// `{@render name(...)}` call sites and the path each one sits at.
+    calls: Vec<(String, Vec<PathEntry<'a>>)>,
+    /// Resolved: snippet node -> the paths it is rendered at.
+    sites: FxHashMap<NodePtr, Vec<Vec<PathEntry<'a>>>>,
+    /// Resolved: render-tag node -> the snippet nodes it renders.
+    rendered: FxHashMap<NodePtr, Vec<&'a TemplateNode<'a>>>,
+}
+
+impl<'a> SnippetSites<'a> {
+    fn resolve(&mut self) {
+        for (name, path) in std::mem::take(&mut self.calls) {
+            let Some(&snippet) = self.decls.get(&name) else {
+                continue;
+            };
+            if let Some(last) = path.last() {
+                let render_tag = &last.fragment.nodes[last.index];
+                self.rendered.entry(node_ptr(render_tag)).or_default().push(snippet);
+            }
+            self.sites.entry(node_ptr(snippet)).or_default().push(path);
+        }
+    }
+}
+
 /// Collect elements and their paths from the template AST.
 fn collect_elements_and_paths<'a>(
-    fragment: &'a Fragment,
+    fragment: &'a Fragment<'a>,
     node_to_dom_idx: &mut FxHashMap<NodePtr, usize>,
     element_paths: &mut FxHashMap<usize, Vec<PathEntry<'a>>>,
     dom_idx_counter: &mut usize,
     current_path: Vec<PathEntry<'a>>,
+    snippets: &mut SnippetSites<'a>,
 ) {
     for (i, node) in fragment.nodes.iter().enumerate() {
         let mut node_path = current_path.clone();
         node_path.push(PathEntry { fragment, index: i });
 
         match node {
+            TemplateNode::RenderTag(render_tag) => {
+                if let Some(name) = render_tag_callee_name(render_tag) {
+                    snippets.calls.push((name, node_path.clone()));
+                }
+            }
             TemplateNode::RegularElement(element) => {
                 let dom_idx = *dom_idx_counter;
                 *dom_idx_counter += 1;
@@ -126,6 +265,7 @@ fn collect_elements_and_paths<'a>(
                     element_paths,
                     dom_idx_counter,
                     node_path,
+                    snippets,
                 );
             }
             TemplateNode::SvelteElement(element) => {
@@ -141,6 +281,7 @@ fn collect_elements_and_paths<'a>(
                     element_paths,
                     dom_idx_counter,
                     node_path,
+                    snippets,
                 );
             }
             TemplateNode::IfBlock(block) => {
@@ -150,6 +291,7 @@ fn collect_elements_and_paths<'a>(
                     element_paths,
                     dom_idx_counter,
                     node_path.clone(),
+                    snippets,
                 );
                 if let Some(ref alt) = block.alternate {
                     collect_elements_and_paths(
@@ -158,6 +300,7 @@ fn collect_elements_and_paths<'a>(
                         element_paths,
                         dom_idx_counter,
                         node_path,
+                        snippets,
                     );
                 }
             }
@@ -168,6 +311,7 @@ fn collect_elements_and_paths<'a>(
                     element_paths,
                     dom_idx_counter,
                     node_path.clone(),
+                    snippets,
                 );
                 if let Some(ref fallback) = block.fallback {
                     collect_elements_and_paths(
@@ -176,6 +320,7 @@ fn collect_elements_and_paths<'a>(
                         element_paths,
                         dom_idx_counter,
                         node_path,
+                        snippets,
                     );
                 }
             }
@@ -187,6 +332,7 @@ fn collect_elements_and_paths<'a>(
                         element_paths,
                         dom_idx_counter,
                         node_path.clone(),
+                        snippets,
                     );
                 }
                 if let Some(ref then) = block.then {
@@ -196,6 +342,7 @@ fn collect_elements_and_paths<'a>(
                         element_paths,
                         dom_idx_counter,
                         node_path.clone(),
+                        snippets,
                     );
                 }
                 if let Some(ref catch) = block.catch {
@@ -205,6 +352,7 @@ fn collect_elements_and_paths<'a>(
                         element_paths,
                         dom_idx_counter,
                         node_path,
+                        snippets,
                     );
                 }
             }
@@ -215,6 +363,7 @@ fn collect_elements_and_paths<'a>(
                     element_paths,
                     dom_idx_counter,
                     node_path,
+                    snippets,
                 );
             }
             TemplateNode::SlotElement(slot) => {
@@ -224,15 +373,20 @@ fn collect_elements_and_paths<'a>(
                     element_paths,
                     dom_idx_counter,
                     node_path,
+                    snippets,
                 );
             }
             TemplateNode::SnippetBlock(snippet) => {
+                if let Some(name) = snippet.expression.identifier_name() {
+                    snippets.decls.insert(name.to_string(), node);
+                }
                 collect_elements_and_paths(
                     &snippet.body,
                     node_to_dom_idx,
                     element_paths,
                     dom_idx_counter,
                     node_path,
+                    snippets,
                 );
             }
             TemplateNode::Component(comp) => {
@@ -242,6 +396,46 @@ fn collect_elements_and_paths<'a>(
                     element_paths,
                     dom_idx_counter,
                     node_path,
+                    snippets,
+                );
+            }
+            TemplateNode::SvelteComponent(comp) => {
+                collect_elements_and_paths(
+                    &comp.fragment,
+                    node_to_dom_idx,
+                    element_paths,
+                    dom_idx_counter,
+                    node_path,
+                    snippets,
+                );
+            }
+            // Wrapper elements the analysis visitor descends into when assigning
+            // `dom_idx`; skipping them here desyncs the two counters and shifts
+            // every later element's sibling data.
+            TemplateNode::SvelteSelf(elem)
+            | TemplateNode::SvelteHead(elem)
+            | TemplateNode::SvelteFragment(elem)
+            | TemplateNode::SvelteBoundary(elem)
+            | TemplateNode::SvelteBody(elem)
+            | TemplateNode::SvelteWindow(elem)
+            | TemplateNode::SvelteDocument(elem) => {
+                collect_elements_and_paths(
+                    &elem.fragment,
+                    node_to_dom_idx,
+                    element_paths,
+                    dom_idx_counter,
+                    node_path,
+                    snippets,
+                );
+            }
+            TemplateNode::TitleElement(title) => {
+                collect_elements_and_paths(
+                    &title.fragment,
+                    node_to_dom_idx,
+                    element_paths,
+                    dom_idx_counter,
+                    node_path,
+                    snippets,
                 );
             }
             _ => {
@@ -258,7 +452,7 @@ fn get_possible_element_siblings(
     path: &[PathEntry],
     direction: Direction,
     adjacent_only: bool,
-    node_to_dom_idx: &FxHashMap<NodePtr, usize>,
+    walk: &mut Walk,
 ) -> FxHashMap<usize, u8> {
     let mut result: FxHashMap<usize, u8> = FxHashMap::default();
 
@@ -305,7 +499,7 @@ fn get_possible_element_siblings(
                     });
 
                     if !has_slot_attr
-                        && let Some(&dom_idx) = node_to_dom_idx.get(&node_ptr(sibling))
+                        && let Some(&dom_idx) = walk.node_to_dom_idx.get(&node_ptr(sibling))
                     {
                         add_to_map_entry(&mut result, dom_idx, NODE_DEFINITELY_EXISTS);
                         if adjacent_only {
@@ -316,7 +510,7 @@ fn get_possible_element_siblings(
                 }
 
                 TemplateNode::SvelteElement(_) => {
-                    if let Some(&dom_idx) = node_to_dom_idx.get(&node_ptr(sibling)) {
+                    if let Some(&dom_idx) = walk.node_to_dom_idx.get(&node_ptr(sibling)) {
                         add_to_map_entry(&mut result, dom_idx, NODE_PROBABLY_EXISTS);
                     }
                     // svelte:element might not render, so don't return for adjacent_only
@@ -324,21 +518,17 @@ fn get_possible_element_siblings(
 
                 _ if is_block(sibling) || matches!(sibling, TemplateNode::Component(_)) => {
                     // For SlotElement and Component, they produce opaque content
-                    if matches!(
-                        sibling,
-                        TemplateNode::SlotElement(_) | TemplateNode::Component(_)
-                    ) {
+                    if matches!(sibling, TemplateNode::SlotElement(_) | TemplateNode::Component(_))
+                    {
                         // The official compiler adds the node itself to the result map
                         // as NODE_PROBABLY_EXISTS. We can't do that directly since we
                         // only track element dom_idx. Instead, we just collect nested children.
                     }
 
-                    let nested = get_possible_nested_siblings(
-                        sibling,
-                        direction,
-                        adjacent_only,
-                        node_to_dom_idx,
-                    );
+                    let saved = std::mem::take(&mut walk.nested_seen);
+                    let nested =
+                        get_possible_nested_siblings(sibling, direction, adjacent_only, walk);
+                    walk.nested_seen = saved;
                     add_to_map(&nested, &mut result);
 
                     if adjacent_only
@@ -350,9 +540,22 @@ fn get_possible_element_siblings(
                 }
 
                 TemplateNode::RenderTag(_) => {
-                    // Render tags produce opaque content. In the official compiler,
-                    // this would add the RenderTag node as NODE_PROBABLY_EXISTS and
-                    // also look at snippet bodies. We handle this via has_opaque_sibling_boundaries.
+                    match walk.snippets.rendered.get(&node_ptr(sibling)) {
+                        Some(snippet_nodes) => {
+                            let saved = std::mem::take(&mut walk.nested_seen);
+                            for snippet in snippet_nodes.clone() {
+                                let nested = get_possible_nested_siblings(
+                                    snippet,
+                                    direction,
+                                    adjacent_only,
+                                    walk,
+                                );
+                                add_to_map(&nested, &mut result);
+                            }
+                            walk.nested_seen = saved;
+                        }
+                        None => walk.incomplete = true,
+                    }
                 }
 
                 _ => {
@@ -381,9 +584,27 @@ fn get_possible_element_siblings(
             continue;
         }
 
-        // If parent is a SnippetBlock, we'd need to look at its call sites.
-        // For now, just stop.
+        // Upstream leaves a snippet body through `SnippetBlock.metadata.sites`, so the
+        // element's real siblings are the ones around each `{@render}` of it.
         if matches!(parent_node, TemplateNode::SnippetBlock(_)) {
+            if !walk.seen.insert(node_ptr(parent_node)) {
+                break;
+            }
+            match walk.snippets.sites.get(&node_ptr(parent_node)) {
+                Some(sites) => {
+                    let single = sites.len() == 1;
+                    for site in sites.clone() {
+                        let siblings =
+                            get_possible_element_siblings(&site, direction, adjacent_only, walk);
+                        let definite = has_definite_elements(&siblings);
+                        add_to_map(&siblings, &mut result);
+                        if adjacent_only && single && definite {
+                            return result;
+                        }
+                    }
+                }
+                None => walk.incomplete = true,
+            }
             break;
         }
 
@@ -397,12 +618,10 @@ fn get_possible_element_siblings(
         if let TemplateNode::EachBlock(each) = parent_node {
             let in_body = std::ptr::eq(entry.fragment, &each.body);
             if in_body {
-                let wrap_siblings = get_possible_nested_siblings(
-                    parent_node,
-                    direction,
-                    adjacent_only,
-                    node_to_dom_idx,
-                );
+                let saved = std::mem::take(&mut walk.nested_seen);
+                let wrap_siblings =
+                    get_possible_nested_siblings(parent_node, direction, adjacent_only, walk);
+                walk.nested_seen = saved;
                 add_to_map(&wrap_siblings, &mut result);
             }
         }
@@ -420,7 +639,7 @@ fn get_possible_nested_siblings(
     node: &TemplateNode,
     direction: Direction,
     adjacent_only: bool,
-    node_to_dom_idx: &FxHashMap<NodePtr, usize>,
+    walk: &mut Walk,
 ) -> FxHashMap<usize, u8> {
     let mut fragments: Vec<Option<&Fragment>> = Vec::new();
 
@@ -445,6 +664,9 @@ fn get_possible_nested_siblings(
             fragments.push(Some(&slot.fragment));
         }
         TemplateNode::SnippetBlock(snippet) => {
+            if !walk.nested_seen.insert(node_ptr(node)) {
+                return FxHashMap::default();
+            }
             fragments.push(Some(&snippet.body));
         }
         TemplateNode::Component(comp) => {
@@ -460,10 +682,8 @@ fn get_possible_nested_siblings(
     }
 
     let mut result: FxHashMap<usize, u8> = FxHashMap::default();
-    let mut exhaustive = !matches!(
-        node,
-        TemplateNode::SlotElement(_) | TemplateNode::SnippetBlock(_)
-    );
+    let mut exhaustive =
+        !matches!(node, TemplateNode::SlotElement(_) | TemplateNode::SnippetBlock(_));
 
     for fragment_opt in &fragments {
         match fragment_opt {
@@ -471,7 +691,7 @@ fn get_possible_nested_siblings(
                 exhaustive = false;
             }
             Some(fragment) => {
-                let map = loop_child(&fragment.nodes, direction, adjacent_only, node_to_dom_idx);
+                let map = loop_child(&fragment.nodes, direction, adjacent_only, walk);
                 exhaustive = exhaustive && has_definite_elements(&map);
                 add_to_map(&map, &mut result);
             }
@@ -495,7 +715,7 @@ fn loop_child(
     children: &[TemplateNode],
     direction: Direction,
     adjacent_only: bool,
-    node_to_dom_idx: &FxHashMap<NodePtr, usize>,
+    walk: &mut Walk,
 ) -> FxHashMap<usize, u8> {
     let mut result: FxHashMap<usize, u8> = FxHashMap::default();
 
@@ -510,7 +730,7 @@ fn loop_child(
 
         match child {
             TemplateNode::RegularElement(_) => {
-                if let Some(&dom_idx) = node_to_dom_idx.get(&node_ptr(child)) {
+                if let Some(&dom_idx) = walk.node_to_dom_idx.get(&node_ptr(child)) {
                     add_to_map_entry(&mut result, dom_idx, NODE_DEFINITELY_EXISTS);
                     if adjacent_only {
                         break;
@@ -518,18 +738,24 @@ fn loop_child(
                 }
             }
             TemplateNode::SvelteElement(_) => {
-                if let Some(&dom_idx) = node_to_dom_idx.get(&node_ptr(child)) {
+                if let Some(&dom_idx) = walk.node_to_dom_idx.get(&node_ptr(child)) {
                     add_to_map_entry(&mut result, dom_idx, NODE_PROBABLY_EXISTS);
                 }
                 // Don't break - svelte:element might not render
             }
-            TemplateNode::RenderTag(_) => {
-                // Render tags produce opaque content
-                // In the official compiler, this would look at snippet bodies
-            }
+            TemplateNode::RenderTag(_) => match walk.snippets.rendered.get(&node_ptr(child)) {
+                Some(snippet_nodes) => {
+                    for snippet in snippet_nodes.clone() {
+                        let nested =
+                            get_possible_nested_siblings(snippet, direction, adjacent_only, walk);
+                        add_to_map(&nested, &mut result);
+                    }
+                }
+                None => walk.incomplete = true,
+            },
             _ if is_block(child) => {
                 let child_result =
-                    get_possible_nested_siblings(child, direction, adjacent_only, node_to_dom_idx);
+                    get_possible_nested_siblings(child, direction, adjacent_only, walk);
                 add_to_map(&child_result, &mut result);
                 if adjacent_only && has_definite_elements(&child_result) {
                     break;
@@ -677,6 +903,21 @@ fn mark_opaque_in_fragment(
             }
             TemplateNode::Component(comp) => {
                 mark_opaque_in_fragment(dom_structure, &comp.fragment, node_to_dom_idx);
+            }
+            TemplateNode::SvelteComponent(comp) => {
+                mark_opaque_in_fragment(dom_structure, &comp.fragment, node_to_dom_idx);
+            }
+            TemplateNode::SvelteSelf(elem)
+            | TemplateNode::SvelteHead(elem)
+            | TemplateNode::SvelteFragment(elem)
+            | TemplateNode::SvelteBoundary(elem)
+            | TemplateNode::SvelteBody(elem)
+            | TemplateNode::SvelteWindow(elem)
+            | TemplateNode::SvelteDocument(elem) => {
+                mark_opaque_in_fragment(dom_structure, &elem.fragment, node_to_dom_idx);
+            }
+            TemplateNode::TitleElement(title) => {
+                mark_opaque_in_fragment(dom_structure, &title.fragment, node_to_dom_idx);
             }
             _ => {}
         }

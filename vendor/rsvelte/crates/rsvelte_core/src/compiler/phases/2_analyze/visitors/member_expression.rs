@@ -11,32 +11,20 @@ use crate::compiler::phases::phase2_analyze::{AnalysisError, BindingKind, errors
 
 /// Visit a member expression (typed JsNode path).
 pub fn visit_typed(node: &JsNode, context: &mut VisitorContext) -> Result<(), AnalysisError> {
-    if let JsNode::MemberExpression {
-        object,
-        property,
-        computed,
-        ..
-    } = node
-    {
+    if let JsNode::MemberExpression { object, property, computed, .. } = node {
         let arena = context.parse_arena;
         let obj_node = arena.get_js_node(*object);
         let prop_node = arena.get_js_node(*property);
 
         // Check for illegal $$-prefixed property access on rest_prop bindings
         if let JsNode::Identifier { name: obj_name, .. } = obj_node
-            && let JsNode::Identifier {
-                name: prop_name, ..
-            } = prop_node
-            && let Some(&binding_idx) = context
-                .analysis
-                .root
-                .scope
-                .declarations
-                .get(obj_name.as_str())
+            && let JsNode::Identifier { name: prop_name, start, end, .. } = prop_node
+            && let Some(&binding_idx) =
+                context.analysis.root.scope.declarations.get(obj_name.as_str())
         {
             let binding = &context.analysis.root.bindings[binding_idx];
             if binding.kind == BindingKind::RestProp && prop_name.starts_with("$$") {
-                return Err(errors::props_illegal_name());
+                return Err(errors::props_illegal_name().at(*start, *end));
             }
         }
 

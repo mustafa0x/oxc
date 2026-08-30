@@ -64,7 +64,9 @@ use oxc_ast::ast::*;
 use oxc_ast_visit::{Visit, walk};
 use oxc_parser::ParseOptions;
 use oxc_semantic::{Semantic, SemanticBuilder};
-use oxc_span::SourceType;
+use oxc_span::{GetSpan, SourceType};
+
+use crate::compiler::phases::phase3_transform::shared::js_scan::contains_identifier;
 use rustc_hash::FxHashSet;
 
 use super::ast_rewrite;
@@ -77,10 +79,25 @@ thread_local! {
 /// AST-based rewrite of bare prop-var reads to prop-getter calls.
 /// See module docs for the full mapping table and `None`-return
 /// rationale.
+/// Which JavaScript goal symbol `source` is written against.
+///
+/// A leading `{` means opposite things in the two: an object literal under
+/// [`Expression`](ParseGoal::Expression), a block statement under
+/// [`Statements`](ParseGoal::Statements). Only the caller knows which it handed
+/// over, so it says rather than the pass guessing from the first byte.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ParseGoal {
+    /// A statement list — the instance script, or one statement out of it.
+    Statements,
+    /// A standalone expression, such as a prop's default value.
+    Expression,
+}
+
 pub fn wrap_prop_source_reads_ast(
     source: &str,
     prop_vars: &[String],
     non_bindable_prop_vars: &[String],
+    goal: ParseGoal,
 ) -> Option<String> {
     if prop_vars.is_empty() {
         return None;
@@ -93,12 +110,9 @@ pub fn wrap_prop_source_reads_ast(
     {
         return None;
     }
-    // Fast probe — bail unless at least one prop var actually
-    // appears in the source.
-    if !prop_vars
-        .iter()
-        .any(|v| memchr::memmem::find(source.as_bytes(), v.as_bytes()).is_some())
-    {
+    // Fast probe — bail unless at least one prop var appears as a
+    // whole identifier token.
+    if !prop_vars.iter().any(|v| contains_identifier(source, v)) {
         return None;
     }
 
@@ -107,7 +121,7 @@ pub fn wrap_prop_source_reads_ast(
     // BlockStatement, so shorthand properties would be invisible
     // to the AST. Wrap with `(...)` to force expression context
     // and adjust span offsets when applying replacements.
-    let needs_paren_wrap = source.trim_start().starts_with('{');
+    let needs_paren_wrap = goal == ParseGoal::Expression && source.trim_start().starts_with('{');
     let leading_ws = source.len() - source.trim_start().len();
     let parse_source: std::borrow::Cow<str> = if needs_paren_wrap {
         // Insert `(` after the leading whitespace and append `)`
@@ -130,13 +144,19 @@ pub fn wrap_prop_source_reads_ast(
     ast_rewrite::with_program(
         &PROP_READ_ALLOC,
         &parse_source,
-        SourceType::mjs(),
-        ParseOptions {
-            allow_return_outside_function: true,
-            ..ParseOptions::default()
-        },
+        // Reactive statements from a `<script lang="ts">` reach this pass before
+        // type erasure. TypeScript is a superset of the JavaScript accepted here,
+        // so use the TS-aware parser for both: otherwise one annotation anywhere
+        // in a block makes the whole scope-aware rewrite fail and sends prop reads
+        // through the heuristic text fallback.
+        SourceType::mjs().with_typescript(true),
+        ParseOptions { allow_return_outside_function: true, ..ParseOptions::default() },
         |program| {
-            let semantic_ret = SemanticBuilder::new().with_build_nodes(true).build(program);
+            let semantic_ret = super::super::profile::semantic_build(
+                super::super::profile::SEM_PROP_SOURCE_READS,
+                program.source_text.len(),
+                || SemanticBuilder::new().with_build_nodes(true).build(program),
+            );
             let semantic = &semantic_ret.semantic;
 
             let mut collector = PropReadCollector {
@@ -175,6 +195,67 @@ pub fn wrap_prop_source_reads_ast(
     )
 }
 
+/// Rewrite prop reads in the fourth argument of generated `$.prop` calls.
+///
+/// Export-let lowering creates these calls before ordinary prop-source reads
+/// run, so they need their own AST pass. Keeping the call and argument spans
+/// from OXC avoids treating commas, templates, comments, or regexes as
+/// delimiters.
+pub fn wrap_prop_reads_in_defaults_ast(source: &str, prop_vars: &[String]) -> Option<String> {
+    if prop_vars.is_empty() || !source.contains("$.prop(") {
+        return None;
+    }
+
+    ast_rewrite::with_program(
+        &PROP_READ_ALLOC,
+        source,
+        SourceType::mjs(),
+        ParseOptions::default(),
+        |program| {
+            let mut collector =
+                PropDefaultCollector { source, prop_vars, replacements: Vec::new() };
+            collector.visit_program(program);
+            ast_rewrite::splice(source, collector.replacements, false)
+                .or_else(|| Some(source.to_string()))
+        },
+    )
+}
+
+struct PropDefaultCollector<'a> {
+    source: &'a str,
+    prop_vars: &'a [String],
+    replacements: Vec<ast_rewrite::Edit>,
+}
+
+impl<'a, 'ast> Visit<'ast> for PropDefaultCollector<'a> {
+    fn visit_call_expression(&mut self, call: &CallExpression<'ast>) {
+        if let Expression::StaticMemberExpression(member) = &call.callee
+            && let Expression::Identifier(object) = &member.object
+            && object.name == "$"
+            && member.property.name == "prop"
+            && let Some(default) = call.arguments.get(3)
+        {
+            let span = default.span();
+            let default_source = &self.source[span.start as usize..span.end as usize];
+            let is_bare_prop = matches!(default, Argument::Identifier(id)
+                if self.prop_vars.iter().any(|prop| prop == id.name.as_str()));
+            if !is_bare_prop {
+                let rewritten = wrap_prop_source_reads_ast(
+                    default_source,
+                    self.prop_vars,
+                    &[],
+                    ParseGoal::Expression,
+                )
+                .unwrap_or_else(|| default_source.to_string());
+                if rewritten != default_source {
+                    self.replacements.push((span.start, span.end, rewritten));
+                }
+            }
+        }
+        walk::walk_call_expression(self, call);
+    }
+}
+
 struct PropReadCollector<'a, 'sem> {
     semantic: &'sem Semantic<'sem>,
     prop_vars: &'a [String],
@@ -196,11 +277,7 @@ impl<'a, 'sem> PropReadCollector<'a, 'sem> {
     }
 
     fn is_bindable_prop_var(&self, name: &str) -> bool {
-        self.is_prop_var(name)
-            && !self
-                .non_bindable_prop_vars
-                .iter()
-                .any(|v| v.as_str() == name)
+        self.is_prop_var(name) && !self.non_bindable_prop_vars.iter().any(|v| v.as_str() == name)
     }
 
     /// Mark this identifier as "do not wrap me" — used by parent
@@ -227,8 +304,7 @@ impl<'a, 'sem, 'ast> Visit<'ast> for PropReadCollector<'a, 'sem> {
             return;
         }
         let name = ident.name.as_str();
-        self.replacements
-            .push((ident.span.start, ident.span.end, format!("{}()", name)));
+        self.replacements.push((ident.span.start, ident.span.end, format!("{}()", name)));
     }
 
     fn visit_object_property(&mut self, prop: &ObjectProperty<'ast>) {
@@ -345,6 +421,45 @@ mod tests {
         names.iter().map(|s| s.to_string()).collect()
     }
 
+    /// The cases below are all expression fragments, so they share the goal
+    /// their callers declare rather than repeating it.
+    fn wrap_prop_source_reads_ast(
+        source: &str,
+        prop_vars: &[String],
+        non_bindable_prop_vars: &[String],
+    ) -> Option<String> {
+        super::wrap_prop_source_reads_ast(
+            source,
+            prop_vars,
+            non_bindable_prop_vars,
+            ParseGoal::Expression,
+        )
+    }
+
+    #[test]
+    fn a_bare_block_under_the_statement_goal_is_not_an_object_literal() {
+        assert_eq!(
+            super::wrap_prop_source_reads_ast(
+                "{ out = count; }",
+                &ssv(&["count"]),
+                &[],
+                ParseGoal::Statements,
+            ),
+            Some("{ out = count(); }".to_string())
+        );
+        // The same text under the expression goal is the object literal the
+        // default-value callers hand over, and does not parse.
+        assert_eq!(
+            super::wrap_prop_source_reads_ast(
+                "{ out = count; }",
+                &ssv(&["count"]),
+                &[],
+                ParseGoal::Expression,
+            ),
+            None
+        );
+    }
+
     /// "Nothing to wrap" (parse succeeded, no replacements) now returns the
     /// source UNCHANGED — `None` is reserved for parse failure / early bail.
     /// This asserts that "skip" outcome.
@@ -362,6 +477,15 @@ mod tests {
     fn wraps_in_expression() {
         let out = wrap_prop_source_reads_ast("let x = count + 1;", &ssv(&["count"]), &[]).unwrap();
         assert_eq!(out, "let x = count() + 1;");
+    }
+
+    #[test]
+    fn wraps_a_prop_read_in_a_typescript_statement_block() {
+        let src = "{ if (tab) { values.forEach((value: Item) => consume(value)); } }";
+        let out =
+            super::wrap_prop_source_reads_ast(src, &ssv(&["tab"]), &[], ParseGoal::Statements)
+                .unwrap();
+        assert_eq!(out, "{ if (tab()) { values.forEach((value: Item) => consume(value)); } }");
     }
 
     #[test]

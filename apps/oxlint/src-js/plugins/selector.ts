@@ -1,5 +1,5 @@
 import esquery from "esquery";
-import { getCurrentVisitorKeys, getVisitorKeysForNode } from "./source_code.ts";
+import visitorKeys from "../generated/keys.ts";
 import {
   STATEMENT_NODE_TYPE_IDS,
   DECLARATION_NODE_TYPE_IDS,
@@ -35,11 +35,10 @@ if (DEBUG) {
 // Options to call `esquery.matches` with.
 const ESQUERY_OPTIONS: ESQueryOptions = {
   nodeTypeKey: "type",
-  get visitorKeys() {
-    return getCurrentVisitorKeys();
-  },
+  visitorKeys,
   fallback(node: EsqueryNode) {
-    return [...getVisitorKeysForNode(node as unknown as Record<string, unknown> & { type: string })];
+    // Our visitor keys should cover all AST node types
+    throw new Error(`Unknown node type: ${node.type}`);
   },
   matchClass: matchesSelectorClass,
 };

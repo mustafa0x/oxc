@@ -4,8 +4,6 @@
 //!
 //! Corresponds to Svelte's `2-analyze/visitors/EachBlock.js`.
 
-use indexmap::IndexSet;
-
 use super::super::{AnalysisError, Binding, BindingKind, errors};
 use super::shared::fragment;
 use super::shared::utils::{
@@ -21,7 +19,10 @@ use crate::ast::template::{EachBlock, TemplateNode};
 /// special dependency tracking for reactivity.
 ///
 /// Corresponds to `EachBlock(node, context)` in EachBlock.js.
-pub fn visit(block: &mut EachBlock, context: &mut VisitorContext) -> Result<(), AnalysisError> {
+pub fn visit<'a, 'b: 'a>(
+    block: &mut EachBlock<'b>,
+    context: &mut VisitorContext<'a>,
+) -> Result<(), AnalysisError> {
     // Check if inside a textarea (logic blocks not allowed)
     if context.element_ancestors.iter().any(|a| a == "textarea") {
         return Err(errors::block_invalid_placement("{#each ...}"));
@@ -44,7 +45,9 @@ pub fn visit(block: &mut EachBlock, context: &mut VisitorContext) -> Result<(), 
         if let Some(name) = context_expr.identifier_name()
             && (name == "$state" || name == "$derived")
         {
-            return Err(super::super::errors::state_invalid_placement(name));
+            return Err(
+                super::super::errors::state_invalid_placement(name).at(block.start, block.end)
+            );
         }
     }
 
@@ -69,7 +72,11 @@ pub fn visit(block: &mut EachBlock, context: &mut VisitorContext) -> Result<(), 
 
     // If keyed but no context, error
     if is_keyed && block.context.is_none() {
-        return Err(errors::each_key_without_as());
+        let key = block.key.as_ref().expect("keyed blocks have a key");
+        return Err(errors::each_key_without_as().at(
+            key.as_node().start().expect("parsed expressions have a start"),
+            key.as_node().end().expect("parsed expressions have an end"),
+        ));
     }
 
     // Visit the expression in parent scope
@@ -95,6 +102,7 @@ pub fn visit(block: &mut EachBlock, context: &mut VisitorContext) -> Result<(), 
 
     // Increment block depth for child analysis
     context.block_depth += 1;
+    context.svelte_self_parent_depth += 1;
 
     // Count non-empty children for animate: validation
     let child_count = block
@@ -111,22 +119,19 @@ pub fn visit(block: &mut EachBlock, context: &mut VisitorContext) -> Result<(), 
         .count();
 
     // Push EachBlock context for animate: validation
-    context.each_block_stack.push(Some(EachBlockContext {
-        has_key: block.key.is_some(),
-        child_count,
-    }));
+    context
+        .each_block_stack
+        .push(Some(EachBlockContext { has_key: block.key.is_some(), child_count }));
 
-    // Clear is_direct_child_of_component since children of control flow blocks
+    // Clear direct_component_parent since children of control flow blocks
     // are not direct children of a component
-    let was_direct_child = context.is_direct_child_of_component;
+    let was_direct_child = context.direct_component_parent;
     let was_direct_snippet = context.is_direct_child_of_snippet;
-    context.is_direct_child_of_component = false;
+    context.direct_component_parent = super::DirectComponentParent::None;
     context.is_direct_child_of_snippet = false;
 
     // Push fragment owner type for const_tag placement validation
-    context
-        .fragment_owner_stack
-        .push(super::FragmentOwnerType::EachBlock);
+    context.fragment_owner_stack.push(super::FragmentOwnerType::EachBlock);
 
     // Update context.scope to the each block's scope for proper scope chain lookup
     // This is critical: identifiers inside the each block body need to resolve
@@ -134,6 +139,17 @@ pub fn visit(block: &mut EachBlock, context: &mut VisitorContext) -> Result<(), 
     let old_scope = context.scope;
     if let Some(&each_scope) = context.analysis.root.template_scope_map.get(&block.start) {
         context.scope = each_scope;
+    }
+
+    // The key is evaluated in the each scope, so item/index references resolve
+    // there. Keep its metadata separate from the collection expression: key
+    // dependencies must not make the each item itself reactive, but the normal
+    // expression walk is still required for calls, rune validation and
+    // `needs_context`.
+    if let Some(key) = &block.key {
+        let key_node = key.as_node();
+        let mut key_metadata = crate::ast::template::ExpressionMetadata::default();
+        walk_js_expression_node(&key_node, context, &mut key_metadata)?;
     }
 
     // Walk the context pattern's default values so that identifiers in defaults
@@ -151,13 +167,23 @@ pub fn visit(block: &mut EachBlock, context: &mut VisitorContext) -> Result<(), 
     // Visit the body and fallback
     fragment::analyze(&mut block.body, context)?;
 
+    // The fallback gets its own child scope (upstream visits it as a `Fragment`
+    // while the body's nodes are walked with the each scope), but upstream's
+    // `animate:` rule reads the parent's key and BODY child count for a fallback
+    // element too — so the frame stays pushed across it.
+    if let Some(ref mut fallback) = block.fallback {
+        let body_scope = context.scope;
+        if let Some(&fallback_scope) =
+            context.analysis.root.each_fallback_scope_map.get(&block.start)
+        {
+            context.scope = fallback_scope;
+        }
+        fragment::analyze(fallback, context)?;
+        context.scope = body_scope;
+    }
+
     // Pop EachBlock context
     context.each_block_stack.pop();
-
-    // Fallback is still in the each block's scope (same scope as body)
-    if let Some(ref mut fallback) = block.fallback {
-        fragment::analyze(fallback, context)?;
-    }
 
     // Restore scope
     context.scope = old_scope;
@@ -165,24 +191,13 @@ pub fn visit(block: &mut EachBlock, context: &mut VisitorContext) -> Result<(), 
     // Pop fragment owner type
     context.fragment_owner_stack.pop();
 
-    // Restore is_direct_child_of_component
-    context.is_direct_child_of_component = was_direct_child;
+    // Restore direct_component_parent
+    context.direct_component_parent = was_direct_child;
     context.is_direct_child_of_snippet = was_direct_snippet;
-
-    // Visit the key expression if present
-    // IMPORTANT: Use a separate metadata for the key expression, NOT block.metadata.expression.
-    // In the official Svelte compiler, the key is visited without the expression metadata context,
-    // so its dependencies are NOT added to node.metadata.expression.dependencies.
-    // Adding key dependencies to expression metadata would incorrectly set EACH_ITEM_REACTIVE
-    // in cases where the iterable has no external dependencies but the key does.
-    if let Some(key) = &block.key {
-        let key_node = key.as_node();
-        let mut key_metadata = crate::ast::template::ExpressionMetadata::default();
-        walk_js_expression_node(&key_node, context, &mut key_metadata)?;
-    }
 
     // Decrement block depth
     context.block_depth -= 1;
+    context.svelte_self_parent_depth -= 1;
 
     // In Svelte 4 (non-runes mode), handle legacy reactivity
     // Reference: svelte/packages/svelte/src/compiler/phases/2-analyze/visitors/EachBlock.js L47-76
@@ -231,10 +246,9 @@ pub fn visit(block: &mut EachBlock, context: &mut VisitorContext) -> Result<(), 
 /// in default values are properly counted as references. For example, in
 /// `{#each array as { a = default_value_1 }}`, the `default_value_1` identifier
 /// needs to be visited to count as a reference to the outer-scope binding.
-/// Typed-AST equivalent of `walk_pattern_defaults`. Walks the pattern via
-/// arena children and materializes only the default-expression subtrees
-/// (the AssignmentPattern right sides), which is cheaper than the JSON-walk
-/// path for the common no-defaults case.
+/// Walks the pattern via arena children and materializes only the
+/// default-expression subtrees (the AssignmentPattern right sides), which is
+/// cheap for the common no-defaults case.
 fn walk_pattern_defaults_typed(
     pattern: &crate::ast::typed_expr::JsNode,
     arena: &crate::ast::arena::ParseArena,
@@ -268,60 +282,6 @@ fn walk_pattern_defaults_typed(
         }
         JsNode::RestElement { argument, .. } => {
             walk_pattern_defaults_typed(arena.get_js_node(*argument), arena, context)?;
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-fn walk_pattern_defaults(
-    pattern: &serde_json::Value,
-    context: &mut VisitorContext,
-) -> Result<(), AnalysisError> {
-    let pattern_type = pattern.get("type").and_then(|t| t.as_str());
-    match pattern_type {
-        Some("AssignmentPattern") => {
-            // Walk the left side for nested patterns
-            if let Some(left) = pattern.get("left") {
-                walk_pattern_defaults(left, context)?;
-            }
-            // Walk the default value expression using a lightweight reference-only walker.
-            // We must NOT use walk_js_node here because that would trigger MemberExpression
-            // and CallExpression visitors which incorrectly set needs_context = true.
-            // The official Svelte's EachBlock visitor does NOT visit the context pattern
-            // during analysis — it only visits node.expression, node.body, node.key, and
-            // node.fallback. We only need to count identifier references for the defaults.
-            if let Some(right) = pattern.get("right") {
-                walk_expression_refs_only(right, context);
-            }
-        }
-        Some("ObjectPattern") => {
-            if let Some(properties) = pattern.get("properties").and_then(|p| p.as_array()) {
-                for prop in properties {
-                    let prop_type = prop.get("type").and_then(|t| t.as_str());
-                    if prop_type == Some("RestElement") {
-                        if let Some(argument) = prop.get("argument") {
-                            walk_pattern_defaults(argument, context)?;
-                        }
-                    } else if let Some(value) = prop.get("value") {
-                        walk_pattern_defaults(value, context)?;
-                    }
-                }
-            }
-        }
-        Some("ArrayPattern") => {
-            if let Some(elements) = pattern.get("elements").and_then(|e| e.as_array()) {
-                for elem in elements {
-                    if !elem.is_null() {
-                        walk_pattern_defaults(elem, context)?;
-                    }
-                }
-            }
-        }
-        Some("RestElement") => {
-            if let Some(argument) = pattern.get("argument") {
-                walk_pattern_defaults(argument, context)?;
-            }
         }
         _ => {}
     }
@@ -388,54 +348,6 @@ fn walk_expression_children_refs_only(node: &serde_json::Value, context: &mut Vi
     }
 }
 
-/// Extract identifier names from a destructuring pattern.
-///
-/// Corresponds to `extract_identifiers` in utils/ast.js.
-fn extract_identifiers_from_pattern(node: &serde_json::Value, names: &mut Vec<String>) {
-    let node_type = node.get("type").and_then(|t| t.as_str());
-    match node_type {
-        Some("Identifier") => {
-            if let Some(name) = node.get("name").and_then(|n| n.as_str()) {
-                names.push(name.to_string());
-            }
-        }
-        Some("ObjectPattern") => {
-            if let Some(props) = node.get("properties").and_then(|p| p.as_array()) {
-                for prop in props {
-                    let prop_type = prop.get("type").and_then(|t| t.as_str());
-                    if prop_type == Some("RestElement") {
-                        if let Some(arg) = prop.get("argument") {
-                            extract_identifiers_from_pattern(arg, names);
-                        }
-                    } else if let Some(value) = prop.get("value") {
-                        extract_identifiers_from_pattern(value, names);
-                    }
-                }
-            }
-        }
-        Some("ArrayPattern") => {
-            if let Some(elements) = node.get("elements").and_then(|e| e.as_array()) {
-                for elem in elements {
-                    if !elem.is_null() {
-                        extract_identifiers_from_pattern(elem, names);
-                    }
-                }
-            }
-        }
-        Some("AssignmentPattern") => {
-            if let Some(left) = node.get("left") {
-                extract_identifiers_from_pattern(left, names);
-            }
-        }
-        Some("RestElement") => {
-            if let Some(arg) = node.get("argument") {
-                extract_identifiers_from_pattern(arg, names);
-            }
-        }
-        _ => {}
-    }
-}
-
 /// Collect transitive dependencies for legacy reactivity.
 ///
 /// This function recursively collects all dependencies of a binding,
@@ -445,7 +357,7 @@ fn extract_identifiers_from_pattern(node: &serde_json::Value, names: &mut Vec<St
 fn collect_transitive_dependencies_impl(
     binding_idx: usize,
     bindings: &[Binding],
-    deps: &mut IndexSet<usize>,
+    deps: &mut crate::ast::template::BindingIndexSet,
 ) {
     if deps.contains(&binding_idx) {
         return;
@@ -461,12 +373,4 @@ fn collect_transitive_dependencies_impl(
             collect_transitive_dependencies_impl(dep_idx, bindings, deps);
         }
     }
-}
-
-/// Alias for visit function.
-pub fn visit_each_block(
-    block: &mut EachBlock,
-    context: &mut VisitorContext,
-) -> Result<(), AnalysisError> {
-    visit(block, context)
 }

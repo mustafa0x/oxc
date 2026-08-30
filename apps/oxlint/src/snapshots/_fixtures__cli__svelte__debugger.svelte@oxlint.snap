@@ -15,7 +15,17 @@ working directory:
    `----
   help: Remove the debugger statement
 
-Found 1 warning and 0 errors.
+  ! eslint(no-unused-vars): Variable 'name2' is declared but never used. Unused variables should start with a '_'.
+    ,-[fixtures/cli/svelte/debugger.svelte:20:6]
+ 19 |     // don't do this. it will run before the previous line
+ 20 |     let name2 = name;
+    :         ^^|^^
+    :           `-- 'name2' is declared here
+ 21 | </script>
+    `----
+  help: Consider removing this declaration.
+
+Found 2 warnings and 0 errors.
 Finished in <variable>ms on 1 file with 96 rules using 1 threads.
 ----------
 CLI result: LintSucceeded

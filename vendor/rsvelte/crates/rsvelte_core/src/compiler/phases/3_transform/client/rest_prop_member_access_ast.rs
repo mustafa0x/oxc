@@ -123,8 +123,7 @@ impl<'a, 'ast> Visit<'ast> for RestPropCollector<'a> {
         if let Expression::Identifier(id) = &member.object
             && self.is_rest_var(id.name.as_str())
         {
-            self.replacements
-                .push((id.span.start, id.span.end, "$$props".to_string()));
+            self.replacements.push((id.span.start, id.span.end, "$$props".to_string()));
         }
         walk::walk_static_member_expression(self, member);
     }

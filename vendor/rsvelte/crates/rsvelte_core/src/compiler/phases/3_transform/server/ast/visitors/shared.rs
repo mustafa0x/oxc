@@ -9,7 +9,10 @@
 //!   pure text). Upstream's `b.literal('<p')` / `b.literal('>')`.
 //! - [`TemplateEntry::Template`] — a `b.template(quasis, expressions)` produced by
 //!   [`process_children`] when a run of text / comment / expression-tag siblings
-//!   is flushed; dynamic `{expr}` interpolations become `${$.escape(expr)}`.
+//!   is flushed; dynamic `{expr}` interpolations become `${$.escape(expr)}`. A
+//!   known expression can fold into a quasi and leave `expressions` empty; it
+//!   must remain a `Template` so an empty rendered chunk is not mistaken for
+//!   removable source whitespace.
 //! - [`TemplateEntry::Stmt`] — an opaque statement (e.g. an `if` for `<textarea>`
 //!   value handling, or an async `$$renderer.push(...)`); these break the
 //!   coalescing run. Not produced by the simple visitors ported so far.
@@ -19,7 +22,7 @@
 //! `build_template`.
 
 use crate::ast::js::Expression;
-use crate::ast::template::{Fragment, RegularElement, TemplateNode, Text};
+use crate::ast::template::{Fragment, RegularElement, TemplateNode};
 use crate::compiler::phases::phase3_transform::server::ast::ServerTransformState;
 use crate::compiler::phases::phase3_transform::shared::template::escape_html;
 use crate::compiler::phases::phase3_transform::utils::{
@@ -45,11 +48,9 @@ pub enum TemplateEntry<'a> {
     Literal(String),
     /// A `b.template(quasis, expressions)`: `quasis.len() == expressions.len() + 1`.
     /// `quasis` are cooked strings; `exprs` are already-built oxc expressions
-    /// (typically `$.escape(expr)`).
-    Template {
-        quasis: Vec<String>,
-        exprs: Vec<OxcExpression<'a>>,
-    },
+    /// (typically `$.escape(expr)`). `exprs` may be empty when every expression
+    /// in the source sequence constant-folded into its surrounding quasi.
+    Template { quasis: Vec<String>, exprs: Vec<OxcExpression<'a>> },
     /// An opaque statement that breaks the coalescing run.
     Stmt(Statement<'a>),
     /// A hoistable declaration — a `{@const}` const or a non-hoistable
@@ -62,6 +63,21 @@ pub enum TemplateEntry<'a> {
     /// declarations sit at the top of the enclosing block before any rendered
     /// HTML).
     HoistableDecl(Statement<'a>),
+}
+
+/// The names declared by the `{#snippet}` blocks directly inside a fragment.
+pub fn fragment_snippet_names<'a, N: AsRef<TemplateNode<'a>>>(
+    nodes: &[N],
+) -> rustc_hash::FxHashSet<String> {
+    let mut out = rustc_hash::FxHashSet::default();
+    for node in nodes {
+        if let TemplateNode::SnippetBlock(snippet) = node.as_ref()
+            && let Some(name) = snippet.expression.name()
+        {
+            out.insert(name.to_string());
+        }
+    }
+    out
 }
 
 /// Port of upstream `process_children`: walk a slice of sibling template nodes,
@@ -81,8 +97,8 @@ pub enum TemplateEntry<'a> {
 /// `<pre>` / `<select>` / `<table>` / SVG special-cases match upstream's
 /// `clean_nodes` + `trim_whitespace` exactly.
 pub fn process_children<'a>(
-    nodes: &[TemplateNode],
-    parent: Option<&RegularElement>,
+    nodes: &[TemplateNode<'a>],
+    parent: Option<&RegularElement<'_>>,
     namespace: &str,
     state: &mut ServerTransformState<'a>,
 ) {
@@ -98,9 +114,27 @@ pub fn process_children<'a>(
 /// pushed so the text node isn't fused with the surrounding fragment during
 /// hydration. RegularElement / TitleElement parents pass `false` (they are not
 /// in upstream's `is_text_first` parent list).
-pub fn process_children_inner<'a>(
-    nodes: &[TemplateNode],
-    parent: Option<&RegularElement>,
+pub fn process_children_inner<'a, N: AsRef<TemplateNode<'a>>>(
+    nodes: &[N],
+    parent: Option<&RegularElement<'_>>,
+    namespace: &str,
+    is_block_parent: bool,
+    state: &mut ServerTransformState<'a>,
+) {
+    // An element's children live in the element's OWN scope (it holds the
+    // `let:` bindings and any `{@const}` declared among the children), mirroring
+    // upstream `RegularElement.js`'s `scope: scopes.get(node.fragment)`. The
+    // attributes are built by the caller, in the enclosing scope.
+    let saved_scope = parent.map(|el| state.enter_template_scope(el.start));
+    process_children_scoped(nodes, parent, namespace, is_block_parent, state);
+    if let Some(saved) = saved_scope {
+        state.restore_scope(saved);
+    }
+}
+
+fn process_children_scoped<'a, N: AsRef<TemplateNode<'a>>>(
+    nodes: &[N],
+    parent: Option<&RegularElement<'_>>,
     namespace: &str,
     is_block_parent: bool,
     state: &mut ServerTransformState<'a>,
@@ -140,8 +174,14 @@ pub fn process_children_inner<'a>(
     let reordered = sort_const_tags(nodes, state);
     let iter_nodes: Vec<&TemplateNode> = match reordered {
         Some(v) => v,
-        None => nodes.iter().collect(),
+        None => nodes.iter().map(|n| n.as_ref()).collect(),
     };
+
+    // 写经 upstream `get_transform`: the `{#snippet}` blocks a fragment declares
+    // are `normal` bindings in its scope, so they shadow a same-named outer
+    // `$derived` / store for the whole fragment — `{@render row()}` next to a
+    // local `{#snippet row()}` must not be read-wrapped into `row()()`.
+    state.shadowed_names.push(fragment_snippet_names(&iter_nodes));
 
     let mut hoisted: Vec<&TemplateNode> = Vec::new();
     let mut filtered: Vec<&TemplateNode> = Vec::new();
@@ -164,7 +204,8 @@ pub fn process_children_inner<'a>(
         super::visit_node(node, state);
     }
 
-    let mut cleaned = clean_whitespace(&filtered, parent, namespace, preserve_whitespace);
+    let mut cleaned =
+        clean_whitespace(&filtered, parent, namespace, preserve_whitespace, state.in_text_element);
 
     // 写经 `clean_nodes` (utils.js:254-263): if the first surviving child of a
     // `<pre>` is a Text node whose data is a single newline (`'\n'` / `'\r\n'`),
@@ -192,13 +233,11 @@ pub fn process_children_inner<'a>(
             TemplateNode::RegularElement(el) if el.name.as_str() == "script"
         )
     {
-        cleaned.push(Cow::Owned(TemplateNode::Comment(
-            crate::ast::template::Comment {
-                start: 0,
-                end: 0,
-                data: CompactString::default(),
-            },
-        )));
+        cleaned.push(Cow::Owned(TemplateNode::Comment(crate::ast::template::Comment {
+            start: 0,
+            end: 0,
+            data: CompactString::default(),
+        })));
     }
 
     // 写经 `clean_nodes` → `Fragment` visitor: when the parent is a fragment /
@@ -211,9 +250,7 @@ pub fn process_children_inner<'a>(
             Some(TemplateNode::Text(_)) | Some(TemplateNode::ExpressionTag(_))
         )
     {
-        state
-            .template
-            .push(TemplateEntry::Literal(EMPTY_COMMENT.to_string()));
+        state.template.push(TemplateEntry::Literal(EMPTY_COMMENT.to_string()));
     }
 
     let mut sequence: Vec<SeqNode<'_>> = Vec::new();
@@ -242,7 +279,7 @@ pub fn process_children_inner<'a>(
 
     for node in &cleaned {
         match node.as_ref() {
-            TemplateNode::Text(t) => sequence.push(SeqNode::Text(t.data.as_str())),
+            TemplateNode::Text(t) => sequence.push(SeqNode::Text(t.data.as_ref())),
             TemplateNode::Comment(c) => sequence.push(SeqNode::Comment(c.data.as_str())),
             TemplateNode::ExpressionTag(tag) => {
                 // SAFETY-of-borrow: `tag` lives in `cleaned`, but the expression
@@ -279,9 +316,7 @@ pub fn process_children_inner<'a>(
                 let blockers = expression_tag_blockers(&tag.expression, state);
                 let inline_await = blockers.is_none()
                     && const_blockers.is_empty()
-                    && state
-                        .expr_source(&tag.expression)
-                        .is_some_and(text_has_await);
+                    && state.expr_source(&tag.expression).is_some_and(text_has_await);
                 if !const_blockers.is_empty() {
                     flush_sequence(&sequence, state);
                     sequence.clear();
@@ -317,14 +352,21 @@ pub fn process_children_inner<'a>(
                             .expr_source(&tag.expression)
                             .map(|s| s.to_string())
                             .unwrap_or_default();
-                        save_wrap_expr_text(state, &src)
+                        // `save_wrap_expr_text` only rewrites the inline `await` into
+                        // the `(await $.save(<arg>))()` shape; upstream's
+                        // `context.visit(node.expression, state)` ALSO read-wraps the
+                        // derived / store reads inside `<arg>` (`d` → `d()`), so apply
+                        // the read-wrap pass to the save-wrapped result.
+                        let mut wrapped = save_wrap_expr_text(state, &src);
+                        state.wrap_reads_in_place(&mut wrapped);
+                        wrapped
                     } else {
                         state.visit_expr(&tag.expression)
                     };
                     let stmt = build_async_expression_push(state, visited, &[], true);
                     state.template.push(TemplateEntry::Stmt(stmt));
                 } else {
-                    sequence.push(SeqNode::Expr(&tag.expression));
+                    sequence.push(SeqNode::Expr(&tag.expression, tag.start, tag.end));
                 }
             }
             other => {
@@ -338,6 +380,7 @@ pub fn process_children_inner<'a>(
         }
     }
     flush_sequence(&sequence, state);
+    state.shadowed_names.pop();
     state.in_element_children = saved_in_element;
     state.namespace = saved_namespace;
 }
@@ -364,14 +407,16 @@ pub fn process_children_inner<'a>(
 ///   an `ExpressionTag`.
 /// - A Text node that reduces to a single `' '` is dropped entirely when the
 ///   parent is a `select` / `tr` / `table` / `tbody` / `thead` / `tfoot` /
-///   `colgroup` / `datalist`, or any non-`text` SVG element (`can_remove_entirely`).
+///   `colgroup` / `datalist`, or an SVG element with no `<text>` anywhere above it
+///   (`can_remove_entirely`).
 /// - The first Text node inside `<pre>` is dropped if it is a lone `\n` / `\r\n`.
-fn clean_whitespace<'n>(
-    nodes: &[&'n TemplateNode],
-    parent: Option<&RegularElement>,
+fn clean_whitespace<'n, 'b>(
+    nodes: &[&'n TemplateNode<'b>],
+    parent: Option<&RegularElement<'_>>,
     namespace: &str,
     preserve_whitespace: bool,
-) -> Vec<Cow<'n, TemplateNode>> {
+    in_text_element: bool,
+) -> Vec<Cow<'n, TemplateNode<'b>>> {
     if preserve_whitespace {
         return nodes.iter().map(|n| Cow::Borrowed(*n)).collect();
     }
@@ -417,6 +462,7 @@ fn clean_whitespace<'n>(
         ),
         None => false,
     } || (namespace == "svg"
+        && !in_text_element
         && !matches!(parent, Some(el) if el.name.as_str() == "text"));
 
     let last_idx = window.len() - 1;
@@ -436,7 +482,7 @@ fn clean_whitespace<'n>(
             continue;
         };
 
-        let mut data: Cow<'_, str> = Cow::Borrowed(text.data.as_str());
+        let mut data: Cow<'_, str> = Cow::Borrowed(text.data.as_ref());
 
         // Trim the very first / last Text node's outer whitespace entirely.
         if i == 0 {
@@ -454,9 +500,8 @@ fn clean_whitespace<'n>(
         }
 
         // Collapse trailing whitespace (unless followed by an ExpressionTag).
-        let next_is_expression_tag = window
-            .get(i + 1)
-            .is_some_and(|n| matches!(**n, TemplateNode::ExpressionTag(_)));
+        let next_is_expression_tag =
+            window.get(i + 1).is_some_and(|n| matches!(**n, TemplateNode::ExpressionTag(_)));
         if !next_is_expression_tag {
             let replaced = replace_trailing_whitespace(&data, " ");
             data = Cow::Owned(replaced);
@@ -470,11 +515,11 @@ fn clean_whitespace<'n>(
             continue;
         }
 
-        if data.as_ref() == text.data.as_str() {
+        if data.as_ref() == text.data.as_ref() {
             out.push(Cow::Borrowed(node));
         } else {
-            let mut new_text: Text = text.clone();
-            new_text.data = CompactString::new(data.as_ref());
+            let mut new_text = text.clone();
+            new_text.data = Cow::Owned(data.into_owned());
             out.push(Cow::Owned(TemplateNode::Text(new_text)));
         }
     }
@@ -482,7 +527,7 @@ fn clean_whitespace<'n>(
     // `<pre>`: drop a leading lone-newline Text node (browser would re-add it).
     if matches!(parent, Some(el) if el.name.as_str() == "pre")
         && let Some(TemplateNode::Text(t)) = out.first().map(|c| c.as_ref())
-        && (t.data.as_str() == "\n" || t.data.as_str() == "\r\n")
+        && (t.data.as_ref() == "\n" || t.data.as_ref() == "\r\n")
     {
         out.remove(0);
     }
@@ -560,11 +605,7 @@ fn expression_tag_blockers(expr: &Expression, state: &ServerTransformState) -> O
             expr_text, &filtered,
         )
     };
-    if blockers.is_empty() {
-        None
-    } else {
-        Some(blockers)
-    }
+    if blockers.is_empty() { None } else { Some(blockers) }
 }
 
 /// Find the per-fragment const-tag blocker EXPRESSIONS (`promises[N]` source
@@ -589,12 +630,39 @@ fn expression_tag_const_blockers(expr: &Expression, state: &ServerTransformState
 enum SeqNode<'n> {
     Text(&'n str),
     Comment(&'n str),
-    Expr(&'n Expression),
+    /// The tag's expression, with the `{ … }` span comments can live in.
+    Expr(&'n Expression<'n>, u32, u32),
 }
 
 /// Whether `src` is a single bare JS identifier (`foo`, `$bar`, `_x9`) — used to
 /// gate the block-local `constant_vars` fold so only a simple `{name}` read folds
 /// to its registered literal (a member access / call / operator never does).
+/// Whether `build_getter` replaces a read of `name` WHOLESALE with a
+/// builder-made node. The `derived` arm calls `b.call(binding.node)` — the node
+/// of the DECLARATION, whose location sits above any comment trailing the script
+/// — and the store arm builds the whole `$.store_get(...)` call fresh, so
+/// neither gives esrap's cursor a stop here. Every other read keeps the source
+/// expression's own `loc`.
+pub(crate) fn read_loses_its_location(state: &ServerTransformState<'_>, source: &str) -> bool {
+    let name = source.trim();
+    if !is_plain_identifier(name) {
+        return false;
+    }
+    if name == "$$props" || name.starts_with("$$derived_array") {
+        return true;
+    }
+    if state.local_derived_names.contains(name) {
+        return true;
+    }
+    state.analysis.root.get_binding(name, state.current_scope_index).is_some_and(|index| {
+        matches!(
+            state.analysis.root.bindings[index].kind,
+            crate::compiler::phases::phase2_analyze::scope::BindingKind::StoreSub
+                | crate::compiler::phases::phase2_analyze::scope::BindingKind::Derived
+        )
+    })
+}
+
 fn is_plain_identifier(src: &str) -> bool {
     let mut chars = src.chars();
     match chars.next() {
@@ -604,10 +672,11 @@ fn is_plain_identifier(src: &str) -> bool {
     chars.all(|c| c.is_alphanumeric() || c == '_' || c == '$')
 }
 
-/// Convert the accumulated `sequence` into one [`TemplateEntry::Template`]
-/// (skipped when empty). Mirrors the inner `flush()` of upstream
-/// `process_children`: cooked text accumulates into the current quasi, and each
-/// dynamic expression splits a new quasi and pushes `$.escape(expr)`.
+/// Convert the accumulated `sequence` into one template entry (skipped when
+/// empty). Mirrors the inner `flush()` of upstream `process_children`: cooked
+/// text accumulates into the current quasi, and each dynamic expression splits
+/// a new quasi and pushes `$.escape(expr)`. A sequence containing an expression
+/// remains a [`TemplateEntry::Template`] even when every expression folds away.
 fn flush_sequence<'a>(sequence: &[SeqNode<'_>], state: &mut ServerTransformState<'a>) {
     if sequence.is_empty() {
         return;
@@ -615,6 +684,7 @@ fn flush_sequence<'a>(sequence: &[SeqNode<'_>], state: &mut ServerTransformState
 
     let mut quasis: Vec<String> = vec![String::new()];
     let mut exprs: Vec<OxcExpression<'a>> = Vec::new();
+    let had_expression_tag = sequence.iter().any(|node| matches!(node, SeqNode::Expr(..)));
 
     for node in sequence {
         match node {
@@ -627,16 +697,16 @@ fn flush_sequence<'a>(sequence: &[SeqNode<'_>], state: &mut ServerTransformState
                 let last = quasis.last_mut().unwrap();
                 let _ = write!(last, "<!--{data}-->");
             }
-            SeqNode::Expr(expr) => {
+            SeqNode::Expr(expr, tag_start, tag_end) => {
+                let (tag_start, tag_end) = (*tag_start, *tag_end);
                 // A `let:`-scoped SLOT variable read (`<Nested let:count>{count}
                 // </Nested>`) must NOT constant-fold to the same-named COMPONENT
                 // binding's value (`let count = 42`). Upstream resolves `count` to
                 // the slot scope parameter (an opaque runtime value), so it stays
                 // `$.escape(count)`. This wins over the `constant_vars` /
-                // `scope.evaluate` folds. (A SNIPPET parameter is NOT in this set —
-                // upstream DOES fold a snippet-param read whose component argument
-                // is statically known, so `slot_let_shadows` is kept distinct from
-                // the snippet-param `shadowed_names`.)
+                // `scope.evaluate` folds. Each-item and snippet parameters are in
+                // this set too — all three are runtime values whose reads must
+                // not fold to a same-named outer binding's literal.
                 if !state.slot_let_shadows.is_empty()
                     && let Some(src) = state.expr_source(expr)
                     && is_plain_identifier(src.trim())
@@ -644,8 +714,19 @@ fn flush_sequence<'a>(sequence: &[SeqNode<'_>], state: &mut ServerTransformState
                         .slot_let_shadows
                         .iter()
                         .any(|f| f.contains(src.trim()))
+                    // …unless a `{@const}` on the render position's own scope
+                    // chain shadows it first. The veto is keyed by NAME, and
+                    // `scope.get` stops at the nearest declaration.
+                    && !state.nearest_declaration_is_template_const(src.trim())
                 {
-                    let visited = state.visit_expr(expr);
+                    let mut visited = state.visit_expr(expr);
+                    if let (Some(start), Some(end)) = (expr.start(), expr.end()) {
+                        state.place_template_expression_comments(
+                            (tag_start + 1, tag_end - 1),
+                            (start, end),
+                            &mut visited,
+                        );
+                    }
                     let escaped = state.b.call("$.escape", vec![visited]);
                     exprs.push(escaped);
                     quasis.push(String::new());
@@ -668,10 +749,15 @@ fn flush_sequence<'a>(sequence: &[SeqNode<'_>], state: &mut ServerTransformState
                     && is_plain_identifier(src.trim())
                     && let Some(value) = state.eval_inputs.constant_vars.get(src.trim())
                 {
-                    if value != "null" && value != "undefined" {
+                    use crate::compiler::phases::phase3_transform::server::evaluate::{
+                        EvalValue, js_display_string,
+                    };
+                    if !matches!(value, EvalValue::Null | EvalValue::Undefined) {
+                        let rendered = js_display_string(value);
                         let last = quasis.last_mut().unwrap();
-                        last.push_str(&escape_html(value));
+                        last.push_str(&escape_html(&rendered));
                     }
+                    state.defer_template_expression_comments((tag_start + 1, tag_end - 1));
                     continue;
                 }
                 // SSR constant-folding (`scope.evaluate`): upstream's
@@ -689,10 +775,21 @@ fn flush_sequence<'a>(sequence: &[SeqNode<'_>], state: &mut ServerTransformState
                         let last = quasis.last_mut().unwrap();
                         last.push_str(&escape_html(&content));
                     }
+                    state.defer_template_expression_comments((tag_start + 1, tag_end - 1));
                     continue;
                 }
 
-                let visited = state.visit_expr(expr);
+                let mut visited = state.visit_expr(expr);
+                if let (Some(start), Some(end)) = (expr.start(), expr.end()) {
+                    state.place_template_expression_comments(
+                        (tag_start + 1, tag_end - 1),
+                        (start, end),
+                        &mut visited,
+                    );
+                }
+                if !state.expr_source(expr).is_some_and(|src| read_loses_its_location(state, src)) {
+                    state.claim_deferred_tail_comment(&mut visited);
+                }
                 let escaped = state.b.call("$.escape", vec![visited]);
                 exprs.push(escaped);
                 quasis.push(String::new());
@@ -700,17 +797,14 @@ fn flush_sequence<'a>(sequence: &[SeqNode<'_>], state: &mut ServerTransformState
         }
     }
 
-    if exprs.is_empty() {
-        // Pure-text/comment run: a plain literal (matches upstream where the
-        // template degenerates to a single-quasi literal that build_template
-        // then folds into the surrounding string).
-        state
-            .template
-            .push(TemplateEntry::Literal(quasis.pop().unwrap()));
+    if !had_expression_tag {
+        // Pure-text/comment run: a plain literal. Do not use `exprs.is_empty()`
+        // here: upstream still builds a template when every source expression
+        // folds to an empty quasi, and that template must produce an empty
+        // renderer push after an adjacent declaration is hoisted (#3457).
+        state.template.push(TemplateEntry::Literal(quasis.pop().unwrap()));
     } else {
-        state
-            .template
-            .push(TemplateEntry::Template { quasis, exprs });
+        state.template.push(TemplateEntry::Template { quasis, exprs });
     }
 }
 
@@ -730,23 +824,24 @@ fn flush_sequence<'a>(sequence: &[SeqNode<'_>], state: &mut ServerTransformState
 /// dependency scan only needs each const's declared names + the identifiers
 /// referenced in its initializer (reusing the same string-based extraction the
 /// const-tag visitor uses, so the two stay consistent).
-fn sort_const_tags<'n>(
-    nodes: &'n [TemplateNode],
+fn sort_const_tags<'n, 'b, N: AsRef<TemplateNode<'b>>>(
+    nodes: &'n [N],
     state: &ServerTransformState<'_>,
-) -> Option<Vec<&'n TemplateNode>> {
+) -> Option<Vec<&'n TemplateNode<'b>>> {
     if state.analysis.runes {
         return None;
     }
 
-    struct ConstInfo<'n> {
-        node: &'n TemplateNode,
+    struct ConstInfo<'n, 'b> {
+        node: &'n TemplateNode<'b>,
         declared: Vec<String>,
         deps: Vec<String>,
     }
 
-    let mut consts: Vec<ConstInfo<'n>> = Vec::new();
+    let mut consts: Vec<ConstInfo<'n, 'b>> = Vec::new();
     let mut others: Vec<&'n TemplateNode> = Vec::new();
     for n in nodes {
+        let n = n.as_ref();
         if let TemplateNode::ConstTag(ct) = n {
             // Slice the FIRST declarator's span (`x = (rhs)`), not the whole
             // `VariableDeclaration` span — the latter now starts at the `const`
@@ -775,11 +870,7 @@ fn sort_const_tags<'n>(
             } else {
                 (Vec::new(), Vec::new())
             };
-            consts.push(ConstInfo {
-                node: n,
-                declared,
-                deps,
-            });
+            consts.push(ConstInfo { node: n, declared, deps });
         } else {
             others.push(n);
         }
@@ -833,14 +924,7 @@ fn sort_const_tags<'n>(
     let mut on_stack = vec![false; consts.len()];
     let mut sorted_idx: Vec<usize> = Vec::new();
     for i in 0..consts.len() {
-        add(
-            i,
-            &deps_of,
-            &name_to_idx,
-            &mut done,
-            &mut on_stack,
-            &mut sorted_idx,
-        );
+        add(i, &deps_of, &name_to_idx, &mut done, &mut on_stack, &mut sorted_idx);
     }
 
     let mut out: Vec<&'n TemplateNode> = sorted_idx.iter().map(|&i| consts[i].node).collect();
@@ -855,9 +939,7 @@ fn sort_const_tags<'n>(
 /// ordering: `{@const}` consts and non-hoistable `{#snippet}` functions sit at
 /// the top of the enclosing fragment block ahead of any rendered HTML).
 fn hoist_declarations<'a>(template: Vec<TemplateEntry<'a>>) -> Vec<TemplateEntry<'a>> {
-    let has_decls = template
-        .iter()
-        .any(|e| matches!(e, TemplateEntry::HoistableDecl(_)));
+    let has_decls = template.iter().any(|e| matches!(e, TemplateEntry::HoistableDecl(_)));
     if !has_decls {
         return template;
     }
@@ -930,10 +1012,7 @@ pub fn build_template<'a>(
                 let last = strings.last_mut().unwrap();
                 last.push_str(&s);
             }
-            TemplateEntry::Template {
-                quasis,
-                exprs: tmpl_exprs,
-            } => {
+            TemplateEntry::Template { quasis, exprs: tmpl_exprs } => {
                 if strings.is_empty() {
                     strings.push(String::new());
                 }
@@ -975,8 +1054,8 @@ pub fn build_template<'a>(
 /// `{#key}` / `{#await}` arms) pass `false` and keep the shallow direct-child
 /// inference — mirroring upstream `infer_namespace`, which only runs the deep
 /// check for the reset-parent kinds.
-pub fn build_fragment_body<'a>(
-    fragment: &Fragment,
+pub fn build_fragment_body<'a, N: AsRef<TemplateNode<'a>>>(
+    nodes: &[N],
     is_text_first_parent: bool,
     reset_namespace: bool,
     state: &mut ServerTransformState<'a>,
@@ -1000,8 +1079,11 @@ pub fn build_fragment_body<'a>(
     // child. Recompute it here (save/restore) so every fragment block matches
     // upstream.
     let saved_standalone = state.is_standalone;
-    state.is_standalone =
-        ServerTransformState::is_standalone_fragment(&fragment.nodes, state.preserve_whitespace);
+    state.is_standalone = ServerTransformState::is_standalone_fragment(
+        nodes,
+        state.preserve_whitespace,
+        state.options.hmr,
+    );
     // Track fragment nesting depth: the root component fragment is depth 1; any
     // nested block / boundary / snippet body is depth ≥ 2. The boundary visitor
     // reads this to decide `failed`-snippet hoist-vs-inline placement.
@@ -1040,17 +1122,11 @@ pub fn build_fragment_body<'a>(
     // (issue #1227). The root component fragment has `state.namespace == "html"`,
     // so its default is unchanged.
     let fragment_namespace = if reset_namespace {
-        infer_namespace_reset(&fragment.nodes, state.namespace)
+        infer_namespace_reset(nodes, state.namespace)
     } else {
-        infer_namespace_from_nodes_owned(&fragment.nodes, state.namespace)
+        infer_namespace_from_nodes_owned(nodes, state.namespace)
     };
-    process_children_inner(
-        &fragment.nodes,
-        None,
-        &fragment_namespace,
-        is_text_first_parent,
-        state,
-    );
+    process_children_inner(nodes, None, &fragment_namespace, is_text_first_parent, state);
     let template = std::mem::replace(&mut state.template, saved);
     let mut body = build_template(template, state);
 
@@ -1089,10 +1165,7 @@ pub fn build_fragment_body<'a>(
         let run_split = new_body
             .iter()
             .position(|s| {
-                !matches!(
-                    s,
-                    Statement::VariableDeclaration(_) | Statement::FunctionDeclaration(_)
-                )
+                !matches!(s, Statement::VariableDeclaration(_) | Statement::FunctionDeclaration(_))
             })
             .unwrap_or(new_body.len());
         new_body.insert(run_split, run_decl);
@@ -1172,13 +1245,7 @@ fn build_async_consts_run<'a>(
     let elems: Vec<Option<OxcExpression<'a>>> = group
         .thunks
         .iter()
-        .map(|(code, _)| {
-            Some(
-                state
-                    .reparse_slice_owned(code)
-                    .unwrap_or_else(|| b.id("undefined")),
-            )
-        })
+        .map(|(code, _)| Some(state.reparse_slice_owned(code).unwrap_or_else(|| b.id("undefined"))))
         .collect();
     let run_call = b.call("$$renderer.run", vec![b.array(elems)]);
     b.var_decl(b.id_pat(&group.name), Some(run_call))
@@ -1196,14 +1263,14 @@ fn build_async_consts_run<'a>(
 /// `clean_nodes` hoist pass is still handled by the per-visitor pipeline rather
 /// than centrally here.
 pub fn build_fragment_block<'a>(
-    fragment: &Fragment,
+    fragment: &Fragment<'a>,
     is_text_first_parent: bool,
     state: &mut ServerTransformState<'a>,
 ) -> Statement<'a> {
     // Block visitors (IfBlock / EachBlock / KeyBlock / AwaitBlock) are NOT
     // namespace-resetting parents upstream, so they keep the shallow direct-child
     // inference (`reset_namespace = false`).
-    let body = build_fragment_body(fragment, is_text_first_parent, false, state);
+    let body = build_fragment_body(&fragment.nodes, is_text_first_parent, false, state);
     state.b.block(body)
 }
 
@@ -1231,10 +1298,8 @@ pub fn blockers_array<'a>(
     indices: &[usize],
 ) -> OxcExpression<'a> {
     let b = state.b;
-    let elems: Vec<Option<OxcExpression<'a>>> = indices
-        .iter()
-        .map(|&i| Some(promise_ref(state, i)))
-        .collect();
+    let elems: Vec<Option<OxcExpression<'a>>> =
+        indices.iter().map(|&i| Some(promise_ref(state, i))).collect();
     b.array(elems)
 }
 
@@ -1456,13 +1521,7 @@ pub fn build_async_expression_push_exprs<'a>(
     if !blocker_exprs.is_empty() {
         let elems: Vec<Option<OxcExpression<'a>>> = blocker_exprs
             .iter()
-            .map(|src| {
-                Some(
-                    state
-                        .reparse_slice_owned(src)
-                        .unwrap_or_else(|| b.id("undefined")),
-                )
-            })
+            .map(|src| Some(state.reparse_slice_owned(src).unwrap_or_else(|| b.id("undefined"))))
             .collect();
         let blockers = b.array(elems);
         let params = b.params(vec![b.id_pat("$$renderer")], None);
@@ -1615,27 +1674,6 @@ impl<'a> PromiseOptimiser<'a> {
     }
 }
 
-/// Compute 1-based line number and 0-based column for a byte offset in source.
-/// (Relocated from the deleted text `server/visitors/element.rs` — used by the
-/// dev-mode `$.push_element($$renderer, '<name>', <line>, <col>)` instrumentation.)
-pub(crate) fn locate_in_source(source: &str, offset: usize) -> (usize, usize) {
-    let offset = offset.min(source.len());
-    let mut line = 1usize;
-    let mut col = 0usize;
-    for (i, ch) in source.char_indices() {
-        if i >= offset {
-            break;
-        }
-        if ch == '\n' {
-            line += 1;
-            col = 0;
-        } else {
-            col += 1;
-        }
-    }
-    (line, col)
-}
-
 /// Infer a fragment's namespace from its children (owned-slice variant). If every
 /// direct `RegularElement` child is SVG (or every one MathML) the fragment adopts
 /// that namespace, so whitespace-only text between them is removable. (Relocated
@@ -1698,23 +1736,20 @@ fn check_ns_walk(node: &TemplateNode, ns: &mut NsCheck) {
             // calls `next()`).
             check_ns_element(el.metadata.svg, el.metadata.mathml, ns);
         }
-        // `<svelte:element>` has no statically-resolved svg/mathml metadata in
-        // rsvelte (upstream reads `node.metadata.svg`, which we cannot recover
-        // here). Treat it as INCONCLUSIVE rather than forcing `html`: forcing
-        // html would wrongly flip a fragment whose namespace comes from
-        // `<svelte:options namespace="svg">` (e.g. `<svelte:element this="svg">`
-        // siblings of a real `<svg>`), keeping whitespace upstream removes. A
-        // real `<svg>` / `<div>` RegularElement sibling still drives the verdict;
-        // absent one, the shallow direct-child fallback inherits the parent
-        // namespace — matching upstream's element loop, which skips SvelteElement.
-        TemplateNode::SvelteElement(_) => {}
-        TemplateNode::Text(t) => {
-            // 写经 upstream Text handler: any non-whitespace text is inconclusive
-            // (`maybe_html`), deferring to the shallow direct-child inference.
-            if !is_svelte_whitespace_only(&t.data) {
-                *ns = NsCheck::MaybeHtml;
-            }
+        // 写经 upstream `check_nodes_for_namespace`, whose walker handles
+        // `SvelteElement` with the same handler as `RegularElement`: phase 2
+        // resolves its svg/mathml metadata (xmlns attribute → ancestor chain →
+        // component namespace option), so a plain root-level `<svelte:element>`
+        // decides `html` even when an `<svg>` sibling follows.
+        TemplateNode::SvelteElement(el) => {
+            check_ns_element(el.metadata.svg, el.metadata.mathml, ns);
         }
+        // Mirrors upstream Text handler: any non-whitespace text is inconclusive
+        // (`maybe_html`), deferring to the shallow direct-child inference.
+        TemplateNode::Text(t) if !is_svelte_whitespace_only(&t.data) => {
+            *ns = NsCheck::MaybeHtml;
+        }
+        TemplateNode::Text(_) => {}
         TemplateNode::IfBlock(b) => {
             for n in &b.consequent.nodes {
                 check_ns_walk(n, ns);
@@ -1748,9 +1783,8 @@ fn check_ns_walk(node: &TemplateNode, ns: &mut NsCheck) {
             }
         }
         TemplateNode::AwaitBlock(b) => {
-            for frag in [b.pending.as_ref(), b.then.as_ref(), b.catch.as_ref()]
-                .into_iter()
-                .flatten()
+            for frag in
+                [b.pending.as_ref(), b.then.as_ref(), b.catch.as_ref()].into_iter().flatten()
             {
                 for n in &frag.nodes {
                     check_ns_walk(n, ns);
@@ -1772,10 +1806,10 @@ fn check_ns_walk(node: &TemplateNode, ns: &mut NsCheck) {
     }
 }
 
-fn check_nodes_for_namespace(nodes: &[TemplateNode]) -> NsCheck {
+fn check_nodes_for_namespace<'t, N: AsRef<TemplateNode<'t>>>(nodes: &[N]) -> NsCheck {
     let mut ns = NsCheck::Keep;
     for node in nodes {
-        check_ns_walk(node, &mut ns);
+        check_ns_walk(node.as_ref(), &mut ns);
         if ns == NsCheck::Html {
             return ns;
         }
@@ -1789,7 +1823,10 @@ fn check_nodes_for_namespace(nodes: &[TemplateNode]) -> NsCheck {
 /// inside `{#if}` / `{#each}` blocks); a definitive verdict wins, otherwise
 /// falls back to the shallow direct-child inference. 写经 upstream
 /// `infer_namespace`'s reset-parent branch + element-loop fall-through.
-pub(crate) fn infer_namespace_reset(nodes: &[TemplateNode], parent_namespace: &str) -> String {
+pub(crate) fn infer_namespace_reset<'a, N: AsRef<TemplateNode<'a>>>(
+    nodes: &[N],
+    parent_namespace: &str,
+) -> String {
     match check_nodes_for_namespace(nodes) {
         NsCheck::Svg => "svg".to_string(),
         NsCheck::Mathml => "mathml".to_string(),
@@ -1800,13 +1837,13 @@ pub(crate) fn infer_namespace_reset(nodes: &[TemplateNode], parent_namespace: &s
     }
 }
 
-pub(crate) fn infer_namespace_from_nodes_owned(
-    nodes: &[TemplateNode],
+pub(crate) fn infer_namespace_from_nodes_owned<'a, N: AsRef<TemplateNode<'a>>>(
+    nodes: &[N],
     parent_namespace: &str,
 ) -> String {
     let mut found_namespace: Option<&str> = None;
     for node in nodes {
-        if let TemplateNode::RegularElement(el) = node {
+        if let TemplateNode::RegularElement(el) = node.as_ref() {
             if el.metadata.svg {
                 match found_namespace {
                     None => found_namespace = Some("svg"),
@@ -1824,7 +1861,5 @@ pub(crate) fn infer_namespace_from_nodes_owned(
             }
         }
     }
-    found_namespace
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| parent_namespace.to_string())
+    found_namespace.map(|s| s.to_string()).unwrap_or_else(|| parent_namespace.to_string())
 }

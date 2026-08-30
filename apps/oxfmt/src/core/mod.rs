@@ -22,9 +22,7 @@ pub use config::{
     resolve_for_api, resolve_for_embedded_js,
 };
 pub use format::{FormatResult, FormatStrategy, SourceFormatter};
-pub use support::{ExternalPluginSupport, classify_file_kind_with_external_support};
-#[cfg(feature = "napi")]
-pub use support::{FileKind, classify_file_kind};
+pub use support::classify_file_kind;
 
 #[cfg(feature = "napi")]
 pub use external_services::{

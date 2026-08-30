@@ -1,176 +1,17 @@
 //! Reactive statement handling and state mutation transformations.
 
+use memchr::memmem;
+use std::borrow::Cow;
+
 use crate::compiler::phases::phase2_analyze::ComponentAnalysis;
 
+use super::store_transforms::declares_binding_in_statement;
 use super::{
-    body_references_identifier, extract_destructure_targets, extract_member_expression_base,
-    find_assignment_position, get_or_compile_regex, is_simple_identifier, lhs_starts_with_keyword,
-    transform_destructure_assignments_with_props, transform_prop_assignments,
-    transform_prop_reads_in_expr, transform_store_assignments_client, transform_store_reads_client,
-    transform_store_sub_calls, wrap_state_vars_in_expr,
+    extract_destructure_targets, extract_member_expression_base, find_assignment_position,
+    get_or_compile_regex, lhs_starts_with_keyword, transform_destructure_assignments_with_props,
+    transform_prop_assignments, transform_prop_reads_in_expr, transform_store_assignments_client,
+    transform_store_reads_client, transform_store_sub_calls, wrap_state_vars_in_expr,
 };
-
-/// Extract assigned variable names and dependency variable names from a raw `$:` reactive statement.
-///
-/// This is used for topological sorting of reactive statements.
-/// Returns (assigned_vars, dependency_vars).
-///
-/// For `$: c = a + b;`, returns (["c"], ["a", "b"])
-/// For `$: console.log(x);`, returns ([], ["console", "x"])
-pub(super) fn extract_reactive_statement_deps(
-    statement: &str,
-    state_vars: &[String],
-    prop_vars: &[String],
-    store_sub_vars: &[String],
-) -> (Vec<String>, Vec<String>) {
-    let trimmed = statement.trim();
-
-    // Extract the body after `$:`
-    let body = if let Some(stripped) = trimmed.strip_prefix("$:") {
-        stripped.trim()
-    } else {
-        return (vec![], vec![]);
-    };
-
-    let body = body.trim_end_matches(';').trim();
-    if body.is_empty() {
-        return (vec![], vec![]);
-    }
-
-    // All known reactive variable names (state vars + prop vars + store subs)
-    // These are the variables that participate in the reactive dependency graph
-    let all_reactive_vars: Vec<&str> = state_vars
-        .iter()
-        .chain(prop_vars.iter())
-        .chain(store_sub_vars.iter())
-        .map(|s| s.as_str())
-        .collect();
-
-    let mut assigned_vars = Vec::new();
-    let mut dep_vars = Vec::new();
-
-    // Check if this is an assignment statement
-    if let Some(eq_pos) = find_assignment_position(body) {
-        let lhs = body[..eq_pos].trim();
-        let rhs = body[eq_pos + 1..].trim();
-
-        // Extract assigned variable from LHS
-        // Simple identifier: `c = ...`
-        if is_simple_identifier(lhs) {
-            assigned_vars.push(lhs.to_string());
-        } else {
-            // Could be a member expression like `obj.prop = ...`
-            // Extract the base identifier
-            if let Some(base) = extract_member_expression_base(lhs) {
-                assigned_vars.push(base.to_string());
-            }
-        }
-
-        // Extract dependencies from RHS
-        for var_name in &all_reactive_vars {
-            if body_references_identifier(rhs, var_name) {
-                // Only add as dependency if it's not also being assigned
-                if !assigned_vars.contains(&var_name.to_string()) {
-                    dep_vars.push(var_name.to_string());
-                }
-            }
-        }
-    } else {
-        // Not a simple assignment - expression statement like `console.log(x)` or `if (...) { x++ }`
-        // All referenced reactive vars are dependencies
-        for var_name in &all_reactive_vars {
-            if body_references_identifier(body, var_name) {
-                dep_vars.push(var_name.to_string());
-            }
-        }
-    }
-
-    // Also scan the entire body for assignments to reactive vars inside nested blocks.
-    // This catches patterns like `$: if (cond) { count++ }` where `count` is assigned
-    // inside an if block but the top-level is not an assignment expression.
-    // We look for `var =`, `var++`, `var--`, `++var`, `--var` patterns.
-    for var_name in &all_reactive_vars {
-        if assigned_vars.contains(&var_name.to_string()) {
-            continue; // Already detected as assigned
-        }
-        if is_assigned_anywhere_in_body(body, var_name)
-            && !assigned_vars.contains(&var_name.to_string())
-        {
-            assigned_vars.push(var_name.to_string());
-        }
-    }
-
-    (assigned_vars, dep_vars)
-}
-
-/// Check if a variable is assigned anywhere in a code body (including nested blocks).
-/// Detects `var = ...`, `var += ...`, `var++`, `var--`, `++var`, `--var` patterns.
-pub(super) fn is_assigned_anywhere_in_body(body: &str, var_name: &str) -> bool {
-    // Check for update expressions: `var++`, `var--`, `++var`, `--var`
-    let pp = format!("{}++", var_name);
-    let mm = format!("{}--", var_name);
-    let pp2 = format!("++{}", var_name);
-    let mm2 = format!("--{}", var_name);
-
-    for pattern in &[&pp, &mm, &pp2, &mm2] {
-        if let Some(pos) = body.find(pattern.as_str()) {
-            // Verify it's at a word boundary
-            let before = if pos > 0 {
-                body.as_bytes()[pos - 1]
-            } else {
-                b' '
-            };
-            let after_pos = pos + pattern.len();
-            let after = if after_pos < body.len() {
-                body.as_bytes()[after_pos]
-            } else {
-                b' '
-            };
-            let before_ok = !before.is_ascii_alphanumeric()
-                && before != b'_'
-                && before != b'$'
-                && before != b'.';
-            let after_ok = !after.is_ascii_alphanumeric() && after != b'_' && after != b'$';
-            if before_ok && after_ok {
-                return true;
-            }
-        }
-    }
-
-    // Check for assignment operators: `var = ...`, `var += ...`, `var -= ...`, etc.
-    let assign_patterns = [
-        " = ", " += ", " -= ", " *= ", " /= ", " %= ", " **= ", " &= ", " |= ", " ^= ", " <<= ",
-        " >>= ", " >>>= ", " ??= ", " &&= ", " ||= ",
-    ];
-    for assign_op in &assign_patterns {
-        let pattern = format!("{}{}", var_name, assign_op);
-        if let Some(pos) = body.find(&pattern) {
-            // Verify the variable name is at a word boundary (not part of a longer name)
-            let before = if pos > 0 {
-                body.as_bytes()[pos - 1]
-            } else {
-                b' '
-            };
-            let before_ok = !before.is_ascii_alphanumeric()
-                && before != b'_'
-                && before != b'$'
-                && before != b'.';
-            if before_ok {
-                // Also make sure it's not `==` or `=>`
-                let after_eq = pos + var_name.len() + assign_op.len();
-                if assign_op == &" = " && after_eq < body.len() {
-                    let next = body.as_bytes()[after_eq - 1]; // the char after '='
-                    if next == b'=' || next == b'>' {
-                        continue;
-                    }
-                }
-                return true;
-            }
-        }
-    }
-
-    false
-}
 
 /// Topologically sort reactive statements based on their dependencies.
 ///
@@ -283,6 +124,7 @@ pub(super) fn transform_reactive_statement(
     // text scan is no longer consulted.
     dep_names: &[String],
     _analysis: &ComponentAnalysis,
+    prop_invalidate_bodies: &rustc_hash::FxHashMap<String, String>,
 ) -> String {
     let trimmed = statement.trim();
 
@@ -298,7 +140,8 @@ pub(super) fn transform_reactive_statement(
     let body = body.trim_end_matches(';').trim();
 
     if body.is_empty() {
-        return String::new();
+        // `$: ;` still emits an (empty) effect upstream.
+        return "$.legacy_pre_effect(() => {}, () => {});".to_string();
     }
 
     // Extract locally-declared variables from the body (e.g., `for (let i = 0; ...)`)
@@ -407,6 +250,26 @@ pub(super) fn transform_reactive_statement(
     };
     let body = body_owned.trim_end_matches(';').trim();
 
+    // The normal top-level statement pipeline removes store-sub spellings that
+    // are shadowed by a local binding before running its name-based rewrites.
+    // Reactive statements return through this dedicated path before reaching
+    // that guard, so apply the same protection here. A template `$t` reference
+    // can create the component StoreSub binding while an IIFE in `$:` declares
+    // its own `const $t`; rewriting that declaration produced `const $t()`.
+    let mut filtered_store_sub_vars = Vec::new();
+    let store_sub_vars =
+        if store_sub_vars.iter().any(|name| declares_binding_in_statement(body, name)) {
+            filtered_store_sub_vars.extend(
+                store_sub_vars
+                    .iter()
+                    .filter(|name| !declares_binding_in_statement(body, name))
+                    .cloned(),
+            );
+            filtered_store_sub_vars.as_slice()
+        } else {
+            store_sub_vars
+        };
+
     // Dependency membership + ORDER come from the Phase-2 AST reference set
     // (`dep_names`), mirroring `2-analyze/visitors/LabeledStatement.js`. The
     // legacy text-scan membership loops were removed: they mis-handled chained
@@ -420,13 +283,21 @@ pub(super) fn transform_reactive_statement(
     // This involves:
     // 1. Transform prop reads to prop() calls
     // 2. Transform prop assignments to prop(value) calls
-    let transformed_body;
+    let transformed_body: String;
+
+    // A CODE comma at bracket depth 0 makes the body a SEQUENCE expression
+    // (`$: a = x, b = y`). Splitting at the first `=` would swallow the rest of
+    // the sequence into the first assignment's RHS (`$.set(a, x, $.set(b, y))`),
+    // so route sequences through the expression path, whose per-assignment
+    // rewrite handles each element, and parenthesize like upstream.
+    let is_sequence_body =
+        !lhs_starts_with_keyword(body) && !body.starts_with('{') && has_top_level_comma(body);
 
     // First, check if this is an assignment statement: `c = expr`
     // We must guard against ternary expressions like `a ? b = x : b = y` where
     // find_assignment_position returns a position inside the ternary branch. In that
     // case the LHS would contain `?` which is not a valid assignment target.
-    if let Some(eq_pos) = find_assignment_position(body) {
+    if !is_sequence_body && let Some(eq_pos) = find_assignment_position(body) {
         let lhs = body[..eq_pos].trim();
         let rhs = body[eq_pos + 1..].trim();
         // If the LHS contains `?` it means the `=` was found inside a ternary branch;
@@ -441,9 +312,12 @@ pub(super) fn transform_reactive_statement(
             // This ensures that a bare `value = null` is not first converted to
             // `value(null)` and then mistakenly re-wrapped by the read pass as
             // `value()(null)`.
-            let temp = transform_prop_update_expressions(body, prop_assignment_transform_vars);
-            let temp =
-                transform_state_update_expressions(&temp, state_vars, non_reactive_state_vars);
+            let temp = transform_update_expressions(
+                body,
+                prop_assignment_transform_vars,
+                state_vars,
+                non_reactive_state_vars,
+            );
             // Route prop reads through the scope-aware AST wrapper so a prop name
             // used as a local binding inside the keyword body — e.g.
             // `$: if (cond) { const [x, y] = f(); … }` where `x`/`y` shadow props —
@@ -454,13 +328,14 @@ pub(super) fn transform_reactive_statement(
                 &temp,
                 prop_assignment_transform_vars,
                 &[],
+                super::prop_source_reads_ast::ParseGoal::Statements,
             )
             .unwrap_or_else(|| transform_prop_reads_in_expr(&temp, prop_assignment_transform_vars));
             let temp = transform_prop_assignments(
                 &temp,
                 prop_assignment_transform_vars,
                 &[],
-                &rustc_hash::FxHashMap::default(),
+                prop_invalidate_bodies,
             );
             // Wrap state-var member mutations (`obj.a.b = x`) in `$.mutate(obj, …)`.
             // The keyword branch (a `$: if (cond) X = rhs` reactive statement) was
@@ -472,13 +347,16 @@ pub(super) fn transform_reactive_statement(
             let temp = transform_state_member_mutations(&temp, state_vars, non_reactive_state_vars);
             let temp = transform_state_set_in_reactive(&temp, state_vars, non_reactive_state_vars);
             transformed_body =
-                wrap_state_vars_in_expr(&temp, state_vars, non_reactive_state_vars, proxy_vars);
+                wrap_state_vars_in_expr(&temp, state_vars, non_reactive_state_vars, proxy_vars)
+                    .into_owned();
         } else if (lhs.starts_with('[') || lhs.starts_with('{')) && {
             // Check if the LHS contains reactive targets that need destructure expansion
             let targets = extract_destructure_targets(lhs);
-            targets
-                .iter()
-                .any(|t| state_vars.contains(t) || store_sub_vars.contains(t))
+            targets.iter().any(|t| {
+                state_vars.contains(t)
+                    || store_sub_vars.contains(t)
+                    || prop_assignment_transform_vars.contains(t)
+            })
         } {
             // Destructure assignment with reactive targets - expand to IIFE
             // Pass prop_assignment_transform_vars so that if the RHS is a prop variable
@@ -488,19 +366,23 @@ pub(super) fn transform_reactive_statement(
             let body = &transform_destructure_assignments_with_props(
                 body,
                 state_vars,
+                non_reactive_state_vars,
                 store_sub_vars,
                 prop_assignment_transform_vars,
             );
-            let body = body.as_str();
-            let temp = transform_prop_update_expressions(body, prop_assignment_transform_vars);
-            let temp =
-                transform_state_update_expressions(&temp, state_vars, non_reactive_state_vars);
+            let body: &str = body;
+            let temp = transform_update_expressions(
+                body,
+                prop_assignment_transform_vars,
+                state_vars,
+                non_reactive_state_vars,
+            );
             let temp = transform_prop_reads_in_expr(&temp, prop_assignment_transform_vars);
             let temp = transform_prop_assignments(
                 &temp,
                 prop_assignment_transform_vars,
                 &[],
-                &rustc_hash::FxHashMap::default(),
+                prop_invalidate_bodies,
             );
             let temp = transform_state_member_mutations(&temp, state_vars, non_reactive_state_vars);
             let temp = transform_state_set_in_reactive(&temp, state_vars, non_reactive_state_vars);
@@ -515,7 +397,8 @@ pub(super) fn transform_reactive_statement(
                 &temp,
                 state_vars,
                 store_sub_vars,
-            );
+            )
+            .into_owned();
         } else {
             // If the LHS is a prop variable, transform to prop(value) call
             if prop_assignment_transform_vars.contains(&lhs.to_string()) {
@@ -545,7 +428,7 @@ pub(super) fn transform_reactive_statement(
                     &transformed_rhs,
                     prop_assignment_transform_vars,
                     &[],
-                    &rustc_hash::FxHashMap::default(),
+                    prop_invalidate_bodies,
                 );
                 let transformed_rhs = wrap_state_vars_in_expr(
                     &transformed_rhs,
@@ -562,10 +445,8 @@ pub(super) fn transform_reactive_statement(
                 // `$.store_unsub($.set(z, ...), '$z', $$stores)`
                 let store_sub_name = format!("${}", lhs);
                 if store_sub_vars.contains(&store_sub_name) {
-                    transformed_body = format!(
-                        "$.store_unsub({}, '{}', $$stores)",
-                        set_expr, store_sub_name
-                    );
+                    transformed_body =
+                        format!("$.store_unsub({}, '{}', $$stores)", set_expr, store_sub_name);
                 } else {
                     transformed_body = set_expr;
                 }
@@ -669,15 +550,19 @@ pub(super) fn transform_reactive_statement(
         let body = &transform_destructure_assignments_with_props(
             body,
             state_vars,
+            non_reactive_state_vars,
             store_sub_vars,
             prop_assignment_transform_vars,
         );
-        let body = body.as_str();
+        let body: &str = body;
         // Transform prop update expressions like `x++` to `$.update_prop(x)` FIRST,
         // before transform_prop_assignments runs (which would incorrectly turn `x++` into `x(x() + 1)`)
-        let temp = transform_prop_update_expressions(body, prop_assignment_transform_vars);
-        // Also transform state update expressions before compound assignments
-        let temp = transform_state_update_expressions(&temp, state_vars, non_reactive_state_vars);
+        let temp = transform_update_expressions(
+            body,
+            prop_assignment_transform_vars,
+            state_vars,
+            non_reactive_state_vars,
+        );
         // Transform prop reads BEFORE prop assignments, so that function calls like
         // `callback(args)` become `callback()(args)` (double-invoke for prop getters).
         // This must happen before transform_prop_assignments to avoid double-wrapping
@@ -694,6 +579,7 @@ pub(super) fn transform_reactive_statement(
             &temp,
             prop_assignment_transform_vars,
             &[],
+            super::prop_source_reads_ast::ParseGoal::Statements,
         )
         .unwrap_or_else(|| transform_prop_reads_in_expr(&temp, prop_assignment_transform_vars));
         // Then transform prop compound assignments (e.g., `count += 1` → `count(count() + 1)`)
@@ -701,7 +587,7 @@ pub(super) fn transform_reactive_statement(
             &temp,
             prop_assignment_transform_vars,
             &[],
-            &rustc_hash::FxHashMap::default(),
+            prop_invalidate_bodies,
         );
         // Transform state member-expression mutations (e.g., `object[key] = []`)
         // to `$.mutate(object, $.get(object)[key] = [])`. Must run before wrap_state_vars_in_expr
@@ -719,8 +605,14 @@ pub(super) fn transform_reactive_statement(
             &temp,
             state_vars,
             store_sub_vars,
-        );
+        )
+        .into_owned();
     }
+
+    // Parenthesize a sequence body the way esrap prints a sequence-expression
+    // statement (`($.set(a, …), $.set(b, …));`).
+    let transformed_body =
+        if is_sequence_body { format!("({})", transformed_body) } else { transformed_body };
 
     // Apply store subscription transformations to body.
     // First, transform store sub calls: `$t('key')` -> `$t()('key')` (double-call for store getters).
@@ -770,11 +662,8 @@ pub(super) fn transform_reactive_statement(
             } else if state_vars.iter().any(|s| s == name)
                 && !non_reactive_state_vars.iter().any(|s| s == name)
             {
-                let getter = if var_state_vars.iter().any(|v| v == name) {
-                    "$.safe_get"
-                } else {
-                    "$.get"
-                };
+                let getter =
+                    if var_state_vars.iter().any(|v| v == name) { "$.safe_get" } else { "$.get" };
                 parts.push(format!("{}({})", getter, name));
             } else if import_names.iter().any(|i| i == name)
                 && !state_vars.iter().any(|s| s == name)
@@ -791,9 +680,7 @@ pub(super) fn transform_reactive_statement(
     // Also transform labeled break in the form `break $` (without semicolon at the end of block).
     let transformed_body =
         if memchr::memmem::find(transformed_body.as_bytes(), b"break $").is_some() {
-            transformed_body
-                .replace("break $;", "return;")
-                .replace("break $\n", "return;\n")
+            transformed_body.replace("break $;", "return;").replace("break $\n", "return;\n")
         } else {
             transformed_body
         };
@@ -819,37 +706,51 @@ pub(super) fn transform_reactive_statement(
         // re-indented — template-literal content is part of the string value and must
         // be preserved byte-for-byte. We use a running in-template state so that only
         // lines outside of any `...` block get an extra tab.
-        use crate::compiler::phases::phase3_transform::client::formatting::update_template_literal_state;
+        use crate::compiler::phases::phase3_transform::client::formatting::{
+            TemplateStateFrame, in_string_content, update_template_literal_stack,
+        };
         let mut indented = String::with_capacity(inner_body.len() + inner_body.lines().count());
-        let mut in_template_literal = false;
+        let mut stack: Vec<TemplateStateFrame> = Vec::new();
         for (i, line) in inner_body.lines().enumerate() {
             if i > 0 {
                 indented.push('\n');
             }
-            if in_template_literal {
-                // Inside a template literal: preserve the line exactly as-is
-                // (including empty lines).
+            if in_string_content(&stack) {
+                // String content: preserve the line exactly as-is, empty lines
+                // included.
                 indented.push_str(line);
             } else if !line.trim().is_empty() {
                 indented.push('\t');
                 indented.push_str(line);
             }
-            in_template_literal = update_template_literal_state(line, in_template_literal);
+            update_template_literal_stack(line, &mut stack);
         }
-        format!(
-            "$.legacy_pre_effect({}, () => {{\n{}\n}});",
-            deps_thunk, indented
-        )
+        format!("$.legacy_pre_effect({}, () => {{\n{}\n}});", deps_thunk, indented)
     } else {
         // Don't add trailing semicolon if the body already ends with '}' (block/if statement)
         // or if the body is a block statement itself
-        let body_needs_semicolon = !inner_body.trim_end().ends_with('}');
+        let body_end = inner_body.trim_end();
+        let body_needs_semicolon = !body_end.ends_with('}') && !body_end.ends_with(';');
         let semi = if body_needs_semicolon { ";" } else { "" };
-        format!(
-            "$.legacy_pre_effect({}, () => {{\n\t{}{}\n}});",
-            deps_thunk, inner_body, semi
-        )
+        format!("$.legacy_pre_effect({}, () => {{\n\t{}{}\n}});", deps_thunk, inner_body, semi)
     }
+}
+
+/// Whether `body` carries a CODE comma at bracket depth 0 — i.e. is a sequence
+/// expression. Comment-/string-/regex-aware via `js_scan::code_bytes`.
+fn has_top_level_comma(body: &str) -> bool {
+    let mut depth = 0i32;
+    for (_, c) in
+        crate::compiler::phases::phase3_transform::shared::js_scan::code_bytes(body.as_bytes())
+    {
+        match c {
+            b'(' | b'{' | b'[' => depth += 1,
+            b')' | b'}' | b']' => depth -= 1,
+            b',' if depth == 0 => return true,
+            _ => {}
+        }
+    }
+    false
 }
 
 /// Unwrap a block statement `{ ... }` and return (inner_content, is_block).
@@ -958,26 +859,34 @@ pub(super) fn unwrap_block_statement_owned(body: &str) -> (String, bool) {
 ///
 /// Converts `x++` to `$.update_prop(x)`, `++x` to `$.update_pre_prop(x)`,
 /// `x--` to `$.update_prop(x, -1)`, and `--x` to `$.update_pre_prop(x, -1)`.
-pub(super) fn transform_prop_update_expressions(expr: &str, prop_vars: &[String]) -> String {
+pub(super) fn transform_prop_update_expressions<'a>(
+    expr: &'a str,
+    prop_vars: &[String],
+) -> Cow<'a, str> {
     if prop_vars.is_empty() {
-        return expr.to_string();
+        return Cow::Borrowed(expr);
     }
     super::reactive_update_ast::transform_reactive_update_ast(expr, prop_vars, &[], &[])
-        .unwrap_or_else(|| expr.to_string())
+        .map_or(Cow::Borrowed(expr), Cow::Owned)
 }
 
-/// Transform update expressions (++ / --) for state variables.
+/// Transform update expressions (++ / --) for prop **and** state variables.
 ///
-/// Converts `x++` to `$.update(x)`, `++x` to `$.update_pre(x)`,
-/// `x--` to `$.update(x, -1)`, and `--x` to `$.update_pre(x, -1)`.
-pub(super) fn transform_state_update_expressions(
+/// One visitor classifies both kinds — props first, exactly as running the prop
+/// pass before the state pass did — so this parses and re-prints the statement
+/// once where two chained calls did it twice.
+pub(super) fn transform_update_expressions(
     expr: &str,
+    prop_vars: &[String],
     state_vars: &[String],
     non_reactive_vars: &[String],
 ) -> String {
+    if prop_vars.is_empty() && state_vars.is_empty() {
+        return expr.to_string();
+    }
     super::reactive_update_ast::transform_reactive_update_ast(
         expr,
-        &[],
+        prop_vars,
         state_vars,
         non_reactive_vars,
     )
@@ -1005,7 +914,62 @@ pub(super) fn extract_locally_declared_vars(body: &str) -> Vec<String> {
             vars.push(m.as_str().to_string());
         }
     }
+    vars.extend(extract_catch_param_names(body));
     vars
+}
+
+/// A `catch` parameter binds its names without a `let`/`const`/`var` keyword,
+/// so the declaration scan above cannot see it; read them off the AST instead.
+fn extract_catch_param_names(body: &str) -> Vec<String> {
+    use oxc_ast::ast::CatchParameter;
+    use oxc_ast_visit::{Visit, walk};
+
+    if memmem::find(body.as_bytes(), b"catch").is_none() {
+        return Vec::new();
+    }
+
+    fn collect_pattern_names(pat: &oxc_ast::ast::BindingPattern, out: &mut Vec<String>) {
+        use oxc_ast::ast::BindingPattern as P;
+        match pat {
+            P::BindingIdentifier(id) => out.push(id.name.to_string()),
+            P::ObjectPattern(obj) => {
+                for prop in obj.properties.iter() {
+                    collect_pattern_names(&prop.value, out);
+                }
+                if let Some(rest) = &obj.rest {
+                    collect_pattern_names(&rest.argument, out);
+                }
+            }
+            P::ArrayPattern(arr) => {
+                for el in arr.elements.iter().flatten() {
+                    collect_pattern_names(el, out);
+                }
+                if let Some(rest) = &arr.rest {
+                    collect_pattern_names(&rest.argument, out);
+                }
+            }
+            P::AssignmentPattern(asgn) => collect_pattern_names(&asgn.left, out),
+        }
+    }
+
+    struct CatchParams {
+        names: Vec<String>,
+    }
+    impl<'a> Visit<'a> for CatchParams {
+        fn visit_catch_parameter(&mut self, param: &CatchParameter<'a>) {
+            collect_pattern_names(&param.pattern, &mut self.names);
+            walk::walk_catch_parameter(self, param);
+        }
+    }
+
+    let allocator = oxc_allocator::Allocator::default();
+    let parsed = oxc_parser::Parser::new(&allocator, body, oxc_span::SourceType::mjs()).parse();
+    if parsed.panicked {
+        return Vec::new();
+    }
+    let mut visitor = CatchParams { names: Vec::new() };
+    visitor.visit_program(&parsed.program);
+    visitor.names
 }
 
 /// Transform simple assignments to state variables into $.set() calls within reactive statements.

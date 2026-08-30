@@ -32,11 +32,11 @@ pub type FormatFileWithConfigCallback =
 /// Takes num_threads as argument; signals JS to perform any one-time setup before formatting.
 pub type JsInitExternalServicesCb = ThreadsafeFunction<
     // Input arguments
-    FnArgs<(u32, Vec<String>)>, // (num_threads, plugins)
+    FnArgs<(u32,)>, // (num_threads,)
     // Return type (what JS function returns)
-    Promise<Vec<String>>,
+    Promise<()>,
     // Arguments (repeated)
-    FnArgs<(u32, Vec<String>)>,
+    FnArgs<(u32,)>,
     // Error status
     Status,
     // CalleeHandled
@@ -219,7 +219,7 @@ impl ExternalServices {
     /// Initialize the JS-side services (worker pool) using the JS callback.
     pub fn init(&self, num_threads: usize) -> Result<(), String> {
         debug_span!("oxfmt::external::init", num_threads = num_threads)
-            .in_scope(|| (self.init)(num_threads, plugins))
+            .in_scope(|| (self.init)(num_threads))
     }
 
     /// Format non-js file using the JS callback.
@@ -249,11 +249,6 @@ impl ExternalServices {
             sort_tailwindcss_classes: Arc::new(|_, _| vec![]),
         }
     }
-
-    #[cfg(test)]
-    pub fn dummy() -> Self {
-        Self::unavailable()
-    }
 }
 
 // ---
@@ -279,13 +274,12 @@ fn wrap_init_external_services(
         let Some(cb) = guard.as_ref() else {
             return Err("JS callback unavailable (environment shutting down)".to_string());
         };
-        let plugins = plugins.to_vec();
         #[expect(clippy::cast_possible_truncation)]
         let result = block_on(async {
-            let status = cb.call_async(FnArgs::from((num_threads as u32, plugins))).await;
+            let status = cb.call_async(FnArgs::from((num_threads as u32,))).await;
             match status {
                 Ok(promise) => match promise.await {
-                    Ok(language_jsons) => Ok(language_jsons),
+                    Ok(()) => Ok(()),
                     Err(err) => Err(err.reason),
                 },
                 Err(err) => Err(err.reason),

@@ -71,7 +71,9 @@ pub fn const_tag(node: &ConstTag, context: &mut ComponentContext) {
         }
 
         // Convert the init expression to JS AST
+        let previous = context.state.suppress_pickled_await_instrumentation.replace(true);
         let converted_init = convert_expression(&parsed.init_expr, context);
+        context.state.suppress_pickled_await_instrumentation.set(previous);
 
         // Build the expression with transforms applied
         let expr_metadata = ExpressionMetadata::from_template_metadata(&node.metadata.expression);
@@ -106,16 +108,20 @@ pub fn const_tag(node: &ConstTag, context: &mut ComponentContext) {
                 is_defined: false,
                 is_reactive: true,
                 replacement_id: None,
+                store_source: None,
             },
         );
 
         // Template-kind binding: legacy reactivity sequences must wrap reads
         // in `$.deep_read_state()`. Match the official compiler's check at
         // utils.js (build_expression) for `binding.kind === 'template'`.
-        context
-            .state
-            .transform_deep_read
-            .insert(id_name.clone(), ());
+        context.state.transform_deep_read.insert(id_name.clone(), ());
+
+        // The `{@const}` shadows any outer same-named prop, so reads must go
+        // through the `$.get(name)` transform above instead of being rewritten
+        // to `$$props.name` (mirrors the `let:` / each-item shadowing).
+        context.state.shadowed_prop_names.insert(id_name.clone());
+        context.state.each_shadowing_names.insert(id_name.clone(), ());
 
         // Extract referenced variable names from init expression for blocker detection
         let init_refs = extract_refs_from_json_expr(&parsed.init_expr);
@@ -173,7 +179,9 @@ pub fn const_tag(node: &ConstTag, context: &mut ComponentContext) {
             std::mem::replace(&mut context.state.transform_deep_read, child_deep_read);
 
         // Convert and build the init expression with the child state
+        let previous = context.state.suppress_pickled_await_instrumentation.replace(true);
         let converted_init = convert_expression(&parsed.init_expr, context);
+        context.state.suppress_pickled_await_instrumentation.set(previous);
         let expr_metadata = ExpressionMetadata::from_template_metadata(&node.metadata.expression);
 
         let built_init = build_expression(context, &converted_init, &expr_metadata);
@@ -287,14 +295,14 @@ pub fn const_tag(node: &ConstTag, context: &mut ComponentContext) {
                     is_defined: false,
                     is_reactive: true,
                     replacement_id: None,
+                    store_source: None,
                 },
             );
             // Template-kind binding (destructured @const) requires
             // `$.deep_read_state()` wrapping in legacy reactivity sequences.
-            context
-                .state
-                .transform_deep_read
-                .insert(id_name.clone(), ());
+            context.state.transform_deep_read.insert(id_name.clone(), ());
+            context.state.shadowed_prop_names.insert(id_name.clone());
+            context.state.each_shadowing_names.insert(id_name.clone(), ());
         }
     }
 }
@@ -372,11 +380,9 @@ fn collect_identifiers(pattern: &serde_json::Value, out: &mut Vec<String>) {
 fn render_pattern_as_string(pattern: &serde_json::Value) -> String {
     let pat_type = pattern.get("type").and_then(|v| v.as_str());
     match pat_type {
-        Some("Identifier") => pattern
-            .get("name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("_")
-            .to_string(),
+        Some("Identifier") => {
+            pattern.get("name").and_then(|v| v.as_str()).unwrap_or("_").to_string()
+        }
         Some("ObjectPattern") | Some("ObjectExpression") => {
             let props: Vec<String> = pattern
                 .get("properties")
@@ -437,18 +443,12 @@ fn render_pattern_as_string(pattern: &serde_json::Value) -> String {
             format!("[{}]", elems.join(", "))
         }
         Some("RestElement") => {
-            let arg = pattern
-                .get("argument")
-                .map(render_pattern_as_string)
-                .unwrap_or_default();
+            let arg = pattern.get("argument").map(render_pattern_as_string).unwrap_or_default();
             format!("...{}", arg)
         }
         Some("AssignmentPattern") => {
             // We don't render defaults in the const destructuring pattern
-            pattern
-                .get("left")
-                .map(render_pattern_as_string)
-                .unwrap_or_default()
+            pattern.get("left").map(render_pattern_as_string).unwrap_or_default()
         }
         _ => "_".to_string(),
     }
@@ -510,10 +510,7 @@ fn create_derived(context: &ComponentContext, expression: JsExpr, is_async: bool
         // because is_last_evaluated_expression returns false for ConstTag parent.
         // Use apply_save_wrapping_non_tail instead of async_thunk's apply_save_wrapping.
         let saved_expr = b::apply_save_wrapping_non_tail(&context.arena, expression);
-        b::unthunk(
-            &context.arena,
-            b::async_arrow(&context.arena, vec![], saved_expr),
-        )
+        b::unthunk(&context.arena, b::async_arrow(&context.arena, vec![], saved_expr))
     } else {
         b::thunk(&context.arena, expression)
     };
@@ -521,10 +518,7 @@ fn create_derived(context: &ComponentContext, expression: JsExpr, is_async: bool
     if is_async {
         // Wrap with save(): (await $.save($.async_derived(thunk)))()
         // Matches official: save(b.call('$.async_derived', thunk))
-        b::save(
-            &context.arena,
-            b::svelte_call(&context.arena, "async_derived", vec![thunk]),
-        )
+        b::save(&context.arena, b::svelte_call(&context.arena, "async_derived", vec![thunk]))
     } else if context.state.analysis.runes {
         b::svelte_call(&context.arena, "derived", vec![thunk])
     } else {
@@ -562,14 +556,10 @@ pub(crate) fn add_const_declaration(
         let const_blocker_map = context.state.const_blocker_map.borrow();
         let top_level_blocker_map = context.state.blocker_map.borrow();
         let current_async_consts_id =
-            context
-                .state
-                .async_consts
-                .as_ref()
-                .and_then(|ac| match &ac.id {
-                    JsExpr::Identifier(name) => Some(name.clone()),
-                    _ => None,
-                });
+            context.state.async_consts.as_ref().and_then(|ac| match &ac.id {
+                JsExpr::Identifier(name) => Some(name.clone()),
+                _ => None,
+            });
 
         let mut blocker_list: Vec<JsExpr> = Vec::new();
         // Deduplicate by pointer identity from the map (same map entry = same expression).
@@ -643,31 +633,20 @@ pub(crate) fn add_const_declaration(
         // Async case: need to handle async consts
         let async_consts = context.state.async_consts.get_or_insert_with(|| {
             let id_name = context.state.memoizer.generate_id("promises");
-            AsyncConsts {
-                id: b::id(&id_name),
-                thunks: Vec::new(),
-            }
+            AsyncConsts { id: b::id(&id_name), thunks: Vec::new() }
         });
 
         // Add let declaration
-        context
-            .state
-            .consts
-            .push(b::let_decl(&context.arena, id_name, None));
+        context.state.consts.push(b::let_decl(&context.arena, id_name, None));
 
         // Add blocker wait thunks before the assignment thunk.
         // Official: if (blockers.length === 1) run.thunks.push(b.thunk(b.member(blockers[0], 'promise')))
         //           else if (blockers.length > 0) run.thunks.push(b.thunk(b.call('$.wait', b.array(blockers))))
         if blockers.len() == 1 {
             // Single blocker: () => blocker.promise
-            let blocker_promise = b::member(
-                &context.arena,
-                blockers.into_iter().next().unwrap(),
-                "promise",
-            );
-            async_consts
-                .thunks
-                .push(b::thunk(&context.arena, blocker_promise));
+            let blocker_promise =
+                b::member(&context.arena, blockers.into_iter().next().unwrap(), "promise");
+            async_consts.thunks.push(b::thunk(&context.arena, blocker_promise));
         } else if blockers.len() > 1 {
             // Multiple blockers: () => $.wait([blocker1, blocker2])
             async_consts.thunks.push(b::thunk(
@@ -684,13 +663,9 @@ pub(crate) fn add_const_declaration(
         // from create_derived already has $.save() wrapping applied internally.
         // Using async_thunk would apply save wrapping again, causing double-save.
         if has_await {
-            async_consts
-                .thunks
-                .push(b::async_arrow(&context.arena, vec![], assignment));
+            async_consts.thunks.push(b::async_arrow(&context.arena, vec![], assignment));
         } else {
-            async_consts
-                .thunks
-                .push(b::thunk(&context.arena, assignment));
+            async_consts.thunks.push(b::thunk(&context.arena, assignment));
         }
 
         // Register the blocker for this binding in const_blocker_map.
@@ -698,16 +673,9 @@ pub(crate) fn add_const_declaration(
         //           for (const binding of bindings) { binding.blocker = blocker; }
         let thunk_index = async_consts.thunks.len() - 1;
         let async_consts_id = async_consts.id.clone();
-        let blocker_expr = b::member_computed(
-            &context.arena,
-            async_consts_id,
-            b::number(thunk_index as f64),
-        );
-        context
-            .state
-            .const_blocker_map
-            .borrow_mut()
-            .insert(id_name.to_string(), blocker_expr);
+        let blocker_expr =
+            b::member_computed(&context.arena, async_consts_id, b::number(thunk_index as f64));
+        context.state.const_blocker_map.borrow_mut().insert(id_name.to_string(), blocker_expr);
 
         if is_reactive_derived {
             context.state.transform.insert(
@@ -722,15 +690,13 @@ pub(crate) fn add_const_declaration(
                     is_defined: false,
                     is_reactive: true,
                     replacement_id: None,
+                    store_source: None,
                 },
             );
         }
     } else {
         // Simple case: just add const declaration
-        context
-            .state
-            .consts
-            .push(b::const_decl(&context.arena, id_name, expression));
+        context.state.consts.push(b::const_decl(&context.arena, id_name, expression));
 
         // In dev mode, add an eager $.get(id) call after the const declaration.
         // This ensures "Cannot access x before initialization" errors are hit immediately.
@@ -770,14 +736,10 @@ pub(crate) fn add_async_declaration_multi(
         let const_blocker_map = context.state.const_blocker_map.borrow();
         let top_level_blocker_map = context.state.blocker_map.borrow();
         let current_async_consts_id =
-            context
-                .state
-                .async_consts
-                .as_ref()
-                .and_then(|ac| match &ac.id {
-                    JsExpr::Identifier(name) => Some(name.clone()),
-                    _ => None,
-                });
+            context.state.async_consts.as_ref().and_then(|ac| match &ac.id {
+                JsExpr::Identifier(name) => Some(name.clone()),
+                _ => None,
+            });
 
         let mut blocker_list: Vec<JsExpr> = Vec::new();
         let mut seen_ptrs: Vec<*const JsExpr> = Vec::new();
@@ -819,30 +781,19 @@ pub(crate) fn add_async_declaration_multi(
     // Open / reuse the async_consts group.
     let async_consts = context.state.async_consts.get_or_insert_with(|| {
         let id_name = context.state.memoizer.generate_id("promises");
-        AsyncConsts {
-            id: b::id(&id_name),
-            thunks: Vec::new(),
-        }
+        AsyncConsts { id: b::id(&id_name), thunks: Vec::new() }
     });
 
     // One bare `let <name>;` per declared identifier.
     for name in declared_names {
-        context
-            .state
-            .consts
-            .push(b::let_decl(&context.arena, name, None));
+        context.state.consts.push(b::let_decl(&context.arena, name, None));
     }
 
     // Blocker-wait thunks before the assignment thunk.
     if blockers.len() == 1 {
-        let blocker_promise = b::member(
-            &context.arena,
-            blockers.into_iter().next().unwrap(),
-            "promise",
-        );
-        async_consts
-            .thunks
-            .push(b::thunk(&context.arena, blocker_promise));
+        let blocker_promise =
+            b::member(&context.arena, blockers.into_iter().next().unwrap(), "promise");
+        async_consts.thunks.push(b::thunk(&context.arena, blocker_promise));
     } else if blockers.len() > 1 {
         async_consts.thunks.push(b::thunk(
             &context.arena,
@@ -853,13 +804,9 @@ pub(crate) fn add_async_declaration_multi(
     // Assignment with the WHOLE pattern as the LHS: `({ length, 0: first } = rhs)`.
     let assignment = b::assign(&context.arena, JsExpr::Raw(lhs_pattern.into()), rhs);
     if has_await {
-        async_consts
-            .thunks
-            .push(b::async_arrow(&context.arena, vec![], assignment));
+        async_consts.thunks.push(b::async_arrow(&context.arena, vec![], assignment));
     } else {
-        async_consts
-            .thunks
-            .push(b::thunk(&context.arena, assignment));
+        async_consts.thunks.push(b::thunk(&context.arena, assignment));
     }
 
     // Register the SAME blocker for every declared name.
@@ -871,20 +818,16 @@ pub(crate) fn add_async_declaration_multi(
             async_consts_id.clone(),
             b::number(thunk_index as f64),
         );
-        context
-            .state
-            .const_blocker_map
-            .borrow_mut()
-            .insert(name.clone(), blocker_expr);
+        context.state.const_blocker_map.borrow_mut().insert(name.clone(), blocker_expr);
     }
 }
 
 /// Parsed variable declaration result.
-struct ParsedDeclaration {
+struct ParsedDeclaration<'a> {
     /// The identifier name (empty for destructuring patterns)
     id_name: String,
     /// The initializer expression
-    init_expr: Expression,
+    init_expr: Expression<'a>,
     /// Whether the id is a simple identifier (true) or destructuring pattern (false)
     is_identifier: bool,
     /// The raw JSON pattern for destructuring (None for simple identifiers)
@@ -898,7 +841,7 @@ struct ParsedDeclaration {
 ///    `{ type: "VariableDeclaration", declarations: [{ id, init }] }`
 /// 2. AssignmentExpression (our Rust parser format):
 ///    `{ type: "AssignmentExpression", left: id, right: init }`
-fn parse_variable_declaration(expr: &Expression) -> Option<ParsedDeclaration> {
+fn parse_variable_declaration<'a>(expr: &Expression<'a>) -> Option<ParsedDeclaration<'a>> {
     {
         let json_value = expr.as_json();
         let obj = json_value.as_object()?;

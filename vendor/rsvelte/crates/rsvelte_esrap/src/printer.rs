@@ -12,12 +12,49 @@
 //! not yet handled return [`Unsupported`] so the harness can attribute misses
 //! precisely rather than emit wrong output.
 
-use oxc_ast::ast::*;
-use oxc_span::GetSpan;
+use oxc_ast::ast::{
+    AccessorProperty, AccessorPropertyType, Argument, ArrayExpression, ArrayExpressionElement,
+    ArrayPattern, ArrowFunctionBody, ArrowFunctionExpression, AssignmentExpression,
+    AssignmentTarget, AssignmentTargetMaybeDefault, AssignmentTargetProperty, BinaryExpression,
+    BindingPattern, BindingProperty, CallExpression, ChainElement, Class, ClassBody, ClassElement,
+    ComputedMemberExpression, ConditionalExpression, Declaration, Decorator, Directive,
+    DoWhileStatement, ExportDeclaration, ExportDefaultDeclaration, ExportDefaultDeclarationKind,
+    ExportFromDeclaration, ExportNamedDeclaration, ExportSpecifier, Expression, ForStatement,
+    ForStatementInit, ForStatementLeft, FormalParameters, Function, IfStatement,
+    ImportAttributeKey, ImportDeclaration, ImportDeclarationSpecifier, ImportOrExportKind,
+    ImportSpecifier, JSXAttributeItem, JSXAttributeName, JSXAttributeValue, JSXChild, JSXElement,
+    JSXElementName, JSXExpressionContainer, JSXFragment, JSXMemberExpression,
+    JSXMemberExpressionObject, JSXOpeningElement, LogicalExpression, MethodDefinition,
+    MethodDefinitionKind, MethodDefinitionType, ModuleExportName, ObjectExpression, ObjectPattern,
+    ObjectProperty, ObjectPropertyKind, PrivateFieldExpression, PrivateInExpression, Program,
+    PropertyDefinition, PropertyDefinitionType, PropertyKey, PropertyKind, SequenceExpression,
+    SimpleAssignmentTarget, Statement, StaticMemberExpression, StringLiteral, SwitchStatement,
+    TSAccessibility, TSEnumDeclaration, TSEnumMember, TSEnumMemberName,
+    TSExternalModuleDeclaration, TSGlobalDeclaration, TSImportEqualsDeclaration, TSImportType,
+    TSImportTypeQualifier, TSInterfaceDeclaration, TSLiteral, TSMappedType,
+    TSMappedTypeModifierOperator, TSModuleBlock, TSModuleReference, TSNamedTupleMember,
+    TSNamespaceDeclaration, TSNamespaceDeclarationBody, TSNamespaceDeclarationKind, TSSignature,
+    TSThisParameter, TSTupleElement, TSType, TSTypeAliasDeclaration, TSTypeAnnotation,
+    TSTypeLiteral, TSTypeName, TSTypeOperatorOperator, TSTypeParameter, TSTypeParameterDeclaration,
+    TSTypeParameterInstantiation, TSTypePredicateName, TSTypeQueryExprName, TemplateLiteral,
+    TryStatement, UnaryExpression, VariableDeclaration, VariableDeclarationKind, WithClause,
+};
+use oxc_span::{GetSpan, Span};
 use oxc_syntax::operator::UnaryOperator;
 
-use crate::context::Context;
-use crate::{PrintOptions, QuoteStyle};
+use compact_str::{CompactString, format_compact};
+
+use crate::PrintOptions;
+use crate::command::EventKind;
+use crate::context::{Context, EventMark};
+
+fn usize_to_u32(value: usize) -> u32 {
+    u32::try_from(value).expect("source positions exceed the u32 AST coordinate range")
+}
+
+fn usize_to_i64(value: usize) -> i64 {
+    i64::try_from(value).expect("command buffers exceed the i64 layout range")
+}
 
 /// A node kind the printer does not yet handle. Carries the kind name so the
 /// conformance harness can report exactly which visitors are still missing.
@@ -30,23 +67,31 @@ pub struct Unsupported(pub &'static str);
 /// written unmapped.
 struct KeywordCursor {
     cursor: Option<(u32, u32)>,
+    line_end: Option<u32>,
 }
 
 impl KeywordCursor {
     /// Write one fragment (e.g. `"declare "`, `"class "`). Mapped if a cursor is
     /// active, otherwise a plain write.
-    fn write(&mut self, ctx: &mut Context, fragment: &str) {
+    fn write<const DIRECT: bool>(&mut self, ctx: &mut Context<DIRECT>, fragment: &str) {
         if let Some((line, col)) = self.cursor {
-            Printer::write_source_keyword(ctx, line, col, fragment);
-            self.cursor = Some((line, col + fragment.len() as u32));
+            ctx.location(line, col);
+            ctx.write(fragment);
+            let end = col.saturating_add(usize_to_u32(fragment.len()));
+            if end <= self.line_end.unwrap_or(u32::MAX) {
+                ctx.location(line, end);
+            }
+            self.cursor = Some((line, col + usize_to_u32(fragment.len())));
         } else {
-            ctx.write(fragment.to_string());
+            ctx.write(fragment);
         }
     }
 }
 
-pub struct Printer<'opt> {
+#[repr(C)]
+pub struct Printer<'opt, const HAS_COMMENTS: bool = true, const DIRECT: bool = false> {
     options: &'opt PrintOptions,
+    emit_locations: bool,
     /// Set by the first unsupported node encountered; printing continues so the
     /// harness gets a single representative miss per file.
     pub missing: Option<Unsupported>,
@@ -54,23 +99,269 @@ pub struct Printer<'opt> {
     /// threads comments positionally (leading before a node, trailing on a
     /// node's last line) rather than attaching them to AST nodes.
     comments: Vec<Cmt>,
+    borrowed_comments: Option<&'opt [oxc_ast::ast::Comment]>,
     comment_index: usize,
-    /// Byte offsets of each line start, for offset→line lookups when placing
-    /// comments. Empty when printing without comments.
+    /// Byte offsets of each line start in the buffer the comment spans index
+    /// into, for offset→line lookups when placing comments. Empty when printing
+    /// without comments.
     line_starts: Vec<u32>,
-    /// Optional caller hooks that inject synthetic leading/trailing comments per
-    /// statement (esrap's `getLeadingComments` / `getTrailingComments`).
-    hooks: Option<&'opt crate::CommentHooks<'opt>>,
+    comment_source: Option<&'opt str>,
+    /// The text the comment spans index into, consulted only to decide whether
+    /// a line break separates two offsets. `line_starts` cannot answer that: it
+    /// doubles as the source-map coordinate table, so it counts LF alone, while
+    /// esrap reads placement off acorn's `loc.line`, which advances on CR and on
+    /// U+2028 / U+2029 too. `None` falls back to `line_starts`.
+    placement_source: Option<&'opt str>,
+    /// Byte offsets of each line start in the buffer source-map positions are
+    /// resolved against. Same as `line_starts` unless the caller split the two
+    /// coordinate spaces (see [`crate::print_split`]).
+    map_line_starts: Option<Vec<u32>>,
+    /// Spans below this offset are synthesized and carry no source location, so
+    /// they take no part in comment placement — the Rust equivalent of esrap's
+    /// `if (node.loc)` guards. `None` = every span is a real location.
+    loc_base: Option<u32>,
+    /// Sorted, disjoint ranges translating a comment-space offset back to a
+    /// source-map-space offset.
+    loc_map: Vec<LocRange>,
+    /// Source-backed brace ranges for default-exported wrapper functions whose
+    /// ordinary body span must remain in comment space.
+    brace_mappings: Vec<BraceMapping>,
+    /// Decorator expressions have no esrap mapping visitor, so their nested
+    /// tokens must stay unmapped too.
+    map_nodes: bool,
+}
+
+/// One `loc_map` entry: comment-space `[start, end)` resolves to `source`.
+/// `linear` means byte *i* of the range resolves to `source + (i - start)`,
+/// which is how a verbatim-copied region is carried in one entry instead of one
+/// per byte; otherwise the whole range anchors at `source`. `None` is
+/// deliberately unmapped.
+#[derive(Debug, Clone, Copy)]
+pub struct LocRange {
+    /// First comment-space byte this entry covers.
+    pub start: u32,
+    /// One past the last comment-space byte this entry covers.
+    pub end: u32,
+    /// Source-map-space offset, or `None` for a deliberately unmapped run.
+    pub source: Option<u32>,
+    /// Whether the range advances through the source byte for byte.
+    pub linear: bool,
+}
+
+/// A block body whose braces map somewhere other than its comment-placement
+/// span. This lets a synthetic wrapper retain its comment island while its
+/// generated braces map to an enclosing source construct.
+#[derive(Debug, Clone, Copy)]
+pub struct BraceMapping {
+    /// Start of the wrapper body in comment-placement coordinates.
+    pub body_start: u32,
+    /// End of the wrapper body in comment-placement coordinates.
+    pub body_end: u32,
+    /// Source offset of the construct that owns the opening brace.
+    pub source_start: u32,
+    /// Source offset immediately after the construct's closing brace.
+    pub source_end: u32,
+}
+
+/// esrap's `write_comment`: re-emit a comment, splitting a multi-line block
+/// body across `newline`s so its interior re-indents to the current level. A
+/// free function so the comment-flush loops can hold a `&Cmt` borrowed straight
+/// out of `self.comments` without cloning it.
+fn write_comment<const DIRECT: bool>(cmt: &Cmt, ctx: &mut Context<DIRECT>) {
+    let value = &cmt.value;
+    if !cmt.block {
+        ctx.write(format_compact!("//{value}"));
+        return;
+    }
+    ctx.write_ascii_bytes(b"/*");
+    let mut multiline = false;
+    for (i, line) in value.split('\n').enumerate() {
+        if i > 0 {
+            ctx.newline();
+            multiline = true;
+        }
+        ctx.write(line);
+    }
+    ctx.write_ascii_bytes(b"*/");
+    if multiline {
+        ctx.newline();
+    }
+}
+
+fn write_borrowed_comment_span<const DIRECT: bool>(
+    start: u32,
+    end: u32,
+    block: bool,
+    source: &str,
+    ctx: &mut Context<DIRECT>,
+) {
+    let raw = source.get(start as usize..end as usize).unwrap_or_default();
+    if !block {
+        ctx.write(raw);
+        return;
+    }
+    let inner = raw.strip_prefix("/*").and_then(|text| text.strip_suffix("*/")).unwrap_or(raw);
+    if !inner.contains('\n') {
+        ctx.write(raw);
+        return;
+    }
+
+    let line_start = source[..start as usize].rfind('\n').map_or(0, |index| index + 1);
+    let opener_line = &source[line_start..start as usize];
+    let indent_len =
+        opener_line.as_bytes().iter().take_while(|&&byte| matches!(byte, b' ' | b'\t')).count();
+    let indentation = &opener_line[..indent_len];
+
+    ctx.write_ascii_bytes(b"/*");
+    for (index, line) in inner.split('\n').enumerate() {
+        if index > 0 {
+            ctx.newline();
+        }
+        ctx.write(line.strip_prefix(indentation).unwrap_or(line));
+    }
+    ctx.write_ascii_bytes(b"*/");
+    ctx.newline();
+}
+
+struct BorrowedCommentDriver<'a> {
+    comments: &'a [oxc_ast::ast::Comment],
+    source: &'a str,
+    index: usize,
+}
+
+#[derive(Clone, Copy)]
+struct CommentMeta {
+    start: u32,
+    end: u32,
+    start_line: u32,
+    block: bool,
+}
+
+impl<'a> BorrowedCommentDriver<'a> {
+    fn new(program: &'a Program<'a>, source: &'a str, located: bool) -> Self {
+        Self {
+            comments: &program.comments,
+            source,
+            index: if located { 0 } else { program.comments.len() },
+        }
+    }
+
+    fn flush_until<const DIRECT: bool>(
+        &mut self,
+        ctx: &mut Context<DIRECT>,
+        to: u32,
+        from: Option<u32>,
+        pad: bool,
+    ) {
+        let Some(next) = self.comments.get(self.index) else {
+            return;
+        };
+        if next.span.start >= to {
+            return;
+        }
+        let mut first = true;
+        while let Some(comment) = self.comments.get(self.index) {
+            if comment.span.start >= to {
+                break;
+            }
+            if first && from.is_some_and(|from| self.has_newline(from, comment.span.start)) {
+                ctx.margin();
+                ctx.newline();
+            }
+            first = false;
+            self.write(comment, ctx);
+            if self.has_newline(comment.span.end, to)
+                || matches!(comment.kind, oxc_ast::ast::CommentKind::Line)
+            {
+                ctx.newline();
+            } else if pad {
+                ctx.write_ascii(b' ');
+            }
+            self.index += 1;
+        }
+    }
+
+    fn flush_trailing<const DIRECT: bool>(
+        &mut self,
+        ctx: &mut Context<DIRECT>,
+        prev_end: u32,
+        next: Option<u32>,
+    ) {
+        while let Some(comment) = self.comments.get(self.index) {
+            if self.has_newline(prev_end, comment.span.start)
+                || next.is_some_and(|next| comment.span.end >= next)
+            {
+                break;
+            }
+            ctx.write_ascii(b' ');
+            self.write(comment, ctx);
+            self.index += 1;
+            if matches!(comment.kind, oxc_ast::ast::CommentKind::Line) {
+                ctx.newline();
+                break;
+            }
+        }
+    }
+
+    fn has_newline(&self, start: u32, end: u32) -> bool {
+        debug_assert!(start <= end);
+        self.source.get(start as usize..end as usize).is_some_and(contains_line_terminator)
+    }
+
+    fn write<const DIRECT: bool>(
+        &self,
+        comment: &oxc_ast::ast::Comment,
+        ctx: &mut Context<DIRECT>,
+    ) {
+        let raw = comment.span.source_text(self.source);
+        if matches!(comment.kind, oxc_ast::ast::CommentKind::Line) {
+            ctx.write(raw);
+            return;
+        }
+        let inner = raw.strip_prefix("/*").and_then(|text| text.strip_suffix("*/")).unwrap_or(raw);
+        if !inner.contains('\n') {
+            ctx.write(raw);
+            return;
+        }
+
+        let line_start =
+            self.source[..comment.span.start as usize].rfind('\n').map_or(0, |index| index + 1);
+        let opener_line = &self.source[line_start..comment.span.start as usize];
+        let indent_len =
+            opener_line.as_bytes().iter().take_while(|&&byte| matches!(byte, b' ' | b'\t')).count();
+        let indentation = &opener_line[..indent_len];
+
+        ctx.write_ascii_bytes(b"/*");
+        for (index, line) in inner.split('\n').enumerate() {
+            if index > 0 {
+                ctx.newline();
+            }
+            ctx.write(line.strip_prefix(indentation).unwrap_or(line));
+        }
+        ctx.write_ascii_bytes(b"*/");
+        ctx.newline();
+    }
+}
+
+/// Whether `text` holds an ECMAScript `LineTerminator`. esrap asks this by
+/// comparing acorn `loc.line` numbers, which advance on CR and on U+2028 /
+/// U+2029 as well as on LF.
+pub(crate) fn contains_line_terminator(text: &str) -> bool {
+    text.as_bytes().iter().any(|&b| b == b'\n' || b == b'\r')
+        || text.contains(['\u{2028}', '\u{2029}'])
 }
 
 /// Byte offsets at which each source line begins (line 1 starts at 0).
+///
+/// LF only: this table also resolves source-map positions, whose line numbering
+/// is the generated buffer's. Comment *placement* asks a different question —
+/// see [`contains_line_terminator`].
 pub fn line_starts(source: &str) -> Vec<u32> {
-    let mut starts = vec![0];
-    for (i, b) in source.bytes().enumerate() {
-        if b == b'\n' {
-            starts.push(i as u32 + 1);
-        }
-    }
+    // Sized off an assumed ~32 bytes per line so a long source does not walk the
+    // whole doubling sequence.
+    let mut starts = Vec::with_capacity(source.len() / 32 + 8);
+    starts.push(0);
+    starts.extend(memchr::memchr_iter(b'\n', source.as_bytes()).map(|i| usize_to_u32(i) + 1));
     starts
 }
 
@@ -82,18 +373,16 @@ pub struct Cmt {
     pub start: u32,
     pub end: u32,
     pub start_line: u32,
-    pub end_line: u32,
     pub block: bool,
     pub value: String,
 }
 
 /// Resolve a program's oxc comments into [`Cmt`]s in source order. `source` is
 /// the text the program was parsed from (for the comment bodies + line numbers).
-pub fn build_comments(program: &Program<'_>, source: &str) -> Vec<Cmt> {
-    let starts = line_starts(source);
+pub fn build_comments(program: &Program<'_>, source: &str, starts: &[u32]) -> Vec<Cmt> {
     let line_of = |offset: u32| -> u32 {
         // 1-based line: number of line starts <= offset.
-        starts.partition_point(|&s| s <= offset) as u32
+        usize_to_u32(starts.partition_point(|&s| s <= offset))
     };
 
     program
@@ -104,10 +393,8 @@ pub fn build_comments(program: &Program<'_>, source: &str) -> Vec<Cmt> {
             let raw = &source[start as usize..end as usize];
             let block = !matches!(c.kind, oxc_ast::ast::CommentKind::Line);
             let value = if block {
-                let inner = raw
-                    .strip_prefix("/*")
-                    .and_then(|s| s.strip_suffix("*/"))
-                    .unwrap_or(raw);
+                let inner =
+                    raw.strip_prefix("/*").and_then(|s| s.strip_suffix("*/")).unwrap_or(raw);
                 // Svelte's `onComment` (1-parse/acorn.js) dedents a multi-line
                 // block comment by its opener line's leading indentation, so the
                 // re-indent on output (one `newline()` per line) doesn't stack
@@ -120,16 +407,35 @@ pub fn build_comments(program: &Program<'_>, source: &str) -> Vec<Cmt> {
             } else {
                 raw.strip_prefix("//").unwrap_or(raw).to_string()
             };
-            Cmt {
-                start,
-                end,
-                start_line: line_of(start),
-                end_line: line_of(end),
-                block,
-                value,
-            }
+            Cmt { start, end, start_line: line_of(start), block, value }
         })
         .collect()
+}
+
+pub(crate) fn comments_are_program_level(program: &Program<'_>) -> bool {
+    let mut comment_index = 0;
+    let spans = program
+        .directives
+        .iter()
+        .map(|directive| directive.span)
+        .chain(program.body.iter().map(GetSpan::span));
+    for span in spans {
+        if span.start == u32::MAX || span.end == u32::MAX {
+            return false;
+        }
+        while program
+            .comments
+            .get(comment_index)
+            .is_some_and(|comment| comment.span.end <= span.start)
+        {
+            comment_index += 1;
+        }
+        if program.comments.get(comment_index).is_some_and(|comment| comment.span.start < span.end)
+        {
+            return false;
+        }
+    }
+    true
 }
 
 /// Strip the comment opener's line indentation from every line of a multi-line
@@ -175,7 +481,7 @@ fn unparen<'a, 'b>(mut expr: &'a Expression<'b>) -> &'a Expression<'b> {
 }
 
 /// Faithful port of esrap's `has_call_expression`: walk a callee's member-object
-/// spine and report whether any link is a CallExpression. Used to decide whether
+/// spine and report whether any link is a `CallExpression`. Used to decide whether
 /// a `new` callee needs wrapping parens.
 fn callee_has_call_expression(expr: &Expression) -> bool {
     let mut node = unparen(expr);
@@ -209,37 +515,41 @@ fn expr_precedence(expr: &Expression) -> u8 {
         Expression::StaticMemberExpression(_)
         | Expression::ComputedMemberExpression(_)
         | Expression::PrivateFieldExpression(_)
-        | Expression::MetaProperty(_)
+        | Expression::ImportMeta(_)
+        | Expression::NewTarget(_)
         | Expression::CallExpression(_)
         | Expression::ChainExpression(_)
         | Expression::ImportExpression(_)
         | Expression::NewExpression(_) => 19,
-        Expression::BooleanLiteral(_)
-        | Expression::NullLiteral(_)
-        | Expression::NumericLiteral(_)
-        | Expression::BigIntLiteral(_)
-        | Expression::RegExpLiteral(_)
-        | Expression::StringLiteral(_) => 18,
         Expression::AwaitExpression(_)
         | Expression::ClassExpression(_)
         | Expression::FunctionExpression(_)
         | Expression::ObjectExpression(_) => 17,
         Expression::UpdateExpression(_) => 16,
         Expression::UnaryExpression(_) => 15,
-        Expression::BinaryExpression(_) => 14,
+        Expression::BinaryExpression(_) | Expression::PrivateInExpression(_) => 14,
         // `as`/`satisfies` sit between binary and logical operators.
         Expression::TSAsExpression(_) | Expression::TSSatisfiesExpression(_) => 13,
         Expression::LogicalExpression(_) => 12,
         Expression::ConditionalExpression(_) => 4,
         Expression::ArrowFunctionExpression(_) | Expression::AssignmentExpression(_) => 3,
         Expression::YieldExpression(_) => 2,
-        Expression::TSInstantiationExpression(_)
-        | Expression::TSNonNullExpression(_)
-        | Expression::TSTypeAssertion(_) => 18,
         // `unparen` already stripped any `ParenthesizedExpression`, so it never
         // reaches here.
         _ => 18,
     }
+}
+
+/// A `class`, `function` or object literal is a `PrimaryExpression`, so it is
+/// already a legal `extends` operand even though its precedence sits below a
+/// `MemberExpression`'s.
+fn heritage_needs_no_parens(expr: &Expression) -> bool {
+    matches!(
+        unparen(expr),
+        Expression::ClassExpression(_)
+            | Expression::FunctionExpression(_)
+            | Expression::ObjectExpression(_)
+    )
 }
 
 /// Binary/logical operator precedence (esrap's `OPERATOR_PRECEDENCE`).
@@ -278,10 +588,7 @@ fn binary_needs_parens(
     // A left-hand `as`/`satisfies` child only needs parens when the parent
     // operator would otherwise swallow the trailing type (`**`, `&`, `|`).
     if !is_right
-        && matches!(
-            child,
-            Expression::TSAsExpression(_) | Expression::TSSatisfiesExpression(_)
-        )
+        && matches!(child, Expression::TSAsExpression(_) | Expression::TSSatisfiesExpression(_))
     {
         return parent_op == "**" || parent_op == "&" || parent_op == "|";
     }
@@ -323,6 +630,7 @@ fn child_binary_op(expr: &Expression) -> &'static str {
     match expr {
         Expression::BinaryExpression(b) => b.operator.as_str(),
         Expression::LogicalExpression(l) => l.operator.as_str(),
+        Expression::PrivateInExpression(_) => "in",
         _ => "",
     }
 }
@@ -352,82 +660,313 @@ fn arrow_concise_body_needs_wrap(body: &Expression) -> bool {
     }
 }
 
-impl<'opt> Printer<'opt> {
-    pub fn new(options: &'opt PrintOptions) -> Self {
+impl<'opt, const HAS_COMMENTS: bool, const DIRECT: bool> Printer<'opt, HAS_COMMENTS, DIRECT> {
+    fn deferred(&mut self) -> &mut Printer<'opt, HAS_COMMENTS, false> {
+        // SAFETY: the const parameter does not affect the repr(C) field layout.
+        unsafe { &mut *(std::ptr::from_mut(self).cast()) }
+    }
+
+    fn comment_free(&mut self) -> &mut Printer<'opt, false, DIRECT> {
+        // SAFETY: the const parameter does not affect the repr(C) field layout.
+        unsafe { &mut *(std::ptr::from_mut(self).cast()) }
+    }
+
+    #[cfg(test)]
+    pub const fn new(options: &'opt PrintOptions) -> Self {
         Self {
             options,
+            emit_locations: false,
             missing: None,
             comments: Vec::new(),
+            borrowed_comments: None,
             comment_index: 0,
             line_starts: Vec::new(),
-            hooks: None,
+            comment_source: None,
+            placement_source: None,
+            map_line_starts: None,
+            loc_base: None,
+            loc_map: Vec::new(),
+            brace_mappings: Vec::new(),
+            map_nodes: true,
         }
     }
 
     /// A printer that interleaves `comments` (see [`build_comments`]).
     /// `line_starts` is the table from [`line_starts`].
-    pub fn with_comments(
+    pub const fn with_comments(
         options: &'opt PrintOptions,
         comments: Vec<Cmt>,
         line_starts: Vec<u32>,
     ) -> Self {
         Self {
             options,
+            emit_locations: false,
             missing: None,
             comments,
+            borrowed_comments: None,
             comment_index: 0,
+            map_line_starts: None,
             line_starts,
-            hooks: None,
+            comment_source: None,
+            placement_source: None,
+            loc_base: None,
+            loc_map: Vec::new(),
+            brace_mappings: Vec::new(),
+            map_nodes: true,
         }
     }
 
-    /// Attach caller comment hooks (builder-style).
-    pub fn with_hooks(mut self, hooks: &'opt crate::CommentHooks<'opt>) -> Self {
-        self.hooks = Some(hooks);
+    /// Decide comment placement by reading `source`, not by comparing lines in
+    /// `line_starts` (which is the source-map coordinate table).
+    pub(crate) const fn with_placement_source(mut self, source: &'opt str) -> Self {
+        self.placement_source = Some(source);
         self
+    }
+
+    pub(crate) const fn with_borrowed_comments(
+        mut self,
+        comments: &'opt [oxc_ast::ast::Comment],
+        source: &'opt str,
+    ) -> Self {
+        self.borrowed_comments = Some(comments);
+        self.comment_source = Some(source);
+        self
+    }
+
+    /// Resolve source-map positions against a different buffer than the one the
+    /// comment spans index into, and treat spans below `loc_base` as
+    /// synthesized (no location). `loc_map` translates comment-space offsets
+    /// back into map-space offsets.
+    pub fn with_split_coordinates(
+        mut self,
+        map_line_starts: Vec<u32>,
+        loc_base: u32,
+        loc_map: &[LocRange],
+        brace_mappings: &[BraceMapping],
+        emit_locations: bool,
+    ) -> Self {
+        self.emit_locations = emit_locations;
+        self.map_line_starts = Some(map_line_starts);
+        self.loc_base = Some(loc_base);
+        self.loc_map = loc_map.to_vec();
+        self.brace_mappings = brace_mappings.to_vec();
+        self
+    }
+
+    /// Enable source-map anchor events for this print.
+    pub const fn with_source_map(mut self) -> Self {
+        self.emit_locations = true;
+        self
+    }
+
+    pub(crate) fn source_map_line_starts(&self) -> &[u32] {
+        self.map_line_starts.as_deref().unwrap_or(&self.line_starts)
     }
 
     /// 1-based line of a byte offset (number of line starts at/before it).
     fn line_of(&self, offset: u32) -> u32 {
-        self.line_starts.partition_point(|&s| s <= offset) as u32
+        usize_to_u32(self.line_starts.partition_point(|&s| s <= offset))
+    }
+
+    fn has_newline_between(&self, start: u32, end: u32) -> bool {
+        if start >= end {
+            return false;
+        }
+        self.placement_text().map_or_else(
+            || self.line_of(start) < self.line_of(end),
+            |source| source.get(start as usize..end as usize).is_some_and(contains_line_terminator),
+        )
+    }
+
+    fn comment_starts_on_earlier_line(&self, comment: CommentMeta, offset: u32) -> bool {
+        self.placement_text().map_or_else(
+            || comment.start_line < self.line_of(offset),
+            |_| self.has_newline_between(comment.start, offset),
+        )
+    }
+
+    /// The text placement decisions are read from, if the caller supplied one.
+    fn placement_text(&self) -> Option<&'opt str> {
+        self.comment_source.or(self.placement_source)
+    }
+
+    /// esrap's `if (node.loc)`: whether a span offset is a real source position
+    /// (and so may carry comments) rather than a synthesized node's placeholder.
+    fn has_loc(&self, offset: u32) -> bool {
+        offset != u32::MAX && self.loc_base.is_none_or(|base| offset >= base)
     }
 
     /// Convert a byte offset to `(line_1based, column_0based)` using
-    /// `line_starts`, mirroring ESTree `loc` (1-based line, 0-based column). The
+    /// `line_starts`, mirroring `ESTree` `loc` (1-based line, 0-based column). The
     /// column is the offset relative to the start of its line; for ASCII / BMP
     /// source this equals the UTF-16 column esrap uses. Returns `None` when
     /// there are no line starts (printing without source context).
     fn offset_to_line_col(&self, offset: u32) -> Option<(u32, u32)> {
-        if self.line_starts.is_empty() {
+        if !self.has_loc(offset) {
             return None;
         }
-        let line = self.line_of(offset);
+        self.map_position(offset)
+    }
+
+    /// [`Self::offset_to_line_col`] without the `loc_base` gate. Under split
+    /// coordinates a real source offset is below `loc_base` and so is "no
+    /// location" *for comments*, but it is still exactly the position a source
+    /// map segment wants. Formatting decisions must keep using
+    /// [`Self::offset_to_line_col`], which cannot compare across the two spaces.
+    fn map_position(&self, offset: u32) -> Option<(u32, u32)> {
+        if offset == u32::MAX {
+            return None;
+        }
+        let map_line_starts = self.map_line_starts.as_deref().unwrap_or(&self.line_starts);
+        if map_line_starts.is_empty() {
+            return None;
+        }
+        let offset = if self.loc_map.is_empty() {
+            offset
+        } else {
+            match self
+                .loc_map
+                .binary_search_by(|range| {
+                    if offset < range.start {
+                        std::cmp::Ordering::Greater
+                    } else if offset >= range.end {
+                        std::cmp::Ordering::Less
+                    } else {
+                        std::cmp::Ordering::Equal
+                    }
+                })
+                .ok()
+                .map(|i| &self.loc_map[i])
+            {
+                Some(range) => match range.source {
+                    Some(mapped) if range.linear => mapped + (offset - range.start),
+                    Some(mapped) => mapped,
+                    None => return None,
+                },
+                None => offset,
+            }
+        };
+        let line = usize_to_u32(map_line_starts.partition_point(|&s| s <= offset));
         // `line` is 1-based; its start offset lives at index `line - 1`.
-        let line_start = self.line_starts[(line - 1) as usize];
+        let line_start = map_line_starts[(line - 1) as usize];
         Some((line, offset.saturating_sub(line_start)))
+    }
+
+    /// Resolve the exclusive end of a source-backed node. A linear `LocRange`
+    /// carries a copied byte run as `[start, end)`, while an AST span also uses
+    /// `end` as the token's final source-map position. Prefer the copied run
+    /// ending at `offset` over a following range starting at the same boundary;
+    /// this matches `RawMapped`'s fallback span restorer.
+    fn map_end_position(&self, offset: u32) -> Option<(u32, u32)> {
+        if !self.loc_map.is_empty() {
+            let index = self.loc_map.partition_point(|range| range.end < offset);
+            if let Some(range) = self.loc_map.get(index)
+                && range.end == offset
+                && range.linear
+                && let Some(source) = range.source
+            {
+                let mapped = source + (offset - range.start);
+                let line_starts = self.map_line_starts.as_deref().unwrap_or(&self.line_starts);
+                let line = usize_to_u32(line_starts.partition_point(|&s| s <= mapped));
+                let line_start = line_starts[(line - 1) as usize];
+                return Some((line, mapped.saturating_sub(line_start)));
+            }
+        }
+        self.map_position(offset)
     }
 
     /// esrap's `write_source_keyword`: bracket the literal `keyword` with
     /// source-map anchors for its exact span, so breakpoints land on the keyword.
-    fn write_source_keyword(ctx: &mut Context, line: u32, column: u32, keyword: &str) {
+    fn write_source_keyword(ctx: &mut Context<DIRECT>, line: u32, column: u32, keyword: &str) {
         ctx.location(line, column);
         ctx.write(keyword);
-        ctx.location(line, column + keyword.len() as u32);
+        ctx.location(line, column + usize_to_u32(keyword.len()));
     }
 
     /// esrap's `write_keyword`: map one `keyword` anchored at the byte offset
     /// `start` (resolved to a source `loc`), then append an unmapped `suffix`. If
     /// the offset can't be resolved (no source context), falls back to a plain
     /// `keyword + suffix` write.
-    fn write_keyword(&self, ctx: &mut Context, start: u32, keyword: &str, suffix: &str) {
-        if let Some((line, column)) = self.offset_to_line_col(start) {
-            Self::write_source_keyword(ctx, line, column, keyword);
+    fn write_keyword(&self, ctx: &mut Context<DIRECT>, start: u32, keyword: &str, suffix: &str) {
+        if !self.emit_locations {
+            ctx.write(keyword);
+            ctx.write(suffix);
+            return;
+        }
+        if let Some((line, column)) = self.map_position(start) {
+            ctx.location(line, column);
+            ctx.write(keyword);
+            let line_starts = self.map_line_starts.as_deref().unwrap_or(&self.line_starts);
+            let line_end =
+                line_starts.get(line as usize).copied().unwrap_or(u32::MAX).saturating_sub(1);
+            let line_start = line_starts[(line - 1) as usize];
+            let end = column.saturating_add(usize_to_u32(keyword.len()));
+            if end <= line_end.saturating_sub(line_start) {
+                ctx.location(line, end);
+            }
             if !suffix.is_empty() {
-                ctx.write(suffix.to_string());
+                ctx.write(suffix);
             }
         } else {
-            ctx.write(format!("{keyword}{suffix}"));
+            ctx.write(format_compact!("{keyword}{suffix}"));
         }
+    }
+
+    /// Write one source-backed token bracketed by anchors for its AST span.
+    /// Synthesized nodes deliberately stay unmapped, matching esrap's `node.loc`
+    /// guard.
+    fn write_node(&self, ctx: &mut Context<DIRECT>, span: Span, content: impl AsRef<str>) {
+        let content = content.as_ref();
+        if !self.emit_locations || !self.map_nodes || span.is_empty() || span.start == u32::MAX {
+            ctx.write(content);
+            return;
+        }
+
+        if self.loc_map.is_empty() && !self.line_starts.is_empty() {
+            ctx.location_offset(span.start);
+            ctx.write(content);
+            ctx.location_offset(span.end);
+            return;
+        }
+
+        if let Some((line, column)) = self.map_position(span.start) {
+            ctx.location(line, column);
+        }
+        ctx.write(content);
+        if let Some((line, column)) = self.map_end_position(span.end) {
+            ctx.location(line, column);
+        }
+    }
+
+    /// A block brace maps to its own source offset; a synthesized block carries
+    /// no braces in the source, so `body_start == body_end` stays unmapped.
+    fn write_block_brace(
+        &self,
+        ctx: &mut Context<DIRECT>,
+        body_start: u32,
+        body_end: u32,
+        mapping: Option<&BraceMapping>,
+        open: bool,
+    ) {
+        if let Some(mapping) = mapping {
+            let span = if open {
+                Span::new(mapping.source_start, mapping.source_start + 1)
+            } else {
+                Span::new(mapping.source_end - 1, mapping.source_end)
+            };
+            self.write_node(ctx, span, if open { "{" } else { "}" });
+            return;
+        }
+        if body_start >= body_end {
+            ctx.write_ascii(if open { b'{' } else { b'}' });
+            return;
+        }
+        let span = if open {
+            Span::new(body_start, body_start + 1)
+        } else {
+            Span::new(body_end - 1, body_end)
+        };
+        self.write_node(ctx, span, if open { "{" } else { "}" });
     }
 
     /// esrap's `create_keyword_write`: returns a closure-like cursor for writing
@@ -437,18 +976,26 @@ impl<'opt> Printer<'opt> {
     /// unmapped. Implemented as an explicit [`KeywordCursor`] because Rust closures
     /// can't borrow `self` mutably across calls the way the JS closure does.
     fn keyword_cursor(&self, start: u32, map_ok: bool) -> KeywordCursor {
-        let cursor = if map_ok {
-            self.offset_to_line_col(start)
-        } else {
-            None
-        };
-        KeywordCursor { cursor }
+        let cursor = if map_ok && self.emit_locations { self.map_position(start) } else { None };
+        let line_end = cursor.map(|(line, _)| {
+            let line_starts = self.map_line_starts.as_deref().unwrap_or(&self.line_starts);
+            line_starts
+                .get(line as usize)
+                .copied()
+                .unwrap_or(u32::MAX)
+                .saturating_sub(1)
+                .saturating_sub(line_starts[(line - 1) as usize])
+        });
+        KeywordCursor { cursor, line_end }
     }
 
     /// esrap's `function_async_function_offset_ok`: the `async function` source
     /// offsets are only trustworthy when the `function` token shares a line with
     /// `async`, anchored by the id or body starting on the same line as the node.
     fn function_async_offset_ok(&self, node: &Function) -> bool {
+        if !self.emit_locations {
+            return false;
+        }
         let Some((line, _)) = self.offset_to_line_col(node.span().start) else {
             return false;
         };
@@ -469,113 +1016,102 @@ impl<'opt> Printer<'opt> {
     /// there are no decorators and the id (or body, if anonymous) starts on the
     /// node's start line.
     fn class_modifier_map_ok(&self, node: &Class) -> bool {
+        if !self.emit_locations {
+            return false;
+        }
         if !node.decorators.is_empty() {
             return false;
         }
         let Some((line, _)) = self.offset_to_line_col(node.span().start) else {
             return false;
         };
-        let anchor = match &node.id {
-            Some(id) => self.offset_to_line_col(id.span().start),
-            None => self.offset_to_line_col(node.body.span().start),
-        };
+        let anchor = node.id.as_ref().map_or_else(
+            || self.offset_to_line_col(node.body.span().start),
+            |id| self.offset_to_line_col(id.span().start),
+        );
         anchor.map(|(l, _)| l) == Some(line)
-    }
-
-    /// Whether any source comment starts within `[start, end)` — used to decide
-    /// if an unwrapped `ParenthesizedExpression` must keep its literal parens to
-    /// bracket an interior comment (`(/*c*/ x)`).
-    fn comment_in_span(&self, start: u32, end: u32) -> bool {
-        self.comments
-            .iter()
-            .any(|c| c.start >= start && c.start < end)
     }
 
     // ----- comments ---------------------------------------------------------
 
-    /// esrap's `write_comment`: re-emit a comment, splitting a multi-line block
-    /// body across `newline`s so its interior re-indents to the current level.
-    fn write_comment(&mut self, cmt: &Cmt, ctx: &mut Context) {
-        self.write_comment_parts(cmt.block, &cmt.value, ctx);
+    fn comment_len(&self) -> usize {
+        self.borrowed_comments.map_or(self.comments.len(), <[_]>::len)
     }
 
-    /// The body of [`Self::write_comment`], shared with synthetic comments
-    /// injected via [`crate::CommentHooks`].
-    fn write_comment_parts(&mut self, block: bool, value: &str, ctx: &mut Context) {
-        if !block {
-            ctx.write(format!("//{value}"));
-            return;
+    fn comment_at(&self, index: usize) -> Option<CommentMeta> {
+        if let Some(comments) = self.borrowed_comments {
+            return comments.get(index).map(|comment| CommentMeta {
+                start: comment.span.start,
+                end: comment.span.end,
+                start_line: 0,
+                block: !matches!(comment.kind, oxc_ast::ast::CommentKind::Line),
+            });
         }
-        ctx.write("/*");
-        let mut multiline = false;
-        for (i, line) in value.split('\n').enumerate() {
-            if i > 0 {
-                ctx.newline();
-                multiline = true;
-            }
-            ctx.write(line.to_string());
-        }
-        ctx.write("*/");
-        if multiline {
-            ctx.newline();
-        }
+        self.comments.get(index).map(|comment| CommentMeta {
+            start: comment.start,
+            end: comment.end,
+            start_line: comment.start_line,
+            block: comment.block,
+        })
     }
 
-    /// esrap's `write_additional_comments`: emit hook-supplied synthetic comments
-    /// around a node. Leading comments get a newline (line) or trailing space
-    /// (single-line block) after them; trailing comments get a leading space
-    /// before the first.
-    fn write_additional_comments(
-        &mut self,
-        comments: &[crate::SynthComment],
-        leading: bool,
-        ctx: &mut Context,
-    ) {
-        for (i, c) in comments.iter().enumerate() {
-            if !leading && i == 0 {
-                ctx.write(" ");
-            }
-            self.write_comment_parts(c.block, &c.value, ctx);
-            if leading {
-                if !c.block {
-                    ctx.newline();
-                } else if !c.value.contains('\n') {
-                    ctx.write(" ");
-                }
-            }
+    fn comment_partition_point(&self, offset: u32) -> usize {
+        self.borrowed_comments.map_or_else(
+            || self.comments.partition_point(|comment| comment.start < offset),
+            |comments| comments.partition_point(|comment| comment.span.start < offset),
+        )
+    }
+
+    fn write_comment_at(&self, index: usize, ctx: &mut Context<DIRECT>) {
+        if let Some(source) = self.comment_source {
+            let comment = self.comment_at(index).expect("pending comment");
+            write_borrowed_comment_span(comment.start, comment.end, comment.block, source, ctx);
+        } else {
+            write_comment(&self.comments[index], ctx);
         }
     }
 
     /// esrap's `flush_comments_until`: emit every pending comment that starts
-    /// before `to` (byte offset / `to_line`). The `from_line` margin rule adds a
+    /// before `to`. The `from` margin rule adds a
     /// blank line before a detached leading comment block.
     fn flush_comments_until(
         &mut self,
-        ctx: &mut Context,
+        ctx: &mut Context<DIRECT>,
         to: u32,
-        to_line: u32,
-        from_line: Option<u32>,
+        from: Option<u32>,
         pad: bool,
     ) {
+        if !HAS_COMMENTS || self.comment_index == self.comment_len() {
+            return;
+        }
+        if !self.has_loc(to) {
+            return;
+        }
+        let Some(next_comment) = self.comment_at(self.comment_index) else {
+            return;
+        };
+        if next_comment.start >= to {
+            return;
+        }
         let mut first = true;
-        while self.comment_index < self.comments.len() {
-            let cmt = self.comments[self.comment_index].clone();
+        while self.comment_index < self.comment_len() {
+            let cmt = self.comment_at(self.comment_index).expect("pending comment");
             if cmt.start >= to {
                 break;
             }
             if first
-                && let Some(from_line) = from_line
-                && cmt.start_line > from_line
+                && let Some(from) = from.filter(|&offset| self.has_loc(offset))
+                && self.has_newline_between(from, cmt.start)
             {
                 ctx.margin();
                 ctx.newline();
             }
             first = false;
-            self.write_comment(&cmt, ctx);
-            if cmt.end_line < to_line {
+            self.write_comment_at(self.comment_index, ctx);
+            if !cmt.block || self.has_newline_between(cmt.end, to) {
                 ctx.newline();
             } else if pad {
-                ctx.write(" ");
+                ctx.write_ascii(b' ');
             }
             self.comment_index += 1;
         }
@@ -589,21 +1125,29 @@ impl<'opt> Printer<'opt> {
     /// on to force the wrapped one-arg-per-line form.
     fn flush_trailing_comments(
         &mut self,
-        ctx: &mut Context,
-        prev_end_line: u32,
+        ctx: &mut Context<DIRECT>,
+        prev_end: u32,
         next: Option<u32>,
     ) -> bool {
+        if !HAS_COMMENTS || self.comment_index == self.comment_len() || !self.has_loc(prev_end) {
+            return false;
+        }
+        // A `next` boundary that is itself synthesized bounds nothing (esrap's
+        // `next` is `null` when the following node has no `loc`).
+        let next = next.filter(|n| self.has_loc(*n));
         let mut emitted_line_newline = false;
-        while self.comment_index < self.comments.len() {
-            let cmt = self.comments[self.comment_index].clone();
-            let fits = cmt.start_line == prev_end_line && next.is_none_or(|n| cmt.end < n);
+        while self.comment_index < self.comment_len() {
+            let cmt = self.comment_at(self.comment_index).expect("pending comment");
+            let fits =
+                !self.has_newline_between(prev_end, cmt.start) && next.is_none_or(|n| cmt.end < n);
             if !fits {
                 break;
             }
-            ctx.write(" ");
-            self.write_comment(&cmt, ctx);
+            ctx.write_ascii(b' ');
+            self.write_comment_at(self.comment_index, ctx);
+            let is_block = cmt.block;
             self.comment_index += 1;
-            if cmt.block {
+            if is_block {
                 continue;
             }
             ctx.newline();
@@ -615,30 +1159,38 @@ impl<'opt> Printer<'opt> {
 
     /// esrap's `reset_comment_index`: re-sync the cursor to the first comment
     /// at/after `node_start` (so a nested body doesn't replay earlier comments).
-    fn reset_comment_index(&mut self, node_start: u32) {
-        let cur = self.comments.get(self.comment_index);
-        let prev = self
-            .comment_index
-            .checked_sub(1)
-            .and_then(|i| self.comments.get(i));
+    /// `None` and synthesized offsets are esrap's `!node.loc`, which discards
+    /// every pending comment instead of carrying the cursor forward.
+    fn reset_comment_index(&mut self, node_start: Option<u32>) {
+        if !HAS_COMMENTS {
+            return;
+        }
+        let Some(node_start) = node_start else {
+            self.comment_index = self.comment_len();
+            return;
+        };
+        if !self.has_loc(node_start) {
+            self.comment_index = self.comment_len();
+            return;
+        }
+        let cur = self.comment_at(self.comment_index);
+        let prev = self.comment_index.checked_sub(1).and_then(|i| self.comment_at(i));
         let synced =
             cur.is_some_and(|c| c.start >= node_start) && prev.is_none_or(|p| p.start < node_start);
         if synced {
             return;
         }
-        self.comment_index = self
-            .comments
-            .iter()
-            .position(|c| c.start >= node_start)
-            .unwrap_or(self.comments.len());
+        // `comments` is in source order (ascending `start`), so binary-search the
+        // first comment at/after `node_start` instead of a linear scan.
+        self.comment_index = self.comment_partition_point(node_start);
     }
 
     /// The `_` wildcard's leading flush: emit comments positioned before `node`.
-    fn flush_leading(&mut self, ctx: &mut Context, node_start: u32, node_start_line: u32) {
-        if self.comments.is_empty() {
+    fn flush_leading(&mut self, ctx: &mut Context<DIRECT>, node_start: u32) {
+        if !HAS_COMMENTS {
             return;
         }
-        self.flush_comments_until(ctx, node_start, node_start_line, None, true);
+        self.flush_comments_until(ctx, node_start, None, true);
     }
 
     /// Port of esrap's `sequence` (`languages/ts/index.js`). Lays `nodes` out as
@@ -654,12 +1206,12 @@ impl<'opt> Printer<'opt> {
     /// limit for the closing `flush_comments_until`.
     fn sequence(
         &mut self,
-        mut nodes: Vec<SeqNode<'_>>,
+        mut nodes: Vec<SeqNode<'_, HAS_COMMENTS>>,
         until: Option<u32>,
         pad: bool,
-        separator: &str,
+        separator: &'static str,
         trailing_newline: bool,
-        parent: &mut Context,
+        parent: &mut Context<DIRECT>,
     ) {
         let n = nodes.len();
         let mut multiline = false;
@@ -677,7 +1229,7 @@ impl<'opt> Printer<'opt> {
         let mut items: Vec<SeqItem> = Vec::with_capacity(n);
         for (i, node) in nodes.iter_mut().enumerate() {
             let mut child = parent.child();
-            (node.render)(self, &mut child);
+            (node.render)(self.deferred(), &mut child);
 
             let node_multiline = child.multiline;
 
@@ -691,10 +1243,10 @@ impl<'opt> Printer<'opt> {
             // start, or `until` for the final node.
             let next = if i == n - 1 { until } else { starts[i + 1] };
             if let Some(end) = node.end {
-                self.flush_trailing_comments(&mut child, self.line_of(end), next);
+                self.deferred().flush_trailing_comments(&mut child, end, next);
             }
 
-            length += child.measure() as i64 + 1;
+            length += usize_to_i64(child.measure()) + 1;
             multiline |= child.multiline;
 
             items.push(SeqItem {
@@ -711,7 +1263,7 @@ impl<'opt> Printer<'opt> {
             parent.indent();
             parent.newline();
         } else if pad && length > 0 {
-            parent.write(" ");
+            parent.write_ascii(b' ');
         }
 
         let mut prev: Option<(bool, bool)> = None;
@@ -724,7 +1276,7 @@ impl<'opt> Printer<'opt> {
                     if multiline {
                         parent.newline();
                     } else {
-                        parent.write(" ");
+                        parent.write_ascii(b' ');
                     }
                 }
             }
@@ -734,11 +1286,8 @@ impl<'opt> Printer<'opt> {
 
         // esrap: flush_comments_until(context, lastNode.loc.end, until, false).
         if let Some(until) = until {
-            let from_line = nodes
-                .last()
-                .and_then(|node| node.end)
-                .map(|e| self.line_of(e));
-            self.flush_comments_until(parent, until, self.line_of(until), from_line, false);
+            let from = nodes.last().and_then(|node| node.end);
+            self.flush_comments_until(parent, until, from, false);
         }
 
         if multiline {
@@ -747,88 +1296,556 @@ impl<'opt> Printer<'opt> {
                 parent.newline();
             }
         } else if pad && length > 0 {
-            parent.write(" ");
+            parent.write_ascii(b' ');
         }
     }
 
-    fn unsupported(&mut self, kind: &'static str, ctx: &mut Context) {
+    fn sequence_indexed(
+        &mut self,
+        n: usize,
+        mut meta: impl FnMut(usize) -> SeqMeta,
+        mut render: impl FnMut(&mut Self, usize, &mut Context<DIRECT>),
+        until: Option<u32>,
+        pad: bool,
+        separator: &'static str,
+        trailing_newline: bool,
+        parent: &mut Context<DIRECT>,
+    ) {
+        // A comment can introduce a newline while rendering, so only clean sequences pre-indent.
+        let has_sequence_comments = DIRECT && HAS_COMMENTS && n > 0 && {
+            let before_until = |cmt: CommentMeta| until.is_none_or(|end| cmt.start < end);
+            let pending = self.comment_at(self.comment_index).is_some_and(before_until);
+            let in_nodes = meta(0).start.is_none_or(|start| {
+                let index = self.comment_partition_point(start);
+                self.comment_at(index).is_some_and(before_until)
+            });
+            pending || in_nodes
+        };
+        let direct_layout = DIRECT && !has_sequence_comments;
+        if n == 0 {
+            if let Some(until) = until {
+                self.flush_comments_until(parent, until, None, false);
+            }
+            return;
+        }
+
+        if n == 1 {
+            let node_meta = meta(0);
+            let mark = parent.event_mark();
+            if direct_layout {
+                if pad {
+                    parent.optimistic_space();
+                }
+                parent.indent();
+            }
+            let scope = parent.begin_scope();
+            render(self, 0, parent);
+            if node_meta.is_elision {
+                parent.write(separator);
+            }
+            if let Some(end) = node_meta.end {
+                self.flush_trailing_comments(parent, end, until);
+            }
+            let mut length = parent.measure_with_layout_spaces(&scope);
+            // The direct path's optimistic opening pad is materialised by the
+            // first write, after `scope` begins. It is outside the child in
+            // esrap (and in the deferred path, which inserts it after measuring),
+            // so do not let that one space flip the 60-column fit decision.
+            if direct_layout && pad && length > 0 {
+                length -= 1;
+            }
+            // Same width rule as the multi-item branches, whose accumulator
+            // (`-1`, then `+= measure + 1` per item) equals `measure` at n == 1.
+            let multiline = parent.end_scope(scope) || usize_to_i64(length) > 60;
+
+            if direct_layout && pad && length == 0 {
+                parent.cancel_optimistic_space();
+            }
+
+            if multiline {
+                parent.insert_event(mark, EventKind::Newline);
+                if !direct_layout {
+                    parent.insert_event(mark, EventKind::Indent);
+                }
+                parent.multiline = true;
+            } else if !direct_layout && pad && length > 0 {
+                parent.insert_event(mark, EventKind::Space);
+            }
+
+            if let Some(until) = until {
+                self.flush_comments_until(parent, until, node_meta.end, false);
+            }
+
+            if multiline {
+                parent.dedent();
+                if trailing_newline {
+                    parent.newline();
+                }
+            } else {
+                if direct_layout {
+                    parent.dedent();
+                }
+                if pad && length > 0 {
+                    parent.write_ascii(b' ');
+                }
+            }
+            return;
+        }
+
+        if n <= 3 {
+            let mut multiline = false;
+            let mut length: i64 = -1;
+            let mut items = [None; 3];
+
+            if direct_layout {
+                parent.indent();
+            }
+
+            for (i, item) in items.iter_mut().enumerate().take(n) {
+                let node_meta = meta(i);
+                let mark = if direct_layout && (pad || i > 0) && !node_meta.is_elision {
+                    parent.retro_space_mark()
+                } else {
+                    parent.event_mark()
+                };
+                let scope = parent.begin_scope();
+                render(self, i, parent);
+
+                let node_multiline = parent.multiline;
+                if i < n - 1 || node_meta.is_elision {
+                    parent.write(separator);
+                }
+
+                let next = if i == n - 1 { until } else { meta(i + 1).start };
+                if let Some(end) = node_meta.end {
+                    self.flush_trailing_comments(parent, end, next);
+                }
+
+                length += usize_to_i64(parent.measure_with_layout_spaces(&scope)) + 1;
+                multiline |= parent.end_scope(scope);
+                *item = Some(SeqLayout {
+                    mark,
+                    multiline: node_multiline,
+                    obj_or_array: node_meta.obj_or_array,
+                    is_elision: node_meta.is_elision,
+                });
+            }
+
+            multiline |= length > 60;
+
+            for i in (0..n).rev() {
+                let item = items[i].unwrap();
+                if i > 0 {
+                    let prev = items[i - 1].unwrap();
+                    let margin = prev.multiline
+                        && item.multiline
+                        && !(prev.obj_or_array && item.obj_or_array);
+                    if !item.is_elision && (multiline || !direct_layout) {
+                        parent.insert_event(
+                            item.mark,
+                            if multiline { EventKind::Newline } else { EventKind::Space },
+                        );
+                    }
+                    if margin {
+                        parent.insert_event(item.mark, EventKind::Margin);
+                    }
+                }
+            }
+
+            let first = items[0].unwrap();
+            if multiline {
+                parent.insert_event(first.mark, EventKind::Newline);
+                if !direct_layout {
+                    parent.insert_event(first.mark, EventKind::Indent);
+                }
+                parent.multiline = true;
+            } else if !direct_layout && pad && length > 0 {
+                parent.insert_event(first.mark, EventKind::Space);
+            }
+
+            if let Some(until) = until {
+                self.flush_comments_until(parent, until, meta(n - 1).end, false);
+            }
+
+            if multiline {
+                parent.dedent();
+                if trailing_newline {
+                    parent.newline();
+                }
+            } else {
+                if direct_layout {
+                    parent.dedent();
+                }
+                if pad && length > 0 {
+                    parent.write_ascii(b' ');
+                }
+            }
+            return;
+        }
+
+        let mut multiline = false;
+        let mut length: i64 = -1;
+        let mut items: Vec<SeqLayout> = Vec::with_capacity(n);
+
+        if direct_layout {
+            parent.indent();
+        }
+
+        for i in 0..n {
+            let node_meta = meta(i);
+            let mark = if direct_layout && (pad || i > 0) && !node_meta.is_elision {
+                parent.retro_space_mark()
+            } else {
+                parent.event_mark()
+            };
+            let scope = parent.begin_scope();
+            render(self, i, parent);
+
+            let node_multiline = parent.multiline;
+            if i < n - 1 || node_meta.is_elision {
+                parent.write(separator);
+            }
+
+            let next = if i == n - 1 { until } else { meta(i + 1).start };
+            if let Some(end) = node_meta.end {
+                self.flush_trailing_comments(parent, end, next);
+            }
+
+            length += usize_to_i64(parent.measure_with_layout_spaces(&scope)) + 1;
+            multiline |= parent.end_scope(scope);
+            items.push(SeqLayout {
+                mark,
+                multiline: node_multiline,
+                obj_or_array: node_meta.obj_or_array,
+                is_elision: node_meta.is_elision,
+            });
+        }
+
+        // esrap writes a nested sequence's own inter-item space as a string, so
+        // its `measure` counts it; here that space is a layout event `measure`
+        // subtracts, and a child measured short flips this 60-column test.
+        multiline |= length > 60;
+
+        for i in (0..items.len()).rev() {
+            let item = items[i];
+            if i > 0 {
+                let prev = items[i - 1];
+                let margin =
+                    prev.multiline && item.multiline && !(prev.obj_or_array && item.obj_or_array);
+                if !item.is_elision && (multiline || !direct_layout) {
+                    parent.insert_event(
+                        item.mark,
+                        if multiline { EventKind::Newline } else { EventKind::Space },
+                    );
+                }
+                if margin {
+                    parent.insert_event(item.mark, EventKind::Margin);
+                }
+            }
+        }
+
+        if let Some(first) = items.first() {
+            if multiline {
+                parent.insert_event(first.mark, EventKind::Newline);
+                if !direct_layout {
+                    parent.insert_event(first.mark, EventKind::Indent);
+                }
+                parent.multiline = true;
+            } else if !direct_layout && pad && length > 0 {
+                parent.insert_event(first.mark, EventKind::Space);
+            }
+        }
+
+        if let Some(until) = until {
+            let from = n.checked_sub(1).and_then(|i| meta(i).end);
+            self.flush_comments_until(parent, until, from, false);
+        }
+
+        if multiline {
+            parent.dedent();
+            if trailing_newline {
+                parent.newline();
+            }
+        } else {
+            if direct_layout {
+                parent.dedent();
+            }
+            if pad && length > 0 {
+                parent.write_ascii(b' ');
+            }
+        }
+    }
+
+    fn sequence_slice<T>(
+        &mut self,
+        nodes: &[T],
+        mut meta: impl FnMut(&T) -> SeqMeta,
+        mut render: impl FnMut(&mut Self, &T, &mut Context<DIRECT>),
+        until: Option<u32>,
+        pad: bool,
+        separator: &'static str,
+        trailing_newline: bool,
+        parent: &mut Context<DIRECT>,
+    ) {
+        self.sequence_indexed(
+            nodes.len(),
+            |i| meta(&nodes[i]),
+            |printer, i, child| render(printer, &nodes[i], child),
+            until,
+            pad,
+            separator,
+            trailing_newline,
+            parent,
+        );
+    }
+
+    fn unsupported(&mut self, kind: &'static str, ctx: &mut Context<DIRECT>) {
         if self.missing.is_none() {
             self.missing = Some(Unsupported(kind));
         }
         // Emit a marker so output is obviously wrong if a miss slips through a
         // test that forgot to check `missing`.
-        ctx.write(format!("/*unsupported:{kind}*/"));
+        ctx.write(format_compact!("/*unsupported:{kind}*/"));
     }
 
     // ----- statements -------------------------------------------------------
 
-    pub fn print_program(&mut self, program: &Program, ctx: &mut Context) {
+    pub fn print_program(&mut self, program: &Program, ctx: &mut Context<DIRECT>) {
         let span = program.span();
+        // Upstream's program is builder-made and carries no `loc`, so its
+        // statement list discards the pending comments and only a nested body
+        // that does carry one re-finds them — which is why a comment inside a
+        // function body survives while a file header does not. Opt-in because
+        // the recovery needs located nested bodies, and rsvelte only has those
+        // where the chunks were re-parsed rather than assembled from builders.
+        let body_start = (!self.options.unlocated_program).then_some(span.start);
         // Directives (`"use strict"`) are a separate oxc node, but esrap (from
         // an acorn AST) sees them as leading string-literal ExpressionStatements
         // in `body`; thread them through the same `body` sequence so margins and
         // leading comments are computed identically.
-        let mut elems: Vec<BodyElem> = program.directives.iter().map(BodyElem::Directive).collect();
-        elems.extend(program.body.iter().map(BodyElem::Statement));
-        self.body_elems(&elems, span.start, span.end, ctx);
+        let elems = program
+            .directives
+            .iter()
+            .map(BodyElem::Directive)
+            .chain(program.body.iter().map(BodyElem::Statement));
+        self.body_elems(elems, body_start, span.end, ctx);
     }
 
-    /// esrap's `body`: statements on their own lines, with a blank line between
-    /// two multiline statements or a change of statement kind, interleaving
-    /// leading (before each statement), trailing (same-line), and end-of-body
-    /// comments. `body_end` is the byte offset that closes the body (program
-    /// end, or the `}` of a block).
-    fn body(
+    pub(crate) fn print_program_with_outer_comments(
+        &mut self,
+        program: &Program,
+        source: &str,
+        ctx: &mut Context<DIRECT>,
+    ) {
+        debug_assert!(!HAS_COMMENTS && DIRECT);
+        let span = program.span();
+        let body_start = (!self.options.unlocated_program).then_some(span.start);
+        let mut comments = BorrowedCommentDriver::new(program, source, body_start.is_some());
+        let keep_empty = self.options.keep_empty_statements;
+        let mut elems = program
+            .directives
+            .iter()
+            .map(BodyElem::Directive)
+            .chain(program.body.iter().map(BodyElem::Statement))
+            .filter(|elem| keep_empty || !elem.is_empty_stmt())
+            .peekable();
+        let mut prev: Option<(BodyElem<'_, '_>, bool)> = None;
+        let mut prev_joined = false;
+        let mut last_end = None;
+        while let Some(elem) = elems.next() {
+            let layout_mark = ctx.event_mark();
+            let mut has_margin = false;
+            let mut joined = false;
+            if let Some((prev_elem, prev_multiline)) = &prev {
+                joined = !prev_joined && prev_elem.is_kept_empty() && elem.is_kept_empty();
+                has_margin = !joined && (*prev_multiline || !elem.same_kind(prev_elem));
+                if has_margin {
+                    ctx.margin();
+                }
+                if !joined {
+                    ctx.newline();
+                }
+            }
+            prev_joined = joined;
+
+            let scope = ctx.begin_scope();
+            comments.flush_until(ctx, elem.span_start(), None, true);
+            elem.print(self, ctx);
+            let multiline = ctx.end_scope(scope);
+            if multiline && prev.is_some() && !has_margin {
+                ctx.insert_event(layout_mark, EventKind::Margin);
+            }
+
+            let end = elem.comment_end();
+            let next = elems.peek().map(BodyElem::comment_end);
+            comments.flush_trailing(ctx, end, next);
+            last_end = Some(end);
+            prev = Some((elem, multiline));
+        }
+
+        ctx.newline();
+        if body_start.is_some() {
+            comments.flush_until(ctx, span.end, last_end, false);
+        }
+    }
+
+    fn comments_are_outer_to_block(
+        &self,
+        statements: &[Statement],
+        body_start: u32,
+        body_end: u32,
+    ) -> bool {
+        if !self.has_loc(body_start) || !self.has_loc(body_end) {
+            return false;
+        }
+        let mut index = self.comment_partition_point(body_start);
+        for statement in statements {
+            let span = statement.span();
+            if !self.has_loc(span.start) || !self.has_loc(span.end) {
+                return false;
+            }
+            while let Some(comment) = self.comment_at(index) {
+                if comment.start >= body_end || comment.end > span.start {
+                    break;
+                }
+                index += 1;
+            }
+            if self
+                .comment_at(index)
+                .is_some_and(|comment| comment.start < span.end && comment.end > span.start)
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn block_comment_island(
         &mut self,
         statements: &[Statement],
         body_start: u32,
         body_end: u32,
-        ctx: &mut Context,
+        ctx: &mut Context<DIRECT>,
     ) {
-        let elems: Vec<BodyElem> = statements.iter().map(BodyElem::Statement).collect();
-        self.body_elems(&elems, body_start, body_end, ctx);
+        self.reset_comment_index(Some(body_start));
+        let keep_empty = self.options.keep_empty_statements;
+        let mut statements = statements
+            .iter()
+            .filter(|statement| {
+                keep_empty
+                    || !matches!(statement, Statement::EmptyStatement(empty) if empty.span.end != u32::MAX)
+            })
+            .peekable();
+        let mut prev: Option<(&Statement<'_>, bool)> = None;
+        let mut prev_joined = false;
+        let mut last_end = None;
+        while let Some(statement) = statements.next() {
+            let layout_mark = ctx.event_mark();
+            let mut has_margin = false;
+            let mut joined = false;
+            if let Some((prev_statement, prev_multiline)) = prev {
+                joined = !prev_joined
+                    && is_kept_empty_stmt(prev_statement)
+                    && is_kept_empty_stmt(statement);
+                has_margin =
+                    !joined && (prev_multiline || !same_statement_kind(prev_statement, statement));
+                if has_margin {
+                    ctx.margin();
+                }
+                if !joined {
+                    ctx.newline();
+                }
+            }
+            prev_joined = joined;
+
+            let scope = ctx.begin_scope();
+            self.flush_leading(ctx, statement.span().start);
+            self.comment_free().print_statement(statement, ctx);
+            let multiline = ctx.end_scope(scope);
+            if multiline && prev.is_some() && !has_margin {
+                ctx.insert_event(layout_mark, EventKind::Margin);
+            }
+
+            let end = statement_comment_end(statement);
+            let next = statements.peek().map(|statement| statement_comment_end(statement));
+            self.flush_trailing_comments(ctx, end, next);
+            last_end = Some(end);
+            prev = Some((statement, multiline));
+        }
+
+        ctx.newline();
+        self.flush_comments_until(ctx, body_end, last_end, false);
     }
 
     /// The element-based core of [`Self::body`], shared by `print_program` so a
     /// program's leading directives participate in the same margin/comment pass.
-    fn body_elems(
+    fn body_elems<'a, 'b>(
         &mut self,
-        elems: &[BodyElem],
-        body_start: u32,
+        elems: impl IntoIterator<Item = BodyElem<'a, 'b>>,
+        body_start: Option<u32>,
         body_end: u32,
-        ctx: &mut Context,
-    ) {
+        ctx: &mut Context<DIRECT>,
+    ) where
+        'a: 'b,
+    {
         // esrap filters `EmptyStatement` (`;`) nodes from statement-list bodies
         // (matching the server AST + official esrap). The client `to_oxc` path,
         // which parses string-codegen `Raw` `;;` into real EmptyStatement nodes the
         // official COMPILER output keeps, opts into preserving them.
-        let non_empty: Vec<&BodyElem> = if self.options.keep_empty_statements {
-            elems.iter().collect()
-        } else {
-            elems.iter().filter(|e| !e.is_empty_stmt()).collect()
-        };
         // Re-sync to the body's own start so a leading comment that precedes the
         // first statement (e.g. a file header) isn't skipped over.
         self.reset_comment_index(body_start);
 
-        let mut prev: Option<(&BodyElem, bool)> = None;
-        for (i, elem) in non_empty.iter().enumerate() {
-            let mut child = ctx.child();
-            elem.print(self, &mut child);
-
-            if let Some((prev_elem, prev_multiline)) = prev {
-                if child.multiline || prev_multiline || !elem.same_kind(prev_elem) {
+        let keep_empty = self.options.keep_empty_statements;
+        let mut elems =
+            elems.into_iter().filter(|elem| keep_empty || !elem.is_empty_stmt()).peekable();
+        let mut prev: Option<(BodyElem<'a, 'b>, bool)> = None;
+        let mut last_end = None;
+        while let Some(elem) = elems.next() {
+            let layout_mark = ctx.event_mark();
+            let mut has_margin = false;
+            if let Some((prev_elem, prev_multiline)) = &prev {
+                // The two kept empties of one `;;` hole are a single upstream
+                // statement, so nothing separates them — but two separate holes
+                // are two statements and take a newline. A pair is built at
+                // consecutive starts (`B::empty_kept(s)` / `(s + 1)`).
+                let joined = prev_elem.is_kept_empty()
+                    && elem.is_kept_empty()
+                    && elem.span_start() == prev_elem.span_start().wrapping_add(1);
+                has_margin = !joined && (*prev_multiline || !elem.same_kind(prev_elem));
+                if has_margin {
                     ctx.margin();
                 }
-                ctx.newline();
+                if !joined {
+                    ctx.newline();
+                }
             }
-            let multiline = child.multiline;
-            ctx.append(child);
 
-            let end_line = self.line_of(elem.span_end());
-            let next = non_empty.get(i + 1).map(|e| e.span_start());
-            self.flush_trailing_comments(ctx, end_line, next);
+            let scope = ctx.begin_scope();
+            if HAS_COMMENTS && DIRECT {
+                let start = elem.span_start();
+                let end = elem.span_end();
+                self.flush_leading(ctx, start);
+                let contains_comment =
+                    self.comment_at(self.comment_index).is_some_and(|comment| comment.start < end);
+                if !contains_comment && self.has_loc(start) && self.has_loc(end) {
+                    elem.print(self.comment_free(), ctx);
+                } else {
+                    elem.print(self, ctx);
+                }
+            } else {
+                elem.print(self, ctx);
+            }
+            let multiline = ctx.end_scope(scope);
+            if multiline && prev.is_some() && !has_margin {
+                ctx.insert_event(layout_mark, EventKind::Margin);
+            }
 
+            let end = elem.comment_end();
+            let next = elems.peek().map(BodyElem::comment_end);
+            self.flush_trailing_comments(ctx, end, next);
+
+            last_end = Some(end);
             prev = Some((elem, multiline));
         }
 
@@ -839,43 +1856,28 @@ impl<'opt> Printer<'opt> {
         // block (`() => { /* x */ }`); the lone pending newline keeps the block
         // `empty()`, so a comment-free `{}` is unaffected.
         ctx.newline();
-        if !self.comments.is_empty() {
-            let from_line = non_empty.last().map(|e| self.line_of(e.span_end()));
-            self.flush_comments_until(ctx, body_end, self.line_of(body_end), from_line, false);
+        if HAS_COMMENTS
+            && body_start.is_some_and(|start| self.has_loc(start))
+            && self.has_loc(body_end)
+        {
+            self.flush_comments_until(ctx, body_end, last_end, false);
         }
     }
 
     /// A program/function-body directive (`"use strict";`), printed like the
-    /// string-literal ExpressionStatement esrap sees.
-    fn print_directive(&mut self, d: &Directive, ctx: &mut Context) {
+    /// string-literal `ExpressionStatement` esrap sees.
+    fn print_directive(&mut self, d: &Directive, ctx: &mut Context<DIRECT>) {
         let start = d.span.start;
-        self.flush_leading(ctx, start, self.line_of(start));
-        ctx.write(self.string_literal(&d.expression));
-        ctx.write(";");
+        self.flush_leading(ctx, start);
+        ctx.write(Self::string_literal(&d.expression));
+        ctx.write_ascii(b';');
     }
 
-    fn print_statement(&mut self, stmt: &Statement, ctx: &mut Context) {
-        // esrap's `_` wildcard order: hook-supplied leading comments, then the
-        // real leading-comment flush + node, then hook-supplied trailing comments.
-        if let Some(hooks) = self.hooks
-            && let Some(f) = &hooks.get_leading
-        {
-            let synth = f(stmt);
-            self.write_additional_comments(&synth, true, ctx);
-        }
-        self.print_statement_inner(stmt, ctx);
-        if let Some(hooks) = self.hooks
-            && let Some(f) = &hooks.get_trailing
-        {
-            let synth = f(stmt);
-            self.write_additional_comments(&synth, false, ctx);
-        }
-    }
-
-    fn print_statement_inner(&mut self, stmt: &Statement, ctx: &mut Context) {
+    #[allow(clippy::too_many_lines)]
+    fn print_statement(&mut self, stmt: &Statement, ctx: &mut Context<DIRECT>) {
         // esrap's `_` wildcard: emit comments positioned before this node first.
         let start = stmt.span().start;
-        self.flush_leading(ctx, start, self.line_of(start));
+        self.flush_leading(ctx, start);
         match stmt {
             Statement::ExpressionStatement(s) => {
                 // esrap wraps a leading object/function-expression statement in
@@ -889,36 +1891,45 @@ impl<'opt> Printer<'opt> {
                 ) || matches!(inner, Expression::AssignmentExpression(a)
                     if matches!(a.left, AssignmentTarget::ObjectAssignmentTarget(_)));
                 if needs_parens {
-                    ctx.write("(");
+                    ctx.write_ascii(b'(');
                     self.print_expression(inner, ctx);
-                    ctx.write(");");
+                    ctx.write_ascii_bytes(b");");
                 } else {
                     self.print_expression(inner, ctx);
-                    ctx.write(";");
+                    ctx.write_ascii(b';');
                 }
             }
             Statement::VariableDeclaration(d) => {
                 self.variable_declaration(d, ctx);
-                ctx.write(";");
+                ctx.write_ascii(b';');
             }
             Statement::ReturnStatement(s) => {
                 if let Some(arg) = &s.argument {
                     // esrap: when a comment sits between `return` and the
                     // argument, wrap the argument in parens (`return (/*c*/ x);`)
                     // so the comment can't be read as ending the statement.
-                    let contains_comment = self
-                        .comments
-                        .get(self.comment_index)
-                        .is_some_and(|c| c.start < arg.span().start);
+                    // Compared against the UNWRAPPED argument because esrap's
+                    // acorn AST has no paren node: with oxc's preserved parens
+                    // `return (/*c*/ x)` would otherwise anchor at the `(`, which
+                    // precedes the comment, and the rule would never fire.
+                    let contains_comment = HAS_COMMENTS
+                        && self
+                            .comment_at(self.comment_index)
+                            // A parsed source comment is strictly before its
+                            // argument. Chunk-backed module statements can
+                            // instead give the synthesized comment and rebuilt
+                            // expression the same anchor; upstream still sees
+                            // the comment between `return` and the argument.
+                            .is_some_and(|c| c.start <= unparen(arg).span().start);
                     let start = s.span().start;
                     if contains_comment {
                         self.write_keyword(ctx, start, "return", " (");
                         self.print_expression(arg, ctx);
-                        ctx.write(");");
+                        ctx.write_ascii_bytes(b");");
                     } else {
                         self.write_keyword(ctx, start, "return", " ");
                         self.print_expression(arg, ctx);
-                        ctx.write(";");
+                        ctx.write_ascii(b';');
                     }
                 } else {
                     self.write_keyword(ctx, s.span().start, "return", ";");
@@ -926,7 +1937,7 @@ impl<'opt> Printer<'opt> {
             }
             Statement::BlockStatement(b) => {
                 let span = b.span();
-                self.block(&b.body, span.start, span.end, ctx)
+                self.block(&b.body, span.start, span.end, ctx);
             }
             Statement::FunctionDeclaration(f) => self.function(f, ctx),
             Statement::ClassDeclaration(c) => self.class_node(c, ctx),
@@ -935,13 +1946,13 @@ impl<'opt> Printer<'opt> {
             Statement::WhileStatement(s) => {
                 ctx.write("while (");
                 self.print_expression(&s.test, ctx);
-                ctx.write(") ");
+                ctx.write_ascii_bytes(b") ");
                 self.print_statement(&s.body, ctx);
             }
             Statement::ThrowStatement(s) => {
                 self.write_keyword(ctx, s.span().start, "throw", " ");
                 self.print_expression(&s.argument, ctx);
-                ctx.write(";");
+                ctx.write_ascii(b';');
             }
             Statement::DoWhileStatement(s) => self.do_while_statement(s, ctx),
             Statement::ExportAllDeclaration(s) => {
@@ -951,39 +1962,41 @@ impl<'opt> Printer<'opt> {
                     ctx.write("export *");
                 }
                 if let Some(exported) = &s.exported {
-                    ctx.write(" as ");
+                    ctx.write_ascii_bytes(b" as ");
                     ctx.write(module_export_name_str(exported));
                 }
                 ctx.write(" from ");
-                ctx.write(self.string_literal(&s.source));
-                ctx.write(";");
+                ctx.write(Self::string_literal(&s.source));
+                ctx.write_ascii(b';');
             }
             Statement::ImportDeclaration(d) => self.import_declaration(d, ctx),
+            Statement::ExportDeclaration(d) => self.export_declaration(d, ctx),
             Statement::ExportNamedDeclaration(d) => self.export_named_declaration(d, ctx),
+            Statement::ExportFromDeclaration(d) => self.export_from_declaration(d, ctx),
             Statement::ExportDefaultDeclaration(d) => self.export_default_declaration(d, ctx),
             Statement::LabeledStatement(s) => {
                 ctx.write(s.label.name.as_str());
-                ctx.write(": ");
+                ctx.write_ascii_bytes(b": ");
                 self.print_statement(&s.body, ctx);
             }
             Statement::ForInStatement(s) => {
                 ctx.write("for (");
                 self.for_statement_left(&s.left, ctx);
-                ctx.write(" in ");
+                ctx.write_ascii_bytes(b" in ");
                 self.print_expression(&s.right, ctx);
-                ctx.write(") ");
+                ctx.write_ascii_bytes(b") ");
                 self.print_statement(&s.body, ctx);
             }
             Statement::ForOfStatement(s) => {
-                ctx.write("for ");
+                ctx.write_ascii_bytes(b"for ");
                 if s.r#await {
                     ctx.write("await ");
                 }
-                ctx.write("(");
+                ctx.write_ascii(b'(');
                 self.for_statement_left(&s.left, ctx);
-                ctx.write(" of ");
+                ctx.write_ascii_bytes(b" of ");
                 self.print_expression(&s.right, ctx);
-                ctx.write(") ");
+                ctx.write_ascii_bytes(b") ");
                 self.print_statement(&s.body, ctx);
             }
             Statement::TryStatement(s) => self.try_statement(s, ctx),
@@ -992,42 +2005,55 @@ impl<'opt> Printer<'opt> {
             Statement::WithStatement(s) => {
                 ctx.write("with (");
                 self.print_expression(&s.object, ctx);
-                ctx.write(") ");
+                ctx.write_ascii_bytes(b") ");
                 self.print_statement(&s.body, ctx);
             }
-            Statement::EmptyStatement(_) => ctx.write(";"),
-            Statement::BreakStatement(s) => match &s.label {
-                Some(l) => ctx.write(format!("break {};", l.name)),
-                None => ctx.write("break;"),
-            },
-            Statement::ContinueStatement(s) => match &s.label {
-                Some(l) => ctx.write(format!("continue {};", l.name)),
-                None => ctx.write("continue;"),
-            },
+            Statement::EmptyStatement(_) => ctx.write_ascii(b';'),
+            Statement::BreakStatement(s) => {
+                ctx.write("break");
+                if let Some(label) = &s.label {
+                    ctx.write_ascii(b' ');
+                    ctx.write(label.name.as_str());
+                }
+                ctx.write_ascii(b';');
+            }
+            Statement::ContinueStatement(s) => {
+                ctx.write("continue");
+                if let Some(label) = &s.label {
+                    ctx.write_ascii(b' ');
+                    ctx.write(label.name.as_str());
+                }
+                ctx.write_ascii(b';');
+            }
             Statement::TSTypeAliasDeclaration(d) => self.type_alias_declaration(d, ctx),
             Statement::TSInterfaceDeclaration(d) => self.interface_declaration(d, ctx),
             Statement::TSEnumDeclaration(d) => self.enum_declaration(d, ctx),
-            Statement::TSModuleDeclaration(d) => self.module_declaration(d, ctx),
+            Statement::TSExternalModuleDeclaration(d) => self.external_module_declaration(d, ctx),
+            Statement::TSNamespaceDeclaration(d) => self.namespace_declaration(d, true, ctx),
             Statement::TSGlobalDeclaration(d) => self.global_declaration(d, ctx),
-            Statement::TSImportEqualsDeclaration(d) => self.import_equals_declaration(d, ctx),
+            Statement::TSImportEqualsDeclaration(d) => Self::import_equals_declaration(d, ctx),
             Statement::TSExportAssignment(d) => {
                 ctx.write("export = ");
                 self.print_expression(&d.expression, ctx);
-                ctx.write(";");
+                ctx.write_ascii(b';');
             }
             Statement::TSNamespaceExportDeclaration(d) => {
                 ctx.write("export as namespace ");
                 ctx.write(d.id.name.as_str());
-                ctx.write(";");
+                ctx.write_ascii(b';');
             }
         }
     }
 
-    fn import_declaration(&mut self, node: &ImportDeclaration, ctx: &mut Context) {
+    fn import_declaration(&mut self, node: &ImportDeclaration, ctx: &mut Context<DIRECT>) {
         if node.specifiers.as_ref().is_none_or(|v| v.is_empty()) {
-            ctx.write("import ");
-            ctx.write(self.string_literal(&node.source));
-            ctx.write(";");
+            self.write_keyword(ctx, node.span.start, "import", " ");
+            self.write_node(ctx, node.source.span, Self::string_literal(&node.source));
+            // Upstream esrap returns before printing this clause. Import
+            // attributes affect module loading, so dropping them is not a
+            // byte-only formatting difference (#3635).
+            Self::import_attributes(node.with_clause.as_deref(), ctx);
+            ctx.write_ascii(b';');
             return;
         }
 
@@ -1044,47 +2070,52 @@ impl<'opt> Printer<'opt> {
             }
         }
 
-        ctx.write("import ");
+        let mut kw = self.keyword_cursor(node.span.start, true);
+        kw.write(ctx, "import ");
         if import_type {
-            ctx.write("type ");
+            kw.write(ctx, "type ");
         }
         if let Some(d) = default_spec {
-            ctx.write(d.local.name.as_str());
+            self.write_node(ctx, d.span, d.local.name.as_str());
             if namespace_spec.is_some() || !named.is_empty() {
-                ctx.write(", ");
+                ctx.write_ascii_bytes(b", ");
             }
         }
         if let Some(ns) = namespace_spec {
-            ctx.write(format!("* as {}", ns.local.name));
+            self.write_node(ctx, ns.span, format_compact!("* as {}", ns.local.name.as_str()));
         }
         if !named.is_empty() {
-            ctx.write("{");
-            let nodes: Vec<SeqNode> = named
-                .iter()
-                .map(|s| {
+            ctx.write_ascii(b'{');
+            self.sequence_slice(
+                &named,
+                |s| {
                     let span = s.span();
-                    SeqNode {
+                    SeqMeta {
                         start: Some(span.start),
                         end: Some(span.end),
                         obj_or_array: false,
                         is_elision: false,
-                        render: Box::new(move |p: &mut Printer, child: &mut Context| {
-                            p.import_specifier(s, child);
-                        }),
                     }
-                })
-                .collect();
-            self.sequence(nodes, None, true, ",", true, ctx);
-            ctx.write("}");
+                },
+                |p, s, child| {
+                    p.import_specifier(s, child);
+                },
+                None,
+                true,
+                ",",
+                true,
+                ctx,
+            );
+            ctx.write_ascii(b'}');
         }
         ctx.write(" from ");
-        ctx.write(self.string_literal(&node.source));
-        self.import_attributes(node.with_clause.as_deref(), ctx);
-        ctx.write(";");
+        self.write_node(ctx, node.source.span, Self::string_literal(&node.source));
+        Self::import_attributes(node.with_clause.as_deref(), ctx);
+        ctx.write_ascii(b';');
     }
 
     /// esrap's import-attributes tail: ` with { key: value, … }`.
-    fn import_attributes(&mut self, clause: Option<&WithClause>, ctx: &mut Context) {
+    fn import_attributes(clause: Option<&WithClause>, ctx: &mut Context<DIRECT>) {
         let Some(clause) = clause else { return };
         if clause.with_entries.is_empty() {
             return;
@@ -1093,18 +2124,18 @@ impl<'opt> Printer<'opt> {
         for (i, attr) in clause.with_entries.iter().enumerate() {
             match &attr.key {
                 ImportAttributeKey::Identifier(id) => ctx.write(id.name.as_str()),
-                ImportAttributeKey::StringLiteral(s) => ctx.write(self.string_literal(s)),
+                ImportAttributeKey::StringLiteral(s) => ctx.write(Self::string_literal(s)),
             }
-            ctx.write(": ");
-            ctx.write(self.string_literal(&attr.value));
+            ctx.write_ascii_bytes(b": ");
+            ctx.write(Self::string_literal(&attr.value));
             if i + 1 != clause.with_entries.len() {
-                ctx.write(", ");
+                ctx.write_ascii_bytes(b", ");
             }
         }
-        ctx.write(" }");
+        ctx.write_ascii_bytes(b" }");
     }
 
-    fn import_specifier(&mut self, node: &ImportSpecifier, ctx: &mut Context) {
+    fn import_specifier(&self, node: &ImportSpecifier, ctx: &mut Context<DIRECT>) {
         if matches!(node.import_kind, ImportOrExportKind::Type) {
             ctx.write("type ");
         }
@@ -1118,62 +2149,85 @@ impl<'opt> Printer<'opt> {
         if let Some(name) = imported
             && name != node.local.name.as_str()
         {
-            ctx.write(name);
-            ctx.write(" as ");
+            self.write_node(ctx, node.imported.span(), name);
+            ctx.write_ascii_bytes(b" as ");
         }
-        ctx.write(node.local.name.as_str());
+        self.write_node(ctx, node.local.span, node.local.name.as_str());
     }
 
-    fn export_named_declaration(&mut self, node: &ExportNamedDeclaration, ctx: &mut Context) {
-        if let Some(decl) = &node.declaration {
-            // A class declaration's decorators are printed *before* `export`.
-            if let Declaration::ClassDeclaration(c) = decl
-                && !c.decorators.is_empty()
-            {
-                for decorator in &c.decorators {
-                    self.decorator(decorator, ctx);
-                }
-                self.write_keyword(ctx, node.span().start, "export", " ");
-                self.class_node_no_decorators(c, ctx);
-                return;
+    fn export_declaration(&mut self, node: &ExportDeclaration, ctx: &mut Context<DIRECT>) {
+        // A class declaration's decorators are printed *before* `export`.
+        if let Declaration::ClassDeclaration(c) = &node.declaration
+            && !c.decorators.is_empty()
+        {
+            for decorator in &c.decorators {
+                self.decorator(decorator, ctx);
             }
             self.write_keyword(ctx, node.span().start, "export", " ");
-            self.declaration(decl, ctx);
+            self.class_node_no_decorators(c, ctx);
             return;
         }
+        self.write_keyword(ctx, node.span().start, "export", " ");
+        self.declaration(&node.declaration, ctx);
+    }
 
-        let mut kw = self.keyword_cursor(node.span().start, true);
+    fn export_specifier_list(
+        &mut self,
+        span_start: u32,
+        specifiers: &[ExportSpecifier],
+        export_kind: ImportOrExportKind,
+        ctx: &mut Context<DIRECT>,
+    ) {
+        let mut kw = self.keyword_cursor(span_start, true);
         kw.write(ctx, "export ");
-        if matches!(node.export_kind, ImportOrExportKind::Type) {
+        if matches!(export_kind, ImportOrExportKind::Type) {
             kw.write(ctx, "type ");
         }
-        ctx.write("{");
-        let nodes: Vec<SeqNode> = node
-            .specifiers
-            .iter()
-            .map(|s| {
+        ctx.write_ascii(b'{');
+        self.sequence_slice(
+            specifiers,
+            |s| {
                 let span = s.span();
-                SeqNode {
+                SeqMeta {
                     start: Some(span.start),
                     end: Some(span.end),
                     obj_or_array: false,
                     is_elision: false,
-                    render: Box::new(move |p: &mut Printer, child: &mut Context| {
-                        p.export_specifier(s, child);
-                    }),
                 }
-            })
-            .collect();
-        self.sequence(nodes, None, true, ",", true, ctx);
-        ctx.write("}");
-        if let Some(source) = &node.source {
-            ctx.write(" from ");
-            ctx.write(self.string_literal(source));
-        }
-        ctx.write(";");
+            },
+            |_p, s, child| {
+                Printer::<HAS_COMMENTS, DIRECT>::export_specifier(s, child);
+            },
+            None,
+            true,
+            ",",
+            true,
+            ctx,
+        );
+        ctx.write_ascii(b'}');
     }
 
-    fn export_default_declaration(&mut self, node: &ExportDefaultDeclaration, ctx: &mut Context) {
+    fn export_named_declaration(
+        &mut self,
+        node: &ExportNamedDeclaration,
+        ctx: &mut Context<DIRECT>,
+    ) {
+        self.export_specifier_list(node.span().start, &node.specifiers, node.export_kind, ctx);
+        ctx.write_ascii(b';');
+    }
+
+    fn export_from_declaration(&mut self, node: &ExportFromDeclaration, ctx: &mut Context<DIRECT>) {
+        self.export_specifier_list(node.span().start, &node.specifiers, node.export_kind, ctx);
+        ctx.write(" from ");
+        ctx.write(Self::string_literal(&node.source));
+        ctx.write_ascii(b';');
+    }
+
+    fn export_default_declaration(
+        &mut self,
+        node: &ExportDefaultDeclaration,
+        ctx: &mut Context<DIRECT>,
+    ) {
         // esrap: `export ` then `default ` via a keyword cursor, mapped only when
         // the export is single-line (`single_line_node`).
         let map_ok = self
@@ -1186,11 +2240,20 @@ impl<'opt> Printer<'opt> {
         match &node.declaration {
             ExportDefaultDeclarationKind::FunctionDeclaration(f) => {
                 // No trailing `;` after a function declaration.
-                self.function(f, ctx);
+                let mapping = f.body.as_ref().and_then(|body| {
+                    let span = body.span();
+                    self.brace_mappings
+                        .iter()
+                        .find(|mapping| {
+                            mapping.body_start == span.start && mapping.body_end == span.end
+                        })
+                        .copied()
+                });
+                self.function_with_brace_mapping(f, mapping.as_ref(), ctx);
             }
             ExportDefaultDeclarationKind::ClassDeclaration(c) => self.class_node(c, ctx),
             ExportDefaultDeclarationKind::TSInterfaceDeclaration(d) => {
-                self.interface_declaration(d, ctx)
+                self.interface_declaration(d, ctx);
             }
             other => {
                 if let Some(expr) = other.as_expression() {
@@ -1198,18 +2261,19 @@ impl<'opt> Printer<'opt> {
                 } else {
                     self.unsupported("ExportDefault", ctx);
                 }
-                ctx.write(";");
+                ctx.write_ascii(b';');
             }
         }
     }
 
-    fn template_literal(&mut self, node: &TemplateLiteral, ctx: &mut Context) {
-        ctx.write("`");
+    fn template_literal(&mut self, node: &TemplateLiteral, ctx: &mut Context<DIRECT>) {
+        ctx.write_ascii(b'`');
         for (i, expr) in node.expressions.iter().enumerate() {
-            let raw = node.quasis[i].value.raw.as_str();
-            ctx.write(format!("{raw}${{"));
+            let raw = node.quasis.get(i).map_or("", |q| q.value.raw.as_str());
+            ctx.write(raw);
+            ctx.write_ascii_bytes(b"${");
             self.print_expression(expr, ctx);
-            ctx.write("}");
+            ctx.write_ascii(b'}');
             // A newline *inside* the literal makes the enclosing context
             // multiline (esrap), which drives statement-margin decisions.
             if raw.contains('\n') {
@@ -1218,14 +2282,15 @@ impl<'opt> Printer<'opt> {
         }
         if let Some(last) = node.quasis.last() {
             let raw = last.value.raw.as_str();
-            ctx.write(format!("{raw}`"));
+            ctx.write(raw);
+            ctx.write_ascii(b'`');
             if raw.contains('\n') {
                 ctx.multiline = true;
             }
         }
     }
 
-    fn export_specifier(&mut self, node: &ExportSpecifier, ctx: &mut Context) {
+    fn export_specifier(node: &ExportSpecifier, ctx: &mut Context<DIRECT>) {
         if matches!(node.export_kind, ImportOrExportKind::Type) {
             ctx.write("type ");
         }
@@ -1233,33 +2298,47 @@ impl<'opt> Printer<'opt> {
         let exported = module_export_name_str(&node.exported);
         ctx.write(local);
         if local != exported {
-            ctx.write(" as ");
+            ctx.write_ascii_bytes(b" as ");
             ctx.write(exported);
         }
     }
 
     /// Print a `Declaration` node (the RHS of `export <decl>` and standalone
     /// declarations). Only the variable form is wired so far.
-    fn declaration(&mut self, decl: &Declaration, ctx: &mut Context) {
+    fn declaration(&mut self, decl: &Declaration, ctx: &mut Context<DIRECT>) {
         match decl {
             Declaration::VariableDeclaration(d) => {
                 self.variable_declaration(d, ctx);
-                ctx.write(";");
+                ctx.write_ascii(b';');
             }
             Declaration::FunctionDeclaration(f) => self.function(f, ctx),
             Declaration::ClassDeclaration(c) => self.class_node(c, ctx),
             Declaration::TSTypeAliasDeclaration(d) => self.type_alias_declaration(d, ctx),
             Declaration::TSInterfaceDeclaration(d) => self.interface_declaration(d, ctx),
             Declaration::TSEnumDeclaration(d) => self.enum_declaration(d, ctx),
-            Declaration::TSModuleDeclaration(d) => self.module_declaration(d, ctx),
+            Declaration::TSExternalModuleDeclaration(d) => self.external_module_declaration(d, ctx),
+            Declaration::TSNamespaceDeclaration(d) => self.namespace_declaration(d, true, ctx),
             Declaration::TSGlobalDeclaration(d) => self.global_declaration(d, ctx),
-            Declaration::TSImportEqualsDeclaration(d) => self.import_equals_declaration(d, ctx),
+            Declaration::TSImportEqualsDeclaration(d) => Self::import_equals_declaration(d, ctx),
         }
     }
 
     /// esrap's `FunctionDeclaration|FunctionExpression`:
     /// `[async ]function[* ] id(params) { body }`.
-    fn function(&mut self, node: &Function, ctx: &mut Context) {
+    fn function(&mut self, node: &Function, ctx: &mut Context<DIRECT>) {
+        self.function_with_brace_mapping(node, None, ctx);
+    }
+
+    /// Print a function, optionally overriding the source positions of its body
+    /// braces. The override is supplied only by the default-export declaration
+    /// path, so a nested block with the same comment-space span cannot consume
+    /// the component wrapper's mapping.
+    fn function_with_brace_mapping(
+        &mut self,
+        node: &Function,
+        brace_mapping: Option<&BraceMapping>,
+        ctx: &mut Context<DIRECT>,
+    ) {
         if node.declare {
             ctx.write("declare ");
         }
@@ -1272,10 +2351,10 @@ impl<'opt> Printer<'opt> {
         let start = node.span().start;
         let offset_ok = self.function_async_offset_ok(node);
         let gen_suffix = if node.generator { "* " } else { " " };
-        match self.offset_to_line_col(start) {
+        match self.map_position(start) {
             Some((line, column)) if node.r#async && offset_ok => {
                 Self::write_source_keyword(ctx, line, column, "async ");
-                let col2 = column + "async ".len() as u32;
+                let col2 = column + usize_to_u32("async ".len());
                 Self::write_source_keyword(ctx, line, col2, "function");
                 ctx.write(gen_suffix);
             }
@@ -1287,38 +2366,54 @@ impl<'opt> Printer<'opt> {
                 if node.r#async {
                     ctx.write("async ");
                 }
-                ctx.write(if node.generator {
-                    "function* "
-                } else {
-                    "function "
-                });
+                ctx.write(if node.generator { "function* " } else { "function " });
             }
         }
         if let Some(id) = &node.id {
-            ctx.write(id.name.as_str());
+            self.write_node(ctx, id.span, id.name.as_str());
         }
         if let Some(tp) = &node.type_parameters {
             self.type_parameter_declaration(tp, ctx);
         }
-        ctx.write("(");
-        self.formal_parameters_with_this(&node.params, node.this_param.as_deref(), ctx);
-        ctx.write(")");
+        ctx.write_ascii(b'(');
+        // esrap: until `(returnType ?? body).loc.start`; a bodyless declare /
+        // overload falls back to the node's own end.
+        let until = node
+            .return_type
+            .as_ref()
+            .map(|rt| rt.span().start)
+            .or_else(|| node.body.as_ref().map(|b| b.span().start))
+            .unwrap_or(node.span.end);
+        self.formal_parameters_with_this(
+            &node.params,
+            node.this_param.as_deref(),
+            Some(until),
+            ctx,
+        );
+        ctx.write_ascii(b')');
         if let Some(rt) = &node.return_type {
             self.type_annotation(rt, ctx);
         }
         // A `declare function`/overload has no body — esrap emits `;`.
         match &node.body {
             Some(body) => {
-                ctx.write(" ");
+                ctx.write_ascii(b' ');
                 let span = body.span();
-                self.block(&body.statements, span.start, span.end, ctx);
+                self.block_with_directives_mapped(
+                    &body.directives,
+                    &body.statements,
+                    span.start,
+                    span.end,
+                    brace_mapping,
+                    ctx,
+                );
             }
-            None => ctx.write(";"),
+            None => ctx.write_ascii(b';'),
         }
     }
 
     /// esrap's `ClassDeclaration|ClassExpression`: `class [id ][extends sup ]{…}`.
-    fn class_node(&mut self, node: &Class, ctx: &mut Context) {
+    fn class_node(&mut self, node: &Class, ctx: &mut Context<DIRECT>) {
         for decorator in &node.decorators {
             self.decorator(decorator, ctx);
         }
@@ -1327,7 +2422,7 @@ impl<'opt> Printer<'opt> {
 
     /// The class body sans leading decorators (already emitted by the caller —
     /// e.g. `export @dec class`, which prints decorators before `export`).
-    fn class_node_no_decorators(&mut self, node: &Class, ctx: &mut Context) {
+    fn class_node_no_decorators(&mut self, node: &Class, ctx: &mut Context<DIRECT>) {
         // esrap's class modifier keyword cursor: `declare `/`abstract `/`class `
         // mapped to their source span when `class_modifier_keywords_map_ok`
         // (no decorators, id/body on the node's start line).
@@ -1345,22 +2440,30 @@ impl<'opt> Printer<'opt> {
             if let Some(tp) = &node.type_parameters {
                 self.type_parameter_declaration(tp, ctx);
             }
-            ctx.write(" ");
+            ctx.write_ascii(b' ');
         } else if let Some(tp) = &node.type_parameters {
             self.type_parameter_declaration(tp, ctx);
-            ctx.write(" ");
+            ctx.write_ascii(b' ');
         }
-        if let Some(super_class) = &node.super_class {
+        if let Some(heritage) = &node.heritage {
             ctx.write("extends ");
-            self.child_with_parens(super_class, 19, ctx);
-            if let Some(ta) = &node.super_type_arguments {
+            // esrap visits the superclass with no parenthesisation at all, which
+            // prints text no parser accepts for anything looser than a
+            // LeftHandSideExpression; parens are kept for those and dropped for
+            // the primary expressions that need none (`extends class {}`).
+            if heritage_needs_no_parens(&heritage.expression) {
+                self.print_expression(&heritage.expression, ctx);
+            } else {
+                self.child_with_parens(&heritage.expression, 19, ctx);
+            }
+            if let Some(ta) = &heritage.type_arguments {
                 self.type_parameter_instantiation(ta, ctx);
             }
-            ctx.write(" ");
+            ctx.write_ascii(b' ');
         }
         if !node.implements.is_empty() {
             ctx.write("implements");
-            let nodes: Vec<SeqNode> = node
+            let nodes: Vec<SeqNode<HAS_COMMENTS>> = node
                 .implements
                 .iter()
                 .map(|imp| {
@@ -1370,12 +2473,15 @@ impl<'opt> Printer<'opt> {
                         end: Some(span.end),
                         obj_or_array: false,
                         is_elision: false,
-                        render: Box::new(move |p: &mut Printer, child: &mut Context| {
-                            p.print_type_name(&imp.expression, child);
-                            if let Some(ta) = &imp.type_arguments {
-                                p.type_parameter_instantiation(ta, child);
-                            }
-                        }),
+                        render: Box::new(
+                            move |p: &mut Printer<'_, HAS_COMMENTS, false>,
+                                  child: &mut Context<false>| {
+                                Printer::<HAS_COMMENTS>::print_type_name(&imp.expression, child);
+                                if let Some(ta) = &imp.type_arguments {
+                                    p.type_parameter_instantiation(ta, child);
+                                }
+                            },
+                        ),
                     }
                 })
                 .collect();
@@ -1384,44 +2490,136 @@ impl<'opt> Printer<'opt> {
         self.class_body(&node.body, ctx);
     }
 
-    fn decorator(&mut self, node: &Decorator, ctx: &mut Context) {
-        ctx.write("@");
+    fn decorator(&mut self, node: &Decorator, ctx: &mut Context<DIRECT>) {
+        ctx.write_ascii(b'@');
+        let map_nodes = std::mem::replace(&mut self.map_nodes, false);
         self.print_expression(&node.expression, ctx);
+        self.map_nodes = map_nodes;
         ctx.newline();
+    }
+
+    fn comments_are_outer_to_class(&self, body: &ClassBody) -> bool {
+        let span = body.span();
+        if !self.has_loc(span.start) || !self.has_loc(span.end) {
+            return false;
+        }
+        let mut index = self.comment_partition_point(span.start);
+        for element in
+            body.body.iter().filter(|element| !matches!(element, ClassElement::TSIndexSignature(_)))
+        {
+            let element_span = element.span();
+            if !self.has_loc(element_span.start) || !self.has_loc(element_span.end) {
+                return false;
+            }
+            while let Some(comment) = self.comment_at(index) {
+                if comment.start >= span.end || comment.end > element_span.start {
+                    break;
+                }
+                index += 1;
+            }
+            if self.comment_at(index).is_some_and(|comment| {
+                comment.start < element_span.end && comment.end > element_span.start
+            }) {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn class_comment_island(&mut self, body: &ClassBody, ctx: &mut Context<DIRECT>) {
+        let span = body.span();
+        self.reset_comment_index(Some(span.start));
+        let mut elements = body
+            .body
+            .iter()
+            .filter(|element| !matches!(element, ClassElement::TSIndexSignature(_)))
+            .peekable();
+        let mut prev: Option<(&ClassElement<'_>, bool)> = None;
+        let mut last_end = None;
+        while let Some(element) = elements.next() {
+            let layout_mark = ctx.event_mark();
+            let mut has_margin = false;
+            if let Some((prev_element, prev_multiline)) = prev {
+                has_margin = prev_multiline
+                    || std::mem::discriminant(prev_element) != std::mem::discriminant(element);
+                if has_margin {
+                    ctx.margin();
+                }
+                ctx.newline();
+            }
+
+            let scope = ctx.begin_scope();
+            self.flush_leading(ctx, element.span().start);
+            self.comment_free().class_element(element, ctx);
+            let multiline = ctx.end_scope(scope);
+            if multiline && prev.is_some() && !has_margin {
+                ctx.insert_event(layout_mark, EventKind::Margin);
+            }
+
+            let end = element.span().end;
+            let next = elements.peek().map(|element| element.span().end);
+            self.flush_trailing_comments(ctx, end, next);
+            last_end = Some(end);
+            prev = Some((element, multiline));
+        }
+
+        ctx.newline();
+        self.flush_comments_until(ctx, span.end, last_end, false);
     }
 
     /// esrap's `BlockStatement|ClassBody`: route class members through the shared
     /// `body` machinery (one-per-line, blank line between two multiline members
     /// or a change of member kind) so leading / trailing / end-of-body comments
     /// are interleaved identically to a statement block.
-    fn class_body(&mut self, body: &ClassBody, ctx: &mut Context) {
+    fn class_body(&mut self, body: &ClassBody, ctx: &mut Context<DIRECT>) {
         let span = body.span();
-        ctx.write("{");
-        let mut child = ctx.child();
-        let elems: Vec<BodyElem> = body
+        if HAS_COMMENTS && DIRECT && self.comments_are_outer_to_class(body) {
+            let has_element = body
+                .body
+                .iter()
+                .any(|element| !matches!(element, ClassElement::TSIndexSignature(_)));
+            let first_comment = self.comment_partition_point(span.start);
+            let has_comment =
+                self.comment_at(first_comment).is_some_and(|comment| comment.start < span.end);
+            if has_element || has_comment {
+                ctx.write_ascii(b'{');
+                ctx.indent();
+                ctx.newline();
+                self.class_comment_island(body, ctx);
+                ctx.dedent();
+                ctx.newline();
+                ctx.write_ascii(b'}');
+                return;
+            }
+        }
+        ctx.write_ascii(b'{');
+        let mark = ctx.event_mark();
+        let scope = ctx.begin_scope();
+        let elems = body
             .body
             .iter()
             // esrap's `body` only skips `EmptyStatement`; TS index signatures are
             // not statements and have no printer mapping here, so drop them.
             .filter(|e| !matches!(e, ClassElement::TSIndexSignature(_)))
-            .map(BodyElem::ClassMember)
-            .collect();
-        self.body_elems(&elems, span.start, span.end, &mut child);
-        if !child.empty() {
-            ctx.indent();
-            ctx.newline();
-            ctx.append(child);
+            .map(BodyElem::ClassMember);
+        self.body_elems(elems, Some(span.start), span.end, ctx);
+        if ctx.empty() {
+            ctx.discard_scope(scope);
+        } else {
+            ctx.end_scope(scope);
+            ctx.insert_event(mark, EventKind::Newline);
+            ctx.insert_event(mark, EventKind::Indent);
             ctx.dedent();
             ctx.newline();
         }
-        ctx.write("}");
+        ctx.write_ascii(b'}');
     }
 
-    fn class_element(&mut self, element: &ClassElement, ctx: &mut Context) {
+    fn class_element(&mut self, element: &ClassElement, ctx: &mut Context<DIRECT>) {
         // esrap's `_` wildcard flushes any comment positioned before the member
         // (e.g. a leading JSDoc block) before visiting it.
         let start = element.span().start;
-        self.flush_leading(ctx, start, self.line_of(start));
+        self.flush_leading(ctx, start);
         match element {
             ClassElement::MethodDefinition(m) => self.method_definition(m, ctx),
             ClassElement::PropertyDefinition(p) => self.property_definition(p, ctx),
@@ -1431,11 +2629,11 @@ impl<'opt> Printer<'opt> {
                 let span = b.span();
                 self.block(&b.body, span.start, span.end, ctx);
             }
-            _ => self.unsupported("ClassElement", ctx),
+            ClassElement::TSIndexSignature(_) => self.unsupported("ClassElement", ctx),
         }
     }
 
-    fn method_definition(&mut self, node: &MethodDefinition, ctx: &mut Context) {
+    fn method_definition(&mut self, node: &MethodDefinition, ctx: &mut Context<DIRECT>) {
         for decorator in &node.decorators {
             self.decorator(decorator, ctx);
         }
@@ -1445,20 +2643,15 @@ impl<'opt> Printer<'opt> {
         // value start on the same line).
         let map_ok = node.decorators.is_empty() && {
             let n = self.offset_to_line_col(node.span().start).map(|(l, _)| l);
-            let v = self
-                .offset_to_line_col(node.value.span().start)
-                .map(|(l, _)| l);
+            let v = self.offset_to_line_col(node.value.span().start).map(|(l, _)| l);
             n.is_some() && n == v
         };
         let mut kw = self.keyword_cursor(node.span().start, map_ok);
-        if matches!(
-            node.r#type,
-            MethodDefinitionType::TSAbstractMethodDefinition
-        ) {
+        if matches!(node.r#type, MethodDefinitionType::TSAbstractMethodDefinition) {
             kw.write(ctx, "abstract ");
         }
         if let Some(acc) = &node.accessibility {
-            kw.write(ctx, &format!("{} ", accessibility_str(acc)));
+            kw.write(ctx, &format!("{} ", accessibility_str(*acc)));
         }
         if node.r#override {
             kw.write(ctx, "override ");
@@ -1475,47 +2668,51 @@ impl<'opt> Printer<'opt> {
             kw.write(ctx, "async ");
         }
         if node.value.generator {
-            ctx.write("*");
+            ctx.write_ascii(b'*');
         }
         if node.computed {
-            ctx.write("[");
+            ctx.write_ascii(b'[');
             self.property_key(&node.key, ctx);
-            ctx.write("]");
+            ctx.write_ascii(b']');
         } else {
             self.property_key(&node.key, ctx);
         }
         if node.optional {
-            ctx.write("?");
+            ctx.write_ascii(b'?');
         }
         if let Some(tp) = &node.value.type_parameters {
             self.type_parameter_declaration(tp, ctx);
         }
-        ctx.write("(");
+        ctx.write_ascii(b'(');
         self.formal_parameters(&node.value.params, ctx);
-        ctx.write(")");
+        ctx.write_ascii(b')');
         if let Some(rt) = &node.value.return_type {
             self.type_annotation(rt, ctx);
         }
-        ctx.write(" ");
+        ctx.write_ascii(b' ');
         // esrap: an abstract method has no body — it emits only the trailing
         // space from `context.write(' ')`, leaving `abstract get a() `.
         if let Some(body) = &node.value.body {
             let span = body.span();
-            self.block(&body.statements, span.start, span.end, ctx);
+            self.block_with_directives(
+                &body.directives,
+                &body.statements,
+                span.start,
+                span.end,
+                ctx,
+            );
         }
     }
 
-    fn property_definition(&mut self, node: &PropertyDefinition, ctx: &mut Context) {
+    fn property_definition(&mut self, node: &PropertyDefinition, ctx: &mut Context<DIRECT>) {
         for decorator in &node.decorators {
             self.decorator(decorator, ctx);
         }
         if let Some(acc) = &node.accessibility {
-            ctx.write(format!("{} ", accessibility_str(acc)));
+            ctx.write(accessibility_str(*acc));
+            ctx.write_ascii(b' ');
         }
-        if matches!(
-            node.r#type,
-            PropertyDefinitionType::TSAbstractPropertyDefinition
-        ) {
+        if matches!(node.r#type, PropertyDefinitionType::TSAbstractPropertyDefinition) {
             ctx.write("abstract ");
         }
         if node.declare {
@@ -1531,39 +2728,37 @@ impl<'opt> Printer<'opt> {
             ctx.write("readonly ");
         }
         if node.computed {
-            ctx.write("[");
+            ctx.write_ascii(b'[');
             self.property_key(&node.key, ctx);
-            ctx.write("]");
+            ctx.write_ascii(b']');
         } else {
             self.property_key(&node.key, ctx);
         }
         if node.optional {
-            ctx.write("?");
+            ctx.write_ascii(b'?');
         }
         if node.definite {
-            ctx.write("!");
+            ctx.write_ascii(b'!');
         }
         if let Some(ann) = &node.type_annotation {
             self.type_annotation(ann, ctx);
         }
         if let Some(value) = &node.value {
-            ctx.write(" = ");
+            ctx.write_ascii_bytes(b" = ");
             self.print_expression(value, ctx);
         }
-        ctx.write(";");
+        ctx.write_ascii(b';');
     }
 
-    fn accessor_property(&mut self, node: &AccessorProperty, ctx: &mut Context) {
+    fn accessor_property(&mut self, node: &AccessorProperty, ctx: &mut Context<DIRECT>) {
         for decorator in &node.decorators {
             self.decorator(decorator, ctx);
         }
         if let Some(acc) = &node.accessibility {
-            ctx.write(format!("{} ", accessibility_str(acc)));
+            ctx.write(accessibility_str(*acc));
+            ctx.write_ascii(b' ');
         }
-        if matches!(
-            node.r#type,
-            AccessorPropertyType::TSAbstractAccessorProperty
-        ) {
+        if matches!(node.r#type, AccessorPropertyType::TSAbstractAccessorProperty) {
             ctx.write("abstract ");
         }
         if node.r#static {
@@ -1571,29 +2766,29 @@ impl<'opt> Printer<'opt> {
         }
         ctx.write("accessor ");
         if node.computed {
-            ctx.write("[");
+            ctx.write_ascii(b'[');
             self.property_key(&node.key, ctx);
-            ctx.write("]");
+            ctx.write_ascii(b']');
         } else {
             self.property_key(&node.key, ctx);
         }
         if node.definite {
-            ctx.write("!");
+            ctx.write_ascii(b'!');
         }
         if let Some(ann) = &node.type_annotation {
             self.type_annotation(ann, ctx);
         }
         if let Some(value) = &node.value {
-            ctx.write(" = ");
+            ctx.write_ascii_bytes(b" = ");
             self.print_expression(value, ctx);
         }
-        ctx.write(";");
+        ctx.write_ascii(b';');
     }
 
-    fn if_statement(&mut self, node: &IfStatement, ctx: &mut Context) {
+    fn if_statement(&mut self, node: &IfStatement, ctx: &mut Context<DIRECT>) {
         self.write_keyword(ctx, node.span().start, "if", " (");
         self.print_expression(&node.test, ctx);
-        ctx.write(") ");
+        ctx.write_ascii_bytes(b") ");
         self.print_statement(&node.consequent, ctx);
         if let Some(alternate) = &node.alternate {
             ctx.space();
@@ -1608,7 +2803,7 @@ impl<'opt> Printer<'opt> {
                     if ce_line == al_line && al_col >= 4 =>
                 {
                     Self::write_source_keyword(ctx, ce_line, ce_col + 1, "else");
-                    ctx.write(" ");
+                    ctx.write_ascii(b' ');
                 }
                 _ => ctx.write("else "),
             }
@@ -1616,7 +2811,7 @@ impl<'opt> Printer<'opt> {
         }
     }
 
-    fn do_while_statement(&mut self, node: &DoWhileStatement, ctx: &mut Context) {
+    fn do_while_statement(&mut self, node: &DoWhileStatement, ctx: &mut Context<DIRECT>) {
         self.write_keyword(ctx, node.span().start, "do", " ");
         self.print_statement(&node.body, ctx);
         // esrap maps the trailing `while` to a computed offset (one past the body
@@ -1625,17 +2820,17 @@ impl<'opt> Printer<'opt> {
         let test_start = self.offset_to_line_col(node.test.span().start);
         match (body_end, test_start) {
             (Some((be_line, be_col)), Some((t_line, t_col))) if be_line == t_line && t_col >= 6 => {
-                ctx.write(" ");
+                ctx.write_ascii(b' ');
                 Self::write_source_keyword(ctx, be_line, be_col + 1, "while");
-                ctx.write(" (");
+                ctx.write_ascii_bytes(b" (");
             }
             _ => ctx.write(" while ("),
         }
         self.print_expression(&node.test, ctx);
-        ctx.write(");");
+        ctx.write_ascii_bytes(b");");
     }
 
-    fn for_statement(&mut self, node: &ForStatement, ctx: &mut Context) {
+    fn for_statement(&mut self, node: &ForStatement, ctx: &mut Context<DIRECT>) {
         ctx.write("for (");
         if let Some(init) = &node.init {
             match init {
@@ -1647,20 +2842,20 @@ impl<'opt> Printer<'opt> {
                 }
             }
         }
-        ctx.write("; ");
+        ctx.write_ascii_bytes(b"; ");
         if let Some(test) = &node.test {
             self.print_expression(test, ctx);
         }
-        ctx.write("; ");
+        ctx.write_ascii_bytes(b"; ");
         if let Some(update) = &node.update {
             self.print_expression(update, ctx);
         }
-        ctx.write(") ");
+        ctx.write_ascii_bytes(b") ");
         self.print_statement(&node.body, ctx);
     }
 
     /// The binding of a `for…in` / `for…of` head: a declaration or a target.
-    fn for_statement_left(&mut self, left: &ForStatementLeft, ctx: &mut Context) {
+    fn for_statement_left(&mut self, left: &ForStatementLeft, ctx: &mut Context<DIRECT>) {
         match left {
             ForStatementLeft::VariableDeclaration(d) => self.variable_declaration(d, ctx),
             _ => match left.as_assignment_target() {
@@ -1671,17 +2866,17 @@ impl<'opt> Printer<'opt> {
     }
 
     /// esrap's `TryStatement`: `try {…}` + optional `catch (p) {…}` + `finally {…}`.
-    fn try_statement(&mut self, node: &TryStatement, ctx: &mut Context) {
+    fn try_statement(&mut self, node: &TryStatement, ctx: &mut Context<DIRECT>) {
         self.write_keyword(ctx, node.span().start, "try", " ");
         let span = node.block.span();
         self.block(&node.block.body, span.start, span.end, ctx);
         if let Some(handler) = &node.handler {
-            ctx.write(" ");
+            ctx.write_ascii(b' ');
             if let Some(param) = &handler.param {
                 // esrap emits `catch(e)` with no space after the keyword.
                 self.write_keyword(ctx, handler.span().start, "catch", "(");
                 self.binding_pattern(&param.pattern, ctx);
-                ctx.write(") ");
+                ctx.write_ascii_bytes(b") ");
             } else {
                 self.write_keyword(ctx, handler.span().start, "catch", " ");
             }
@@ -1692,20 +2887,17 @@ impl<'opt> Printer<'opt> {
             // esrap maps `finally` to a computed offset (one past the previous
             // block end) when the finalizer begins on the prev block's end line
             // at column >= 7. Otherwise an unmapped ` finally `.
-            let prev_end = node
-                .handler
-                .as_ref()
-                .map(|h| h.span().end)
-                .unwrap_or(node.block.span().end);
+            let prev_end =
+                node.handler.as_ref().map_or_else(|| node.block.span().end, |h| h.span().end);
             let prev = self.offset_to_line_col(prev_end);
             let fin = self.offset_to_line_col(finalizer.span().start);
             match (prev, fin) {
                 (Some((p_line, p_col)), Some((f_line, f_col)))
                     if p_line == f_line && f_col >= 7 =>
                 {
-                    ctx.write(" ");
+                    ctx.write_ascii(b' ');
                     Self::write_source_keyword(ctx, p_line, p_col + 1, "finally");
-                    ctx.write(" ");
+                    ctx.write_ascii(b' ');
                 }
                 _ => ctx.write(" finally "),
             }
@@ -1716,10 +2908,10 @@ impl<'opt> Printer<'opt> {
 
     /// esrap's `SwitchStatement`: `switch (disc) {`, each case indented with a
     /// blank-line margin between cases, statements one-per-line.
-    fn switch_statement(&mut self, node: &SwitchStatement, ctx: &mut Context) {
+    fn switch_statement(&mut self, node: &SwitchStatement, ctx: &mut Context<DIRECT>) {
         self.write_keyword(ctx, node.span().start, "switch", " (");
         self.print_expression(&node.discriminant, ctx);
-        ctx.write(") {");
+        ctx.write_ascii_bytes(b") {");
         ctx.indent();
 
         for (i, case) in node.cases.iter().enumerate() {
@@ -1731,7 +2923,7 @@ impl<'opt> Printer<'opt> {
                 Some(test) => {
                     self.write_keyword(ctx, case.span().start, "case", " ");
                     self.print_expression(test, ctx);
-                    ctx.write(":");
+                    ctx.write_ascii(b':');
                 }
                 None => self.write_keyword(ctx, case.span().start, "default", ":"),
             }
@@ -1745,109 +2937,115 @@ impl<'opt> Printer<'opt> {
 
         ctx.dedent();
         ctx.newline();
-        ctx.write("}");
+        ctx.write_ascii(b'}');
     }
 
-    fn object_pattern(&mut self, node: &ObjectPattern, ctx: &mut Context) {
-        ctx.write("{");
-        let mut nodes: Vec<SeqNode> = node
-            .properties
-            .iter()
-            .map(|prop| {
-                let span = prop.span();
-                SeqNode {
+    fn object_pattern(&mut self, node: &ObjectPattern, ctx: &mut Context<DIRECT>) {
+        ctx.write_ascii(b'{');
+        let property_len = node.properties.len();
+        let n = property_len + usize::from(node.rest.is_some());
+        self.sequence_indexed(
+            n,
+            |i| {
+                let span = if i < property_len {
+                    node.properties[i].span()
+                } else {
+                    node.rest.as_ref().unwrap().span()
+                };
+                SeqMeta {
                     start: Some(span.start),
                     end: Some(span.end),
                     obj_or_array: false,
                     is_elision: false,
-                    render: Box::new(move |p: &mut Printer, child: &mut Context| {
-                        // esrap's `sequence` visits each property through the `_`
-                        // wildcard, which flushes any comment positioned before it
-                        // (`{ a, /* c */ b } = x` or a `// line` comment before a
-                        // destructured prop). Mirror that per property — a `// line`
-                        // comment also forces the sequence multiline (via the
-                        // `newline()` in `write_comment`), so it can't swallow the
-                        // following token (`tabindex = // c 0` → unparseable).
-                        p.flush_leading(child, span.start, p.line_of(span.start));
-                        p.binding_property(prop, child);
-                    }),
                 }
-            })
-            .collect();
-        if let Some(rest) = &node.rest {
-            let span = rest.span();
-            nodes.push(SeqNode {
-                start: Some(span.start),
-                end: Some(span.end),
-                obj_or_array: false,
-                is_elision: false,
-                render: Box::new(move |p: &mut Printer, child: &mut Context| {
-                    p.flush_leading(child, span.start, p.line_of(span.start));
-                    child.write("...");
+            },
+            |p, i, child| {
+                if i < property_len {
+                    let prop = &node.properties[i];
+                    let span = prop.span();
+                    p.flush_leading(child, span.start);
+                    p.binding_property(prop, child);
+                } else {
+                    let rest = node.rest.as_ref().unwrap();
+                    let span = rest.span();
+                    p.flush_leading(child, span.start);
+                    child.write_ascii_bytes(b"...");
                     p.binding_pattern(&rest.argument, child);
-                }),
-            });
-        }
-        self.sequence(nodes, Some(node.span().end), true, ",", true, ctx);
-        ctx.write("}");
+                }
+            },
+            Some(node.span().end),
+            true,
+            ",",
+            true,
+            ctx,
+        );
+        ctx.write_ascii(b'}');
     }
 
-    fn binding_property(&mut self, node: &BindingProperty, ctx: &mut Context) {
+    fn binding_property(&mut self, node: &BindingProperty, ctx: &mut Context<DIRECT>) {
         if node.shorthand {
             self.binding_pattern(&node.value, ctx);
             return;
         }
         if node.computed {
-            ctx.write("[");
+            ctx.write_ascii(b'[');
             self.property_key(&node.key, ctx);
-            ctx.write("]: ");
+            ctx.write_ascii_bytes(b"]: ");
         } else {
             self.property_key(&node.key, ctx);
-            ctx.write(": ");
+            ctx.write_ascii_bytes(b": ");
         }
         self.binding_pattern(&node.value, ctx);
     }
 
-    fn array_pattern(&mut self, node: &ArrayPattern, ctx: &mut Context) {
-        ctx.write("[");
-        let mut nodes: Vec<SeqNode> = node
-            .elements
-            .iter()
-            .map(|el| {
-                let span = el.as_ref().map(|p| p.span());
-                SeqNode {
-                    start: span.map(|s| s.start),
-                    end: span.map(|s| s.end),
-                    obj_or_array: false,
-                    is_elision: el.is_none(),
-                    render: Box::new(move |p: &mut Printer, child: &mut Context| {
-                        if let Some(pattern) = el {
-                            p.binding_pattern(pattern, child);
-                        }
-                    }),
+    fn array_pattern(&mut self, node: &ArrayPattern, ctx: &mut Context<DIRECT>) {
+        ctx.write_ascii(b'[');
+        let element_len = node.elements.len();
+        let n = element_len + usize::from(node.rest.is_some());
+        self.sequence_indexed(
+            n,
+            |i| {
+                if i < element_len {
+                    let span = node.elements[i].as_ref().map(oxc_span::GetSpan::span);
+                    SeqMeta {
+                        start: span.map(|s| s.start),
+                        end: span.map(|s| s.end),
+                        obj_or_array: false,
+                        is_elision: span.is_none(),
+                    }
+                } else {
+                    let span = node.rest.as_ref().unwrap().span();
+                    SeqMeta {
+                        start: Some(span.start),
+                        end: Some(span.end),
+                        obj_or_array: false,
+                        is_elision: false,
+                    }
                 }
-            })
-            .collect();
-        if let Some(rest) = &node.rest {
-            let span = rest.span();
-            nodes.push(SeqNode {
-                start: Some(span.start),
-                end: Some(span.end),
-                obj_or_array: false,
-                is_elision: false,
-                render: Box::new(move |p: &mut Printer, child: &mut Context| {
-                    child.write("...");
+            },
+            |p, i, child| {
+                if i < element_len {
+                    if let Some(pattern) = &node.elements[i] {
+                        p.binding_pattern(pattern, child);
+                    }
+                } else {
+                    let rest = node.rest.as_ref().unwrap();
+                    child.write_ascii_bytes(b"...");
                     p.binding_pattern(&rest.argument, child);
-                }),
-            });
-        }
-        self.sequence(nodes, Some(node.span().end), false, ",", true, ctx);
-        ctx.write("]");
+                }
+            },
+            Some(node.span().end),
+            false,
+            ",",
+            true,
+            ctx,
+        );
+        ctx.write_ascii(b']');
     }
 
     /// Parameter list via esrap's `sequence` (no padding): `a, b, ...rest`.
-    fn formal_parameters(&mut self, params: &FormalParameters, ctx: &mut Context) {
-        self.formal_parameters_with_this(params, None, ctx);
+    fn formal_parameters(&mut self, params: &FormalParameters, ctx: &mut Context<DIRECT>) {
+        self.formal_parameters_with_this(params, None, Some(params.span().end), ctx);
     }
 
     /// As [`Self::formal_parameters`], but with a leading `this: T` parameter —
@@ -1856,35 +3054,41 @@ impl<'opt> Printer<'opt> {
         &mut self,
         params: &FormalParameters,
         this_param: Option<&TSThisParameter>,
-        ctx: &mut Context,
+        until: Option<u32>,
+        ctx: &mut Context<DIRECT>,
     ) {
-        let mut nodes: Vec<SeqNode> = Vec::new();
-        if let Some(tp) = this_param {
-            let span = tp.span;
-            nodes.push(SeqNode {
-                start: Some(span.start),
-                end: Some(span.end),
-                obj_or_array: false,
-                is_elision: false,
-                render: Box::new(move |p: &mut Printer, child: &mut Context| {
-                    child.write("this");
+        let this_len = usize::from(this_param.is_some());
+        let item_len = params.items.len();
+        let n = this_len + item_len + usize::from(params.rest.is_some());
+        self.sequence_indexed(
+            n,
+            |i| {
+                let span = if i < this_len {
+                    this_param.unwrap().span
+                } else if i - this_len < item_len {
+                    params.items[i - this_len].span()
+                } else {
+                    params.rest.as_ref().unwrap().span()
+                };
+                SeqMeta {
+                    start: Some(span.start),
+                    end: Some(span.end),
+                    obj_or_array: false,
+                    is_elision: false,
+                }
+            },
+            |p, i, child| {
+                if i < this_len {
+                    let tp = this_param.unwrap();
+                    child.write_ascii_bytes(b"this");
                     if let Some(ann) = &tp.type_annotation {
                         p.type_annotation(ann, child);
                     }
-                }),
-            });
-        }
-        nodes.extend(params.items.iter().map(|param| {
-            let span = param.span();
-            SeqNode {
-                start: Some(span.start),
-                end: Some(span.end),
-                obj_or_array: false,
-                is_elision: false,
-                render: Box::new(move |p: &mut Printer, child: &mut Context| {
-                    // TS parameter properties (`constructor(private readonly x: T)`).
+                } else if i - this_len < item_len {
+                    let param = &params.items[i - this_len];
                     if let Some(acc) = &param.accessibility {
-                        child.write(format!("{} ", accessibility_str(acc)));
+                        child.write(accessibility_str(*acc));
+                        child.write_ascii(b' ');
                     }
                     if param.readonly {
                         child.write("readonly ");
@@ -1894,101 +3098,214 @@ impl<'opt> Printer<'opt> {
                     }
                     p.binding_pattern(&param.pattern, child);
                     if param.optional {
-                        child.write("?");
+                        child.write_ascii(b'?');
                     }
                     if let Some(ann) = &param.type_annotation {
                         p.type_annotation(ann, child);
                     }
-                    // Default value: oxc stores parameter defaults on
-                    // `FormalParameter::initializer`, not as an
-                    // `AssignmentPattern`.
                     if let Some(init) = &param.initializer {
-                        child.write(" = ");
+                        child.write_ascii_bytes(b" = ");
                         p.print_expression(init, child);
                     }
-                }),
-            }
-        }));
-        if let Some(rest) = &params.rest {
-            let span = rest.span();
-            nodes.push(SeqNode {
-                start: Some(span.start),
-                end: Some(span.end),
-                obj_or_array: false,
-                is_elision: false,
-                render: Box::new(move |p: &mut Printer, child: &mut Context| {
-                    child.write("...");
+                } else {
+                    let rest = params.rest.as_ref().unwrap();
+                    child.write_ascii_bytes(b"...");
                     p.binding_pattern(&rest.rest.argument, child);
                     if let Some(ann) = &rest.type_annotation {
                         p.type_annotation(ann, child);
                     }
-                }),
-            });
-        }
-        // esrap passes the closing `)` location as `until`, but the Rust caller
-        // already owns the parens around `formal_parameters`; there is no node
-        // span for the list itself, so no end-of-list comment flush is needed
-        // here (params rarely carry trailing comments in the corpus).
-        self.sequence(nodes, None, false, ",", true, ctx);
+                }
+            },
+            until,
+            false,
+            ",",
+            true,
+            ctx,
+        );
     }
 
     /// esrap's `ArrowFunctionExpression`: `[async ](params) => body`, wrapping an
     /// object concise body in parens so it isn't read as a block.
-    fn arrow_function(&mut self, node: &ArrowFunctionExpression, ctx: &mut Context) {
+    fn arrow_function(&mut self, node: &ArrowFunctionExpression, ctx: &mut Context<DIRECT>) {
+        self.arrow_function_with_owned_comments(node, None, ctx);
+    }
+
+    fn arrow_function_with_owned_comments(
+        &mut self,
+        node: &ArrowFunctionExpression,
+        owned_comment_until: Option<u32>,
+        ctx: &mut Context<DIRECT>,
+    ) {
         if node.r#async {
             ctx.write("async ");
         }
         if let Some(tp) = &node.type_parameters {
             self.type_parameter_declaration(tp, ctx);
         }
-        ctx.write("(");
-        self.formal_parameters(&node.params, ctx);
-        ctx.write(")");
+        ctx.write_ascii(b'(');
+        // esrap runs the params sequence until `(returnType ?? body).loc.start`,
+        // so a comment ahead of a located body flushes inside a synthesized
+        // arrow's empty parens.
+        let body_start =
+            node.return_type.as_ref().map_or_else(|| node.body.span().start, |rt| rt.span().start);
+        // A comment-owning generated arrow can have an original-source body
+        // span, which is below `loc_base` and therefore cannot bound comments
+        // in the synthetic comment buffer. In that case the next call argument
+        // is the boundary upstream's generated arrow effectively gets. A
+        // located body (for example a header-comment carrier) remains the more
+        // precise boundary.
+        let until = if owned_comment_until.is_some() && !self.has_loc(body_start) {
+            owned_comment_until
+        } else {
+            Some(body_start)
+        };
+        self.formal_parameters_with_this(&node.params, None, until, ctx);
+        ctx.write_ascii(b')');
         if let Some(rt) = &node.return_type {
             self.type_annotation(rt, ctx);
         }
-        ctx.write(" => ");
-        if node.expression {
-            // Concise body: a single `ExpressionStatement` holds the expression.
-            if let Some(Statement::ExpressionStatement(es)) = node.body.statements.first() {
-                let body = &es.expression;
-                if arrow_concise_body_needs_wrap(body) {
-                    ctx.write("(");
-                    self.print_expression(body, ctx);
-                    ctx.write(")");
-                } else {
-                    self.print_expression(body, ctx);
-                }
-            }
+        ctx.write_ascii_bytes(b" => ");
+        if let ArrowFunctionBody::FunctionBody(body) = &node.body {
+            let span = body.span();
+            self.block_with_directives(
+                &body.directives,
+                &body.statements,
+                span.start,
+                span.end,
+                ctx,
+            );
         } else {
-            let span = node.body.span();
-            self.block(&node.body.statements, span.start, span.end, ctx);
+            let Some(body) = node.body.as_expression() else {
+                return;
+            };
+            if arrow_concise_body_needs_wrap(body) {
+                ctx.write_ascii(b'(');
+                self.print_expression(body, ctx);
+                ctx.write_ascii(b')');
+            } else {
+                self.print_expression(body, ctx);
+            }
         }
     }
 
-    /// esrap's `BlockStatement|ClassBody`: build the body into a child context,
-    /// and only break it across lines when it has real content (so an empty body
-    /// stays `{}`). The `Newline`s are idempotent flags, so body's trailing
-    /// newline and the closing one collapse to a single line break before `}`.
-    fn block(&mut self, body: &[Statement], body_start: u32, body_end: u32, ctx: &mut Context) {
-        ctx.write("{");
-        let mut child = ctx.child();
-        self.body(body, body_start, body_end, &mut child);
-        if !child.empty() {
+    /// esrap's `BlockStatement|ClassBody`: only break a body across lines when
+    /// it has real content, so an empty body stays `{}`.
+    fn block(
+        &mut self,
+        body: &[Statement],
+        body_start: u32,
+        body_end: u32,
+        ctx: &mut Context<DIRECT>,
+    ) {
+        self.block_with_directives(&[], body, body_start, body_end, ctx);
+    }
+
+    /// A function body's leading string-literal statements are a separate oxc
+    /// node (`FunctionBody::directives`), so a printer that walks `statements`
+    /// alone deletes them — and only the first one of a body is a directive, so
+    /// the deletion is silent and semantics-preserving-looking.
+    fn block_with_directives(
+        &mut self,
+        directives: &[Directive],
+        body: &[Statement],
+        body_start: u32,
+        body_end: u32,
+        ctx: &mut Context<DIRECT>,
+    ) {
+        self.block_with_directives_mapped(directives, body, body_start, body_end, None, ctx);
+    }
+
+    fn block_with_directives_mapped(
+        &mut self,
+        directives: &[Directive],
+        body: &[Statement],
+        body_start: u32,
+        body_end: u32,
+        brace_mapping: Option<&BraceMapping>,
+        ctx: &mut Context<DIRECT>,
+    ) {
+        if !HAS_COMMENTS {
+            let keep_empty = self.options.keep_empty_statements;
+            let has_content = !directives.is_empty() || body.iter().any(|statement| {
+                keep_empty
+                    || !matches!(statement, Statement::EmptyStatement(empty) if empty.span.end != u32::MAX)
+            });
+            if !has_content {
+                self.write_block_brace(ctx, body_start, body_end, brace_mapping, true);
+                self.write_block_brace(ctx, body_start, body_end, brace_mapping, false);
+                return;
+            }
+
+            self.write_block_brace(ctx, body_start, body_end, brace_mapping, true);
             ctx.indent();
             ctx.newline();
-            ctx.append(child);
+            self.body_elems(
+                directives
+                    .iter()
+                    .map(BodyElem::Directive)
+                    .chain(body.iter().map(BodyElem::Statement)),
+                Some(body_start),
+                body_end,
+                ctx,
+            );
+            ctx.dedent();
+            ctx.newline();
+            self.write_block_brace(ctx, body_start, body_end, brace_mapping, false);
+            return;
+        }
+
+        // The comment-island fast path is statement-only; a body with directives
+        // takes the general path rather than a second copy of the interleaving.
+        if DIRECT
+            && directives.is_empty()
+            && self.comments_are_outer_to_block(body, body_start, body_end)
+        {
+            let keep_empty = self.options.keep_empty_statements;
+            let has_statement = body.iter().any(|statement| {
+                keep_empty
+                    || !matches!(statement, Statement::EmptyStatement(empty) if empty.span.end != u32::MAX)
+            });
+            let first_comment = self.comment_partition_point(body_start);
+            let has_comment =
+                self.comment_at(first_comment).is_some_and(|comment| comment.start < body_end);
+            if has_statement || has_comment {
+                self.write_block_brace(ctx, body_start, body_end, brace_mapping, true);
+                ctx.indent();
+                ctx.newline();
+                self.block_comment_island(body, body_start, body_end, ctx);
+                ctx.dedent();
+                ctx.newline();
+                self.write_block_brace(ctx, body_start, body_end, brace_mapping, false);
+                return;
+            }
+        }
+
+        self.write_block_brace(ctx, body_start, body_end, brace_mapping, true);
+        let mark = ctx.event_mark();
+        let scope = ctx.begin_scope();
+        self.body_elems(
+            directives.iter().map(BodyElem::Directive).chain(body.iter().map(BodyElem::Statement)),
+            Some(body_start),
+            body_end,
+            ctx,
+        );
+        if ctx.empty() {
+            ctx.discard_scope(scope);
+        } else {
+            ctx.end_scope(scope);
+            ctx.insert_event(mark, EventKind::Newline);
+            ctx.insert_event(mark, EventKind::Indent);
             ctx.dedent();
             ctx.newline();
         }
-        ctx.write("}");
+        self.write_block_brace(ctx, body_start, body_end, brace_mapping, false);
     }
 
     /// esrap's `handle_var_declaration` (not the generic `sequence`): break the
     /// declarators one-per-line — joined by `,\n` and indented — when any
     /// declarator is itself multiline (e.g. carries a leading comment) or there
     /// is more than one and they don't fit (`measure + 2*(n-1) > 50`).
-    fn variable_declaration(&mut self, decl: &VariableDeclaration, ctx: &mut Context) {
+    fn variable_declaration(&mut self, decl: &VariableDeclaration, ctx: &mut Context<DIRECT>) {
         // esrap's `handle_var_declaration`: a keyword cursor anchored at the
         // declaration start writes `declare ` (if present) then the kind keyword,
         // each mapped to its source span so breakpoints land on `let`/`const`/etc.
@@ -2005,65 +3322,88 @@ impl<'opt> Printer<'opt> {
         }
         kw.write(ctx, keyword);
 
+        if let [declarator] = decl.declarations.as_slice() {
+            self.flush_leading(ctx, declarator.span().start);
+            self.binding_pattern(&declarator.id, ctx);
+            if declarator.definite {
+                ctx.write_ascii(b'!');
+            }
+            if let Some(ann) = &declarator.type_annotation {
+                self.type_annotation(ann, ctx);
+            }
+            if let Some(init) = &declarator.init {
+                ctx.write_ascii_bytes(b" = ");
+                self.print_expression(init, ctx);
+            }
+            return;
+        }
+
         let n = decl.declarations.len();
-        let mut rendered: Vec<Context> = Vec::with_capacity(n);
         // esrap measures the whole `child_context`, which includes the keyword,
         // so the fit test sees `let `/`const ` etc. as part of the length.
         let mut total_measure = keyword.len();
         let mut any_multiline = false;
-        for declarator in &decl.declarations {
-            let mut child = ctx.child();
+        let first = ctx.event_mark();
+        let mut separators = Vec::with_capacity(n.saturating_sub(1));
+        if DIRECT && n > 1 {
+            ctx.indent();
+        }
+        for (index, declarator) in decl.declarations.iter().enumerate() {
+            if index > 0 {
+                ctx.write_ascii(b',');
+                separators.push(ctx.event_mark());
+            }
+            let scope = ctx.begin_scope();
             let start = declarator.span().start;
-            self.flush_leading(&mut child, start, self.line_of(start));
-            self.binding_pattern(&declarator.id, &mut child);
+            self.flush_leading(ctx, start);
+            self.binding_pattern(&declarator.id, ctx);
             if declarator.definite {
-                child.write("!");
+                ctx.write_ascii(b'!');
             }
             if let Some(ann) = &declarator.type_annotation {
-                self.type_annotation(ann, &mut child);
+                self.type_annotation(ann, ctx);
             }
             if let Some(init) = &declarator.init {
-                child.write(" = ");
-                self.print_expression(init, &mut child);
+                ctx.write_ascii_bytes(b" = ");
+                self.print_expression(init, ctx);
             }
-            total_measure += child.measure();
-            any_multiline |= child.multiline;
-            rendered.push(child);
+            total_measure += ctx.measure_with_layout_spaces(&scope);
+            any_multiline |= ctx.end_scope(scope);
         }
 
         let length = total_measure + 2 * n.saturating_sub(1);
         let multiline = any_multiline || (n > 1 && length > 50);
 
         if multiline {
-            if n > 1 {
-                ctx.indent();
+            for separator in separators.into_iter().rev() {
+                ctx.insert_event(separator, EventKind::Newline);
             }
-            for (i, child) in rendered.into_iter().enumerate() {
-                if i > 0 {
-                    ctx.write(",");
-                    ctx.newline();
-                }
-                ctx.append(child);
+            if n > 1 && !DIRECT {
+                ctx.insert_event(first, EventKind::Indent);
             }
             if n > 1 {
                 ctx.dedent();
             }
+            ctx.multiline = true;
         } else {
-            for (i, child) in rendered.into_iter().enumerate() {
-                if i > 0 {
-                    ctx.write(", ");
-                }
-                ctx.append(child);
+            if DIRECT && n > 1 {
+                ctx.dedent();
+            }
+            for separator in separators.into_iter().rev() {
+                ctx.insert_event(separator, EventKind::Space);
             }
         }
     }
 
-    fn binding_pattern(&mut self, pattern: &BindingPattern, ctx: &mut Context) {
+    fn binding_pattern(&mut self, pattern: &BindingPattern, ctx: &mut Context<DIRECT>) {
+        self.flush_leading(ctx, pattern.span().start);
         match pattern {
-            BindingPattern::BindingIdentifier(id) => ctx.write(id.name.as_str()),
+            BindingPattern::BindingIdentifier(id) => {
+                self.write_node(ctx, id.span, id.name.as_str());
+            }
             BindingPattern::AssignmentPattern(a) => {
                 self.binding_pattern(&a.left, ctx);
-                ctx.write(" = ");
+                ctx.write_ascii_bytes(b" = ");
                 self.print_expression(&a.right, ctx);
             }
             BindingPattern::ObjectPattern(o) => self.object_pattern(o, ctx),
@@ -2073,10 +3413,21 @@ impl<'opt> Printer<'opt> {
 
     // ----- expressions ------------------------------------------------------
 
-    fn print_expression(&mut self, expr: &Expression, ctx: &mut Context) {
+    #[allow(clippy::too_many_lines)]
+    fn print_expression(&mut self, expr: &Expression, ctx: &mut Context<DIRECT>) {
         // esrap's `_` wildcard: emit comments positioned before this node first.
-        let start = expr.span().start;
-        self.flush_leading(ctx, start, self.line_of(start));
+        let span = expr.span();
+        let start = span.start;
+        self.flush_leading(ctx, start);
+        if HAS_COMMENTS
+            && DIRECT
+            && self.has_loc(start)
+            && self.has_loc(span.end)
+            && self.comment_at(self.comment_index).is_none_or(|comment| comment.start >= span.end)
+        {
+            self.comment_free().print_expression(expr, ctx);
+            return;
+        }
         match expr {
             Expression::ParenthesizedExpression(p) => {
                 // esrap parses with acorn, which ELIDES parentheses — there is
@@ -2088,53 +3439,45 @@ impl<'opt> Printer<'opt> {
                 // (`child_with_parens` / `binary_needs_parens` at each parent)
                 // re-add only the parens the grammar requires.
                 //
-                // Two exceptions keep the literal parens:
-                //
-                // 1. A comment inside the paren span: dropping the parens would
-                //    leave the interior comment dangling (`return (/*c*/ x)`,
-                //    `return (// hey\n x)`). The comment is flushed as a leading
-                //    comment of the inner expression, so the parens must stay to
-                //    bracket it as in the source.
-                // 2. A sequence: `(a, b)` parses as `Paren(Sequence)`, and the
-                //    `SequenceExpression` visitor already emits its own
-                //    surrounding parens, so the paren layer is dropped to avoid
-                //    doubling. (An explicit redundant `((a, b))` is handled
-                //    recursively — the outer layer here, the inner by the
-                //    sequence visitor.)
-                if matches!(p.expression, Expression::SequenceExpression(_)) {
-                    self.print_expression(&p.expression, ctx);
-                } else if self.comment_in_span(p.span.start, p.span.end) {
-                    ctx.write("(");
-                    self.print_expression(&p.expression, ctx);
-                    ctx.write(")");
-                } else {
-                    self.print_expression(&p.expression, ctx);
-                }
+                // There is no exception. A comment leading the inner expression
+                // does need bracketing (`return (/*c*/ x)`, `return (// hey\n x)`),
+                // but esrap emits those parens from `ReturnStatement` — the one
+                // place it parenthesizes for a comment — not from the operand, so
+                // reproducing them here instead would double whatever a parent
+                // adds from precedence.
+                self.print_expression(&p.expression, ctx);
             }
             Expression::ChainExpression(c) => match &c.expression {
                 ChainElement::CallExpression(call) => self.call_expression(call, ctx),
                 ChainElement::StaticMemberExpression(m) => self.static_member(m, ctx),
                 ChainElement::ComputedMemberExpression(m) => self.computed_member(m, ctx),
-                ChainElement::PrivateFieldExpression(_) => {
-                    self.unsupported("PrivateFieldExpression", ctx)
-                }
-                _ => self.unsupported("ChainElement", ctx),
+                ChainElement::PrivateFieldExpression(m) => self.private_field(m, ctx),
+                ChainElement::TSNonNullExpression(_) => self.unsupported("ChainElement", ctx),
             },
-            Expression::Identifier(id) => ctx.write(id.name.as_str()),
-            Expression::ThisExpression(_) => ctx.write("this"),
-            Expression::BooleanLiteral(b) => ctx.write(if b.value { "true" } else { "false" }),
-            Expression::NullLiteral(_) => ctx.write("null"),
-            Expression::NumericLiteral(n) => ctx
-                .write(literal_raw(n.raw.as_ref().map(|a| a.as_str()), || {
-                    n.value.to_string()
-                })),
-            Expression::BigIntLiteral(n) => ctx
-                .write(literal_raw(n.raw.as_ref().map(|a| a.as_str()), || {
-                    format!("{}n", n.value)
-                })),
-            Expression::StringLiteral(s) => ctx.write(self.string_literal(s)),
+            Expression::Identifier(id) => self.write_node(ctx, id.span, id.name.as_str()),
+            Expression::ThisExpression(_) => ctx.write_ascii_bytes(b"this"),
+            Expression::BooleanLiteral(b) => {
+                self.write_node(ctx, b.span, if b.value { "true" } else { "false" });
+            }
+            Expression::NullLiteral(n) => self.write_node(ctx, n.span, "null"),
+            Expression::NumericLiteral(n) => self.write_node(
+                ctx,
+                n.span,
+                literal_raw(n.raw.as_ref().map(oxc_ast::ast::Str::as_str), || {
+                    format_compact!("{}", n.value)
+                }),
+            ),
+            Expression::BigIntLiteral(n) => self.write_node(
+                ctx,
+                n.span,
+                literal_raw(n.raw.as_ref().map(oxc_ast::ast::Str::as_str), || {
+                    format_compact!("{}n", n.value)
+                }),
+            ),
+            Expression::StringLiteral(s) => self.write_node(ctx, s.span, Self::string_literal(s)),
             Expression::TemplateLiteral(t) => self.template_literal(t, ctx),
             Expression::BinaryExpression(b) => self.binary_expression(b, ctx),
+            Expression::PrivateInExpression(p) => self.private_in_expression(p, ctx),
             Expression::LogicalExpression(l) => self.logical_expression(l, ctx),
             Expression::UnaryExpression(u) => self.unary_expression(u, ctx),
             Expression::CallExpression(c) => self.call_expression(c, ctx),
@@ -2147,15 +3490,16 @@ impl<'opt> Printer<'opt> {
             Expression::ArrowFunctionExpression(a) => self.arrow_function(a, ctx),
             Expression::FunctionExpression(f) => self.function(f, ctx),
             Expression::ClassExpression(c) => self.class_node(c, ctx),
-            Expression::PrivateFieldExpression(m) => {
-                self.child_with_parens(&m.object, 19, ctx);
-                ctx.write(if m.optional { "?." } else { "." });
-                ctx.write(format!("#{}", m.field.name));
+            Expression::PrivateFieldExpression(m) => self.private_field(m, ctx),
+            Expression::ImportMeta(_) => {
+                ctx.write("import");
+                ctx.write_ascii(b'.');
+                ctx.write_ascii_bytes(b"meta");
             }
-            Expression::MetaProperty(m) => {
-                ctx.write(m.meta.name.as_str());
-                ctx.write(".");
-                ctx.write(m.property.name.as_str());
+            Expression::NewTarget(_) => {
+                ctx.write_ascii_bytes(b"new");
+                ctx.write_ascii(b'.');
+                ctx.write("target");
             }
             Expression::AwaitExpression(a) => {
                 // esrap's `AwaitExpression`: map `await` to its source span, then
@@ -2165,7 +3509,7 @@ impl<'opt> Printer<'opt> {
                 if expr_precedence(&a.argument) < 17 {
                     self.write_keyword(ctx, start, "await", " (");
                     self.print_expression(&a.argument, ctx);
-                    ctx.write(")");
+                    ctx.write_ascii(b')');
                 } else {
                     self.write_keyword(ctx, start, "await", " ");
                     self.print_expression(&a.argument, ctx);
@@ -2175,20 +3519,20 @@ impl<'opt> Printer<'opt> {
             Expression::YieldExpression(y) => {
                 ctx.write(if y.delegate { "yield*" } else { "yield" });
                 if let Some(arg) = &y.argument {
-                    ctx.write(" ");
+                    ctx.write_ascii(b' ');
                     self.print_expression(arg, ctx);
                 }
             }
             Expression::RegExpLiteral(r) => match &r.raw {
                 Some(raw) => ctx.write(raw.as_str()),
-                None => ctx.write(format!("/{}/{}", r.regex.pattern.text, r.regex.flags)),
+                None => ctx.write(format_compact!("/{}/{}", r.regex.pattern.text, r.regex.flags)),
             },
             Expression::TaggedTemplateExpression(t) => {
                 self.print_expression(&t.tag, ctx);
                 self.template_literal(&t.quasi, ctx);
             }
             Expression::NewExpression(n) => {
-                ctx.write("new ");
+                ctx.write_ascii_bytes(b"new ");
                 // `new` binds tighter than a call, so a callee whose member-spine
                 // contains a CallExpression (`$.get(x).Member`) — or a
                 // ChainExpression — must be parenthesized, else `new a().b(c)`
@@ -2198,22 +3542,22 @@ impl<'opt> Printer<'opt> {
                 if matches!(callee, Expression::ChainExpression(_))
                     || callee_has_call_expression(callee)
                 {
-                    ctx.write("(");
+                    ctx.write_ascii(b'(');
                     self.print_expression(&n.callee, ctx);
-                    ctx.write(")");
+                    ctx.write_ascii(b')');
                 } else {
                     self.child_with_parens(&n.callee, 19, ctx);
                 }
-                self.call_arguments(&n.arguments, n.span().end, ctx);
+                self.call_arguments(&n.arguments, n.span().end, None, ctx);
             }
             Expression::UpdateExpression(u) => {
                 let op = u.operator.as_str();
                 if u.prefix {
-                    ctx.write(op.to_string());
+                    ctx.write(op);
                     self.simple_assignment_target(&u.argument, ctx);
                 } else {
                     self.simple_assignment_target(&u.argument, ctx);
-                    ctx.write(op.to_string());
+                    ctx.write(op);
                 }
             }
             Expression::SequenceExpression(s) => self.sequence_expression(s, ctx),
@@ -2222,14 +3566,14 @@ impl<'opt> Printer<'opt> {
                 ctx.write("import(");
                 self.print_expression(&n.source, ctx);
                 if let Some(options) = &n.options {
-                    ctx.write(", ");
+                    ctx.write_ascii_bytes(b", ");
                     self.print_expression(options, ctx);
                 }
-                ctx.write(")");
+                ctx.write_ascii(b')');
             }
             Expression::TSAsExpression(e) => {
                 self.child_with_parens(&e.expression, 13, ctx);
-                ctx.write(" as ");
+                ctx.write_ascii_bytes(b" as ");
                 self.print_type(&e.type_annotation, ctx);
             }
             Expression::TSSatisfiesExpression(e) => {
@@ -2239,12 +3583,12 @@ impl<'opt> Printer<'opt> {
             }
             Expression::TSNonNullExpression(e) => {
                 self.child_with_parens(&e.expression, 18, ctx);
-                ctx.write("!");
+                ctx.write_ascii(b'!');
             }
             Expression::TSTypeAssertion(e) => {
-                ctx.write("<");
+                ctx.write_ascii(b'<');
                 self.print_type(&e.type_annotation, ctx);
-                ctx.write(">");
+                ctx.write_ascii(b'>');
                 self.child_with_parens(&e.expression, 18, ctx);
             }
             Expression::TSInstantiationExpression(e) => {
@@ -2259,7 +3603,7 @@ impl<'opt> Printer<'opt> {
 
     // ----- JSX (port of esrap's `languages/tsx`) ---------------------------
 
-    fn jsx_element(&mut self, node: &JSXElement, ctx: &mut Context) {
+    fn jsx_element(&mut self, node: &JSXElement, ctx: &mut Context<DIRECT>) {
         // oxc derives self-closing from the absence of a closing element.
         self.jsx_opening_element(&node.opening_element, node.closing_element.is_none(), ctx);
         if !node.children.is_empty() {
@@ -2272,14 +3616,14 @@ impl<'opt> Printer<'opt> {
             ctx.dedent();
         }
         if let Some(closing) = &node.closing_element {
-            ctx.write("</");
-            self.jsx_element_name(&closing.name, ctx);
-            ctx.write(">");
+            ctx.write_ascii_bytes(b"</");
+            Self::jsx_element_name(&closing.name, ctx);
+            ctx.write_ascii(b'>');
         }
     }
 
-    fn jsx_fragment(&mut self, node: &JSXFragment, ctx: &mut Context) {
-        ctx.write("<>");
+    fn jsx_fragment(&mut self, node: &JSXFragment, ctx: &mut Context<DIRECT>) {
+        ctx.write_ascii_bytes(b"<>");
         if !node.children.is_empty() {
             ctx.indent();
         }
@@ -2289,107 +3633,111 @@ impl<'opt> Printer<'opt> {
         if !node.children.is_empty() {
             ctx.dedent();
         }
-        ctx.write("</>");
+        ctx.write_ascii_bytes(b"</>");
     }
 
     fn jsx_opening_element(
         &mut self,
         node: &JSXOpeningElement,
         self_closing: bool,
-        ctx: &mut Context,
+        ctx: &mut Context<DIRECT>,
     ) {
-        ctx.write("<");
-        self.jsx_element_name(&node.name, ctx);
+        ctx.write_ascii(b'<');
+        Self::jsx_element_name(&node.name, ctx);
         if let Some(type_args) = &node.type_arguments {
             self.type_parameter_instantiation(type_args, ctx);
         }
         for attr in &node.attributes {
-            ctx.write(" ");
+            ctx.write_ascii(b' ');
             match attr {
                 JSXAttributeItem::Attribute(a) => {
-                    self.jsx_attribute_name(&a.name, ctx);
+                    Self::jsx_attribute_name(&a.name, ctx);
                     if let Some(value) = &a.value {
-                        ctx.write("=");
+                        ctx.write_ascii(b'=');
                         self.jsx_attribute_value(value, ctx);
                     }
                 }
                 JSXAttributeItem::SpreadAttribute(s) => {
-                    ctx.write("{...");
+                    ctx.write_ascii_bytes(b"{...");
                     self.print_expression(&s.argument, ctx);
-                    ctx.write("}");
+                    ctx.write_ascii(b'}');
                 }
             }
         }
         if self_closing {
-            ctx.write(" /");
+            ctx.write_ascii_bytes(b" /");
         }
-        ctx.write(">");
+        ctx.write_ascii(b'>');
     }
 
-    fn jsx_child(&mut self, child: &JSXChild, ctx: &mut Context) {
+    fn jsx_child(&mut self, child: &JSXChild, ctx: &mut Context<DIRECT>) {
         match child {
             JSXChild::Text(t) => ctx.write(t.value.as_str()),
             JSXChild::Element(e) => self.jsx_element(e, ctx),
             JSXChild::Fragment(f) => self.jsx_fragment(f, ctx),
             JSXChild::ExpressionContainer(c) => self.jsx_expression_container(c, ctx),
             JSXChild::Spread(s) => {
-                ctx.write("{...");
+                ctx.write_ascii_bytes(b"{...");
                 self.print_expression(&s.expression, ctx);
-                ctx.write("}");
+                ctx.write_ascii(b'}');
             }
         }
     }
 
-    fn jsx_expression_container(&mut self, node: &JSXExpressionContainer, ctx: &mut Context) {
-        ctx.write("{");
+    fn jsx_expression_container(
+        &mut self,
+        node: &JSXExpressionContainer,
+        ctx: &mut Context<DIRECT>,
+    ) {
+        ctx.write_ascii(b'{');
         // A `JSXEmptyExpression` (e.g. `{}` or `{/* comment */}`) prints nothing.
         if let Some(expr) = node.expression.as_expression() {
             self.print_expression(expr, ctx);
         }
-        ctx.write("}");
+        ctx.write_ascii(b'}');
     }
 
-    fn jsx_attribute_value(&mut self, value: &JSXAttributeValue, ctx: &mut Context) {
+    fn jsx_attribute_value(&mut self, value: &JSXAttributeValue, ctx: &mut Context<DIRECT>) {
         match value {
-            JSXAttributeValue::StringLiteral(s) => ctx.write(self.string_literal(s)),
+            JSXAttributeValue::StringLiteral(s) => ctx.write(Self::string_literal(s)),
             JSXAttributeValue::ExpressionContainer(c) => self.jsx_expression_container(c, ctx),
             JSXAttributeValue::Element(e) => self.jsx_element(e, ctx),
             JSXAttributeValue::Fragment(f) => self.jsx_fragment(f, ctx),
         }
     }
 
-    fn jsx_attribute_name(&mut self, name: &JSXAttributeName, ctx: &mut Context) {
+    fn jsx_attribute_name(name: &JSXAttributeName, ctx: &mut Context<DIRECT>) {
         match name {
             JSXAttributeName::Identifier(id) => ctx.write(id.name.as_str()),
             JSXAttributeName::NamespacedName(n) => {
                 ctx.write(n.namespace.name.as_str());
-                ctx.write(":");
+                ctx.write_ascii(b':');
                 ctx.write(n.name.name.as_str());
             }
         }
     }
 
-    fn jsx_element_name(&mut self, name: &JSXElementName, ctx: &mut Context) {
+    fn jsx_element_name(name: &JSXElementName, ctx: &mut Context<DIRECT>) {
         match name {
             JSXElementName::Identifier(id) => ctx.write(id.name.as_str()),
             JSXElementName::IdentifierReference(id) => ctx.write(id.name.as_str()),
             JSXElementName::NamespacedName(n) => {
                 ctx.write(n.namespace.name.as_str());
-                ctx.write(":");
+                ctx.write_ascii(b':');
                 ctx.write(n.name.name.as_str());
             }
-            JSXElementName::MemberExpression(m) => self.jsx_member_expression(m, ctx),
-            JSXElementName::ThisExpression(_) => ctx.write("this"),
+            JSXElementName::MemberExpression(m) => Self::jsx_member_expression(m, ctx),
+            JSXElementName::ThisExpression(_) => ctx.write_ascii_bytes(b"this"),
         }
     }
 
-    fn jsx_member_expression(&mut self, node: &JSXMemberExpression, ctx: &mut Context) {
+    fn jsx_member_expression(node: &JSXMemberExpression, ctx: &mut Context<DIRECT>) {
         match &node.object {
             JSXMemberExpressionObject::IdentifierReference(id) => ctx.write(id.name.as_str()),
-            JSXMemberExpressionObject::MemberExpression(m) => self.jsx_member_expression(m, ctx),
-            JSXMemberExpressionObject::ThisExpression(_) => ctx.write("this"),
+            JSXMemberExpressionObject::MemberExpression(m) => Self::jsx_member_expression(m, ctx),
+            JSXMemberExpressionObject::ThisExpression(_) => ctx.write_ascii_bytes(b"this"),
         }
-        ctx.write(".");
+        ctx.write_ascii(b'.');
         ctx.write(node.property.name.as_str());
     }
 
@@ -2401,38 +3749,62 @@ impl<'opt> Printer<'opt> {
     /// `ChainExpression` at the top, so its inner member objects are plain
     /// members/identifiers and never trip this — only an explicitly nested chain
     /// (the snippet-argument base) does.
-    fn member_object_with_parens(&mut self, object: &Expression, ctx: &mut Context) {
-        if matches!(object, Expression::ChainExpression(_)) {
-            ctx.write("(");
-            self.print_expression(object, ctx);
-            ctx.write(")");
+    fn member_object_with_parens(&mut self, object: &Expression, ctx: &mut Context<DIRECT>) {
+        // oxc keeps a `ParenthesizedExpression` around the nested chain, which
+        // `print_expression` would then drop — look through it as the callee
+        // rule does, so the required parens are not lost.
+        if matches!(unparen(object), Expression::ChainExpression(_)) {
+            ctx.write_ascii(b'(');
+            self.print_expression(unparen(object), ctx);
+            ctx.write_ascii(b')');
         } else {
             self.child_with_parens(object, 19, ctx);
         }
     }
 
     /// Print `child` parenthesised iff its precedence is below `min`.
-    fn child_with_parens(&mut self, child: &Expression, min: u8, ctx: &mut Context) {
+    fn child_with_parens(&mut self, child: &Expression, min: u8, ctx: &mut Context<DIRECT>) {
         if expr_precedence(child) < min {
-            ctx.write("(");
+            ctx.write_ascii(b'(');
             self.print_expression(child, ctx);
-            ctx.write(")");
+            ctx.write_ascii(b')');
         } else {
             self.print_expression(child, ctx);
         }
     }
 
-    fn binary_expression(&mut self, node: &BinaryExpression, ctx: &mut Context) {
+    fn private_field(&mut self, node: &PrivateFieldExpression, ctx: &mut Context<DIRECT>) {
+        self.child_with_parens(&node.object, 19, ctx);
+        ctx.write(if node.optional { "?." } else { "." });
+        ctx.write_ascii(b'#');
+        ctx.write(node.field.name.as_str());
+    }
+
+    /// ESTree has no `PrivateInExpression`; it models `#x in o` as a
+    /// `BinaryExpression` whose `left` is a `PrivateIdentifier`, which esrap
+    /// never parenthesizes. oxc gives it its own node, so print the same shape.
+    fn private_in_expression(&mut self, node: &PrivateInExpression, ctx: &mut Context<DIRECT>) {
+        ctx.write_ascii(b'#');
+        ctx.write(node.left.name.as_str());
+        ctx.write(" in ");
+        self.binary_child(&node.right, false, "in", true, ctx);
+    }
+
+    fn binary_expression(&mut self, node: &BinaryExpression, ctx: &mut Context<DIRECT>) {
         let op = node.operator.as_str();
         self.binary_child(&node.left, false, op, false, ctx);
-        ctx.write(format!(" {op} "));
+        ctx.write_ascii(b' ');
+        ctx.write(op);
+        ctx.write_ascii(b' ');
         self.binary_child(&node.right, false, op, true, ctx);
     }
 
-    fn logical_expression(&mut self, node: &LogicalExpression, ctx: &mut Context) {
+    fn logical_expression(&mut self, node: &LogicalExpression, ctx: &mut Context<DIRECT>) {
         let op = node.operator.as_str();
         self.binary_child(&node.left, true, op, false, ctx);
-        ctx.write(format!(" {op} "));
+        ctx.write_ascii(b' ');
+        ctx.write(op);
+        ctx.write_ascii(b' ');
         self.binary_child(&node.right, true, op, true, ctx);
     }
 
@@ -2445,77 +3817,107 @@ impl<'opt> Printer<'opt> {
         parent_is_logical: bool,
         parent_op: &str,
         is_right: bool,
-        ctx: &mut Context,
+        ctx: &mut Context<DIRECT>,
     ) {
         if binary_needs_parens(child, parent_is_logical, parent_op, is_right) {
-            ctx.write("(");
+            ctx.write_ascii(b'(');
             self.print_expression(child, ctx);
-            ctx.write(")");
+            ctx.write_ascii(b')');
         } else {
             self.print_expression(child, ctx);
         }
     }
 
-    fn unary_expression(&mut self, node: &UnaryExpression, ctx: &mut Context) {
+    fn unary_expression(&mut self, node: &UnaryExpression, ctx: &mut Context<DIRECT>) {
         let op = node.operator.as_str();
         // `typeof`/`void`/`delete` are word operators and need a trailing space.
         if matches!(
             node.operator,
             UnaryOperator::Typeof | UnaryOperator::Void | UnaryOperator::Delete
         ) {
-            ctx.write(format!("{op} "));
+            ctx.write(op);
+            ctx.write_ascii(b' ');
         } else {
-            ctx.write(op.to_string());
+            ctx.write(op);
         }
         self.child_with_parens(&node.argument, 15, ctx);
     }
 
-    fn call_expression(&mut self, node: &CallExpression, ctx: &mut Context) {
+    fn call_expression(&mut self, node: &CallExpression, ctx: &mut Context<DIRECT>) {
+        let comment_argument = node
+            .callee
+            .span()
+            .start
+            .checked_sub(crate::COMMENT_ARGUMENT_CALLEE_BASE)
+            // Index 255 is `COMPONENT_BODY_MARKER` (`u32::MAX - 1`),
+            // which is visited on ordinary component output as well.
+            .filter(|index| *index < 255)
+            .map(|index| index as usize);
+        // Builder-created calls carry `SPAN` (zero); a nonzero span is an
+        // explicit source-backed call such as a lowered directive runtime call.
+        if node.span.start != 0
+            && let Some((line, column)) = self.map_position(node.span.start)
+        {
+            ctx.location(line, column);
+        }
         // esrap's `CallExpression|NewExpression` wrap rule: parenthesize the
         // callee when it is a ChainExpression — otherwise a NON-optional call on
         // an optional-chain callee (`(a?.b)(c)`) would be mis-printed as the
         // optional-chain call `a?.b(c)`, which short-circuits differently. The
         // precedence path (`< 19`) does not catch this because a ChainExpression
         // has the same precedence (19) as a call.
-        if matches!(unparen(&node.callee), Expression::ChainExpression(_)) {
-            ctx.write("(");
+        if comment_argument.is_some() {
+            self.comment_free().child_with_parens(&node.callee, 19, ctx);
+        } else if matches!(unparen(&node.callee), Expression::ChainExpression(_)) {
+            ctx.write_ascii(b'(');
             self.print_expression(unparen(&node.callee), ctx);
-            ctx.write(")");
+            ctx.write_ascii(b')');
         } else {
             self.child_with_parens(&node.callee, 19, ctx);
         }
         if node.optional {
-            ctx.write("?.");
+            ctx.write_ascii_bytes(b"?.");
         }
-        self.call_arguments(&node.arguments, node.span().end, ctx);
+        self.call_arguments(&node.arguments, node.span().end, comment_argument, ctx);
+        if node.span.start != 0
+            && let Some((line, column)) = self.map_end_position(node.span.end)
+        {
+            ctx.location(line, column);
+        }
     }
 
-    fn static_member(&mut self, node: &StaticMemberExpression, ctx: &mut Context) {
+    fn static_member(&mut self, node: &StaticMemberExpression, ctx: &mut Context<DIRECT>) {
         self.member_object_with_parens(&node.object, ctx);
         ctx.write(if node.optional { "?." } else { "." });
-        ctx.write(node.property.name.as_str());
+        self.write_node(ctx, node.property.span, node.property.name.as_str());
     }
 
-    fn computed_member(&mut self, node: &ComputedMemberExpression, ctx: &mut Context) {
+    fn computed_member(&mut self, node: &ComputedMemberExpression, ctx: &mut Context<DIRECT>) {
         self.member_object_with_parens(&node.object, ctx);
         if node.optional {
-            ctx.write("?.");
+            ctx.write_ascii_bytes(b"?.");
         }
-        ctx.write("[");
+        ctx.write_ascii(b'[');
         self.print_expression(&node.expression, ctx);
-        ctx.write("]");
+        ctx.write_ascii(b']');
     }
 
-    fn assignment_expression(&mut self, node: &AssignmentExpression, ctx: &mut Context) {
+    fn assignment_expression(&mut self, node: &AssignmentExpression, ctx: &mut Context<DIRECT>) {
         // esrap visits both sides without adding parens.
         self.assignment_target(&node.left, ctx);
-        ctx.write(format!(" {} ", node.operator.as_str()));
+        ctx.write_ascii(b' ');
+        ctx.write(node.operator.as_str());
+        ctx.write_ascii(b' ');
         self.print_expression(&node.right, ctx);
     }
 
     /// A `SimpleAssignmentTarget` (the operand of `++`/`--`, a subset of
     /// `AssignmentTarget`).
-    fn simple_assignment_target(&mut self, target: &SimpleAssignmentTarget, ctx: &mut Context) {
+    fn simple_assignment_target(
+        &mut self,
+        target: &SimpleAssignmentTarget,
+        ctx: &mut Context<DIRECT>,
+    ) {
         match target {
             SimpleAssignmentTarget::AssignmentTargetIdentifier(id) => ctx.write(id.name.as_str()),
             SimpleAssignmentTarget::StaticMemberExpression(m) => self.static_member(m, ctx),
@@ -2523,13 +3925,14 @@ impl<'opt> Printer<'opt> {
             SimpleAssignmentTarget::PrivateFieldExpression(m) => {
                 self.child_with_parens(&m.object, 19, ctx);
                 ctx.write(if m.optional { "?." } else { "." });
-                ctx.write(format!("#{}", m.field.name));
+                ctx.write_ascii(b'#');
+                ctx.write(m.field.name.as_str());
             }
             _ => self.unsupported("SimpleAssignmentTarget", ctx),
         }
     }
 
-    fn assignment_target(&mut self, target: &AssignmentTarget, ctx: &mut Context) {
+    fn assignment_target(&mut self, target: &AssignmentTarget, ctx: &mut Context<DIRECT>) {
         match target {
             AssignmentTarget::AssignmentTargetIdentifier(id) => ctx.write(id.name.as_str()),
             AssignmentTarget::StaticMemberExpression(m) => self.static_member(m, ctx),
@@ -2537,77 +3940,88 @@ impl<'opt> Printer<'opt> {
             AssignmentTarget::PrivateFieldExpression(m) => {
                 self.child_with_parens(&m.object, 19, ctx);
                 ctx.write(if m.optional { "?." } else { "." });
-                ctx.write(format!("#{}", m.field.name));
+                ctx.write_ascii(b'#');
+                ctx.write(m.field.name.as_str());
             }
             AssignmentTarget::ArrayAssignmentTarget(a) => {
-                ctx.write("[");
-                let mut nodes: Vec<SeqNode> = a
-                    .elements
-                    .iter()
-                    .map(|el| {
-                        let span = el.as_ref().map(|t| t.span());
-                        SeqNode {
-                            start: span.map(|s| s.start),
-                            end: span.map(|s| s.end),
-                            obj_or_array: false,
-                            is_elision: el.is_none(),
-                            render: Box::new(move |p: &mut Printer, child: &mut Context| {
-                                if let Some(t) = el {
-                                    p.assignment_target_maybe_default(t, child);
-                                }
-                            }),
+                ctx.write_ascii(b'[');
+                let element_len = a.elements.len();
+                let n = element_len + usize::from(a.rest.is_some());
+                self.sequence_indexed(
+                    n,
+                    |i| {
+                        if i < element_len {
+                            let span = a.elements[i].as_ref().map(oxc_span::GetSpan::span);
+                            SeqMeta {
+                                start: span.map(|s| s.start),
+                                end: span.map(|s| s.end),
+                                obj_or_array: false,
+                                is_elision: span.is_none(),
+                            }
+                        } else {
+                            let span = a.rest.as_ref().unwrap().span();
+                            SeqMeta {
+                                start: Some(span.start),
+                                end: Some(span.end),
+                                obj_or_array: false,
+                                is_elision: false,
+                            }
                         }
-                    })
-                    .collect();
-                if let Some(rest) = &a.rest {
-                    let span = rest.span();
-                    nodes.push(SeqNode {
-                        start: Some(span.start),
-                        end: Some(span.end),
-                        obj_or_array: false,
-                        is_elision: false,
-                        render: Box::new(move |p: &mut Printer, child: &mut Context| {
-                            child.write("...");
+                    },
+                    |p, i, child| {
+                        if i < element_len {
+                            if let Some(target) = &a.elements[i] {
+                                p.assignment_target_maybe_default(target, child);
+                            }
+                        } else {
+                            let rest = a.rest.as_ref().unwrap();
+                            child.write_ascii_bytes(b"...");
                             p.assignment_target(&rest.target, child);
-                        }),
-                    });
-                }
-                self.sequence(nodes, Some(a.span().end), false, ",", true, ctx);
-                ctx.write("]");
+                        }
+                    },
+                    Some(a.span().end),
+                    false,
+                    ",",
+                    true,
+                    ctx,
+                );
+                ctx.write_ascii(b']');
             }
             AssignmentTarget::ObjectAssignmentTarget(o) => {
-                ctx.write("{");
-                let mut nodes: Vec<SeqNode> = o
-                    .properties
-                    .iter()
-                    .map(|prop| {
-                        let span = prop.span();
-                        SeqNode {
+                ctx.write_ascii(b'{');
+                let property_len = o.properties.len();
+                let n = property_len + usize::from(o.rest.is_some());
+                self.sequence_indexed(
+                    n,
+                    |i| {
+                        let span = if i < property_len {
+                            o.properties[i].span()
+                        } else {
+                            o.rest.as_ref().unwrap().span()
+                        };
+                        SeqMeta {
                             start: Some(span.start),
                             end: Some(span.end),
                             obj_or_array: false,
                             is_elision: false,
-                            render: Box::new(move |p: &mut Printer, child: &mut Context| {
-                                p.assignment_target_property(prop, child);
-                            }),
                         }
-                    })
-                    .collect();
-                if let Some(rest) = &o.rest {
-                    let span = rest.span();
-                    nodes.push(SeqNode {
-                        start: Some(span.start),
-                        end: Some(span.end),
-                        obj_or_array: false,
-                        is_elision: false,
-                        render: Box::new(move |p: &mut Printer, child: &mut Context| {
-                            child.write("...");
+                    },
+                    |p, i, child| {
+                        if i < property_len {
+                            p.assignment_target_property(&o.properties[i], child);
+                        } else {
+                            let rest = o.rest.as_ref().unwrap();
+                            child.write_ascii_bytes(b"...");
                             p.assignment_target(&rest.target, child);
-                        }),
-                    });
-                }
-                self.sequence(nodes, Some(o.span().end), true, ",", true, ctx);
-                ctx.write("}");
+                        }
+                    },
+                    Some(o.span().end),
+                    true,
+                    ",",
+                    true,
+                    ctx,
+                );
+                ctx.write_ascii(b'}');
             }
             _ => self.unsupported("AssignmentTarget", ctx),
         }
@@ -2616,12 +4030,12 @@ impl<'opt> Printer<'opt> {
     fn assignment_target_maybe_default(
         &mut self,
         target: &AssignmentTargetMaybeDefault,
-        ctx: &mut Context,
+        ctx: &mut Context<DIRECT>,
     ) {
         match target {
             AssignmentTargetMaybeDefault::AssignmentTargetWithDefault(d) => {
                 self.assignment_target(&d.binding, ctx);
-                ctx.write(" = ");
+                ctx.write_ascii_bytes(b" = ");
                 self.print_expression(&d.init, ctx);
             }
             _ => match target.as_assignment_target() {
@@ -2631,23 +4045,27 @@ impl<'opt> Printer<'opt> {
         }
     }
 
-    fn assignment_target_property(&mut self, prop: &AssignmentTargetProperty, ctx: &mut Context) {
+    fn assignment_target_property(
+        &mut self,
+        prop: &AssignmentTargetProperty,
+        ctx: &mut Context<DIRECT>,
+    ) {
         match prop {
             AssignmentTargetProperty::AssignmentTargetPropertyIdentifier(p) => {
                 ctx.write(p.binding.name.as_str());
                 if let Some(init) = &p.init {
-                    ctx.write(" = ");
+                    ctx.write_ascii_bytes(b" = ");
                     self.print_expression(init, ctx);
                 }
             }
             AssignmentTargetProperty::AssignmentTargetPropertyProperty(p) => {
                 if p.computed {
-                    ctx.write("[");
+                    ctx.write_ascii(b'[');
                     self.property_key(&p.name, ctx);
-                    ctx.write("]: ");
+                    ctx.write_ascii_bytes(b"]: ");
                 } else {
                     self.property_key(&p.name, ctx);
-                    ctx.write(": ");
+                    ctx.write_ascii_bytes(b": ");
                 }
                 self.assignment_target_maybe_default(&p.binding, ctx);
             }
@@ -2658,13 +4076,13 @@ impl<'opt> Printer<'opt> {
     /// precedence); the branches are emitted as-is. When either branch is
     /// multiline or the two together exceed 50 columns, break onto indented
     /// `? …` / `: …` lines.
-    fn conditional_expression(&mut self, node: &ConditionalExpression, ctx: &mut Context) {
+    fn conditional_expression(&mut self, node: &ConditionalExpression, ctx: &mut Context<DIRECT>) {
         self.child_with_parens(&node.test, 5, ctx);
 
         let mut consequent = ctx.child();
-        self.print_expression(&node.consequent, &mut consequent);
+        self.deferred().print_expression(&node.consequent, &mut consequent);
         let mut alternate = ctx.child();
-        self.print_expression(&node.alternate, &mut alternate);
+        self.deferred().print_expression(&node.alternate, &mut alternate);
 
         let multiline = consequent.multiline
             || alternate.multiline
@@ -2673,116 +4091,118 @@ impl<'opt> Printer<'opt> {
         if multiline {
             ctx.indent();
             ctx.newline();
-            ctx.write("? ");
+            ctx.write_ascii_bytes(b"? ");
             ctx.append(consequent);
             ctx.newline();
-            ctx.write(": ");
+            ctx.write_ascii_bytes(b": ");
             ctx.append(alternate);
             ctx.dedent();
         } else {
-            ctx.write(" ? ");
+            ctx.write_ascii_bytes(b" ? ");
             ctx.append(consequent);
-            ctx.write(" : ");
+            ctx.write_ascii_bytes(b" : ");
             ctx.append(alternate);
         }
     }
 
-    fn array_expression(&mut self, node: &ArrayExpression, ctx: &mut Context) {
-        ctx.write("[");
-        let nodes: Vec<SeqNode> = node
-            .elements
-            .iter()
-            .map(|el| {
-                let is_elision = matches!(el, ArrayExpressionElement::Elision(_));
+    fn array_expression(&mut self, node: &ArrayExpression, ctx: &mut Context<DIRECT>) {
+        ctx.write_ascii(b'[');
+        self.sequence_slice(
+            &node.elements,
+            |el| {
                 let span = el.span();
-                SeqNode {
+                SeqMeta {
                     start: Some(span.start),
                     end: Some(span.end),
                     obj_or_array: false,
-                    is_elision,
-                    render: Box::new(move |p: &mut Printer, child: &mut Context| match el {
-                        ArrayExpressionElement::SpreadElement(s) => {
-                            child.write("...");
-                            p.print_expression(&s.argument, child);
-                        }
-                        ArrayExpressionElement::Elision(_) => {}
-                        _ => {
-                            if let Some(e) = el.as_expression() {
-                                p.print_expression(e, child);
-                            }
-                        }
-                    }),
+                    is_elision: matches!(el, ArrayExpressionElement::Elision(_)),
                 }
-            })
-            .collect();
-        self.sequence(nodes, Some(node.span().end), false, ",", true, ctx);
-        ctx.write("]");
+            },
+            |p, el, child| match el {
+                ArrayExpressionElement::SpreadElement(s) => {
+                    child.write_ascii_bytes(b"...");
+                    p.print_expression(&s.argument, child);
+                }
+                ArrayExpressionElement::Elision(_) => {}
+                _ => {
+                    if let Some(e) = el.as_expression() {
+                        p.print_expression(e, child);
+                    }
+                }
+            },
+            Some(node.span().end),
+            false,
+            ",",
+            true,
+            ctx,
+        );
+        ctx.write_ascii(b']');
     }
 
     /// esrap always parenthesizes a sequence expression (`(a, b)`), laying the
     /// comma list out with the shared `sequence` machinery.
-    fn sequence_expression(&mut self, node: &SequenceExpression, ctx: &mut Context) {
-        ctx.write("(");
-        let nodes: Vec<SeqNode> = node
-            .expressions
-            .iter()
-            .map(|e| {
+    fn sequence_expression(&mut self, node: &SequenceExpression, ctx: &mut Context<DIRECT>) {
+        ctx.write_ascii(b'(');
+        self.sequence_slice(
+            &node.expressions,
+            |e| {
                 let span = e.span();
-                SeqNode {
+                SeqMeta {
                     start: Some(span.start),
                     end: Some(span.end),
                     obj_or_array: false,
                     is_elision: false,
-                    render: Box::new(move |p: &mut Printer, child: &mut Context| {
-                        p.print_expression(e, child);
-                    }),
                 }
-            })
-            .collect();
-        self.sequence(nodes, Some(node.span().end), false, ",", true, ctx);
-        ctx.write(")");
+            },
+            |p, e, child| p.print_expression(e, child),
+            Some(node.span().end),
+            false,
+            ",",
+            true,
+            ctx,
+        );
+        ctx.write_ascii(b')');
     }
 
-    fn object_expression(&mut self, node: &ObjectExpression, ctx: &mut Context) {
-        ctx.write("{");
-        let nodes: Vec<SeqNode> = node
-            .properties
-            .iter()
-            .map(|prop| {
+    fn object_expression(&mut self, node: &ObjectExpression, ctx: &mut Context<DIRECT>) {
+        ctx.write_ascii(b'{');
+        self.sequence_slice(
+            &node.properties,
+            |prop| {
                 let span = prop.span();
                 let obj_or_array = matches!(prop, ObjectPropertyKind::ObjectProperty(p)
                 if matches!(
                     &p.value,
                     Expression::ObjectExpression(_) | Expression::ArrayExpression(_)
                 ));
-                SeqNode {
+                SeqMeta {
                     start: Some(span.start),
                     end: Some(span.end),
                     obj_or_array,
                     is_elision: false,
-                    render: Box::new(move |p: &mut Printer, child: &mut Context| {
-                        // esrap's `sequence` visits each property through the `_`
-                        // wildcard, which flushes any comment positioned before
-                        // it (`{ /** doc */ key: … }`). Mirror that per property.
-                        p.flush_leading(child, span.start, p.line_of(span.start));
-                        match prop {
-                            ObjectPropertyKind::ObjectProperty(prop) => {
-                                p.object_property(prop, child)
-                            }
-                            ObjectPropertyKind::SpreadProperty(s) => {
-                                child.write("...");
-                                p.print_expression(&s.argument, child);
-                            }
-                        }
-                    }),
                 }
-            })
-            .collect();
-        self.sequence(nodes, Some(node.span().end), true, ",", true, ctx);
-        ctx.write("}");
+            },
+            |p, prop, child| {
+                let span = prop.span();
+                p.flush_leading(child, span.start);
+                match prop {
+                    ObjectPropertyKind::ObjectProperty(prop) => p.object_property(prop, child),
+                    ObjectPropertyKind::SpreadProperty(s) => {
+                        child.write_ascii_bytes(b"...");
+                        p.print_expression(&s.argument, child);
+                    }
+                }
+            },
+            Some(node.span().end),
+            true,
+            ",",
+            true,
+            ctx,
+        );
+        ctx.write_ascii(b'}');
     }
 
-    fn object_property(&mut self, prop: &ObjectProperty, ctx: &mut Context) {
+    fn object_property(&mut self, prop: &ObjectProperty, ctx: &mut Context<DIRECT>) {
         // Shorthand `{ x }` when key and value are the same identifier.
         if !prop.computed
             && prop.kind == PropertyKind::Init
@@ -2799,55 +4219,68 @@ impl<'opt> Printer<'opt> {
         // string-keyed function property prints as `"k"() {}`, not `"k": function`.
         if let Expression::FunctionExpression(f) = &prop.value {
             match prop.kind {
-                PropertyKind::Get => ctx.write("get "),
-                PropertyKind::Set => ctx.write("set "),
+                PropertyKind::Get => ctx.write_ascii_bytes(b"get "),
+                PropertyKind::Set => ctx.write_ascii_bytes(b"set "),
                 PropertyKind::Init => {}
             }
             if f.r#async {
                 ctx.write("async ");
             }
             if f.generator {
-                ctx.write("*");
+                ctx.write_ascii(b'*');
             }
             if prop.computed {
-                ctx.write("[");
+                ctx.write_ascii(b'[');
                 self.property_key(&prop.key, ctx);
-                ctx.write("]");
+                ctx.write_ascii(b']');
             } else {
                 self.property_key(&prop.key, ctx);
             }
-            ctx.write("(");
+            ctx.write_ascii(b'(');
             self.formal_parameters(&f.params, ctx);
-            ctx.write(")");
-            ctx.write(" ");
+            ctx.write_ascii(b')');
+            ctx.write_ascii(b' ');
             match &f.body {
                 Some(body) => {
                     let span = body.span();
-                    self.block(&body.statements, span.start, span.end, ctx);
+                    self.block_with_directives(
+                        &body.directives,
+                        &body.statements,
+                        span.start,
+                        span.end,
+                        ctx,
+                    );
                 }
-                None => ctx.write("{}"),
+                None => ctx.write_ascii_bytes(b"{}"),
             }
             return;
         }
         if prop.computed {
-            ctx.write("[");
+            ctx.write_ascii(b'[');
             self.property_key(&prop.key, ctx);
-            ctx.write("]: ");
+            ctx.write_ascii_bytes(b"]: ");
         } else {
             self.property_key(&prop.key, ctx);
-            ctx.write(": ");
+            ctx.write_ascii_bytes(b": ");
         }
         self.print_expression(&prop.value, ctx);
     }
 
-    fn property_key(&mut self, key: &PropertyKey, ctx: &mut Context) {
+    fn property_key(&mut self, key: &PropertyKey, ctx: &mut Context<DIRECT>) {
         match key {
-            PropertyKey::StaticIdentifier(id) => ctx.write(id.name.as_str()),
-            PropertyKey::PrivateIdentifier(id) => ctx.write(format!("#{}", id.name)),
-            PropertyKey::StringLiteral(s) => ctx.write(self.string_literal(s)),
+            PropertyKey::StaticIdentifier(id) => {
+                self.write_node(ctx, id.span, id.name.as_str());
+            }
+            PropertyKey::PrivateIdentifier(id) => {
+                ctx.write_ascii(b'#');
+                ctx.write(id.name.as_str());
+            }
+            PropertyKey::StringLiteral(s) => {
+                self.write_node(ctx, s.span, Self::string_literal(s));
+            }
             PropertyKey::NumericLiteral(n) => ctx
-                .write(literal_raw(n.raw.as_ref().map(|a| a.as_str()), || {
-                    n.value.to_string()
+                .write(literal_raw(n.raw.as_ref().map(oxc_ast::ast::Str::as_str), || {
+                    format_compact!("{}", n.value)
                 })),
             _ => {
                 if let Some(e) = key.as_expression() {
@@ -2864,101 +4297,381 @@ impl<'opt> Printer<'opt> {
     /// argument is itself multiline** — so a trailing function/array/object
     /// argument can span lines while the call stays on one line
     /// (`$.run([ … ])`, `foo(a, b, () => { … })`). Length is not a factor.
-    fn call_arguments(&mut self, args: &[Argument], call_end: u32, ctx: &mut Context) {
+    #[inline]
+    fn print_argument(&mut self, arg: &Argument, ctx: &mut Context<DIRECT>) {
+        match arg {
+            Argument::SpreadElement(spread) => {
+                ctx.write_ascii_bytes(b"...");
+                self.print_expression(&spread.argument, ctx);
+            }
+            _ => match arg.as_expression() {
+                Some(expression) => self.print_expression(expression, ctx),
+                None => self.unsupported("Argument", ctx),
+            },
+        }
+    }
+
+    #[inline]
+    fn call_argument_direct(
+        &mut self,
+        arg: &Argument,
+        next: Option<u32>,
+        comma: bool,
+        owns_comments: bool,
+        ctx: &mut Context<DIRECT>,
+    ) -> bool {
+        let scope = ctx.begin_scope();
+        if owns_comments
+            && let Some(Expression::ArrowFunctionExpression(arrow)) = arg.as_expression()
+        {
+            self.arrow_function_with_owned_comments(arrow, next, ctx);
+        } else {
+            self.print_argument(arg, ctx);
+        }
+        let trailing_end = if owns_comments {
+            arg.as_expression()
+                .map(|expression| match expression {
+                    Expression::ArrowFunctionExpression(arrow) => arrow.body.span().end,
+                    other => other.span().end,
+                })
+                .unwrap_or_else(|| arg.span().end)
+        } else {
+            arg.span().end
+        };
+        let mut emitted_line = false;
+        if owns_comments {
+            emitted_line = self.flush_trailing_comments(ctx, trailing_end, next);
+        }
+        if comma {
+            ctx.write_ascii(b',');
+        }
+        if !owns_comments {
+            emitted_line = self.flush_trailing_comments(ctx, trailing_end, next);
+        }
+        ctx.end_scope(scope) || (comma && emitted_line)
+    }
+
+    #[inline]
+    fn call_argument_plain(
+        &mut self,
+        arg: &Argument,
+        comma: bool,
+        ctx: &mut Context<DIRECT>,
+    ) -> bool {
+        let scope = ctx.begin_scope();
+        self.print_argument(arg, ctx);
+        if comma {
+            ctx.write_ascii(b',');
+        }
+        ctx.end_scope(scope)
+    }
+
+    fn call_arguments_plain(&mut self, args: &[Argument], ctx: &mut Context<DIRECT>) {
+        match args {
+            [] => ctx.write_ascii_bytes(b"()"),
+            [arg] => {
+                ctx.write_ascii(b'(');
+                self.print_argument(arg, ctx);
+                ctx.write_ascii(b')');
+            }
+            [first, last] => {
+                ctx.write_ascii(b'(');
+                let start = ctx.event_mark();
+                if DIRECT {
+                    ctx.indent();
+                }
+                let multiline = self.call_argument_plain(first, true, ctx);
+                if DIRECT && !multiline {
+                    ctx.dedent();
+                }
+                let separator = ctx.retro_space_mark();
+                self.print_argument(last, ctx);
+                if multiline {
+                    ctx.insert_event(separator, EventKind::Newline);
+                    ctx.insert_event(start, EventKind::Newline);
+                    if !DIRECT {
+                        ctx.insert_event(start, EventKind::Indent);
+                    }
+                    ctx.dedent();
+                    ctx.newline();
+                }
+                ctx.write_ascii(b')');
+            }
+            [first, second, last] => {
+                ctx.write_ascii(b'(');
+                let start = ctx.event_mark();
+                if DIRECT {
+                    ctx.indent();
+                }
+                let first_multiline = self.call_argument_plain(first, true, ctx);
+                if DIRECT && !first_multiline {
+                    ctx.dedent();
+                }
+                let first_separator = ctx.retro_space_mark();
+                if DIRECT && !first_multiline {
+                    ctx.indent();
+                }
+                let second_multiline = self.call_argument_plain(second, true, ctx);
+                let multiline = first_multiline || second_multiline;
+                if DIRECT && !multiline {
+                    ctx.dedent();
+                }
+                let second_separator = ctx.retro_space_mark();
+                self.print_argument(last, ctx);
+                if multiline {
+                    ctx.insert_event(second_separator, EventKind::Newline);
+                    ctx.insert_event(first_separator, EventKind::Newline);
+                    ctx.insert_event(start, EventKind::Newline);
+                    if !DIRECT {
+                        ctx.insert_event(start, EventKind::Indent);
+                    }
+                    ctx.dedent();
+                    ctx.newline();
+                }
+                ctx.write_ascii(b')');
+            }
+            _ => {
+                ctx.write_ascii(b'(');
+                let start = ctx.event_mark();
+                let mut separators = Vec::with_capacity(args.len() - 1);
+                let mut multiline = false;
+                let mut direct_indent = false;
+                for (i, arg) in args.iter().enumerate() {
+                    let is_last = i == args.len() - 1;
+                    if i > 0 {
+                        separators.push(ctx.retro_space_mark());
+                    }
+                    if is_last {
+                        if DIRECT && direct_indent && !multiline {
+                            ctx.dedent();
+                            direct_indent = false;
+                        }
+                        self.print_argument(arg, ctx);
+                    } else {
+                        if DIRECT && !direct_indent {
+                            ctx.indent();
+                            direct_indent = true;
+                        }
+                        let item_multiline = self.call_argument_plain(arg, true, ctx);
+                        multiline |= item_multiline;
+                        if DIRECT && !multiline {
+                            ctx.dedent();
+                            direct_indent = false;
+                        }
+                    }
+                }
+                if multiline {
+                    for separator in separators.into_iter().rev() {
+                        ctx.insert_event(separator, EventKind::Newline);
+                    }
+                    ctx.insert_event(start, EventKind::Newline);
+                    if !DIRECT {
+                        ctx.insert_event(start, EventKind::Indent);
+                    }
+                    ctx.dedent();
+                    ctx.newline();
+                }
+                ctx.write_ascii(b')');
+            }
+        }
+    }
+
+    fn call_arguments(
+        &mut self,
+        args: &[Argument],
+        call_end: u32,
+        comment_argument: Option<usize>,
+        ctx: &mut Context<DIRECT>,
+    ) {
+        if !HAS_COMMENTS {
+            self.call_arguments_plain(args, ctx);
+            return;
+        }
+
         let n = args.len();
 
-        // Render each argument into its own context (non-final ones carry the
-        // trailing comma), flushing each arg's trailing comments in source order
-        // — esrap threads comments through the single `comment_index` cursor in
-        // its argument loop (`flush_trailing_comments(context, arg.loc.end, next)`).
-        let mut rendered: Vec<Context> = Vec::with_capacity(n);
+        if let [arg] = args {
+            let arg_start =
+                arg.as_expression().map_or_else(|| arg.span().start, |e| unparen(e).span().start);
+            let wrap = self.comment_at(self.comment_index).is_some_and(|c| {
+                c.start < arg_start && self.comment_starts_on_earlier_line(c, arg_start)
+            });
 
-        // esrap special case: a comment sitting *above* the final argument forces
-        // the whole sequence multiline (it sets the non-final `child_context`'s
-        // `multiline`), so a `(\n\t// comment\n\targ\n)` layout is used instead of
-        // dangling the comment after `(`.
+            ctx.write_ascii(b'(');
+            if wrap {
+                ctx.indent();
+                ctx.newline();
+            }
+            let owns_comments = comment_argument == Some(0);
+            if owns_comments
+                && let Some(Expression::ArrowFunctionExpression(arrow)) = arg.as_expression()
+            {
+                self.arrow_function_with_owned_comments(arrow, Some(call_end), ctx);
+            } else {
+                self.print_argument(arg, ctx);
+            }
+            // esrap flushes the trailing comment into a child context nothing
+            // is written to afterwards, so its `newline()` never reaches the
+            // `)` write — the statement is NOT multiline and gets no blank-line
+            // margins. Isolate the flush the same way.
+            let scope = ctx.begin_scope();
+            let trailing_end = if owns_comments {
+                arg.as_expression().map_or_else(
+                    || arg.span().end,
+                    |expression| match expression {
+                        Expression::ArrowFunctionExpression(arrow) => arrow.body.span().end,
+                        other => other.span().end,
+                    },
+                )
+            } else {
+                arg.span().end
+            };
+            self.flush_trailing_comments(ctx, trailing_end, Some(call_end));
+            ctx.end_scope(scope);
+            if wrap {
+                ctx.dedent();
+                ctx.newline();
+            }
+            ctx.write_ascii(b')');
+            return;
+        }
+
+        if let [first, second] = args {
+            let second_start = second
+                .as_expression()
+                .map_or_else(|| second.span().start, |e| unparen(e).span().start);
+            let force_multiline = self.comment_at(self.comment_index).is_some_and(|c| {
+                c.start < second_start
+                    && (!c.block || self.comment_starts_on_earlier_line(c, second_start))
+            });
+
+            ctx.write_ascii(b'(');
+            let start = ctx.event_mark();
+            let first_multiline = self.call_argument_direct(
+                first,
+                Some(second.span().start),
+                true,
+                comment_argument == Some(0),
+                ctx,
+            );
+            let separator = ctx.event_mark();
+            ctx.space();
+            self.call_argument_direct(
+                second,
+                Some(call_end),
+                false,
+                comment_argument == Some(1),
+                ctx,
+            );
+
+            if force_multiline || first_multiline {
+                ctx.insert_event(separator, EventKind::Newline);
+                ctx.insert_event(start, EventKind::Newline);
+                ctx.insert_event(start, EventKind::Indent);
+                ctx.dedent();
+                ctx.newline();
+            }
+            ctx.write_ascii(b')');
+            return;
+        }
+
+        if let [first, second, last] = args {
+            let last_start =
+                last.as_expression().map_or_else(|| last.span().start, |e| unparen(e).span().start);
+            let force_multiline = self.comment_at(self.comment_index).is_some_and(|c| {
+                c.start < last_start && self.comment_starts_on_earlier_line(c, last_start)
+            });
+            ctx.write_ascii(b'(');
+            let start = ctx.event_mark();
+            let first_multiline = self.call_argument_direct(
+                first,
+                Some(second.span().start),
+                true,
+                comment_argument == Some(0),
+                ctx,
+            );
+            let first_separator = ctx.event_mark();
+            ctx.space();
+            let second_multiline = self.call_argument_direct(
+                second,
+                Some(last.span().start),
+                true,
+                comment_argument == Some(1),
+                ctx,
+            );
+            let second_separator = ctx.event_mark();
+            ctx.space();
+            self.call_argument_direct(
+                last,
+                Some(call_end),
+                false,
+                comment_argument == Some(2),
+                ctx,
+            );
+
+            if force_multiline || first_multiline || second_multiline {
+                ctx.insert_event(second_separator, EventKind::Newline);
+                ctx.insert_event(first_separator, EventKind::Newline);
+                ctx.insert_event(start, EventKind::Newline);
+                ctx.insert_event(start, EventKind::Indent);
+                ctx.dedent();
+                ctx.newline();
+            }
+            ctx.write_ascii(b')');
+            return;
+        }
+
+        if args.is_empty() {
+            ctx.write_ascii_bytes(b"()");
+            return;
+        }
+
+        ctx.write_ascii(b'(');
+        let start = ctx.event_mark();
+        let mut separators = Vec::with_capacity(n - 1);
         let mut force_multiline = false;
+        let mut any_multiline = false;
 
         for (i, arg) in args.iter().enumerate() {
             let is_last = i == n - 1;
-            let arg_start = arg.span().start;
+            let arg_start =
+                arg.as_expression().map_or_else(|| arg.span().start, |e| unparen(e).span().start);
 
             if is_last
-                && let Some(c) = self.comments.get(self.comment_index)
+                && let Some(c) = self.comment_at(self.comment_index)
                 && c.start < arg_start
-                && c.start_line < self.line_of(arg_start)
+                && self.comment_starts_on_earlier_line(c, arg_start)
             {
                 force_multiline = true;
             }
 
-            let mut child = ctx.child();
-            match arg {
-                Argument::SpreadElement(s) => {
-                    child.write("...");
-                    self.print_expression(&s.argument, &mut child);
-                }
-                _ => match arg.as_expression() {
-                    Some(e) => self.print_expression(e, &mut child),
-                    None => self.unsupported("Argument", &mut child),
-                },
+            if i > 0 {
+                separators.push(ctx.event_mark());
+                ctx.space();
             }
-            if !is_last {
-                child.write(",");
-            }
-
-            let next = if is_last {
-                Some(call_end)
-            } else {
-                Some(args[i + 1].span().start)
-            };
-            let emitted_line =
-                self.flush_trailing_comments(&mut child, self.line_of(arg.span().end), next);
-            // esrap accumulates all non-final args in one `child_context` and
-            // `append`s a `join` context after each, which propagates the
-            // trailing line comment's pending newline into `child_context.multiline`
-            // and forces the wrapped layout. Mirror that per non-final arg.
-            if emitted_line && !is_last {
-                child.multiline = true;
-            }
-
-            rendered.push(child);
+            let next = if is_last { Some(call_end) } else { Some(args[i + 1].span().start) };
+            any_multiline |=
+                self.call_argument_direct(arg, next, !is_last, comment_argument == Some(i), ctx)
+                    && !is_last;
         }
 
-        // esrap forces the wrap only on the **non-final** args' multiline state
-        // (so a trailing multiline function/array/object argument keeps the call
-        // on one line). The force-multiline special case also only sets the
-        // non-final context.
-        let wrap = force_multiline
-            || rendered
-                .iter()
-                .take(n.saturating_sub(1))
-                .any(|c| c.multiline);
-
-        ctx.write("(");
-        if wrap {
-            ctx.indent();
-            for arg_ctx in rendered {
-                ctx.newline();
-                ctx.append(arg_ctx);
+        if force_multiline || any_multiline {
+            for separator in separators.into_iter().rev() {
+                ctx.insert_event(separator, EventKind::Newline);
             }
+            ctx.insert_event(start, EventKind::Newline);
+            ctx.insert_event(start, EventKind::Indent);
             ctx.dedent();
             ctx.newline();
-        } else {
-            for (i, arg_ctx) in rendered.into_iter().enumerate() {
-                if i > 0 {
-                    ctx.write(" ");
-                }
-                ctx.append(arg_ctx);
-            }
         }
-        ctx.write(")");
+        ctx.write_ascii(b')');
     }
 
     // ----- TypeScript types -------------------------------------------------
 
     /// esrap's `TSTypeAnnotation`: `: ` + the type.
-    fn type_annotation(&mut self, node: &TSTypeAnnotation, ctx: &mut Context) {
-        ctx.write(": ");
+    fn type_annotation(&mut self, node: &TSTypeAnnotation, ctx: &mut Context<DIRECT>) {
+        ctx.write_ascii_bytes(b": ");
         self.print_type(&node.type_annotation, ctx);
     }
 
@@ -2966,83 +4679,88 @@ impl<'opt> Printer<'opt> {
     fn type_parameter_instantiation(
         &mut self,
         node: &TSTypeParameterInstantiation,
-        ctx: &mut Context,
+        ctx: &mut Context<DIRECT>,
     ) {
-        ctx.write("<");
+        ctx.write_ascii(b'<');
         for (i, p) in node.params.iter().enumerate() {
             if i > 0 {
-                ctx.write(", ");
+                ctx.write_ascii_bytes(b", ");
             }
             self.print_type(p, ctx);
         }
-        ctx.write(">");
+        ctx.write_ascii(b'>');
     }
 
     /// esrap's `TSTypeParameterDeclaration`: `<T, U extends V = W>`.
-    fn type_parameter_declaration(&mut self, node: &TSTypeParameterDeclaration, ctx: &mut Context) {
-        ctx.write("<");
+    fn type_parameter_declaration(
+        &mut self,
+        node: &TSTypeParameterDeclaration,
+        ctx: &mut Context<DIRECT>,
+    ) {
+        ctx.write_ascii(b'<');
         for (i, p) in node.params.iter().enumerate() {
             if i > 0 {
-                ctx.write(", ");
+                ctx.write_ascii_bytes(b", ");
             }
             self.type_parameter(p, ctx);
         }
-        ctx.write(">");
+        ctx.write_ascii(b'>');
     }
 
-    fn type_parameter(&mut self, node: &TSTypeParameter, ctx: &mut Context) {
+    fn type_parameter(&mut self, node: &TSTypeParameter, ctx: &mut Context<DIRECT>) {
         ctx.write(node.name.name.as_str());
         if let Some(constraint) = &node.constraint {
             ctx.write(" extends ");
             self.print_type(constraint, ctx);
         }
         if let Some(default) = &node.default {
-            ctx.write(" = ");
+            ctx.write_ascii_bytes(b" = ");
             self.print_type(default, ctx);
         }
     }
 
     /// esrap's `TSTypeName` (`IdentifierReference` / `TSQualifiedName`).
-    fn print_type_name(&mut self, name: &TSTypeName, ctx: &mut Context) {
+    fn print_type_name(name: &TSTypeName, ctx: &mut Context<DIRECT>) {
         match name {
             TSTypeName::IdentifierReference(id) => ctx.write(id.name.as_str()),
             TSTypeName::QualifiedName(q) => {
-                self.print_type_name(&q.left, ctx);
-                ctx.write(".");
+                Self::print_type_name(&q.left, ctx);
+                ctx.write_ascii(b'.');
                 ctx.write(q.right.name.as_str());
             }
-            TSTypeName::ThisExpression(_) => ctx.write("this"),
+            TSTypeName::ThisExpression(_) => ctx.write_ascii_bytes(b"this"),
         }
     }
 
     /// The core type dispatcher (esrap's TS type visitors).
-    fn print_type(&mut self, ty: &TSType, ctx: &mut Context) {
+    #[allow(clippy::too_many_lines)]
+    fn print_type(&mut self, ty: &TSType, ctx: &mut Context<DIRECT>) {
         match ty {
-            TSType::TSAnyKeyword(_) => ctx.write("any"),
+            TSType::TSAnyKeyword(_) => ctx.write_ascii_bytes(b"any"),
             TSType::TSBigIntKeyword(_) => ctx.write("bigint"),
             TSType::TSBooleanKeyword(_) => ctx.write("boolean"),
             TSType::TSIntrinsicKeyword(_) => ctx.write("intrinsic"),
             TSType::TSNeverKeyword(_) => ctx.write("never"),
-            TSType::TSNullKeyword(_) => ctx.write("null"),
+            TSType::TSNullKeyword(_) => ctx.write_ascii_bytes(b"null"),
             TSType::TSNumberKeyword(_) => ctx.write("number"),
             TSType::TSObjectKeyword(_) => ctx.write("object"),
             TSType::TSStringKeyword(_) => ctx.write("string"),
             TSType::TSSymbolKeyword(_) => ctx.write("symbol"),
             TSType::TSUndefinedKeyword(_) => ctx.write("undefined"),
             TSType::TSUnknownKeyword(_) => ctx.write("unknown"),
-            TSType::TSVoidKeyword(_) => ctx.write("void"),
-            TSType::TSThisType(_) => ctx.write("this"),
+            TSType::TSVoidKeyword(_) => ctx.write_ascii_bytes(b"void"),
+            TSType::TSThisType(_) => ctx.write_ascii_bytes(b"this"),
             TSType::TSArrayType(t) => {
                 self.print_type(&t.element_type, ctx);
-                ctx.write("[]");
+                ctx.write_ascii_bytes(b"[]");
             }
             TSType::TSParenthesizedType(t) => {
-                ctx.write("(");
+                ctx.write_ascii(b'(');
                 self.print_type(&t.type_annotation, ctx);
-                ctx.write(")");
+                ctx.write_ascii(b')');
             }
             TSType::TSTypeReference(t) => {
-                self.print_type_name(&t.type_name, ctx);
+                Self::print_type_name(&t.type_name, ctx);
                 if let Some(ta) = &t.type_arguments {
                     self.type_parameter_instantiation(ta, ctx);
                 }
@@ -3050,27 +4768,27 @@ impl<'opt> Printer<'opt> {
             TSType::TSTypeLiteral(t) => self.type_literal(t, ctx),
             TSType::TSUnionType(t) => {
                 // No trailing newline so a following `=>` stays on the line.
-                let nodes = self.type_seq_nodes(&t.types);
+                let nodes = Self::type_seq_nodes(&t.types);
                 self.sequence(nodes, Some(t.span.end), false, " |", false, ctx);
             }
             TSType::TSIntersectionType(t) => {
-                let nodes = self.type_seq_nodes(&t.types);
+                let nodes = Self::type_seq_nodes(&t.types);
                 self.sequence(nodes, Some(t.span.end), false, " &", false, ctx);
             }
             TSType::TSConditionalType(t) => {
                 self.print_type(&t.check_type, ctx);
                 ctx.write(" extends ");
                 self.print_type(&t.extends_type, ctx);
-                ctx.write(" ? ");
+                ctx.write_ascii_bytes(b" ? ");
                 self.print_type(&t.true_type, ctx);
-                ctx.write(" : ");
+                ctx.write_ascii_bytes(b" : ");
                 self.print_type(&t.false_type, ctx);
             }
             TSType::TSIndexedAccessType(t) => {
                 self.print_type(&t.object_type, ctx);
-                ctx.write("[");
+                ctx.write_ascii(b'[');
                 self.print_type(&t.index_type, ctx);
-                ctx.write("]");
+                ctx.write_ascii(b']');
             }
             TSType::TSInferType(t) => {
                 ctx.write("infer ");
@@ -3078,20 +4796,21 @@ impl<'opt> Printer<'opt> {
             }
             TSType::TSLiteralType(t) => self.ts_literal(&t.literal, ctx),
             TSType::TSTypeOperatorType(t) => {
-                ctx.write(format!("{} ", ts_type_operator_str(t.operator)));
+                ctx.write(ts_type_operator_str(t.operator));
+                ctx.write_ascii(b' ');
                 self.print_type(&t.type_annotation, ctx);
             }
             TSType::TSTypeQuery(t) => {
                 ctx.write("typeof ");
                 match &t.expr_name {
-                    TSTypeQueryExprName::TSImportType(it) => self.import_type(it, ctx),
+                    TSTypeQueryExprName::TSImportType(it) => Self::import_type(it, ctx),
                     TSTypeQueryExprName::IdentifierReference(id) => ctx.write(id.name.as_str()),
                     TSTypeQueryExprName::QualifiedName(q) => {
-                        self.print_type_name(&q.left, ctx);
-                        ctx.write(".");
+                        Self::print_type_name(&q.left, ctx);
+                        ctx.write_ascii(b'.');
                         ctx.write(q.right.name.as_str());
                     }
-                    TSTypeQueryExprName::ThisExpression(_) => ctx.write("this"),
+                    TSTypeQueryExprName::ThisExpression(_) => ctx.write_ascii_bytes(b"this"),
                 }
                 if let Some(ta) = &t.type_arguments {
                     self.type_parameter_instantiation(ta, ctx);
@@ -3103,25 +4822,25 @@ impl<'opt> Printer<'opt> {
                 }
                 match &t.parameter_name {
                     TSTypePredicateName::Identifier(id) => ctx.write(id.name.as_str()),
-                    TSTypePredicateName::This(_) => ctx.write("this"),
+                    TSTypePredicateName::This(_) => ctx.write_ascii_bytes(b"this"),
                 }
                 if let Some(ann) = &t.type_annotation {
-                    ctx.write(" is ");
+                    ctx.write_ascii_bytes(b" is ");
                     self.print_type(&ann.type_annotation, ctx);
                 }
             }
             TSType::TSTupleType(t) => {
-                ctx.write("[");
-                let nodes = self.tuple_element_seq_nodes(&t.element_types);
+                ctx.write_ascii(b'[');
+                let nodes = Self::tuple_element_seq_nodes(&t.element_types);
                 self.sequence(nodes, Some(t.span.end), false, ",", true, ctx);
-                ctx.write("]");
+                ctx.write_ascii(b']');
             }
             TSType::TSNamedTupleMember(t) => self.named_tuple_member(t, ctx),
             TSType::TSFunctionType(t) => {
                 if let Some(tp) = &t.type_parameters {
                     self.type_parameter_declaration(tp, ctx);
                 }
-                ctx.write("(");
+                ctx.write_ascii(b'(');
                 self.formal_parameters(&t.params, ctx);
                 ctx.write(") => ");
                 self.print_type(&t.return_type.type_annotation, ctx);
@@ -3130,30 +4849,32 @@ impl<'opt> Printer<'opt> {
                 if t.r#abstract {
                     ctx.write("abstract ");
                 }
-                ctx.write("new ");
+                ctx.write_ascii_bytes(b"new ");
                 if let Some(tp) = &t.type_parameters {
                     self.type_parameter_declaration(tp, ctx);
                 }
-                ctx.write("(");
+                ctx.write_ascii(b'(');
                 self.formal_parameters(&t.params, ctx);
                 ctx.write(") => ");
                 self.print_type(&t.return_type.type_annotation, ctx);
             }
-            TSType::TSImportType(t) => self.import_type(t, ctx),
+            TSType::TSImportType(t) => Self::import_type(t, ctx),
             TSType::TSMappedType(t) => self.mapped_type(t, ctx),
             TSType::TSTemplateLiteralType(t) => {
-                ctx.write("`");
+                ctx.write_ascii(b'`');
                 for (i, inner) in t.types.iter().enumerate() {
-                    let raw = t.quasis[i].value.raw.as_str();
-                    ctx.write(format!("{raw}${{"));
+                    let raw = t.quasis.get(i).map_or("", |q| q.value.raw.as_str());
+                    ctx.write(raw);
+                    ctx.write_ascii_bytes(b"${");
                     self.print_type(inner, ctx);
-                    ctx.write("}");
+                    ctx.write_ascii(b'}');
                     if raw.contains('\n') {
                         ctx.multiline = true;
                     }
                 }
                 if let Some(last) = t.quasis.last() {
-                    ctx.write(format!("{}`", last.value.raw));
+                    ctx.write(last.value.raw.as_str());
+                    ctx.write_ascii(b'`');
                 }
             }
             other => self.unsupported(ts_type_kind(other), ctx),
@@ -3162,45 +4883,45 @@ impl<'opt> Printer<'opt> {
 
     /// esrap's `TSImportType`: `import('src')[.qualifier]`. (Type-argument
     /// support is unused by the samples.)
-    fn import_type(&mut self, node: &TSImportType, ctx: &mut Context) {
+    fn import_type(node: &TSImportType, ctx: &mut Context<DIRECT>) {
         ctx.write("import(");
-        ctx.write(self.string_literal(&node.source));
-        ctx.write(")");
+        ctx.write(Self::string_literal(&node.source));
+        ctx.write_ascii(b')');
         if let Some(qualifier) = &node.qualifier {
-            ctx.write(".");
-            self.import_type_qualifier(qualifier, ctx);
+            ctx.write_ascii(b'.');
+            Self::import_type_qualifier(qualifier, ctx);
         }
     }
 
-    fn import_type_qualifier(&mut self, q: &TSImportTypeQualifier, ctx: &mut Context) {
+    fn import_type_qualifier(q: &TSImportTypeQualifier, ctx: &mut Context<DIRECT>) {
         match q {
             TSImportTypeQualifier::Identifier(id) => ctx.write(id.name.as_str()),
             TSImportTypeQualifier::QualifiedName(qn) => {
-                self.import_type_qualifier(&qn.left, ctx);
-                ctx.write(".");
+                Self::import_type_qualifier(&qn.left, ctx);
+                ctx.write_ascii(b'.');
                 ctx.write(qn.right.name.as_str());
             }
         }
     }
 
     /// esrap's `TSNamedTupleMember`: `label[?]: type`.
-    fn named_tuple_member(&mut self, node: &TSNamedTupleMember, ctx: &mut Context) {
+    fn named_tuple_member(&mut self, node: &TSNamedTupleMember, ctx: &mut Context<DIRECT>) {
         ctx.write(node.label.name.as_str());
         if node.optional {
-            ctx.write("?");
+            ctx.write_ascii(b'?');
         }
-        ctx.write(": ");
+        ctx.write_ascii_bytes(b": ");
         self.tuple_element(&node.element_type, ctx);
     }
 
-    fn tuple_element(&mut self, el: &TSTupleElement, ctx: &mut Context) {
+    fn tuple_element(&mut self, el: &TSTupleElement, ctx: &mut Context<DIRECT>) {
         match el {
             TSTupleElement::TSOptionalType(t) => {
                 self.print_type(&t.type_annotation, ctx);
-                ctx.write("?");
+                ctx.write_ascii(b'?');
             }
             TSTupleElement::TSRestType(t) => {
-                ctx.write("...");
+                ctx.write_ascii_bytes(b"...");
                 self.print_type(&t.type_annotation, ctx);
             }
             _ => {
@@ -3212,57 +4933,57 @@ impl<'opt> Printer<'opt> {
     }
 
     /// esrap's `TSMappedType`: `{[K in C]: T}` (no inner spaces).
-    fn mapped_type(&mut self, node: &TSMappedType, ctx: &mut Context) {
-        ctx.write("{");
+    fn mapped_type(&mut self, node: &TSMappedType, ctx: &mut Context<DIRECT>) {
+        ctx.write_ascii(b'{');
         if let Some(readonly) = node.readonly {
             ctx.write(mapped_modifier_prefix(readonly, "readonly"));
         }
-        ctx.write("[");
+        ctx.write_ascii(b'[');
         ctx.write(node.key.name.as_str());
-        ctx.write(" in ");
+        ctx.write_ascii_bytes(b" in ");
         self.print_type(&node.constraint, ctx);
         if let Some(name_type) = &node.name_type {
-            ctx.write(" as ");
+            ctx.write_ascii_bytes(b" as ");
             self.print_type(name_type, ctx);
         }
-        ctx.write("]");
+        ctx.write_ascii(b']');
         if let Some(optional) = node.optional {
             ctx.write(mapped_modifier_prefix(optional, "?"));
         }
         if let Some(ann) = &node.type_annotation {
-            ctx.write(": ");
+            ctx.write_ascii_bytes(b": ");
             self.print_type(ann, ctx);
         }
-        ctx.write("}");
+        ctx.write_ascii(b'}');
     }
 
     /// esrap's `TSTypeLiteral`: `{ ` + `;`-separated members + ` }`.
-    fn type_literal(&mut self, node: &TSTypeLiteral, ctx: &mut Context) {
-        ctx.write("{ ");
-        let nodes = self.signature_seq_nodes(&node.members);
+    fn type_literal(&mut self, node: &TSTypeLiteral, ctx: &mut Context<DIRECT>) {
+        ctx.write_ascii_bytes(b"{ ");
+        let nodes = Self::signature_seq_nodes(&node.members);
         self.sequence(nodes, Some(node.span.end), false, ";", true, ctx);
-        ctx.write(" }");
+        ctx.write_ascii_bytes(b" }");
     }
 
-    fn ts_literal(&mut self, lit: &TSLiteral, ctx: &mut Context) {
+    fn ts_literal(&mut self, lit: &TSLiteral, ctx: &mut Context<DIRECT>) {
         match lit {
             TSLiteral::BooleanLiteral(b) => ctx.write(if b.value { "true" } else { "false" }),
             TSLiteral::NumericLiteral(n) => ctx
-                .write(literal_raw(n.raw.as_ref().map(|a| a.as_str()), || {
-                    n.value.to_string()
+                .write(literal_raw(n.raw.as_ref().map(oxc_ast::ast::Str::as_str), || {
+                    format_compact!("{}", n.value)
                 })),
             TSLiteral::BigIntLiteral(n) => ctx
-                .write(literal_raw(n.raw.as_ref().map(|a| a.as_str()), || {
-                    format!("{}n", n.value)
+                .write(literal_raw(n.raw.as_ref().map(oxc_ast::ast::Str::as_str), || {
+                    format_compact!("{}n", n.value)
                 })),
-            TSLiteral::StringLiteral(s) => ctx.write(self.string_literal(s)),
+            TSLiteral::StringLiteral(s) => ctx.write(Self::string_literal(s)),
             TSLiteral::TemplateLiteral(t) => self.template_literal(t, ctx),
             TSLiteral::UnaryExpression(u) => self.unary_expression(u, ctx),
         }
     }
 
     /// Build [`SeqNode`]s for a list of types (union/intersection).
-    fn type_seq_nodes<'p>(&self, types: &'p [TSType<'p>]) -> Vec<SeqNode<'p>> {
+    fn type_seq_nodes<'p>(types: &'p [TSType<'p>]) -> Vec<SeqNode<'p, HAS_COMMENTS>> {
         types
             .iter()
             .map(|ty| {
@@ -3272,15 +4993,20 @@ impl<'opt> Printer<'opt> {
                     end: Some(span.end),
                     obj_or_array: false,
                     is_elision: false,
-                    render: Box::new(move |p: &mut Printer, child: &mut Context| {
-                        p.print_type(ty, child);
-                    }),
+                    render: Box::new(
+                        move |p: &mut Printer<'_, HAS_COMMENTS, false>,
+                              child: &mut Context<false>| {
+                            p.print_type(ty, child);
+                        },
+                    ),
                 }
             })
             .collect()
     }
 
-    fn tuple_element_seq_nodes<'p>(&self, els: &'p [TSTupleElement<'p>]) -> Vec<SeqNode<'p>> {
+    fn tuple_element_seq_nodes<'p>(
+        els: &'p [TSTupleElement<'p>],
+    ) -> Vec<SeqNode<'p, HAS_COMMENTS>> {
         els.iter()
             .map(|el| {
                 let span = el.span();
@@ -3289,15 +5015,18 @@ impl<'opt> Printer<'opt> {
                     end: Some(span.end),
                     obj_or_array: false,
                     is_elision: false,
-                    render: Box::new(move |p: &mut Printer, child: &mut Context| {
-                        p.tuple_element(el, child);
-                    }),
+                    render: Box::new(
+                        move |p: &mut Printer<'_, HAS_COMMENTS, false>,
+                              child: &mut Context<false>| {
+                            p.tuple_element(el, child);
+                        },
+                    ),
                 }
             })
             .collect()
     }
 
-    fn signature_seq_nodes<'p>(&self, members: &'p [TSSignature<'p>]) -> Vec<SeqNode<'p>> {
+    fn signature_seq_nodes<'p>(members: &'p [TSSignature<'p>]) -> Vec<SeqNode<'p, HAS_COMMENTS>> {
         members
             .iter()
             .map(|m| {
@@ -3307,30 +5036,33 @@ impl<'opt> Printer<'opt> {
                     end: Some(span.end),
                     obj_or_array: false,
                     is_elision: false,
-                    render: Box::new(move |p: &mut Printer, child: &mut Context| {
-                        p.signature(m, child);
-                    }),
+                    render: Box::new(
+                        move |p: &mut Printer<'_, HAS_COMMENTS, false>,
+                              child: &mut Context<false>| {
+                            p.signature(m, child);
+                        },
+                    ),
                 }
             })
             .collect()
     }
 
     /// esrap's `TSSignature` visitors (members of an interface / type literal).
-    fn signature(&mut self, sig: &TSSignature, ctx: &mut Context) {
+    fn signature(&mut self, sig: &TSSignature, ctx: &mut Context<DIRECT>) {
         match sig {
             TSSignature::TSPropertySignature(s) => {
                 if s.readonly {
                     ctx.write("readonly ");
                 }
                 if s.computed {
-                    ctx.write("[");
+                    ctx.write_ascii(b'[');
                     self.property_key(&s.key, ctx);
-                    ctx.write("]");
+                    ctx.write_ascii(b']');
                 } else {
                     self.property_key(&s.key, ctx);
                 }
                 if s.optional {
-                    ctx.write("?");
+                    ctx.write_ascii(b'?');
                 }
                 if let Some(ann) = &s.type_annotation {
                     self.type_annotation(ann, ctx);
@@ -3340,34 +5072,29 @@ impl<'opt> Printer<'opt> {
                 if s.readonly {
                     ctx.write("readonly ");
                 }
-                ctx.write("[");
-                for (i, param) in s.parameters.iter().enumerate() {
-                    if i > 0 {
-                        ctx.write(", ");
-                    }
-                    ctx.write(param.name.as_str());
-                    self.type_annotation(&param.type_annotation, ctx);
-                }
-                ctx.write("]");
+                ctx.write_ascii(b'[');
+                ctx.write(s.parameter.name.as_str());
+                self.type_annotation(&s.parameter.type_annotation, ctx);
+                ctx.write_ascii(b']');
                 self.type_annotation(&s.type_annotation, ctx);
             }
             TSSignature::TSMethodSignature(s) => {
                 if s.computed {
-                    ctx.write("[");
+                    ctx.write_ascii(b'[');
                     self.property_key(&s.key, ctx);
-                    ctx.write("]");
+                    ctx.write_ascii(b']');
                 } else {
                     self.property_key(&s.key, ctx);
                 }
                 if s.optional {
-                    ctx.write("?");
+                    ctx.write_ascii(b'?');
                 }
                 if let Some(tp) = &s.type_parameters {
                     self.type_parameter_declaration(tp, ctx);
                 }
-                ctx.write("(");
+                ctx.write_ascii(b'(');
                 self.formal_parameters(&s.params, ctx);
-                ctx.write(")");
+                ctx.write_ascii(b')');
                 if let Some(rt) = &s.return_type {
                     self.type_annotation(rt, ctx);
                 }
@@ -3376,21 +5103,21 @@ impl<'opt> Printer<'opt> {
                 if let Some(tp) = &s.type_parameters {
                     self.type_parameter_declaration(tp, ctx);
                 }
-                ctx.write("(");
+                ctx.write_ascii(b'(');
                 self.formal_parameters(&s.params, ctx);
-                ctx.write(")");
+                ctx.write_ascii(b')');
                 if let Some(rt) = &s.return_type {
                     self.type_annotation(rt, ctx);
                 }
             }
             TSSignature::TSConstructSignatureDeclaration(s) => {
-                ctx.write("new");
+                ctx.write_ascii_bytes(b"new");
                 if let Some(tp) = &s.type_parameters {
                     self.type_parameter_declaration(tp, ctx);
                 }
-                ctx.write("(");
+                ctx.write_ascii(b'(');
                 self.formal_parameters(&s.params, ctx);
-                ctx.write(")");
+                ctx.write_ascii(b')');
                 if let Some(rt) = &s.return_type {
                     self.type_annotation(rt, ctx);
                 }
@@ -3400,7 +5127,7 @@ impl<'opt> Printer<'opt> {
 
     // ----- TypeScript declarations ------------------------------------------
 
-    fn type_alias_declaration(&mut self, node: &TSTypeAliasDeclaration, ctx: &mut Context) {
+    fn type_alias_declaration(&mut self, node: &TSTypeAliasDeclaration, ctx: &mut Context<DIRECT>) {
         if node.declare {
             ctx.write("declare ");
         }
@@ -3409,12 +5136,12 @@ impl<'opt> Printer<'opt> {
         if let Some(tp) = &node.type_parameters {
             self.type_parameter_declaration(tp, ctx);
         }
-        ctx.write(" = ");
+        ctx.write_ascii_bytes(b" = ");
         self.print_type(&node.type_annotation, ctx);
-        ctx.write(";");
+        ctx.write_ascii(b';');
     }
 
-    fn interface_declaration(&mut self, node: &TSInterfaceDeclaration, ctx: &mut Context) {
+    fn interface_declaration(&mut self, node: &TSInterfaceDeclaration, ctx: &mut Context<DIRECT>) {
         if node.declare {
             ctx.write("declare ");
         }
@@ -3425,7 +5152,7 @@ impl<'opt> Printer<'opt> {
         }
         if !node.extends.is_empty() {
             ctx.write(" extends ");
-            let nodes: Vec<SeqNode> = node
+            let nodes: Vec<SeqNode<HAS_COMMENTS>> = node
                 .extends
                 .iter()
                 .map(|h| {
@@ -3435,25 +5162,31 @@ impl<'opt> Printer<'opt> {
                         end: Some(span.end),
                         obj_or_array: false,
                         is_elision: false,
-                        render: Box::new(move |p: &mut Printer, child: &mut Context| {
-                            p.print_expression(&h.expression, child);
-                            if let Some(ta) = &h.type_arguments {
-                                p.type_parameter_instantiation(ta, child);
-                            }
-                        }),
+                        render: Box::new(
+                            move |p: &mut Printer<'_, HAS_COMMENTS, false>,
+                                  child: &mut Context<false>| {
+                                Printer::<HAS_COMMENTS, false>::print_type_name(
+                                    &h.type_name,
+                                    child,
+                                );
+                                if let Some(ta) = &h.type_arguments {
+                                    p.type_parameter_instantiation(ta, child);
+                                }
+                            },
+                        ),
                     }
                 })
                 .collect();
             self.sequence(nodes, Some(node.body.span().start), false, ",", true, ctx);
         }
-        ctx.write(" {");
+        ctx.write_ascii_bytes(b" {");
         // esrap's `TSInterfaceBody`: `;`-separated members with padding.
-        let nodes = self.signature_seq_nodes(&node.body.body);
+        let nodes = Self::signature_seq_nodes(&node.body.body);
         self.sequence(nodes, Some(node.body.span().end), true, ";", true, ctx);
-        ctx.write("}");
+        ctx.write_ascii(b'}');
     }
 
-    fn enum_declaration(&mut self, node: &TSEnumDeclaration, ctx: &mut Context) {
+    fn enum_declaration(&mut self, node: &TSEnumDeclaration, ctx: &mut Context<DIRECT>) {
         if node.declare {
             ctx.write("declare ");
         }
@@ -3462,10 +5195,10 @@ impl<'opt> Printer<'opt> {
         }
         ctx.write("enum ");
         ctx.write(node.id.name.as_str());
-        ctx.write(" {");
+        ctx.write_ascii_bytes(b" {");
         ctx.indent();
         ctx.newline();
-        let nodes: Vec<SeqNode> = node
+        let nodes: Vec<SeqNode<HAS_COMMENTS>> = node
             .body
             .members
             .iter()
@@ -3476,64 +5209,83 @@ impl<'opt> Printer<'opt> {
                     end: Some(span.end),
                     obj_or_array: false,
                     is_elision: false,
-                    render: Box::new(move |p: &mut Printer, child: &mut Context| {
-                        p.enum_member(m, child);
-                    }),
+                    render: Box::new(
+                        move |p: &mut Printer<'_, HAS_COMMENTS, false>,
+                              child: &mut Context<false>| {
+                            p.enum_member(m, child);
+                        },
+                    ),
                 }
             })
             .collect();
         self.sequence(nodes, Some(node.span.end), false, ",", true, ctx);
         ctx.dedent();
         ctx.newline();
-        ctx.write("}");
+        ctx.write_ascii(b'}');
     }
 
-    fn enum_member(&mut self, node: &TSEnumMember, ctx: &mut Context) {
+    fn enum_member(&mut self, node: &TSEnumMember, ctx: &mut Context<DIRECT>) {
         match &node.id {
             TSEnumMemberName::Identifier(id) => ctx.write(id.name.as_str()),
-            TSEnumMemberName::String(s) => ctx.write(self.string_literal(s)),
+            TSEnumMemberName::String(s) => ctx.write(Self::string_literal(s)),
             TSEnumMemberName::ComputedString(s) => {
-                ctx.write("[");
-                ctx.write(self.string_literal(s));
-                ctx.write("]");
+                ctx.write_ascii(b'[');
+                ctx.write(Self::string_literal(s));
+                ctx.write_ascii(b']');
             }
             TSEnumMemberName::ComputedTemplateString(t) => {
-                ctx.write("[");
+                ctx.write_ascii(b'[');
                 self.template_literal(t, ctx);
-                ctx.write("]");
+                ctx.write_ascii(b']');
             }
         }
         if let Some(init) = &node.initializer {
-            ctx.write(" = ");
+            ctx.write_ascii_bytes(b" = ");
             self.print_expression(init, ctx);
         }
     }
 
-    fn module_declaration(&mut self, node: &TSModuleDeclaration, ctx: &mut Context) {
+    fn external_module_declaration(
+        &mut self,
+        node: &TSExternalModuleDeclaration,
+        ctx: &mut Context<DIRECT>,
+    ) {
         if node.declare {
             ctx.write("declare ");
         }
-        let kind = match node.kind {
-            TSModuleDeclarationKind::Module => "module ",
-            TSModuleDeclarationKind::Namespace => "namespace ",
-        };
-        ctx.write(kind);
-        match &node.id {
-            TSModuleDeclarationName::Identifier(id) => ctx.write(id.name.as_str()),
-            TSModuleDeclarationName::StringLiteral(s) => ctx.write(self.string_literal(s)),
+        ctx.write("module ");
+        ctx.write(Self::string_literal(&node.id));
+        if let Some(body) = &node.body {
+            self.module_block(body, ctx);
         }
+    }
+
+    fn namespace_declaration(
+        &mut self,
+        node: &TSNamespaceDeclaration,
+        include_keyword: bool,
+        ctx: &mut Context<DIRECT>,
+    ) {
+        if include_keyword {
+            if node.declare {
+                ctx.write("declare ");
+            }
+            ctx.write(match node.kind {
+                TSNamespaceDeclarationKind::Module => "module ",
+                TSNamespaceDeclarationKind::Namespace => "namespace ",
+            });
+        }
+        ctx.write(node.id.name.as_str());
         match &node.body {
-            None => {}
-            Some(TSModuleDeclarationBody::TSModuleBlock(block)) => self.module_block(block, ctx),
-            Some(TSModuleDeclarationBody::TSModuleDeclaration(inner)) => {
-                // `namespace A.B {}` — esrap recurses into the nested decl.
-                ctx.write(".");
-                self.module_declaration(inner, ctx);
+            TSNamespaceDeclarationBody::TSModuleBlock(block) => self.module_block(block, ctx),
+            TSNamespaceDeclarationBody::TSNamespaceDeclaration(inner) => {
+                ctx.write_ascii(b'.');
+                self.namespace_declaration(inner, false, ctx);
             }
         }
     }
 
-    fn global_declaration(&mut self, node: &TSGlobalDeclaration, ctx: &mut Context) {
+    fn global_declaration(&mut self, node: &TSGlobalDeclaration, ctx: &mut Context<DIRECT>) {
         if node.declare {
             ctx.write("declare ");
         }
@@ -3542,34 +5294,37 @@ impl<'opt> Printer<'opt> {
     }
 
     /// esrap's `TSModuleBlock`: ` {` + indented body + `}`.
-    fn module_block(&mut self, node: &TSModuleBlock, ctx: &mut Context) {
-        ctx.write(" {");
+    fn module_block(&mut self, node: &TSModuleBlock, ctx: &mut Context<DIRECT>) {
+        ctx.write_ascii_bytes(b" {");
         ctx.indent();
         ctx.newline();
-        let mut elems: Vec<BodyElem> = node.directives.iter().map(BodyElem::Directive).collect();
-        elems.extend(node.body.iter().map(BodyElem::Statement));
-        self.body_elems(&elems, node.span.start, node.span.end, ctx);
+        let elems = node
+            .directives
+            .iter()
+            .map(BodyElem::Directive)
+            .chain(node.body.iter().map(BodyElem::Statement));
+        self.body_elems(elems, Some(node.span.start), node.span.end, ctx);
         ctx.dedent();
         ctx.newline();
-        ctx.write("}");
+        ctx.write_ascii(b'}');
     }
 
-    fn import_equals_declaration(&mut self, node: &TSImportEqualsDeclaration, ctx: &mut Context) {
+    fn import_equals_declaration(node: &TSImportEqualsDeclaration, ctx: &mut Context<DIRECT>) {
         ctx.write("import ");
         ctx.write(node.id.name.as_str());
-        ctx.write(" = ");
+        ctx.write_ascii_bytes(b" = ");
         match &node.module_reference {
             TSModuleReference::ExternalModuleReference(r) => {
                 ctx.write("require(");
-                ctx.write(self.string_literal(&r.expression));
-                ctx.write(");");
+                ctx.write(Self::string_literal(&r.expression));
+                ctx.write_ascii_bytes(b");");
             }
             TSModuleReference::IdentifierReference(id) => {
                 ctx.write(id.name.as_str());
             }
             TSModuleReference::QualifiedName(q) => {
-                self.print_type_name(&q.left, ctx);
-                ctx.write(".");
+                Self::print_type_name(&q.left, ctx);
+                ctx.write_ascii(b'.');
                 ctx.write(q.right.name.as_str());
             }
         }
@@ -3577,46 +5332,36 @@ impl<'opt> Printer<'opt> {
 
     // ----- literals ---------------------------------------------------------
 
-    fn string_literal(&self, s: &StringLiteral) -> String {
+    fn string_literal(s: &StringLiteral) -> CompactString {
         if let Some(raw) = &s.raw {
-            return raw.to_string();
+            return raw.as_str().into();
         }
-        quote(s.value.as_str(), self.options.quote)
+        quote(s.value.as_str())
     }
 }
 
 /// esrap prefers a literal's preserved `raw` spelling; only synthesised literals
 /// fall back to a canonical rendering.
-fn literal_raw(raw: Option<&str>, fallback: impl FnOnce() -> String) -> String {
-    match raw {
-        Some(r) => r.to_string(),
-        None => fallback(),
-    }
+fn literal_raw(raw: Option<&str>, fallback: impl FnOnce() -> CompactString) -> CompactString {
+    raw.map_or_else(fallback, Into::into)
 }
 
-/// Quote a string value with the preferred quote char, escaping as needed.
-fn quote(value: &str, style: QuoteStyle) -> String {
-    let q = match style {
-        QuoteStyle::Single => '\'',
-        QuoteStyle::Double => '"',
-    };
+/// Quote a string value in single quotes, escaping as needed.
+fn quote(value: &str) -> CompactString {
     // esrap's `quote` escapes only `\`, the quote char, `\n`, and `\r` — a literal
     // tab is left as-is. Match it exactly (don't escape `\t`).
-    let mut out = String::with_capacity(value.len() + 2);
-    out.push(q);
+    let mut out = CompactString::with_capacity(value.len() + 2);
+    out.push('\'');
     for ch in value.chars() {
         match ch {
             '\\' => out.push_str("\\\\"),
-            c if c == q => {
-                out.push('\\');
-                out.push(c);
-            }
+            '\'' => out.push_str("\\'"),
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             c => out.push(c),
         }
     }
-    out.push(q);
+    out.push('\'');
     out
 }
 
@@ -3625,7 +5370,7 @@ fn quote(value: &str, style: QuoteStyle) -> String {
 /// whether it's a property with an object/array value (which suppresses the
 /// blank-line margin between adjacent multiline elements).
 struct SeqItem {
-    ctx: Context,
+    ctx: Context<false>,
     multiline: bool,
     obj_or_array: bool,
     /// This item is an array elision (a hole, `[a, , b]`). esrap still writes
@@ -3634,10 +5379,29 @@ struct SeqItem {
     is_elision: bool,
 }
 
+#[derive(Clone, Copy)]
+struct SeqLayout {
+    mark: EventMark,
+    multiline: bool,
+    obj_or_array: bool,
+    is_elision: bool,
+}
+
+#[derive(Clone, Copy)]
+struct SeqMeta {
+    start: Option<u32>,
+    end: Option<u32>,
+    obj_or_array: bool,
+    is_elision: bool,
+}
+
 /// One node of a comma sequence, as fed to [`Printer::sequence`]. Carries the
 /// node's source span (so trailing comments can be flushed in source order) and
 /// a closure that renders it into a child context.
-struct SeqNode<'p> {
+type SeqRenderer<'p, const HAS_COMMENTS: bool> =
+    dyn FnMut(&mut Printer<'_, HAS_COMMENTS, false>, &mut Context<false>) + 'p;
+
+struct SeqNode<'p, const HAS_COMMENTS: bool> {
     /// Node `loc.end` byte offset, or `None` for a synthetic node without a
     /// span (no trailing-comment flush is attempted for it).
     end: Option<u32>,
@@ -3646,10 +5410,10 @@ struct SeqNode<'p> {
     start: Option<u32>,
     obj_or_array: bool,
     is_elision: bool,
-    render: Box<dyn FnMut(&mut Printer<'_>, &mut Context) + 'p>,
+    render: Box<SeqRenderer<'p, HAS_COMMENTS>>,
 }
 
-fn accessibility_str(acc: &TSAccessibility) -> &'static str {
+const fn accessibility_str(acc: TSAccessibility) -> &'static str {
     match acc {
         TSAccessibility::Private => "private",
         TSAccessibility::Protected => "protected",
@@ -3657,7 +5421,7 @@ fn accessibility_str(acc: &TSAccessibility) -> &'static str {
     }
 }
 
-fn ts_type_operator_str(op: TSTypeOperatorOperator) -> &'static str {
+const fn ts_type_operator_str(op: TSTypeOperatorOperator) -> &'static str {
     match op {
         TSTypeOperatorOperator::Keyof => "keyof",
         TSTypeOperatorOperator::Unique => "unique",
@@ -3674,7 +5438,7 @@ fn mapped_modifier_prefix(op: TSMappedTypeModifierOperator, keyword: &str) -> St
     }
 }
 
-fn ts_type_kind(ty: &TSType) -> &'static str {
+const fn ts_type_kind(ty: &TSType) -> &'static str {
     match ty {
         TSType::JSDocNullableType(_) => "JSDocNullableType",
         TSType::JSDocNonNullableType(_) => "JSDocNonNullableType",
@@ -3699,7 +5463,7 @@ enum BodyElem<'a, 'b> {
     ClassMember(&'b ClassElement<'a>),
 }
 
-impl<'a, 'b> BodyElem<'a, 'b> {
+impl<'a> BodyElem<'a, '_> {
     fn is_empty_stmt(&self) -> bool {
         match self {
             // A *sentinel* empty (`span.end == u32::MAX`) is a deliberately-kept
@@ -3712,11 +5476,23 @@ impl<'a, 'b> BodyElem<'a, 'b> {
         }
     }
 
-    fn span_start(&self) -> u32 {
+    /// A surviving `EmptyStatement` is half of the `;;` upstream prints for a
+    /// removed `$inspect(...)`: one `ExpressionStatement` whose expression is
+    /// `b.empty`. The pair must print on one line and group with an
+    /// `ExpressionStatement` for esrap's margin rule.
+    fn is_kept_empty(&self) -> bool {
+        matches!(self, BodyElem::Statement(Statement::EmptyStatement(_)))
+    }
+
+    /// A sentinel empty has no real end, but its start is the removed
+    /// statement's own start — the anchor a comment trailing it on that line
+    /// needs.
+    fn comment_end(&self) -> u32 {
         match self {
-            BodyElem::Directive(d) => d.span.start,
-            BodyElem::Statement(s) => s.span().start,
-            BodyElem::ClassMember(e) => e.span().start,
+            BodyElem::Statement(Statement::EmptyStatement(s)) if s.span.end == u32::MAX => {
+                s.span.start
+            }
+            _ => self.span_end(),
         }
     }
 
@@ -3728,15 +5504,21 @@ impl<'a, 'b> BodyElem<'a, 'b> {
         }
     }
 
+    fn span_start(&self) -> u32 {
+        match self {
+            BodyElem::Directive(d) => d.span.start,
+            BodyElem::Statement(s) => s.span().start,
+            BodyElem::ClassMember(e) => e.span().start,
+        }
+    }
+
     /// esrap's `child.type === prev_type` margin grouping. A directive groups as
     /// its own kind (separated from a following non-directive, matching the
     /// acorn shape where `"use strict"` precedes `import`/`let`).
     fn same_kind(&self, other: &BodyElem<'a, '_>) -> bool {
         match (self, other) {
             (BodyElem::Directive(_), BodyElem::Directive(_)) => true,
-            (BodyElem::Statement(a), BodyElem::Statement(b)) => {
-                std::mem::discriminant(*a) == std::mem::discriminant(*b)
-            }
+            (BodyElem::Statement(a), BodyElem::Statement(b)) => same_statement_kind(a, b),
             (BodyElem::ClassMember(a), BodyElem::ClassMember(b)) => {
                 std::mem::discriminant(*a) == std::mem::discriminant(*b)
             }
@@ -3744,7 +5526,11 @@ impl<'a, 'b> BodyElem<'a, 'b> {
         }
     }
 
-    fn print(&self, printer: &mut Printer, ctx: &mut Context) {
+    fn print<const HAS_COMMENTS: bool, const DIRECT: bool>(
+        &self,
+        printer: &mut Printer<'_, HAS_COMMENTS, DIRECT>,
+        ctx: &mut Context<DIRECT>,
+    ) {
         match self {
             BodyElem::Directive(d) => printer.print_directive(d, ctx),
             BodyElem::Statement(s) => printer.print_statement(s, ctx),
@@ -3753,11 +5539,37 @@ impl<'a, 'b> BodyElem<'a, 'b> {
     }
 }
 
-fn expression_kind(expr: &Expression) -> &'static str {
+/// A surviving `EmptyStatement` is half of one `;;` hole (see
+/// [`BodyElem::is_kept_empty`]).
+const fn is_kept_empty_stmt(stmt: &Statement) -> bool {
+    matches!(stmt, Statement::EmptyStatement(_))
+}
+
+/// A sentinel empty's end is `u32::MAX`; its start is the anchor a trailing
+/// comment needs (see [`BodyElem::comment_end`]).
+fn statement_comment_end(stmt: &Statement) -> u32 {
+    match stmt {
+        Statement::EmptyStatement(s) if s.span.end == u32::MAX => s.span.start,
+        _ => stmt.span().end,
+    }
+}
+
+/// esrap's `child.type === prev_type` margin rule. A kept `EmptyStatement` is
+/// half of the `;;` upstream emits as an `ExpressionStatement`, so it groups
+/// with one.
+fn same_statement_kind(a: &Statement, b: &Statement) -> bool {
+    const fn expression_like(s: &Statement) -> bool {
+        matches!(s, Statement::EmptyStatement(_) | Statement::ExpressionStatement(_))
+    }
+    (expression_like(a) && expression_like(b))
+        || std::mem::discriminant(a) == std::mem::discriminant(b)
+}
+
+const fn expression_kind(expr: &Expression) -> &'static str {
     match expr {
         Expression::TaggedTemplateExpression(_) => "TaggedTemplateExpression",
         Expression::YieldExpression(_) => "YieldExpression",
-        Expression::MetaProperty(_) => "MetaProperty",
+        Expression::ImportMeta(_) | Expression::NewTarget(_) => "MetaProperty",
         Expression::ImportExpression(_) => "ImportExpression",
         Expression::PrivateFieldExpression(_) => "PrivateFieldExpression",
         Expression::PrivateInExpression(_) => "PrivateInExpression",
@@ -3777,74 +5589,111 @@ mod tests {
     fn roundtrip(src: &str) -> (String, Option<Unsupported>) {
         let allocator = Allocator::default();
         let ret = Parser::new(&allocator, src, SourceType::mjs()).parse();
-        assert!(
-            ret.diagnostics.is_empty(),
-            "parse error: {:?}",
-            ret.diagnostics
-        );
+        assert!(ret.diagnostics.is_empty(), "parse error: {:?}", ret.diagnostics);
         let opts = PrintOptions::default();
-        let mut printer = Printer::new(&opts);
+        let mut printer = Printer::<false>::new(&opts);
         let mut ctx = Context::new();
         printer.print_program(&ret.program, &mut ctx);
-        (
-            crate::command::print(&ctx.into_commands(), &opts.indent),
-            printer.missing,
-        )
+        (crate::command::print(&ctx.into_buffer(), &opts.indent, 0), printer.missing)
     }
 
     fn print_ok(src: &str) -> String {
         let (out, missing) = roundtrip(src);
-        assert!(
-            missing.is_none(),
-            "unsupported node: {missing:?} for {src:?}"
-        );
+        assert!(missing.is_none(), "unsupported node: {missing:?} for {src:?}");
         out
+    }
+
+    #[test]
+    fn side_effect_import_keeps_attributes() {
+        assert_eq!(
+            print_ok("import './data.json' with { type: 'json' }"),
+            "import './data.json' with { type: 'json' };"
+        );
     }
 
     fn print_with_comments_ok(src: &str) -> String {
         let allocator = Allocator::default();
         let ret = Parser::new(&allocator, src, SourceType::mjs()).parse();
-        assert!(
-            ret.diagnostics.is_empty(),
-            "parse error: {:?}",
-            ret.diagnostics
-        );
+        assert!(ret.diagnostics.is_empty(), "parse error: {:?}", ret.diagnostics);
         let opts = PrintOptions::default();
-        let comments = build_comments(&ret.program, src);
-        let mut printer = Printer::with_comments(&opts, comments, line_starts(src));
+        let comments = build_comments(&ret.program, src, &line_starts(src));
+        let mut printer = Printer::<true>::with_comments(&opts, comments, line_starts(src));
         let mut ctx = Context::new();
         printer.print_program(&ret.program, &mut ctx);
-        let out = crate::command::print(&ctx.into_commands(), &opts.indent);
-        assert!(
-            printer.missing.is_none(),
-            "unsupported node: {:?}",
-            printer.missing
-        );
+        let out = crate::command::print(&ctx.into_buffer(), &opts.indent, 0);
+        assert!(printer.missing.is_none(), "unsupported node: {:?}", printer.missing);
         out
+    }
+
+    fn synthetic_sequence_deferred(n: usize, unsupported: bool) -> String {
+        let opts = PrintOptions::default();
+        let mut printer = Printer::<false>::new(&opts);
+        let mut ctx = Context::new();
+        ctx.write_ascii(b'[');
+        printer.sequence_indexed(
+            n,
+            |_| SeqMeta { start: None, end: None, obj_or_array: false, is_elision: false },
+            |printer, i, child| {
+                if unsupported && i + 1 == n {
+                    printer.unsupported("Synthetic", child);
+                }
+            },
+            None,
+            true,
+            ",",
+            true,
+            &mut ctx,
+        );
+        ctx.write_ascii(b']');
+        let capacity = ctx.measure();
+        crate::command::print(&ctx.into_buffer(), &opts.indent, capacity)
+    }
+
+    fn synthetic_sequence_direct(n: usize, unsupported: bool) -> String {
+        let opts = PrintOptions::default();
+        let mut printer = Printer::<false, true>::new(&opts);
+        let mut ctx = Context::new_direct(&opts.indent, 32);
+        ctx.write_ascii(b'[');
+        printer.sequence_indexed(
+            n,
+            |_| SeqMeta { start: None, end: None, obj_or_array: false, is_elision: false },
+            |printer, i, child| {
+                if unsupported && i + 1 == n {
+                    printer.unsupported("Synthetic", child);
+                }
+            },
+            None,
+            true,
+            ",",
+            true,
+            &mut ctx,
+        );
+        ctx.write_ascii(b']');
+        let (buffer, _, indent, dirty) = ctx.into_direct_parts();
+        crate::command::finish_direct(buffer, &indent, dirty).0
+    }
+
+    #[test]
+    fn optimistic_sequence_matches_empty_and_unsupported_renderers() {
+        for n in [1, 2] {
+            assert_eq!(synthetic_sequence_direct(n, false), synthetic_sequence_deferred(n, false));
+            assert_eq!(synthetic_sequence_direct(n, true), synthetic_sequence_deferred(n, true));
+        }
     }
 
     #[test]
     fn comments_leading_line() {
-        assert_eq!(
-            print_with_comments_ok("// hi\nconst x = 1;"),
-            "// hi\nconst x = 1;"
-        );
+        assert_eq!(print_with_comments_ok("// hi\nconst x = 1;"), "// hi\nconst x = 1;");
     }
 
     #[test]
     fn comments_leading_block() {
-        assert_eq!(
-            print_with_comments_ok("/* a */\nconst x = 1;"),
-            "/* a */\nconst x = 1;"
-        );
+        assert_eq!(print_with_comments_ok("/* a */\nconst x = 1;"), "/* a */\nconst x = 1;");
     }
 
     #[test]
     fn comments_trailing_line() {
-        assert_eq!(
-            print_with_comments_ok("const x = 1; // tail"),
-            "const x = 1; // tail"
-        );
+        assert_eq!(print_with_comments_ok("const x = 1; // tail"), "const x = 1; // tail");
     }
 
     #[test]
@@ -3854,6 +5703,16 @@ mod tests {
         assert_eq!(
             print_with_comments_ok("const a = 1;\n// c\nconst b = 2;"),
             "const a = 1;\n\n// c\nconst b = 2;"
+        );
+    }
+
+    #[test]
+    fn same_line_comment_before_later_statement_stays_trailing_on_previous() {
+        assert_eq!(
+            print_with_comments_ok(
+                "async function f() { let y = 1; return (await $.track_reactivity_loss(/* c */ load()))()(); }"
+            ),
+            "async function f() {\n\tlet y = 1; /* c */\n\n\treturn (await $.track_reactivity_loss(load()))()();\n}"
         );
     }
 
@@ -3884,14 +5743,8 @@ mod tests {
         assert_eq!(print_ok("const x = !y;"), "const x = !y;");
         assert_eq!(print_ok("const x = a ? b : c;"), "const x = a ? b : c;");
         // Branches are not parenthesised (esrap), even low-precedence ones.
-        assert_eq!(
-            print_ok("const x = a ? () => b : c;"),
-            "const x = a ? () => b : c;"
-        );
-        assert_eq!(
-            print_ok("const x = a ? b : c ? d : e;"),
-            "const x = a ? b : c ? d : e;"
-        );
+        assert_eq!(print_ok("const x = a ? () => b : c;"), "const x = a ? () => b : c;");
+        assert_eq!(print_ok("const x = a ? b : c ? d : e;"), "const x = a ? b : c ? d : e;");
     }
 
     #[test]
@@ -3916,31 +5769,16 @@ mod tests {
     fn imports() {
         assert_eq!(print_ok("import 'x';"), "import 'x';");
         assert_eq!(print_ok("import a from 'x';"), "import a from 'x';");
-        assert_eq!(
-            print_ok("import { a, b } from 'x';"),
-            "import { a, b } from 'x';"
-        );
-        assert_eq!(
-            print_ok("import { a as b } from 'x';"),
-            "import { a as b } from 'x';"
-        );
-        assert_eq!(
-            print_ok("import a, { b } from 'x';"),
-            "import a, { b } from 'x';"
-        );
-        assert_eq!(
-            print_ok("import * as ns from 'x';"),
-            "import * as ns from 'x';"
-        );
+        assert_eq!(print_ok("import { a, b } from 'x';"), "import { a, b } from 'x';");
+        assert_eq!(print_ok("import { a as b } from 'x';"), "import { a as b } from 'x';");
+        assert_eq!(print_ok("import a, { b } from 'x';"), "import a, { b } from 'x';");
+        assert_eq!(print_ok("import * as ns from 'x';"), "import * as ns from 'x';");
     }
 
     #[test]
     fn exports() {
         assert_eq!(print_ok("export { a, b };"), "export { a, b };");
-        assert_eq!(
-            print_ok("export { a as b } from 'x';"),
-            "export { a as b } from 'x';"
-        );
+        assert_eq!(print_ok("export { a as b } from 'x';"), "export { a as b } from 'x';");
         assert_eq!(print_ok("export const x = 1;"), "export const x = 1;");
     }
 
@@ -3950,14 +5788,8 @@ mod tests {
             print_ok("function f(a, b) { return a; }"),
             "function f(a, b) {\n\treturn a;\n}"
         );
-        assert_eq!(
-            print_ok("const g = (x) => x + 1;"),
-            "const g = (x) => x + 1;"
-        );
-        assert_eq!(
-            print_ok("const h = () => ({ a: 1 });"),
-            "const h = () => ({ a: 1 });"
-        );
+        assert_eq!(print_ok("const g = (x) => x + 1;"), "const g = (x) => x + 1;");
+        assert_eq!(print_ok("const h = () => ({ a: 1 });"), "const h = () => ({ a: 1 });");
         assert_eq!(print_ok("async function a() {}"), "async function a() {}");
         assert_eq!(print_ok("function r(...xs) {}"), "function r(...xs) {}");
         assert_eq!(print_ok("const e = await f();"), "const e = await f();");
@@ -3970,10 +5802,7 @@ mod tests {
     fn call_trailing_multiline_arg_stays_inline() {
         // A multiline *final* argument does not wrap the call (esrap's bespoke
         // call layout) — only a multiline non-final argument would.
-        assert_eq!(
-            print_ok("foo(a, () => { b(); });"),
-            "foo(a, () => {\n\tb();\n});"
-        );
+        assert_eq!(print_ok("foo(a, () => { b(); });"), "foo(a, () => {\n\tb();\n});");
     }
 
     #[test]
@@ -3988,29 +5817,20 @@ mod tests {
     fn private_and_meta() {
         assert_eq!(print_ok("this.#x;"), "this.#x;");
         assert_eq!(print_ok("export * from 'x';"), "export * from 'x';");
-        assert_eq!(
-            print_ok("export * as ns from 'x';"),
-            "export * as ns from 'x';"
-        );
+        assert_eq!(print_ok("export * as ns from 'x';"), "export * as ns from 'x';");
     }
 
     #[test]
     fn classes() {
         assert_eq!(print_ok("class A {}"), "class A {}");
         assert_eq!(print_ok("const C = class {};"), "const C = class {};");
-        assert_eq!(
-            print_ok("class A extends B { m() {} }"),
-            "class A extends B {\n\tm() {}\n}"
-        );
+        assert_eq!(print_ok("class A extends B { m() {} }"), "class A extends B {\n\tm() {}\n}");
         assert_eq!(print_ok("class A { x = 1; }"), "class A {\n\tx = 1;\n}");
     }
 
     #[test]
     fn object_methods() {
-        assert_eq!(
-            print_ok("const o = { f() {}, g() {} };"),
-            "const o = { f() {}, g() {} };"
-        );
+        assert_eq!(print_ok("const o = { f() {}, g() {} };"), "const o = { f() {}, g() {} };");
         assert_eq!(
             print_ok("const o = { get x() {}, set x(v) {} };"),
             "const o = { get x() {}, set x(v) {} };"
@@ -4043,14 +5863,8 @@ mod tests {
             print_ok("outer: for (const x of xs) break outer;"),
             "outer: for (const x of xs) break outer;"
         );
-        assert_eq!(
-            print_ok("for (const x of xs) f(x);"),
-            "for (const x of xs) f(x);"
-        );
-        assert_eq!(
-            print_ok("for (const k in o) f(k);"),
-            "for (const k in o) f(k);"
-        );
+        assert_eq!(print_ok("for (const x of xs) f(x);"), "for (const x of xs) f(x);");
+        assert_eq!(print_ok("for (const k in o) f(k);"), "for (const k in o) f(k);");
         assert_eq!(
             print_ok("try { a(); } catch (e) { b(); }"),
             "try {\n\ta();\n} catch(e) {\n\tb();\n}"
@@ -4064,14 +5878,8 @@ mod tests {
 
     #[test]
     fn param_defaults() {
-        assert_eq!(
-            print_ok("function f(a = 1, b) {}"),
-            "function f(a = 1, b) {}"
-        );
-        assert_eq!(
-            print_ok("const g = (x = 2) => x;"),
-            "const g = (x = 2) => x;"
-        );
+        assert_eq!(print_ok("function f(a = 1, b) {}"), "function f(a = 1, b) {}");
+        assert_eq!(print_ok("const g = (x = 2) => x;"), "const g = (x = 2) => x;");
     }
 
     #[test]
@@ -4088,14 +5896,8 @@ mod tests {
     fn destructuring_patterns() {
         assert_eq!(print_ok("const { a, b: c } = o;"), "const { a, b: c } = o;");
         assert_eq!(print_ok("const [x, y] = arr;"), "const [x, y] = arr;");
-        assert_eq!(
-            print_ok("const { a, ...rest } = o;"),
-            "const { a, ...rest } = o;"
-        );
-        assert_eq!(
-            print_ok("function f({ a = 1 }) {}"),
-            "function f({ a = 1 }) {}"
-        );
+        assert_eq!(print_ok("const { a, ...rest } = o;"), "const { a, ...rest } = o;");
+        assert_eq!(print_ok("function f({ a = 1 }) {}"), "function f({ a = 1 }) {}");
     }
 
     #[test]

@@ -44,10 +44,7 @@ pub fn attach_tag(node: &AttachTag, context: &mut ComponentContext) -> Transform
         b::call(
             &context.arena,
             b::member_path(&context.arena, "$.attach"),
-            vec![
-                context.state.node.clone(),
-                b::thunk(&context.arena, expression.clone()),
-            ],
+            vec![context.state.node.clone(), b::thunk(&context.arena, expression.clone())],
         ),
     );
 

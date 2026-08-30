@@ -28,7 +28,9 @@ use crate::compiler::phases::phase3_transform::js_ast::nodes::*;
 /// and no other non-whitespace content. This mirrors the official compiler's
 /// `alt.nodes.length === 1 && alt.nodes[0].type === 'IfBlock'` check, but is more
 /// lenient about surrounding whitespace text nodes (which our parser sometimes emits).
-fn get_elseif_block(fragment: &crate::ast::template::Fragment) -> Option<&IfBlock> {
+fn get_elseif_block<'a>(
+    fragment: &'a crate::ast::template::Fragment<'a>,
+) -> Option<&'a IfBlock<'a>> {
     let mut found: Option<&IfBlock> = None;
     for node in &fragment.nodes {
         match node {
@@ -58,9 +60,7 @@ fn collect_branch_blocker_strings(branch: &IfBlock, context: &mut ComponentConte
     let converted = convert_expression(&branch.test, context);
     let meta = ExpressionMetadata::from_template_metadata(&branch.metadata.expression);
     let expr = build_expression(context, &converted, &meta);
-    let exprs = context
-        .state
-        .get_all_blockers_for_expr(&expr, &context.arena);
+    let exprs = context.state.get_all_blockers_for_expr(&expr, &context.arena);
     let mut strings: Vec<String> = exprs
         .into_iter()
         .map(|e| {
@@ -75,7 +75,10 @@ fn collect_branch_blocker_strings(branch: &IfBlock, context: &mut ComponentConte
     strings
 }
 
-fn collect_branches<'a>(node: &'a IfBlock, context: &mut ComponentContext) -> Vec<&'a IfBlock> {
+fn collect_branches<'a>(
+    node: &'a IfBlock<'a>,
+    context: &mut ComponentContext,
+) -> Vec<&'a IfBlock<'a>> {
     let mut branches: Vec<&IfBlock> = vec![node];
     let mut current = node;
     let mut current_blockers = collect_branch_blocker_strings(node, context);
@@ -149,9 +152,7 @@ pub fn if_block(node: &IfBlock, context: &mut ComponentContext) {
 
     // Check if the expression has blockers (references variables assigned after await)
     // Check both instance-level blocker_map and const-tag-level const_blocker_map.
-    let blocker_exprs = context
-        .state
-        .get_all_blockers_for_expr(&expression, &context.arena);
+    let blocker_exprs = context.state.get_all_blockers_for_expr(&expression, &context.arena);
     let has_blockers = !blocker_exprs.is_empty();
 
     // Scope `const_blocker_map` to this if-block. The map is name-keyed and
@@ -191,10 +192,7 @@ pub fn if_block(node: &IfBlock, context: &mut ComponentContext) {
         statements.push(b::var_decl(
             &context.arena,
             &consequent_id_name,
-            Some(b::arrow_block(
-                vec![b::id_pattern("$$anchor")],
-                consequent_block.body,
-            )),
+            Some(b::arrow_block(vec![b::id_pattern("$$anchor")], consequent_block.body)),
         ));
 
         // Build the test expression for this branch
@@ -223,11 +221,7 @@ pub fn if_block(node: &IfBlock, context: &mut ComponentContext) {
                         vec![b::arrow(&context.arena, vec![], expr)],
                     )),
                 ));
-                b::call(
-                    &context.arena,
-                    b::member_path(&context.arena, "$.get"),
-                    vec![derived_id],
-                )
+                b::call(&context.arena, b::member_path(&context.arena, "$.get"), vec![derived_id])
             } else {
                 expr
             }
@@ -235,10 +229,7 @@ pub fn if_block(node: &IfBlock, context: &mut ComponentContext) {
 
         // $$render(consequent_n) or $$render(consequent_n, index) for elseif branches
         let render_stmt = if index == 0 {
-            b::stmt(
-                &context.arena,
-                b::call(&context.arena, b::id("$$render"), vec![consequent_id]),
-            )
+            b::stmt(&context.arena, b::call(&context.arena, b::id("$$render"), vec![consequent_id]))
         } else {
             b::stmt(
                 &context.arena,
@@ -267,10 +258,7 @@ pub fn if_block(node: &IfBlock, context: &mut ComponentContext) {
         statements.push(b::var_decl(
             &context.arena,
             &alternate_id_name,
-            Some(b::arrow_block(
-                vec![b::id_pattern("$$anchor")],
-                alternate_block.body,
-            )),
+            Some(b::arrow_block(vec![b::id_pattern("$$anchor")], alternate_block.body)),
         ));
 
         // $$render(alternate, -1). Svelte 5.53.7 (upstream commit
@@ -280,11 +268,7 @@ pub fn if_block(node: &IfBlock, context: &mut ComponentContext) {
         // SSR hydration markers (`<!--[-1-->`).
         Some(b::stmt(
             &context.arena,
-            b::call(
-                &context.arena,
-                b::id("$$render"),
-                vec![alternate_id, b::number(-1.0)],
-            ),
+            b::call(&context.arena, b::id("$$render"), vec![alternate_id, b::number(-1.0)]),
         ))
     } else {
         None
@@ -298,11 +282,7 @@ pub fn if_block(node: &IfBlock, context: &mut ComponentContext) {
     }
 
     // Build $.if() arguments
-    let render_body = if let Some(chain) = if_chain {
-        vec![chain]
-    } else {
-        vec![]
-    };
+    let render_body = if let Some(chain) = if_chain { vec![chain] } else { vec![] };
 
     let mut args = vec![
         context.state.node.clone(),
@@ -317,7 +297,7 @@ pub fn if_block(node: &IfBlock, context: &mut ComponentContext) {
 
     let if_call = b::call(&context.arena, b::member_path(&context.arena, "$.if"), args);
     let if_statement = if context.state.dev {
-        use crate::compiler::phases::phase3_transform::client::visitors::attribute::locate_in_source;
+        use crate::compiler::phases::phase3_transform::utils::locate_in_source;
         let (line, col) = locate_in_source(&context.state.analysis.source, node.start as usize);
         super::shared::utils::add_svelte_meta_dev(
             &context.arena,
@@ -337,11 +317,8 @@ pub fn if_block(node: &IfBlock, context: &mut ComponentContext) {
     // If async (has_await or has_blockers), wrap in $.async()
     if has_await || has_blockers {
         // Blockers array: collect all blocker expressions from the expression
-        let blockers = if has_blockers || has_await {
-            b::array(blocker_exprs)
-        } else {
-            b::array(vec![])
-        };
+        let blockers =
+            if has_blockers || has_await { b::array(blocker_exprs) } else { b::array(vec![]) };
 
         // Async values: only present when has_await
         let async_values = if has_await {

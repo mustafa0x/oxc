@@ -1,48 +1,78 @@
 //! AST-based rewrite of private-field assignments + updates in
-//! class method bodies (with `this.` prefix and proxy detection
-//! for `$state` fields).
+//! class method and constructor bodies, with proxy detection for
+//! `$state` fields.
 //!
 //! Replaces the assignment / update branches in
 //! `class_transforms.rs::transform_class_methods` (lines 1169+).
 //!
-//! Differs from `private_field_assign_ast` (PR #207, non-this
-//! constructor variant) in two ways:
+//! The receiver is not part of the match: a qualified name is any
+//! `<expr>.#field` text the caller lists, so `inst.#x` from
+//! `const inst = this` is handled here exactly like `this.#x`.
+//! `private_field_assign_ast` covers a narrower non-`this` case and
+//! models neither the proxy flag nor the logical operators, so it is
+//! only reached as a fallback when this pass declines to parse.
 //!
-//! 1. `$state` fields get a `, true` flag when the RHS expression
-//!    needs proxy wrapping (per `expression_needs_proxy`). Other
-//!    rune types and the non-this variant don't apply this.
-//! 2. Update expressions (`q++`, `--q`) are also rewritten to
-//!    `$.update(q)` / `$.update_pre(q[, -1])`.
+//! Mappings (preserved exactly). Whether the `, true` proxy flag is
+//! emitted follows upstream `AssignmentExpression.js`:
+//! `needs_proxy = field is $state && is_non_coercive_operator(op) &&
+//! should_proxy(value)`. Only `=` and the *logical* compounds
+//! (`||= &&= ??=`) are non-coercive; arithmetic / bitwise / shift
+//! compounds are coercive and never proxy.
 //!
-//! Mappings (preserved exactly):
+//! The compound operand is the *visited* left-hand side, so it follows upstream
+//! `MemberExpression.js`, whose read form has two conditions:
+//! `in_constructor && (field.type === '$state.raw' || field.type === '$state')`.
+//! `v_read_qualified` carries both — the caller lists a name there only when it
+//! is a constructor body *and* the field is `$state` / `$state.raw`, so a
+//! `$derived` field still reads through `$.get` inside a constructor. The depth
+//! check is separate because upstream `shared/function.js` clears
+//! `in_constructor` on entry to any nested function.
+//!
+//! Neither list is `this`-only: upstream keys off `PrivateIdentifier`, not the
+//! receiver, so `inst.#x` takes the same path as `this.#x`.
 //!
 //! | Source        | Replacement (proxy-needing $state)         | Replacement (otherwise)             |
 //! |---------------|--------------------------------------------|-------------------------------------|
 //! | `q = expr`    | `$.set(q, expr, true)`                     | `$.set(q, expr)`                    |
-//! | `q += expr`   | `$.set(q, $.get(q) + expr, true)`          | `$.set(q, $.get(q) + expr)`         |
-//! | (incl. `-= *= /= %= **=`)                                                                          |
+//! | `q += expr`   | `$.set(q, $.get(q) + expr)`                | `$.set(q, $.get(q) + expr)`         |
+//! | (incl. coercive `-= *= /= %= **= &= |= ^= <<= >>= >>>=` — never proxy)                             |
+//! | `q ??= expr`  | `$.get(q) ?? $.set(q, expr)`               | `$.get(q) ?? $.set(q, expr)`        |
+//! | (incl. logical `||= &&=`; the built value is a LogicalExpression → always proxies for `$state`)   |
 //! | `q++`         | `$.update(q)`                              | `$.update(q)`                       |
 //! | `q--`         | `$.update(q, -1)`                          | `$.update(q, -1)`                   |
 //! | `++q`         | `$.update_pre(q)`                          | `$.update_pre(q)`                   |
 //! | `--q`         | `$.update_pre(q, -1)`                      | `$.update_pre(q, -1)`               |
 //!
+//! The four update rows are a deliberate divergence for a non-`this` receiver —
+//! see the comment at the rewrite site.
+//!
 //! Where `q` matches one of the qualified names. `state_qualified`
 //! holds the `$state`-rune-type qualifieds (proxy-aware); other
 //! qualifieds (`$state.raw`, `$state.frozen`, `$derived`,
 //! `$derived.by`) go in `other_qualified`.
+//!
+//! The update rows hold for a non-`this` receiver too, where upstream
+//! diverges — see `compatibility/deliberate-divergences.md`.
+//!
+//! The pass has two implementations — a text-splicing one and an
+//! in-place AST one, picked between by `ast_rewrite::dual_run::resolve`
+//! — that differ only in the representation they emit. Every decision
+//! they share ([`target_present`], [`classify`], [`compound_of`],
+//! [`needs_proxy`], [`update_call`]) is stated once here and called
+//! from both, so a rule cannot be changed for one representation only.
 
 use std::cell::RefCell;
 // mold principle P6: trusted-input compiler hot path uses FxHash, never SipHash.
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
-use oxc_allocator::Allocator;
+use oxc_allocator::{Allocator, CloneIn};
 use oxc_ast::ast::*;
 use oxc_ast_visit::Visit;
 use oxc_ast_visit::walk;
 use oxc_parser::{ParseOptions, Parser};
 use oxc_span::GetSpan;
 use oxc_span::SourceType;
-use oxc_syntax::operator::{AssignmentOperator, UpdateOperator};
+use oxc_syntax::operator::{AssignmentOperator, UnaryOperator, UpdateOperator};
 
 use super::ast_rewrite::{self, Edit};
 
@@ -137,8 +167,7 @@ impl<'ast> Visit<'ast> for BindingInfoCollector {
         if let BindingPattern::BindingIdentifier(id) = &decl.id
             && let Some(init) = &decl.init
         {
-            self.var_proxy
-                .insert(id.name.to_string(), should_proxy_no_trace(init));
+            self.var_proxy.insert(id.name.to_string(), should_proxy_no_trace(init));
         }
     }
 
@@ -157,6 +186,88 @@ impl<'ast> Visit<'ast> for BindingInfoCollector {
     }
 }
 
+#[derive(Clone, Copy)]
+enum Match {
+    State,
+    Other,
+}
+
+fn classify(text: &str, state_qualified: &[String], other_qualified: &[String]) -> Option<Match> {
+    if state_qualified.iter().any(|q| q.as_str() == text) {
+        Some(Match::State)
+    } else if other_qualified.iter().any(|q| q.as_str() == text) {
+        Some(Match::Other)
+    } else {
+        None
+    }
+}
+
+/// Whether a qualified name occurs in `source` at all — the cheap probe that
+/// keeps a source with no private-field writes from being parsed.
+fn target_present(source: &str, state_qualified: &[String], other_qualified: &[String]) -> bool {
+    state_qualified
+        .iter()
+        .chain(other_qualified.iter())
+        .any(|q| memchr::memmem::find(source.as_bytes(), q.as_bytes()).is_some())
+}
+
+/// How a compound assignment expands into the `$.set` value, mirroring upstream
+/// `build_assignment_value` (`utils/ast.js`): the logical compounds build a
+/// `LogicalExpression`, every other compound a `BinaryExpression`. `None` is
+/// plain `=`, whose value is the RHS verbatim.
+#[derive(Clone, Copy)]
+enum Compound {
+    Binary(oxc_syntax::operator::BinaryOperator),
+    Logical(oxc_syntax::operator::LogicalOperator),
+}
+
+impl Compound {
+    fn as_str(self) -> &'static str {
+        match self {
+            Compound::Binary(op) => op.as_str(),
+            Compound::Logical(op) => op.as_str(),
+        }
+    }
+}
+
+fn compound_of(operator: AssignmentOperator) -> Option<Compound> {
+    operator
+        .to_logical_operator()
+        .map(Compound::Logical)
+        .or_else(|| operator.to_binary_operator().map(Compound::Binary))
+}
+
+/// Whether the `$.set` call gets the trailing `, true` proxy flag, mirroring
+/// upstream `AssignmentExpression.js`: `needs_proxy = field.type === '$state' &&
+/// is_non_coercive_operator(operator) && should_proxy(value, scope)`, where
+/// `value` is the built assignment value. The non-coercive operators are
+/// `= || && ??`; arithmetic / bitwise / shift compounds are coercive and never
+/// proxy. Since #18594 the logical ops short-circuit around the `$.set` rather
+/// than folding the read into its argument, so their `value` is the bare RHS
+/// and `should_proxy` traces it exactly as it does for `=`.
+fn needs_proxy(
+    kind: Match,
+    compound: Option<Compound>,
+    right: &Expression<'_>,
+    var_proxy: &HashMap<String, bool>,
+    reassigned: &HashSet<String>,
+) -> bool {
+    matches!(kind, Match::State)
+        && match compound {
+            None | Some(Compound::Logical(_)) => {
+                should_proxy_with_bindings(right, var_proxy, reassigned)
+            }
+            Some(Compound::Binary(_)) => false,
+        }
+}
+
+/// The runtime helper an update expression lowers to, and whether it needs the
+/// `-1` step argument: `q++` → `$.update(q)`, `--q` → `$.update_pre(q, -1)`.
+fn update_call(operator: UpdateOperator, prefix: bool) -> (&'static str, bool) {
+    let callee = if prefix { "$.update_pre" } else { "$.update" };
+    (callee, matches!(operator, UpdateOperator::Decrement))
+}
+
 thread_local! {
     static MODULE_PRIVATE_CLASS_ASSIGN_ALLOC: RefCell<Allocator> =
         RefCell::new(Allocator::default());
@@ -171,20 +282,38 @@ pub fn transform_private_class_assign_ast(
     source: &str,
     state_qualified: &[String],
     other_qualified: &[String],
+    v_read_qualified: &[String],
 ) -> Option<String> {
-    if state_qualified.is_empty() && other_qualified.is_empty() {
-        return None;
-    }
-    if !state_qualified
-        .iter()
-        .chain(other_qualified.iter())
-        .any(|q| memchr::memmem::find(source.as_bytes(), q.as_bytes()).is_some())
-    {
+    let spliced = || {
+        transform_private_class_assign_spliced(
+            source,
+            state_qualified,
+            other_qualified,
+            v_read_qualified,
+        )
+    };
+    ast_rewrite::dual_run::resolve("private_class_assign_ast:inplace", source, spliced, || {
+        transform_private_class_assign_in_place(
+            source,
+            state_qualified,
+            other_qualified,
+            v_read_qualified,
+        )
+    })
+}
+
+fn transform_private_class_assign_spliced(
+    source: &str,
+    state_qualified: &[String],
+    other_qualified: &[String],
+    v_read_qualified: &[String],
+) -> Option<String> {
+    if !target_present(source, state_qualified, other_qualified) {
         return None;
     }
 
     ast_rewrite::fixed_point(source, |src| {
-        single_pass(src, state_qualified, other_qualified)
+        single_pass(src, state_qualified, other_qualified, v_read_qualified)
     })
 }
 
@@ -192,6 +321,7 @@ fn single_pass(
     source: &str,
     state_qualified: &[String],
     other_qualified: &[String],
+    v_read_qualified: &[String],
 ) -> Option<String> {
     MODULE_PRIVATE_CLASS_ASSIGN_ALLOC.with(|cell| {
         let allocator = std::mem::take(&mut *cell.borrow_mut());
@@ -201,12 +331,21 @@ fn single_pass(
         // retry by wrapping in a synthetic class so OXC can recognise the
         // method signatures.  Span offsets are adjusted back to the original
         // source after collection.
+        ast_rewrite::dual_run::count_parse(
+            ast_rewrite::dual_run::current_or(file!()),
+            source.len(),
+        );
+        let _pt = super::super::profile::timer_start();
         let parser_ret = Parser::new(&allocator, source, SourceType::mjs())
             .with_options(ParseOptions {
                 allow_return_outside_function: true,
                 ..ParseOptions::default()
             })
             .parse();
+        super::super::profile::record_direct_parse(
+            super::super::profile::timer_elapsed(_pt),
+            source.len(),
+        );
 
         const CLASS_PREFIX: &str = "class _Dummy_ {\n";
         let (parse_str_owned, span_offset): (Option<String>, u32) =
@@ -223,12 +362,21 @@ fn single_pass(
         };
 
         let program_to_visit = if parse_str_owned.is_some() {
+            ast_rewrite::dual_run::count_parse(
+                ast_rewrite::dual_run::current_or(file!()),
+                parse_str.len(),
+            );
+            let _pt = super::super::profile::timer_start();
             let ret = Parser::new(&allocator, parse_str, SourceType::mjs())
                 .with_options(ParseOptions {
                     allow_return_outside_function: true,
                     ..ParseOptions::default()
                 })
                 .parse();
+            super::super::profile::record_direct_parse(
+                super::super::profile::timer_elapsed(_pt),
+                parse_str.len(),
+            );
             if !ret.diagnostics.is_empty() {
                 *cell.borrow_mut() = allocator;
                 return None;
@@ -250,8 +398,11 @@ fn single_pass(
             source: parse_str,
             state_qualified,
             other_qualified,
+            v_read_qualified,
+            function_depth: 0,
             var_proxy: &binding_info.var_proxy,
             reassigned: &binding_info.reassigned,
+            tight_parents: HashSet::default(),
             replacements: Vec::new(),
         };
         collector.visit_program(program_ref);
@@ -277,30 +428,106 @@ struct PrivateClassAssignCollector<'a> {
     source: &'a str,
     state_qualified: &'a [String],
     other_qualified: &'a [String],
+    v_read_qualified: &'a [String],
+    function_depth: u32,
     var_proxy: &'a HashMap<String, bool>,
     reassigned: &'a HashSet<String>,
+    /// Spans of expressions whose parent binds tighter than a logical operator,
+    /// so the logical form a short-circuiting assignment expands into has to be
+    /// parenthesised there. The in-place path gets this from its printer.
+    tight_parents: HashSet<(u32, u32)>,
     replacements: Vec<Edit>,
 }
 
-#[derive(Clone, Copy)]
-enum Match {
-    State,
-    Other,
+/// The visited left-hand side of a compound assignment, per upstream
+/// `MemberExpression.js`.
+fn field_read_text(qualified: &str, dot_v: bool) -> String {
+    if dot_v { format!("{}.v", qualified) } else { format!("$.get({})", qualified) }
 }
 
-impl<'a> PrivateClassAssignCollector<'a> {
-    fn classify(&self, text: &str) -> Option<Match> {
-        if self.state_qualified.iter().any(|q| q.as_str() == text) {
-            Some(Match::State)
-        } else if self.other_qualified.iter().any(|q| q.as_str() == text) {
-            Some(Match::Other)
-        } else {
-            None
-        }
+/// Upstream `shared/function.js` clears `in_constructor` on entry to any nested
+/// function, so only the constructor's own statements read through `.v`.
+fn reads_dot_v(qualified: &str, v_read_qualified: &[String], function_depth: u32) -> bool {
+    function_depth == 0 && v_read_qualified.iter().any(|q| q.as_str() == qualified)
+}
+
+impl PrivateClassAssignCollector<'_> {
+    fn mark_tight(&mut self, expr: &Expression<'_>) {
+        let span = expr.span();
+        self.tight_parents.insert((span.start, span.end));
     }
 }
 
 impl<'a, 'ast> Visit<'ast> for PrivateClassAssignCollector<'a> {
+    fn visit_function(&mut self, func: &Function<'ast>, flags: oxc_syntax::scope::ScopeFlags) {
+        self.function_depth += 1;
+        walk::walk_function(self, func, flags);
+        self.function_depth -= 1;
+    }
+
+    fn visit_arrow_function_expression(&mut self, expr: &ArrowFunctionExpression<'ast>) {
+        self.function_depth += 1;
+        walk::walk_arrow_function_expression(self, expr);
+        self.function_depth -= 1;
+    }
+
+    fn visit_unary_expression(&mut self, expr: &UnaryExpression<'ast>) {
+        self.mark_tight(&expr.argument);
+        walk::walk_unary_expression(self, expr);
+    }
+
+    fn visit_await_expression(&mut self, expr: &AwaitExpression<'ast>) {
+        self.mark_tight(&expr.argument);
+        walk::walk_await_expression(self, expr);
+    }
+
+    fn visit_binary_expression(&mut self, expr: &BinaryExpression<'ast>) {
+        self.mark_tight(&expr.left);
+        self.mark_tight(&expr.right);
+        walk::walk_binary_expression(self, expr);
+    }
+
+    fn visit_logical_expression(&mut self, expr: &LogicalExpression<'ast>) {
+        self.mark_tight(&expr.left);
+        self.mark_tight(&expr.right);
+        walk::walk_logical_expression(self, expr);
+    }
+
+    fn visit_conditional_expression(&mut self, expr: &ConditionalExpression<'ast>) {
+        self.mark_tight(&expr.test);
+        walk::walk_conditional_expression(self, expr);
+    }
+
+    fn visit_static_member_expression(&mut self, expr: &StaticMemberExpression<'ast>) {
+        self.mark_tight(&expr.object);
+        walk::walk_static_member_expression(self, expr);
+    }
+
+    fn visit_computed_member_expression(&mut self, expr: &ComputedMemberExpression<'ast>) {
+        self.mark_tight(&expr.object);
+        walk::walk_computed_member_expression(self, expr);
+    }
+
+    fn visit_private_field_expression(&mut self, expr: &PrivateFieldExpression<'ast>) {
+        self.mark_tight(&expr.object);
+        walk::walk_private_field_expression(self, expr);
+    }
+
+    fn visit_call_expression(&mut self, expr: &CallExpression<'ast>) {
+        self.mark_tight(&expr.callee);
+        walk::walk_call_expression(self, expr);
+    }
+
+    fn visit_new_expression(&mut self, expr: &NewExpression<'ast>) {
+        self.mark_tight(&expr.callee);
+        walk::walk_new_expression(self, expr);
+    }
+
+    fn visit_tagged_template_expression(&mut self, expr: &TaggedTemplateExpression<'ast>) {
+        self.mark_tight(&expr.tag);
+        walk::walk_tagged_template_expression(self, expr);
+    }
+
     fn visit_assignment_expression(&mut self, expr: &AssignmentExpression<'ast>) {
         walk::walk_assignment_expression(self, expr);
 
@@ -308,50 +535,44 @@ impl<'a, 'ast> Visit<'ast> for PrivateClassAssignCollector<'a> {
             return;
         };
         let pf_text = &self.source[pf.span.start as usize..pf.span.end as usize];
-        let Some(kind) = self.classify(pf_text) else {
+        let Some(kind) = classify(pf_text, self.state_qualified, self.other_qualified) else {
             return;
         };
         let qualified = pf_text;
 
-        let op_str = match expr.operator {
-            AssignmentOperator::Assign => None,
-            AssignmentOperator::Addition => Some("+"),
-            AssignmentOperator::Subtraction => Some("-"),
-            AssignmentOperator::Multiplication => Some("*"),
-            AssignmentOperator::Division => Some("/"),
-            AssignmentOperator::Remainder => Some("%"),
-            AssignmentOperator::Exponential => Some("**"),
-            _ => return,
-        };
-
+        let compound = compound_of(expr.operator);
         let rhs_span = expr.right.span();
         let rhs_text = &self.source[rhs_span.start as usize..rhs_span.end as usize];
+        let needs_proxy = needs_proxy(kind, compound, &expr.right, self.var_proxy, self.reassigned);
 
-        // Proxy logic mirrors upstream `AssignmentExpression.js` private-state
-        // branch: `needs_proxy = field.type === '$state' &&
-        // is_non_coercive_operator(operator) && should_proxy(value, scope)`.
-        // The only non-coercive operator this pass handles is `=` (compound
-        // arithmetic `+= -= *= …` is coercive, so it never proxies); the
-        // logical compound ops are excluded earlier. `should_proxy` is the
-        // scope-aware check that traces an identifier RHS to its binding's
-        // initializer.
-        let needs_proxy = matches!(kind, Match::State)
-            && op_str.is_none()
-            && should_proxy_with_bindings(&expr.right, self.var_proxy, self.reassigned);
-
-        let rewrite = match op_str {
-            None if needs_proxy => format!("$.set({}, {}, true)", qualified, rhs_text),
-            None => format!("$.set({}, {})", qualified, rhs_text),
-            Some(op) => format!(
-                "$.set({}, $.get({}) {} {})",
-                qualified, qualified, op, rhs_text
-            ),
+        let read = || {
+            field_read_text(
+                qualified,
+                reads_dot_v(qualified, self.v_read_qualified, self.function_depth),
+            )
+        };
+        // A logical compound short-circuits around the whole `$.set`, so the
+        // setter only runs when the operator actually assigns.
+        let value = match compound {
+            None | Some(Compound::Logical(_)) => rhs_text.to_string(),
+            Some(op @ Compound::Binary(_)) => format!("{} {} {}", read(), op.as_str(), rhs_text),
+        };
+        let set = if needs_proxy {
+            format!("$.set({}, {}, true)", qualified, value)
+        } else {
+            format!("$.set({}, {})", qualified, value)
+        };
+        let rewrite = match compound {
+            Some(Compound::Logical(op)) => format!("{} {} {}", read(), op.as_str(), set),
+            _ => set,
         };
 
-        self.replacements
-            .push((expr.span.start, expr.span.end, rewrite));
+        self.replacements.push((expr.span.start, expr.span.end, rewrite));
     }
 
+    /// The helper form is kept for every receiver, not just `this`: upstream
+    /// gates it on a literal `this` and its fallthrough emits the unparseable
+    /// `$.get(inst.#n)++` (`compatibility/deliberate-divergences.md`).
     fn visit_update_expression(&mut self, expr: &UpdateExpression<'ast>) {
         walk::walk_update_expression(self, expr);
 
@@ -359,20 +580,23 @@ impl<'a, 'ast> Visit<'ast> for PrivateClassAssignCollector<'a> {
             return;
         };
         let pf_text = &self.source[pf.span.start as usize..pf.span.end as usize];
-        if self.classify(pf_text).is_none() {
+        if classify(pf_text, self.state_qualified, self.other_qualified).is_none() {
             return;
         }
         let qualified = pf_text;
 
-        let rewrite = match (expr.operator, expr.prefix) {
-            (UpdateOperator::Increment, false) => format!("$.update({})", qualified),
-            (UpdateOperator::Decrement, false) => format!("$.update({}, -1)", qualified),
-            (UpdateOperator::Increment, true) => format!("$.update_pre({})", qualified),
-            (UpdateOperator::Decrement, true) => format!("$.update_pre({}, -1)", qualified),
+        // Deliberate divergence: upstream `UpdateExpression.js` gates this form on
+        // `argument.object.type === 'ThisExpression'` and falls through to a visited
+        // member otherwise, which in a method body yields the unparseable
+        // `$.get(q)++`, so we keep the valid form for every receiver.
+        let (callee, decrement) = update_call(expr.operator, expr.prefix);
+        let rewrite = if decrement {
+            format!("{}({}, -1)", callee, qualified)
+        } else {
+            format!("{}({})", callee, qualified)
         };
 
-        self.replacements
-            .push((expr.span.start, expr.span.end, rewrite));
+        self.replacements.push((expr.span.start, expr.span.end, rewrite));
     }
 }
 
@@ -384,52 +608,64 @@ mod tests {
         names.iter().map(|s| s.to_string()).collect()
     }
 
+    /// A method body: compound operands read through `$.get`, so nothing is
+    /// listed as a `.v` read.
+    fn method_body(
+        source: &str,
+        state_qualified: &[String],
+        other_qualified: &[String],
+    ) -> Option<String> {
+        transform_private_class_assign_ast(source, state_qualified, other_qualified, &[])
+    }
+
+    /// A constructor body whose names are all `$state` / `$state.raw`, so every
+    /// one of them reads through `.v`.
+    fn ctor_body(
+        source: &str,
+        state_qualified: &[String],
+        other_qualified: &[String],
+    ) -> Option<String> {
+        let v_read: Vec<String> =
+            state_qualified.iter().chain(other_qualified.iter()).cloned().collect();
+        transform_private_class_assign_ast(source, state_qualified, other_qualified, &v_read)
+    }
+
+    /// A constructor body holding a `$derived` field: upstream still reads it
+    /// through `$.get`, so it is absent from `v_read_qualified`.
+    fn ctor_body_derived(source: &str, derived_qualified: &[String]) -> Option<String> {
+        transform_private_class_assign_ast(source, &[], derived_qualified, &[])
+    }
+
     #[test]
     fn state_assign_with_proxy_object_literal() {
         // `{ x: 1 }` needs proxy.
-        let out = transform_private_class_assign_ast(
-            "this.#data = { x: 1 };",
-            &ssv(&["this.#data"]),
-            &[],
-        )
-        .unwrap();
+        let out = method_body("this.#data = { x: 1 };", &ssv(&["this.#data"]), &[]).unwrap();
         assert_eq!(out, "$.set(this.#data, { x: 1 }, true);");
     }
 
     #[test]
     fn state_assign_without_proxy_primitive() {
         // `5` is primitive — no proxy needed.
-        let out =
-            transform_private_class_assign_ast("this.#count = 5;", &ssv(&["this.#count"]), &[])
-                .unwrap();
+        let out = method_body("this.#count = 5;", &ssv(&["this.#count"]), &[]).unwrap();
         assert_eq!(out, "$.set(this.#count, 5);");
     }
 
     #[test]
     fn state_assign_with_proxy_array_literal() {
-        let out = transform_private_class_assign_ast(
-            "this.#list = [1, 2, 3];",
-            &ssv(&["this.#list"]),
-            &[],
-        )
-        .unwrap();
+        let out = method_body("this.#list = [1, 2, 3];", &ssv(&["this.#list"]), &[]).unwrap();
         assert_eq!(out, "$.set(this.#list, [1, 2, 3], true);");
     }
 
     #[test]
     fn state_assign_with_proxy_new_expression() {
-        let out =
-            transform_private_class_assign_ast("this.#obj = new Foo();", &ssv(&["this.#obj"]), &[])
-                .unwrap();
+        let out = method_body("this.#obj = new Foo();", &ssv(&["this.#obj"]), &[]).unwrap();
         assert_eq!(out, "$.set(this.#obj, new Foo(), true);");
     }
 
     #[test]
     fn derived_assign_no_proxy_even_with_object() {
         // $derived doesn't get proxy logic.
-        let out =
-            transform_private_class_assign_ast("this.#d = { x: 1 };", &[], &ssv(&["this.#d"]))
-                .unwrap();
+        let out = method_body("this.#d = { x: 1 };", &[], &ssv(&["this.#d"])).unwrap();
         assert_eq!(out, "$.set(this.#d, { x: 1 });");
     }
 
@@ -438,12 +674,7 @@ mod tests {
         // Compound arithmetic (`+=`) is a coercive operator, so upstream's
         // `is_non_coercive_operator(operator)` gate makes `needs_proxy` false
         // regardless of the RHS shape — no `, true` even for an object literal.
-        let out = transform_private_class_assign_ast(
-            "this.#data += { x: 1 };",
-            &ssv(&["this.#data"]),
-            &[],
-        )
-        .unwrap();
+        let out = method_body("this.#data += { x: 1 };", &ssv(&["this.#data"]), &[]).unwrap();
         assert_eq!(out, "$.set(this.#data, $.get(this.#data) + { x: 1 });");
     }
 
@@ -451,110 +682,84 @@ mod tests {
     fn state_assign_identifier_traces_to_nonproxyable_initial() {
         // `fps` is bound to a BinaryExpression initializer, which is not
         // proxyable, so the assignment to a `$state` field must not proxy.
-        let out = transform_private_class_assign_ast(
-            "const fps = 1000 / delta;\nthis.#fps = fps;",
-            &ssv(&["this.#fps"]),
-            &[],
-        )
-        .unwrap();
-        assert_eq!(out, "const fps = 1000 / delta;\n$.set(this.#fps, fps);");
+        let out =
+            method_body("const fps = 1000 / delta;\nthis.#fps = fps;", &ssv(&["this.#fps"]), &[])
+                .unwrap();
+        assert_eq!(out, "const fps = 1000 / delta;\n\n$.set(this.#fps, fps);");
     }
 
     #[test]
     fn compound_state_without_proxy_primitive() {
-        let out =
-            transform_private_class_assign_ast("this.#count += 3;", &ssv(&["this.#count"]), &[])
-                .unwrap();
+        let out = method_body("this.#count += 3;", &ssv(&["this.#count"]), &[]).unwrap();
         assert_eq!(out, "$.set(this.#count, $.get(this.#count) + 3);");
     }
 
     #[test]
     fn post_increment_state() {
-        let out = transform_private_class_assign_ast("this.#count++;", &ssv(&["this.#count"]), &[])
-            .unwrap();
+        let out = method_body("this.#count++;", &ssv(&["this.#count"]), &[]).unwrap();
         assert_eq!(out, "$.update(this.#count);");
     }
 
     #[test]
     fn post_decrement_state() {
-        let out = transform_private_class_assign_ast("this.#count--;", &ssv(&["this.#count"]), &[])
-            .unwrap();
+        let out = method_body("this.#count--;", &ssv(&["this.#count"]), &[]).unwrap();
         assert_eq!(out, "$.update(this.#count, -1);");
     }
 
     #[test]
     fn pre_increment_state() {
-        let out = transform_private_class_assign_ast("++this.#count;", &ssv(&["this.#count"]), &[])
-            .unwrap();
+        let out = method_body("++this.#count;", &ssv(&["this.#count"]), &[]).unwrap();
         assert_eq!(out, "$.update_pre(this.#count);");
     }
 
     #[test]
     fn pre_decrement_state() {
-        let out = transform_private_class_assign_ast("--this.#count;", &ssv(&["this.#count"]), &[])
-            .unwrap();
+        let out = method_body("--this.#count;", &ssv(&["this.#count"]), &[]).unwrap();
         assert_eq!(out, "$.update_pre(this.#count, -1);");
     }
 
     #[test]
     fn instance_prefix_state() {
-        let out = transform_private_class_assign_ast(
-            "instance.#count = 5;",
-            &ssv(&["instance.#count"]),
-            &[],
-        )
-        .unwrap();
+        let out = method_body("instance.#count = 5;", &ssv(&["instance.#count"]), &[]).unwrap();
         assert_eq!(out, "$.set(instance.#count, 5);");
     }
 
     #[test]
     fn unknown_field_left_alone() {
-        assert!(
-            transform_private_class_assign_ast("this.#other = 5;", &ssv(&["this.#count"]), &[])
-                .is_none()
-        );
+        assert!(method_body("this.#other = 5;", &ssv(&["this.#count"]), &[]).is_none());
     }
 
     #[test]
     fn does_not_rewrite_inside_string_literal() {
         let src = r#"let s = "this.#count = 5";"#;
-        assert!(transform_private_class_assign_ast(src, &ssv(&["this.#count"]), &[]).is_none());
+        assert!(method_body(src, &ssv(&["this.#count"]), &[]).is_none());
     }
 
     #[test]
     fn rewrites_inside_template_expression() {
         let src = "let s = `${this.#count = 5}`;";
-        let out = transform_private_class_assign_ast(src, &ssv(&["this.#count"]), &[]).unwrap();
+        let out = method_body(src, &ssv(&["this.#count"]), &[]).unwrap();
         assert_eq!(out, "let s = `${$.set(this.#count, 5)}`;");
     }
 
     #[test]
     fn multiple_fields_in_one_source() {
-        let out = transform_private_class_assign_ast(
-            "this.#a = 1; this.#b++;",
-            &ssv(&["this.#a"]),
-            &ssv(&["this.#b"]),
-        )
-        .unwrap();
-        assert_eq!(out, "$.set(this.#a, 1); $.update(this.#b);");
+        let out =
+            method_body("this.#a = 1; this.#b++;", &ssv(&["this.#a"]), &ssv(&["this.#b"])).unwrap();
+        assert_eq!(out, "$.set(this.#a, 1);\n$.update(this.#b);");
     }
 
     #[test]
     fn already_wrapped_no_op() {
         // After wrap, the AssignmentExpression is gone.
         let src = "$.set(this.#count, 5);";
-        assert!(transform_private_class_assign_ast(src, &ssv(&["this.#count"]), &[]).is_none());
+        assert!(method_body(src, &ssv(&["this.#count"]), &[]).is_none());
     }
 
     #[test]
     fn arrow_function_rhs_no_proxy() {
         // Arrow function isn't proxy-needing.
-        let out = transform_private_class_assign_ast(
-            "this.#cb = (x) => x + 1;",
-            &ssv(&["this.#cb"]),
-            &[],
-        )
-        .unwrap();
+        let out = method_body("this.#cb = (x) => x + 1;", &ssv(&["this.#cb"]), &[]).unwrap();
         assert_eq!(out, "$.set(this.#cb, (x) => x + 1);");
     }
 
@@ -562,46 +767,112 @@ mod tests {
     fn member_chain_lhs_left_alone() {
         // `this.#count.foo = 5` — LHS is StaticMember, not bare
         // PrivateField. Different code path.
-        assert!(
-            transform_private_class_assign_ast("this.#count.foo = 5;", &ssv(&["this.#count"]), &[])
-                .is_none()
-        );
+        assert!(method_body("this.#count.foo = 5;", &ssv(&["this.#count"]), &[]).is_none());
     }
 
     #[test]
     fn empty_qualified_no_op() {
-        assert!(transform_private_class_assign_ast("this.#count = 5;", &[], &[]).is_none());
+        assert!(method_body("this.#count = 5;", &[], &[]).is_none());
     }
 
     #[test]
     fn parse_error_returns_none() {
-        assert!(
-            transform_private_class_assign_ast("this.#count = (", &ssv(&["this.#count"]), &[])
-                .is_none()
-        );
+        assert!(method_body("this.#count = (", &ssv(&["this.#count"]), &[]).is_none());
     }
 
     #[test]
     fn no_op_without_qualified_in_source() {
-        assert!(
-            transform_private_class_assign_ast("let x = 1;", &ssv(&["this.#count"]), &[]).is_none()
-        );
+        assert!(method_body("let x = 1;", &ssv(&["this.#count"]), &[]).is_none());
     }
 
     #[test]
-    fn unsupported_compound_left_alone() {
-        // ??=, &&=, ||= not in text version's allowlist
-        assert!(
-            transform_private_class_assign_ast("this.#count ??= 5;", &ssv(&["this.#count"]), &[])
-                .is_none()
-        );
+    fn nullish_assign_state_proxies() {
+        // The setter is only reached on the assigning branch; `run()` is proxyable,
+        // so the `$state` field gets `, true`. Regression test for issue #1438
+        // (`??=` was previously left un-rewritten, producing the invalid
+        // `$.get(this.#promise) ??= run()`).
+        let out = method_body("this.#promise ??= run();", &ssv(&["this.#promise"]), &[]).unwrap();
+        assert_eq!(out, "$.get(this.#promise) ?? $.set(this.#promise, run(), true);");
+    }
+
+    #[test]
+    fn logical_or_assign_state_proxies() {
+        let out = method_body("this.#x ||= y;", &ssv(&["this.#x"]), &[]).unwrap();
+        assert_eq!(out, "$.get(this.#x) || $.set(this.#x, y, true);");
+    }
+
+    #[test]
+    fn logical_and_assign_state_proxies() {
+        let out = method_body("this.#x &&= y;", &ssv(&["this.#x"]), &[]).unwrap();
+        assert_eq!(out, "$.get(this.#x) && $.set(this.#x, y, true);");
+    }
+
+    #[test]
+    fn logical_assign_other_no_proxy() {
+        // `$derived`/etc. (other_qualified) never proxy — no `, true`.
+        let out = method_body("this.#d ??= y;", &[], &ssv(&["this.#d"])).unwrap();
+        assert_eq!(out, "$.get(this.#d) ?? $.set(this.#d, y);");
+    }
+
+    #[test]
+    fn bitwise_compound_state_no_proxy() {
+        // Bitwise compound (`&=`) is coercive → no proxy, binary expansion.
+        let out = method_body("this.#count &= 3;", &ssv(&["this.#count"]), &[]).unwrap();
+        assert_eq!(out, "$.set(this.#count, $.get(this.#count) & 3);");
+    }
+
+    #[test]
+    fn shift_compound_state_no_proxy() {
+        let out = method_body("this.#count <<= 2;", &ssv(&["this.#count"]), &[]).unwrap();
+        assert_eq!(out, "$.set(this.#count, $.get(this.#count) << 2);");
+    }
+
+    #[test]
+    fn constructor_compound_reads_dot_v() {
+        let out = ctor_body("this.#count += 3;", &ssv(&["this.#count"]), &[]).unwrap();
+        assert_eq!(out, "$.set(this.#count, this.#count.v + 3);");
+    }
+
+    #[test]
+    fn constructor_derived_still_reads_through_get() {
+        // `.v` is for `$state` / `$state.raw` only — a `$derived` field keeps
+        // `$.get` even at constructor depth.
+        let out = ctor_body_derived("this.#d ??= s;", &ssv(&["this.#d"])).unwrap();
+        assert_eq!(out, "$.get(this.#d) ?? $.set(this.#d, s);");
+    }
+
+    #[test]
+    fn a_non_this_receiver_takes_the_same_path() {
+        // Upstream keys off `PrivateIdentifier`, not the receiver.
+        let out = ctor_body("inst.#count += 3;", &ssv(&["inst.#count"]), &[]).unwrap();
+        assert_eq!(out, "$.set(inst.#count, inst.#count.v + 3);");
+    }
+
+    #[test]
+    fn constructor_logical_reads_dot_v() {
+        let out = ctor_body("this.#promise ??= run();", &ssv(&["this.#promise"]), &[]).unwrap();
+        assert_eq!(out, "this.#promise.v ?? $.set(this.#promise, run(), true);");
+    }
+
+    #[test]
+    fn constructor_nested_function_reads_through_get() {
+        let out =
+            ctor_body("run(() => { this.#count += 3; });", &ssv(&["this.#count"]), &[]).unwrap();
+        assert_eq!(out, "run(() => {\n\t$.set(this.#count, $.get(this.#count) + 3);\n});");
+    }
+
+    #[test]
+    fn constructor_plain_assign_is_unaffected() {
+        // `=` never reads the field, so the constructor form matches the method one.
+        let out = ctor_body("this.#count = 5;", &ssv(&["this.#count"]), &[]).unwrap();
+        assert_eq!(out, "$.set(this.#count, 5);");
     }
 
     #[test]
     fn return_at_top_level_works() {
         // Class method bodies often have bare return
         let src = "return this.#count = 5;";
-        let out = transform_private_class_assign_ast(src, &ssv(&["this.#count"]), &[]).unwrap();
+        let out = method_body(src, &ssv(&["this.#count"]), &[]).unwrap();
         assert_eq!(out, "return $.set(this.#count, 5);");
     }
 
@@ -611,18 +882,13 @@ mod tests {
         // The source is NOT valid as a standalone module (it's a method definition),
         // so Fix #2 (class wrapper) must kick in.
         let src = "remove(item) {\n  this.#files = this.#files.filter((f) => {\n    if (f === item) return false;\n    return true;\n  });\n}";
-        let out = transform_private_class_assign_ast(src, &ssv(&["this.#files"]), &[]).unwrap();
+        let out = method_body(src, &ssv(&["this.#files"]), &[]).unwrap();
+        // Asserted on the whitespace-free form: the shape is what matters here,
+        // and the printer is free to break the call across lines.
+        let flat: String = out.chars().filter(|c| !c.is_whitespace()).collect();
         // The assignment should be rewritten; no stray ) should appear
-        assert!(
-            out.contains("$.set(this.#files,"),
-            "expected $.set rewrite, got: {}",
-            out
-        );
-        assert!(
-            !out.contains("return false);"),
-            "stray ) detected in: {}",
-            out
-        );
+        assert!(flat.contains("$.set(this.#files,"), "expected $.set rewrite, got: {}", out);
+        assert!(!out.contains("return false);"), "stray ) detected in: {}", out);
     }
 
     #[test]
@@ -641,16 +907,314 @@ mod tests {
             "}\n",
             "add(item) {\n  this.#files = this.#files.concat(item);\n}\n",
         );
-        let out = transform_private_class_assign_ast(src, &ssv(&["this.#files"]), &[]).unwrap();
-        assert!(
-            out.contains("$.set(this.#files,"),
-            "expected $.set rewrite, got:\n{}",
-            out
+        let out = method_body(src, &ssv(&["this.#files"]), &[]).unwrap();
+        assert!(out.contains("$.set(this.#files,"), "expected $.set rewrite, got:\n{}", out);
+        assert!(!out.contains("return false);"), "stray ) detected in:\n{}", out);
+    }
+}
+
+// ── in-place port ──────────────────────────────────────────────────────
+
+thread_local! {
+    static MODULE_PRIVATE_CLASS_ASSIGN_IN_PLACE_ALLOC: RefCell<Allocator> =
+        RefCell::new(Allocator::default());
+}
+
+/// In-place equivalent of [`transform_private_class_assign_ast`]. Class method
+/// bodies reach this pass without their enclosing `class`, so the driver parses
+/// them inside a synthetic one and strips it back off what it prints.
+pub(crate) fn transform_private_class_assign_in_place(
+    source: &str,
+    state_qualified: &[String],
+    other_qualified: &[String],
+    v_read_qualified: &[String],
+) -> ast_rewrite::Rewrite {
+    if !target_present(source, state_qualified, other_qualified) {
+        return ast_rewrite::Rewrite::Unchanged;
+    }
+
+    ast_rewrite::with_class_fragment_program_mut(
+        &MODULE_PRIVATE_CLASS_ASSIGN_IN_PLACE_ALLOC,
+        source,
+        ParseOptions { allow_return_outside_function: true, ..ParseOptions::default() },
+        |allocator, program, parse_str| {
+            let mut binding_info = BindingInfoCollector::default();
+            binding_info.visit_program(program);
+
+            let mut rewriter = PrivateClassAssignRewriter {
+                b: crate::compiler::phases::phase3_transform::builders::B::new(allocator),
+                alloc: allocator,
+                source: parse_str,
+                state_qualified,
+                other_qualified,
+                v_read_qualified,
+                function_depth: 0,
+                var_proxy: binding_info.var_proxy,
+                reassigned: binding_info.reassigned,
+                changed: false,
+            };
+            oxc_ast_visit::VisitMut::visit_program(&mut rewriter, program);
+            rewriter.changed
+        },
+    )
+}
+
+struct PrivateClassAssignRewriter<'a, 'b> {
+    b: crate::compiler::phases::phase3_transform::builders::B<'a>,
+    alloc: &'a Allocator,
+    source: &'b str,
+    state_qualified: &'b [String],
+    other_qualified: &'b [String],
+    v_read_qualified: &'b [String],
+    function_depth: u32,
+    var_proxy: HashMap<String, bool>,
+    reassigned: HashSet<String>,
+    changed: bool,
+}
+
+impl<'a, 'b> PrivateClassAssignRewriter<'a, 'b> {
+    fn rewrite_assignment(&mut self, expr: &mut Expression<'a>) {
+        let Expression::AssignmentExpression(assign) = &*expr else {
+            return;
+        };
+        let AssignmentTarget::PrivateFieldExpression(pf) = &assign.left else {
+            return;
+        };
+        let pf_text = &self.source[pf.span.start as usize..pf.span.end as usize];
+        let Some(kind) = classify(pf_text, self.state_qualified, self.other_qualified) else {
+            return;
+        };
+        let dot_v = reads_dot_v(pf_text, self.v_read_qualified, self.function_depth);
+        let compound = compound_of(assign.operator);
+        let needs_proxy =
+            needs_proxy(kind, compound, &assign.right, &self.var_proxy, &self.reassigned);
+
+        let taken = std::mem::replace(expr, self.b.void0());
+        let Expression::AssignmentExpression(assign) = taken else { unreachable!("checked above") };
+        let assign = assign.unbox();
+        let AssignmentTarget::PrivateFieldExpression(pf) = assign.left else {
+            unreachable!("checked above")
+        };
+
+        // A logical compound short-circuits around the whole `$.set`, so the
+        // setter only runs when the operator actually assigns.
+        let logical = match compound {
+            Some(Compound::Logical(op)) => Some((op, self.field_read(&pf, dot_v))),
+            _ => None,
+        };
+        let value = match compound {
+            None | Some(Compound::Logical(_)) => assign.right,
+            Some(Compound::Binary(op)) => {
+                self.b.binary(op, self.field_read(&pf, dot_v), assign.right)
+            }
+        };
+
+        let mut args = vec![Expression::PrivateFieldExpression(pf), value];
+        if needs_proxy {
+            args.push(self.b.bool(true));
+        }
+        let call = self.b.call("$.set", args);
+        *expr = match logical {
+            Some((op, read)) => self.b.logical(op, read, call),
+            None => call,
+        };
+        self.changed = true;
+    }
+
+    /// Same deliberate divergence as the spliced collector's
+    /// `visit_update_expression` (`compatibility/deliberate-divergences.md`).
+    fn rewrite_update(&mut self, expr: &mut Expression<'a>) {
+        let Expression::UpdateExpression(update) = &*expr else {
+            return;
+        };
+        let SimpleAssignmentTarget::PrivateFieldExpression(pf) = &update.argument else {
+            return;
+        };
+        let pf_text = &self.source[pf.span.start as usize..pf.span.end as usize];
+        if classify(pf_text, self.state_qualified, self.other_qualified).is_none() {
+            return;
+        }
+        // Deliberate divergence: upstream `UpdateExpression.js` gates this form on
+        // `argument.object.type === 'ThisExpression'` and falls through to a visited
+        // member otherwise, which in a method body yields the unparseable
+        // `$.get(q)++`, so we keep the valid form for every receiver.
+        let (callee, decrement) = update_call(update.operator, update.prefix);
+
+        let taken = std::mem::replace(expr, self.b.void0());
+        let Expression::UpdateExpression(update) = taken else { unreachable!("checked above") };
+        let SimpleAssignmentTarget::PrivateFieldExpression(pf) = update.unbox().argument else {
+            unreachable!("checked above")
+        };
+
+        let mut args = vec![Expression::PrivateFieldExpression(pf)];
+        if decrement {
+            args.push(self.b.unary(UnaryOperator::UnaryNegation, self.b.number(1.0)));
+        }
+        *expr = self.b.call(callee, args);
+        self.changed = true;
+    }
+
+    fn field_read(
+        &self,
+        pf: &oxc_allocator::Box<'a, PrivateFieldExpression<'a>>,
+        dot_v: bool,
+    ) -> Expression<'a> {
+        let field = Expression::PrivateFieldExpression(pf.clone_in(self.alloc));
+        if dot_v { self.b.member(field, "v") } else { self.b.call("$.get", vec![field]) }
+    }
+}
+
+impl<'a, 'b> oxc_ast_visit::VisitMut<'a> for PrivateClassAssignRewriter<'a, 'b> {
+    fn visit_function(&mut self, func: &mut Function<'a>, flags: oxc_syntax::scope::ScopeFlags) {
+        self.function_depth += 1;
+        oxc_ast_visit::walk_mut::walk_function(self, func, flags);
+        self.function_depth -= 1;
+    }
+
+    fn visit_arrow_function_expression(&mut self, expr: &mut ArrowFunctionExpression<'a>) {
+        self.function_depth += 1;
+        oxc_ast_visit::walk_mut::walk_arrow_function_expression(self, expr);
+        self.function_depth -= 1;
+    }
+
+    fn visit_expression(&mut self, expr: &mut Expression<'a>) {
+        oxc_ast_visit::walk_mut::walk_expression(self, expr);
+
+        match &*expr {
+            Expression::AssignmentExpression(_) => self.rewrite_assignment(expr),
+            Expression::UpdateExpression(_) => self.rewrite_update(expr),
+            _ => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod in_place_tests {
+    use super::*;
+
+    fn ssv(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn method_body(
+        source: &str,
+        state_qualified: &[String],
+        other_qualified: &[String],
+    ) -> Option<String> {
+        transform_private_class_assign_ast(source, state_qualified, other_qualified, &[])
+    }
+
+    fn method_body_in_place(
+        source: &str,
+        state_qualified: &[String],
+        other_qualified: &[String],
+    ) -> Option<String> {
+        transform_private_class_assign_in_place(source, state_qualified, other_qualified, &[])
+            .into_option()
+    }
+
+    fn ctor_body_in_place(
+        source: &str,
+        state_qualified: &[String],
+        other_qualified: &[String],
+    ) -> Option<String> {
+        let v_read: Vec<String> =
+            state_qualified.iter().chain(other_qualified.iter()).cloned().collect();
+        transform_private_class_assign_in_place(source, state_qualified, other_qualified, &v_read)
+            .into_option()
+    }
+
+    #[test]
+    fn rewrites_a_bare_class_method_body() {
+        // A method definition is not a module, so this only reaches the rewriter
+        // through the synthetic-`class` wrapper — and must come back without it.
+        let src = "remove(item) {\n  this.#files = this.#files.filter((f) => f !== item);\n}";
+        let out = method_body_in_place(src, &ssv(&["this.#files"]), &[]).unwrap();
+        assert!(out.contains("$.set(this.#files,"), "expected $.set rewrite, got: {out}");
+        assert!(!out.contains("_Dummy_"), "wrapper leaked into: {out}");
+        assert!(out.starts_with("remove(item)"), "wrapper indent leaked into: {out}");
+    }
+
+    #[test]
+    fn constructor_compound_reads_dot_v_in_place() {
+        let out = ctor_body_in_place("this.#count += 3;", &ssv(&["this.#count"]), &[]).unwrap();
+        assert_eq!(out.trim(), "$.set(this.#count, this.#count.v + 3);");
+    }
+
+    #[test]
+    fn agrees_with_the_spliced_path_on_a_class_method_body() {
+        let src = concat!(
+            "get files() {\n  return this.#files;\n}\n",
+            "add(item) {\n  this.#files = this.#files.concat(item);\n}\n",
         );
-        assert!(
-            !out.contains("return false);"),
-            "stray ) detected in:\n{}",
-            out
+        let state = ssv(&["this.#files"]);
+        let spliced = method_body(src, &state, &[]).unwrap();
+        let in_place = method_body_in_place(src, &state, &[]).unwrap();
+        // Reprinting is not byte-preserving — the in-place path re-emits the whole
+        // fragment — so the two paths are compared the way the dual-run gate
+        // compares them: through the printer.
+        assert_eq!(
+            ast_rewrite::dual_run::normalize(&in_place),
+            ast_rewrite::dual_run::normalize(&spliced),
         );
+        assert_ne!(in_place, src, "the in-place path must have rewritten");
+    }
+}
+
+#[cfg(test)]
+mod shared_decision_tests {
+    use super::*;
+
+    fn ssv(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// `(source, $state qualifieds, other qualifieds, expected rewrite)`.
+    ///
+    /// One row per decision the two implementations used to state separately:
+    /// changing an operator's spelling, its binary-versus-logical class, the
+    /// proxy flag or an update's callee / step argument moves at least one
+    /// expected string here. The rows are single statements so both paths —
+    /// one splicing bytes, one reprinting the program — land on the same text.
+    const DECISIONS: &[(&str, &[&str], &[&str], &str)] = &[
+        ("this.#a = { x: 1 };", &["this.#a"], &[], "$.set(this.#a, { x: 1 }, true);"),
+        ("this.#a = 5;", &["this.#a"], &[], "$.set(this.#a, 5);"),
+        ("this.#d = { x: 1 };", &[], &["this.#d"], "$.set(this.#d, { x: 1 });"),
+        ("this.#a += 3;", &["this.#a"], &[], "$.set(this.#a, $.get(this.#a) + 3);"),
+        ("this.#a += { x: 1 };", &["this.#a"], &[], "$.set(this.#a, $.get(this.#a) + { x: 1 });"),
+        ("this.#a >>>= 2;", &["this.#a"], &[], "$.set(this.#a, $.get(this.#a) >>> 2);"),
+        ("this.#a **= 2;", &["this.#a"], &[], "$.set(this.#a, $.get(this.#a) ** 2);"),
+        ("this.#a ??= run();", &["this.#a"], &[], "$.get(this.#a) ?? $.set(this.#a, run(), true);"),
+        ("this.#a ||= y;", &["this.#a"], &[], "$.get(this.#a) || $.set(this.#a, y, true);"),
+        ("this.#d &&= y;", &[], &["this.#d"], "$.get(this.#d) && $.set(this.#d, y);"),
+        ("this.#a++;", &["this.#a"], &[], "$.update(this.#a);"),
+        ("this.#a--;", &["this.#a"], &[], "$.update(this.#a, -1);"),
+        ("++this.#a;", &["this.#a"], &[], "$.update_pre(this.#a);"),
+        ("--this.#a;", &["this.#a"], &[], "$.update_pre(this.#a, -1);"),
+    ];
+
+    /// The text path, which `resolve` returns under `RSVELTE_AST_SPLICE` and
+    /// falls back to when the in-place path cannot parse a fragment. Reached
+    /// only by calling it directly: which path answers is a process-wide
+    /// setting read once, so the public entry point cannot exercise both.
+    #[test]
+    fn spliced_path_lowers_every_decision() {
+        for (source, state, other, expected) in DECISIONS {
+            let out = transform_private_class_assign_spliced(source, &ssv(state), &ssv(other), &[])
+                .unwrap_or_else(|| panic!("spliced path did not rewrite `{source}`"));
+            assert_eq!(&out, expected, "spliced path, source `{source}`");
+        }
+    }
+
+    /// The in-place path, which `resolve` returns by default.
+    #[test]
+    fn in_place_path_lowers_every_decision() {
+        for (source, state, other, expected) in DECISIONS {
+            let out =
+                transform_private_class_assign_in_place(source, &ssv(state), &ssv(other), &[])
+                    .into_option()
+                    .unwrap_or_else(|| panic!("in-place path did not rewrite `{source}`"));
+            assert_eq!(&out, expected, "in-place path, source `{source}`");
+        }
     }
 }

@@ -3,11 +3,8 @@
 //! Replaces the text-based `transform_state_in_expr` and `transform_state_assignments`
 //! with a single OXC parse + AST walk, eliminating O(M*N) text scanning.
 //!
-//! The main entry point is [`transform_state_vars_ast`], which:
-//! 1. Parses the script text once with OXC (using a thread-local allocator)
-//! 2. Walks the AST to find ALL identifier references and assignments to state variables
-//! 3. Collects replacements as (byte_start, byte_end, replacement_string)
-//! 4. Applies all replacements in a single pass (right-to-left to preserve offsets)
+//! The entry points parse script text or accept a retained OXC program, then walk the AST,
+//! collect replacements, and apply them right-to-left to preserve offsets.
 
 use std::cell::RefCell;
 use std::fmt::Write as _;
@@ -19,12 +16,19 @@ use oxc_ast_visit::walk;
 use oxc_parser::Parser;
 use oxc_span::GetSpan;
 use oxc_span::SourceType;
+use oxc_span::Span;
 use oxc_syntax::operator::{AssignmentOperator, BinaryOperator, UpdateOperator};
 use oxc_syntax::scope::ScopeFlags;
 use oxc_syntax::scope::ScopeId;
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 
-use super::destructure_transforms::unthunk_string;
+use super::async_derived_dev::{
+    AsyncDerivedLocations, destructured_label, dev_args, first_bound_name,
+};
+use super::destructure_transforms::{
+    ArrayHelperRead, build_fallback_string, extract_destructure_paths, js_number_to_string,
+    unthunk_string,
+};
 use super::expression_utils::{
     contains_direct_await_in_expression, extract_enclosing_function_name, extract_trace_call_label,
     find_trace_source_location, strip_top_level_await_from_expr,
@@ -34,6 +38,10 @@ use super::props_transforms::transform_props_destructuring;
 use super::rune_transforms::{process_derived_destructuring_pattern, wrap_state_value};
 use super::{DERIVED_TMP_COUNTER, SCRIPT_ARRAY_COUNTER, STATE_TMP_COUNTER, VAR_STATE_VARS};
 use crate::compiler::phases::phase2_analyze::ComponentAnalysis;
+use crate::compiler::phases::phase2_analyze::types::ScriptProjection;
+use crate::compiler::phases::phase3_transform::js_ast::to_oxc::SINGLE_TARGET_DESTRUCTURE_SEQUENCE_MARKER;
+use crate::compiler::phases::phase3_transform::shared::js_scan::find_code_from;
+use crate::compiler::phases::phase3_transform::shared::template::escape_js_string;
 
 thread_local! {
     static AST_TRANSFORM_ALLOCATOR: RefCell<Allocator> = RefCell::new(Allocator::default());
@@ -67,6 +75,39 @@ fn collect_binding_identifier_names(pattern: &BindingPattern<'_>, out: &mut Vec<
     }
 }
 
+/// Label the leaf declarators of a destructured `$derived` with their own
+/// binding names. The `$$array` temps are already labelled by pattern kind at
+/// their emit site, and the `$$d` source temp upstream leaves bare, so both are
+/// skipped here.
+fn tag_derived_leaves(declarations: &mut [String], dev: bool) {
+    if !dev {
+        return;
+    }
+    for decl in declarations.iter_mut() {
+        let Some((name, init)) = decl.split_once(" = ") else {
+            continue;
+        };
+        if name.starts_with("$$array") || name.starts_with("$$d") || !init.starts_with("$.derived(")
+        {
+            continue;
+        }
+        *decl = format!("{} = $.tag({}, '{}')", name, init, name);
+    }
+}
+
+/// The `$$array` label for a destructured `$derived`. Upstream reads the kind
+/// off the *top-level* declarator, so `let { a: [x] } = $derived(o)` says
+/// "object" even for the inner array (`VariableDeclaration.js:176-186`).
+fn derived_insert_label(dev: bool, pattern_text: &str) -> Option<&'static str> {
+    dev.then(|| {
+        if pattern_text.trim_start().starts_with('[') {
+            "[$derived iterable]"
+        } else {
+            "[$derived object]"
+        }
+    })
+}
+
 /// AST-based should_proxy check, mirroring the official Svelte compiler's `should_proxy()`.
 /// Returns `false` for expression types that are known to produce non-proxyable values:
 ///  - Literal, TemplateLiteral, ArrowFunctionExpression, FunctionExpression
@@ -76,7 +117,11 @@ fn collect_binding_identifier_names(pattern: &BindingPattern<'_>, out: &mut Vec<
 /// For Identifier nodes, looks up the non_proxy_vars list (which contains variables
 /// with known non-proxyable initial values).
 /// For all other expression types (CallExpression, MemberExpression, etc.), returns `true`.
-fn should_proxy_ast(expr: &Expression<'_>, non_proxy_vars: &[String]) -> bool {
+///
+/// `dev` reflects whether the caller decides on the *visited* expression, as
+/// `create_state_declarator` does — by then the dev equality rewrite has turned
+/// an `a === b` initializer into a `$.strict_equals(...)` call.
+fn should_proxy_ast(expr: &Expression<'_>, non_proxy_vars: &[String], dev: bool) -> bool {
     match expr {
         Expression::BooleanLiteral(_)
         | Expression::NullLiteral(_)
@@ -88,13 +133,26 @@ fn should_proxy_ast(expr: &Expression<'_>, non_proxy_vars: &[String]) -> bool {
         Expression::ArrowFunctionExpression(_) => false,
         Expression::FunctionExpression(_) => false,
         Expression::UnaryExpression(_) => false,
-        Expression::BinaryExpression(_) => false,
+        Expression::BinaryExpression(binary) => {
+            use oxc_syntax::operator::BinaryOperator;
+            dev && matches!(
+                binary.operator,
+                BinaryOperator::StrictEquality
+                    | BinaryOperator::StrictInequality
+                    | BinaryOperator::Equality
+                    | BinaryOperator::Inequality
+            )
+        }
         // TypeScript casts: unwrap and recurse on the inner expression.
-        Expression::TSAsExpression(e) => should_proxy_ast(&e.expression, non_proxy_vars),
-        Expression::TSSatisfiesExpression(e) => should_proxy_ast(&e.expression, non_proxy_vars),
-        Expression::TSNonNullExpression(e) => should_proxy_ast(&e.expression, non_proxy_vars),
-        Expression::TSTypeAssertion(e) => should_proxy_ast(&e.expression, non_proxy_vars),
-        Expression::TSInstantiationExpression(e) => should_proxy_ast(&e.expression, non_proxy_vars),
+        Expression::TSAsExpression(e) => should_proxy_ast(&e.expression, non_proxy_vars, dev),
+        Expression::TSSatisfiesExpression(e) => {
+            should_proxy_ast(&e.expression, non_proxy_vars, dev)
+        }
+        Expression::TSNonNullExpression(e) => should_proxy_ast(&e.expression, non_proxy_vars, dev),
+        Expression::TSTypeAssertion(e) => should_proxy_ast(&e.expression, non_proxy_vars, dev),
+        Expression::TSInstantiationExpression(e) => {
+            should_proxy_ast(&e.expression, non_proxy_vars, dev)
+        }
         Expression::Identifier(ident) => {
             if ident.name == "undefined" {
                 return false;
@@ -107,7 +165,7 @@ fn should_proxy_ast(expr: &Expression<'_>, non_proxy_vars: &[String]) -> bool {
         }
         // ParenthesizedExpression: check inner expression
         Expression::ParenthesizedExpression(paren) => {
-            should_proxy_ast(&paren.expression, non_proxy_vars)
+            should_proxy_ast(&paren.expression, non_proxy_vars, dev)
         }
         // SequenceExpression (comma): upstream `should_proxy` does NOT whitelist
         // SequenceExpression, so it falls through to `return true` — a comma
@@ -119,20 +177,49 @@ fn should_proxy_ast(expr: &Expression<'_>, non_proxy_vars: &[String]) -> bool {
     }
 }
 
+/// A declarator initializer with its redundant parentheses peeled off, paired
+/// with the span a rewrite of it must cover.
+///
+/// Upstream parses with acorn, which builds no `ParenthesizedExpression` at
+/// all, so `let v = ($state(1))` reaches `get_rune` as the bare call and the
+/// parens never survive into the output. Matching only the bare
+/// `CallExpression` here left the rune unlowered instead (#3248).
+fn init_without_parens<'x, 'ast>(init: &'x Expression<'ast>) -> (&'x Expression<'ast>, Span) {
+    (init.without_parentheses(), init.span())
+}
+
 /// Execute a closure with a freshly-reset thread-local OXC allocator.
 fn with_ast_transform_allocator<F, R>(f: F) -> R
 where
     F: FnOnce(&Allocator) -> R,
 {
+    // `reset` keeps the chunks it already owns, so one outsized component would
+    // otherwise pin its peak arena on this thread for the rest of the process.
+    const MAX_RETAINED_BYTES: usize = 16 * 1024 * 1024;
+
     AST_TRANSFORM_ALLOCATOR.with(|cell| {
         let mut alloc = cell.borrow_mut();
         alloc.reset();
-        f(&alloc)
+        let out = f(&alloc);
+        if alloc.capacity() > MAX_RETAINED_BYTES {
+            *alloc = Allocator::default();
+        }
+        out
     })
 }
 
 /// A replacement to apply to the source text.
 #[derive(Debug)]
+/// See [`StateVarCollector::trailing_update_comment`].
+struct TrailingUpdateComment {
+    comment: String,
+    is_line: bool,
+    new_end: u32,
+    indent: String,
+    line_start: u32,
+    stmt_starts_line: bool,
+}
+
 struct Replacement {
     /// Byte offset start (inclusive) in the original source.
     start: u32,
@@ -175,18 +262,43 @@ struct StateVarCollector<'a, 's> {
     /// Component filename for `$inspect.trace()` label suffix generation.
     /// See `AstTransformConfig::filename`.
     filename: Option<&'s str>,
+    /// Label inherited by an anonymous function from its immediate AST parent.
+    trace_parent_label: Option<String>,
+    /// Upstream's `get_function_label` answer for the current function.
+    trace_function_label: Option<String>,
+    /// Whether the current function is async. Upstream reads this from the
+    /// parent Function node when lowering its traced BlockStatement.
+    trace_function_is_async: bool,
+    /// Whether the current Function node is the value of a class method.
+    trace_in_class_method: bool,
+    /// Set by `visit_method_definition` for the Function child it is about to walk.
+    trace_next_function_is_class_method: bool,
+    /// See `AstTransformConfig::async_derived_locations`.
+    async_derived_locations: Option<&'a AsyncDerivedLocations>,
     /// Var-declared state vars that need $.safe_get() instead of $.get().
     var_state_vars: Vec<String>,
     /// Collected replacements.
     replacements: Vec<Replacement>,
+    /// Whether `replacements` is still ordered by ascending `start`. Holds for
+    /// every source-order walk; when a handler pushes out of order,
+    /// `take_inner_replacements` falls back to a full scan.
+    replacements_sorted: bool,
     /// Stack of scoped variable sets for shadowing detection.
     /// Each scope level tracks variables declared in that scope
     /// (function params, let/const/var declarations, catch params, for-loop vars).
     scoped_vars: Vec<FxHashSet<String>>,
+    active_state_vars: Vec<FxHashSet<String>>,
     /// Stack tracking whether we're currently inside a shorthand property.
     /// When inside a shorthand property like `{ foo }`, the IdentifierReference
     /// for `foo` needs special handling: `{ foo: $.get(foo) }`.
     in_shorthand_property: bool,
+    /// Subtrees carrying a `svelte-ignore await_reactivity_loss`.
+    await_ignore_ranges: super::await_reactivity_loss_ast::AwaitIgnoreRanges,
+    /// Comment runs the `await` wrap has to carry inside the call.
+    await_comment_runs: super::await_reactivity_loss_ast::AwaitCommentRuns,
+    /// Starts of `await` expressions that are a whole statement relying on ASI.
+    /// Statement start → end of the statement a `;` has to separate it from.
+    await_separators: FxHashMap<u32, u32>,
 
     // --- Phase A-2 fields ---
     /// Prop source variables that need getter/setter wrapping: `prop` -> `prop()`.
@@ -201,6 +313,13 @@ struct StateVarCollector<'a, 's> {
     read_only_prop_names: FxHashSet<String>,
     /// Rest prop variable names -> `others.x` -> `$$props.x`.
     rest_prop_vars: FxHashSet<String>,
+    /// Start offsets of `rest.x` StaticMemberExpressions that are a DIRECT operand
+    /// of an Assignment/Update expression, so their `rest -> $$props` rewrite must
+    /// be suppressed. Mirrors upstream Identifier.js, which skips the optimization
+    /// when the member access's grandparent is an Assignment/Update expression
+    /// (e.g. `ctx.globalAlpha *= rest.opacity` keeps `rest.opacity`). Populated when
+    /// visiting the parent assignment/update (before the member itself is visited).
+    rest_operand_member_starts: FxHashSet<u32>,
     /// State vars needed for store access pattern (store base is a reactive state var).
     state_vars_for_store: FxHashSet<String>,
     /// Prop vars needed for store access pattern (store base is a prop).
@@ -236,9 +355,26 @@ struct StateVarCollector<'a, 's> {
     /// component-function body (depth 1), so we trigger the `$.save(...)`
     /// wrap when our `function_depth >= 1`.
     function_depth: u32,
+
+    /// Semantic for the parsed script, set after construction. Enables
+    /// per-site resolution of a bare-identifier assignment RHS (upstream
+    /// `should_proxy` consults the scope at the assignment; the name-list
+    /// cannot distinguish two same-named inner bindings).
+    semantic: Option<&'a oxc_semantic::Semantic<'a>>,
 }
 
 impl<'a, 's> StateVarCollector<'a, 's> {
+    /// Per-site proxy decision for a bare-identifier assignment RHS that
+    /// resolves to a function-local declaration (see
+    /// `state_assigns_combined_ast::ident_rhs_needs_proxy`). `None` defers
+    /// to the name-list `should_proxy_ast` fallback.
+    fn ident_rhs_site_decision(&self, rhs: &Expression<'_>) -> Option<bool> {
+        let Expression::Identifier(rhs_id) = rhs.get_inner_expression() else {
+            return None;
+        };
+        super::state_assigns_combined_ast::ident_rhs_needs_proxy(self.semantic?, rhs_id)
+    }
+
     fn new(
         source: &'s str,
         state_vars: &'a FxHashSet<&'a str>,
@@ -251,6 +387,7 @@ impl<'a, 's> StateVarCollector<'a, 's> {
         dev: bool,
         analysis_source: Option<&'s str>,
         filename: Option<&'s str>,
+        async_derived_locations: Option<&'a AsyncDerivedLocations>,
         prop_source_vars: &'a [String],
         non_bindable_prop_vars: &[String],
         store_sub_vars: &[String],
@@ -284,16 +421,28 @@ impl<'a, 's> StateVarCollector<'a, 's> {
             dev,
             analysis_source,
             filename,
+            trace_parent_label: None,
+            trace_function_label: None,
+            trace_function_is_async: false,
+            trace_in_class_method: false,
+            trace_next_function_is_class_method: false,
+            async_derived_locations,
             var_state_vars,
             replacements: Vec::new(),
+            replacements_sorted: true,
             scoped_vars: vec![FxHashSet::default()],
+            active_state_vars: vec![FxHashSet::default()],
             in_shorthand_property: false,
+            await_ignore_ranges: Default::default(),
+            await_comment_runs: Default::default(),
+            await_separators: FxHashMap::default(),
             prop_source_vars: prop_source_set,
             non_bindable_prop_vars: non_bindable_set,
             store_sub_vars: store_sub_set,
             read_only_props: read_only_props.to_vec(),
             read_only_prop_names,
             rest_prop_vars: rest_prop_set,
+            rest_operand_member_starts: FxHashSet::default(),
             state_vars_for_store: state_set_for_store,
             prop_vars_for_store: prop_set_for_store,
             paren_expr_span: None,
@@ -301,29 +450,71 @@ impl<'a, 's> StateVarCollector<'a, 's> {
             exported_names,
             prop_source_vars_slice: prop_source_vars,
             function_depth: 0,
+            semantic: None,
         }
     }
 
     /// Check if a name is a state variable that should be transformed,
     /// considering non-reactive exclusions and scope shadowing.
     fn is_active_state_var(&self, name: &str) -> bool {
-        self.state_vars.contains(name)
-            && !self.non_reactive_vars.contains(name)
-            && !self.is_shadowed(name)
+        !self.non_reactive_vars.contains(name)
+            && (self.resolves_to_local_state(name)
+                || (self.state_vars.contains(name) && !self.is_state_var_shadowed(name)))
     }
 
     /// Check if a name is a state variable (including non-reactive),
     /// used for assignment transforms which apply to all state vars.
     fn is_any_state_var(&self, name: &str) -> bool {
-        self.state_vars.contains(name) && !self.is_shadowed(name)
+        self.resolves_to_local_state(name)
+            || (self.state_vars.contains(name) && !self.is_state_var_shadowed(name))
+    }
+
+    /// Resolve a locally declared rune binding independently of the root
+    /// analysis name set. The root declaration map keeps the outer binding on
+    /// a collision, so an inner `$derived` named like an outer prop is absent
+    /// from `state_vars` even though reads in that scope are reactive.
+    fn resolves_to_local_state(&self, name: &str) -> bool {
+        for (state_scope, scope) in
+            self.active_state_vars.iter().rev().zip(self.scoped_vars.iter().rev())
+        {
+            if state_scope.contains(name) {
+                return true;
+            }
+            if scope.contains(name) {
+                return false;
+            }
+        }
+        false
+    }
+
+    fn is_state_var_shadowed(&self, name: &str) -> bool {
+        for (state_scope, scope) in
+            self.active_state_vars.iter().rev().zip(self.scoped_vars.iter().rev())
+        {
+            if state_scope.contains(name) {
+                return false;
+            }
+            if scope.contains(name) {
+                return true;
+            }
+        }
+        false
     }
 
     /// Check if a variable is shadowed by any enclosing scope.
     fn is_shadowed(&self, name: &str) -> bool {
-        self.scoped_vars
-            .iter()
-            .rev()
-            .any(|scope| scope.contains(name))
+        self.scoped_vars.iter().rev().any(|scope| scope.contains(name))
+    }
+
+    /// Check whether a non-state transform binding (prop/store/rest) is hidden
+    /// by a local declaration. Reactive declarations live in
+    /// `active_state_vars`, rather than `scoped_vars`, so that their own reads
+    /// still receive `$.get(...)`. They nevertheless shadow an outer prop (for
+    /// example an inner `const ref = $derived(...)` shadowing a bindable `ref`
+    /// prop), and must participate in resolving every other binding kind.
+    fn is_non_state_binding_shadowed(&self, name: &str) -> bool {
+        self.is_shadowed(name)
+            || self.active_state_vars.iter().rev().any(|scope| scope.contains(name))
     }
 
     /// Declare a variable in the current scope.
@@ -336,30 +527,24 @@ impl<'a, 's> StateVarCollector<'a, 's> {
     /// If inside a ParenthesizedExpression, return (and consume) its span.
     /// Otherwise return the given (start, end) as-is.
     fn effective_span(&mut self, start: u32, end: u32) -> (u32, u32) {
-        if let Some((ps, pe)) = self.paren_expr_span.take() {
-            (ps, pe)
-        } else {
-            (start, end)
-        }
+        if let Some((ps, pe)) = self.paren_expr_span.take() { (ps, pe) } else { (start, end) }
     }
 
     /// Push a new scope level.
     fn push_scope(&mut self) {
         self.scoped_vars.push(FxHashSet::default());
+        self.active_state_vars.push(FxHashSet::default());
     }
 
     /// Pop the current scope level.
     fn pop_scope(&mut self) {
         self.scoped_vars.pop();
+        self.active_state_vars.pop();
     }
 
     /// Get the appropriate getter function for a state variable.
     fn getter_for(&self, name: &str) -> &'static str {
-        if self.var_state_vars.iter().any(|s| s.as_str() == name) {
-            "$.safe_get"
-        } else {
-            "$.get"
-        }
+        if self.var_state_vars.iter().any(|s| s.as_str() == name) { "$.safe_get" } else { "$.get" }
     }
 
     /// Check if a name is an active prop source var (needs getter/setter wrapping).
@@ -368,30 +553,42 @@ impl<'a, 's> StateVarCollector<'a, 's> {
         self.prop_source_vars.contains(name)
             && !self.read_only_prop_names.contains(name)
             && !self.rest_prop_vars.contains(name)
-            && !self.is_shadowed(name)
+            && !self.is_non_state_binding_shadowed(name)
     }
 
     /// Check if a name is a store subscription variable.
     fn is_active_store_sub(&self, name: &str) -> bool {
-        self.store_sub_vars.contains(name) && !self.is_shadowed(name)
+        self.store_sub_vars.contains(name) && !self.is_non_state_binding_shadowed(name)
     }
 
     /// Check if a name is a read-only prop.
     fn is_active_read_only_prop(&self, name: &str) -> bool {
-        self.read_only_prop_names.contains(name) && !self.is_shadowed(name)
+        self.read_only_prop_names.contains(name) && !self.is_non_state_binding_shadowed(name)
     }
 
     /// Check if a name is a rest prop variable.
     fn is_active_rest_prop(&self, name: &str) -> bool {
-        self.rest_prop_vars.contains(name) && !self.is_shadowed(name)
+        self.rest_prop_vars.contains(name) && !self.is_non_state_binding_shadowed(name)
+    }
+
+    /// If `expr` is a bare single-level `rest.x` StaticMemberExpression on an active
+    /// rest-prop identifier (no parentheses / TS wrappers, non-computed), return the
+    /// member expression's start offset. Used to suppress the `rest -> $$props`
+    /// rewrite when such a member is a direct Assignment/Update operand, mirroring
+    /// upstream's `grand_parent.type !== 'AssignmentExpression' | 'UpdateExpression'`.
+    fn direct_rest_member_operand_start(&self, expr: &Expression<'_>) -> Option<u32> {
+        if let Expression::StaticMemberExpression(member) = expr
+            && let Expression::Identifier(obj) = &member.object
+            && self.is_active_rest_prop(obj.name.as_str())
+        {
+            return Some(member.span.start);
+        }
+        None
     }
 
     /// Get the prop alias for a read-only prop.
     fn get_read_only_prop_alias(&self, name: &str) -> Option<&str> {
-        self.read_only_props
-            .iter()
-            .find(|(n, _)| n == name)
-            .map(|(_, alias)| alias.as_str())
+        self.read_only_props.iter().find(|(n, _)| n == name).map(|(_, alias)| alias.as_str())
     }
 
     /// Get the store access expression for a store's base variable.
@@ -513,6 +710,32 @@ impl<'a, 's> StateVarCollector<'a, 's> {
         false
     }
 
+    /// Whether a known transform declaration introduces a reactive binding,
+    /// rather than a prop/store helper binding. This distinction matters when
+    /// root analysis retained an outer same-named prop declaration.
+    fn is_reactive_transform_declaration(&self, declarator: &VariableDeclarator<'_>) -> bool {
+        let Some(init) = &declarator.init else {
+            return false;
+        };
+        let init_start = init.span().start as usize;
+        let init_end = init.span().end as usize;
+        if init_end <= self.source.len() {
+            let init_text = &self.source[init_start..init_end];
+            if init_text.starts_with("$.state(")
+                || init_text.starts_with("$.state.raw(")
+                || init_text.starts_with("$.derived(")
+                || init_text.starts_with("$.derived_by(")
+                || init_text.starts_with("await $.async_derived(")
+            {
+                return true;
+            }
+        }
+        self.is_state_call_init(init)
+            || self.is_state_raw_or_frozen_init(init)
+            || self.is_derived_call_init(init)
+            || self.is_derived_by_init(init)
+    }
+
     /// Returns true if `init` is a plain `$derived(...)` CallExpression whose
     /// `$derived` reference is the rune (not shadowed, not a store sub).
     fn is_derived_call_init(&self, init: &Expression<'_>) -> bool {
@@ -591,8 +814,310 @@ impl<'a, 's> StateVarCollector<'a, 's> {
         member.property.name == "by"
     }
 
+    /// A same-line comment trailing a whole-statement `x++;` / `x--;`.
+    /// Upstream rewrites the update by REUSING the argument node (with loc),
+    /// so esrap's comment cursor pulls the trailing comment INSIDE the
+    /// `$.update(...)` call; the text splice has to reproduce that placement.
+    fn trailing_update_comment(&self, start: u32, end: u32) -> Option<TrailingUpdateComment> {
+        let src = self.source.as_bytes();
+        // Forward from `end`: horizontal ws, `;`, horizontal ws, then a comment
+        // that is the last thing on the line.
+        let mut j = end as usize;
+        while j < src.len() && matches!(src[j], b' ' | b'\t') {
+            j += 1;
+        }
+        if j >= src.len() || src[j] != b';' {
+            return None;
+        }
+        j += 1;
+        while j < src.len() && matches!(src[j], b' ' | b'\t') {
+            j += 1;
+        }
+        let (comment, is_line, mut new_end) = if self.source[j..].starts_with("//") {
+            let line_end = memchr::memchr(b'\n', &src[j..]).map_or(src.len(), |p| j + p);
+            (self.source[j..line_end].trim_end().to_string(), true, line_end)
+        } else if self.source[j..].starts_with("/*") {
+            let close = memchr::memmem::find(&src[j + 2..], b"*/")? + j + 4;
+            let line_end = memchr::memchr(b'\n', &src[close..]).map_or(src.len(), |p| close + p);
+            if !self.source[close..line_end].trim().is_empty() {
+                return None;
+            }
+            (self.source[j..close].to_string(), false, close)
+        } else {
+            return None;
+        };
+        if is_line {
+            new_end = new_end.min(src.len());
+        }
+        // Statement position: the last CODE byte before `start` (comment- and
+        // string-aware) must end a statement or open a block. Run only after
+        // the forward check succeeded — the prefix scan is O(prefix).
+        let mut last_code: Option<u8> = None;
+        for (_, c) in crate::compiler::phases::phase3_transform::shared::js_scan::code_bytes(
+            &src[..start as usize],
+        ) {
+            if !c.is_ascii_whitespace() {
+                last_code = Some(c);
+            }
+        }
+        if !matches!(last_code, None | Some(b'{') | Some(b'}') | Some(b';')) {
+            return None;
+        }
+        let line_start = memchr::memrchr(b'\n', &src[..start as usize]).map_or(0, |p| p + 1);
+        let prefix = &self.source[line_start..start as usize];
+        let indent: String = prefix.chars().take_while(|c| *c == ' ' || *c == '\t').collect();
+        Some(TrailingUpdateComment {
+            comment,
+            is_line,
+            new_end: new_end as u32,
+            indent,
+            line_start: line_start as u32,
+            stmt_starts_line: prefix.trim().is_empty(),
+        })
+    }
+
+    /// Comment spans inside the trivia region `source[from..to]` (between two
+    /// code tokens, so only whitespace and comments can occur there).
+    fn trivia_comment_spans(&self, from: u32, to: u32) -> Vec<(u32, u32)> {
+        let mut spans = Vec::new();
+        if from >= to || to as usize > self.source.len() {
+            return spans;
+        }
+        let bytes = self.source.as_bytes();
+        let mut i = from as usize;
+        let end = to as usize;
+        while i < end {
+            if bytes[i].is_ascii_whitespace() {
+                i += 1;
+            } else if bytes[i] == b'/' && i + 1 < end && bytes[i + 1] == b'/' {
+                let stop = memchr::memchr(b'\n', &bytes[i..end]).map_or(end, |p| i + p);
+                spans.push((i as u32, stop as u32));
+                i = stop;
+            } else if bytes[i] == b'/' && i + 1 < end && bytes[i + 1] == b'*' {
+                let Some(close) = memchr::memmem::find(&bytes[i + 2..end], b"*/") else {
+                    return spans;
+                };
+                let stop = i + 2 + close + 2;
+                spans.push((i as u32, stop as u32));
+                i = stop;
+            } else {
+                break;
+            }
+        }
+        spans
+    }
+
+    /// Render `spans` the way esrap's `flush_comments_until` does before the
+    /// node starting at `to`: each comment is followed by a newline when the
+    /// source has one before `to`, else by a space when `pad`.
+    fn flush_trivia_comments(&self, spans: &[(u32, u32)], to: u32, pad: bool) -> String {
+        let mut out = String::new();
+        for &(start, end) in spans {
+            out.push_str(&self.source[start as usize..end as usize]);
+            if self.source[end as usize..to as usize].contains('\n') {
+                out.push('\n');
+            } else if pad {
+                out.push(' ');
+            }
+        }
+        out
+    }
+
+    /// The comments a rune call holds around its single argument: (everything
+    /// between the callee and the argument — the `(` does not divide them —
+    /// and everything between the argument and `)`).
+    fn rune_call_comment_slots(
+        &self,
+        call: &CallExpression<'_>,
+        arg_span: Span,
+        init_span: Span,
+    ) -> (Vec<(u32, u32)>, Vec<(u32, u32)>) {
+        let callee_end = call.callee.span().end;
+        let open = self
+            .trivia_code_start(callee_end, arg_span.start)
+            .filter(|&p| self.source.as_bytes().get(p as usize) == Some(&b'('))
+            .map(|p| p + 1);
+        // A comment between redundant parens and the callee (`(/* c */ $state(1))`)
+        // is flushed before the value just like one inside the call's own parens.
+        let mut pre = Vec::new();
+        if init_span.start < call.span.start {
+            let region =
+                &self.source.as_bytes()[init_span.start as usize..call.span.start as usize];
+            if let Some(last_open) = region.iter().rposition(|&b| b == b'(') {
+                let from = init_span.start + last_open as u32 + 1;
+                pre.extend(self.trivia_comment_spans(from, call.span.start));
+            }
+        }
+        pre.extend(self.trivia_comment_spans(callee_end, arg_span.start));
+        if let Some(open) = open {
+            pre.extend(self.trivia_comment_spans(open, arg_span.start));
+        }
+        let post = self.trivia_comment_spans(arg_span.end, call.span.end.saturating_sub(1));
+        (pre, post)
+    }
+
+    /// First code byte at/after `from` (skipping whitespace and comments),
+    /// bounded by `to`.
+    fn trivia_code_start(&self, from: u32, to: u32) -> Option<u32> {
+        let bytes = self.source.as_bytes();
+        let mut i = from as usize;
+        let end = (to as usize).min(bytes.len());
+        while i < end {
+            if bytes[i].is_ascii_whitespace() {
+                i += 1;
+            } else if bytes[i] == b'/' && i + 1 < end && bytes[i + 1] == b'/' {
+                i = memchr::memchr(b'\n', &bytes[i..end]).map_or(end, |p| i + p);
+            } else if bytes[i] == b'/' && i + 1 < end && bytes[i + 1] == b'*' {
+                let close = memchr::memmem::find(&bytes[i + 2..end], b"*/")?;
+                i = i + 2 + close + 2;
+            } else {
+                return Some(i as u32);
+            }
+        }
+        None
+    }
+
+    /// The comment run written between a declarator's binding and its rune
+    /// call. Any code byte restarts the run, so a comment inside a type
+    /// annotation — which is not adjacent to the call — is not one of them.
+    ///
+    /// Upstream never leaves these ahead of the declarator: the lowered call
+    /// either inherits the source callee's `loc` (`$state`) or hands the
+    /// argument to a node esrap flushes them inside, so they end up within the
+    /// wrapper rather than before it.
+    fn declarator_lead_comment_spans(&self, from: u32, to: u32) -> Vec<(u32, u32)> {
+        let bytes = self.source.as_bytes();
+        let mut i = from as usize;
+        let end = (to as usize).min(bytes.len());
+        let mut run: Vec<(u32, u32)> = Vec::new();
+        while i < end {
+            match bytes[i] {
+                b if b.is_ascii_whitespace() => i += 1,
+                b'/' if bytes.get(i + 1) == Some(&b'/') && i + 1 < end => {
+                    let stop = memchr::memchr(b'\n', &bytes[i..end]).map_or(end, |p| i + p);
+                    run.push((i as u32, stop as u32));
+                    i = stop;
+                }
+                b'/' if bytes.get(i + 1) == Some(&b'*') && i + 1 < end => {
+                    let Some(close) = memchr::memmem::find(&bytes[i + 2..end], b"*/") else {
+                        return Vec::new();
+                    };
+                    let stop = i + 2 + close + 2;
+                    run.push((i as u32, stop as u32));
+                    i = stop;
+                }
+                quote @ (b'\'' | b'"' | b'`') => {
+                    run.clear();
+                    i += 1;
+                    while i < end && bytes[i] != quote {
+                        i += if bytes[i] == b'\\' { 2 } else { 1 };
+                    }
+                    i += 1;
+                }
+                _ => {
+                    run.clear();
+                    i += 1;
+                }
+            }
+        }
+        run
+    }
+
+    /// Same-line trailing comments (esrap's `flush_trailing_comments`): each is
+    /// emitted after a space; a `//` comment forces a newline so it cannot
+    /// swallow what the caller appends. Comments past the first newline are not
+    /// trailing and are returned in `rest`.
+    fn split_trailing_comments(
+        &self,
+        spans: &[(u32, u32)],
+        prev_end: u32,
+    ) -> (String, Vec<(u32, u32)>) {
+        let mut out = String::new();
+        let mut rest = Vec::new();
+        let mut broken = false;
+        for &(start, end) in spans {
+            let same_line = !self.source[prev_end as usize..start as usize].contains('\n');
+            if broken || !same_line {
+                broken = true;
+                rest.push((start, end));
+                continue;
+            }
+            out.push(' ');
+            out.push_str(&self.source[start as usize..end as usize]);
+            if self.source[start as usize..].starts_with("//") {
+                out.push('\n');
+                broken = true;
+            }
+        }
+        (out, rest)
+    }
+
+    /// Append comments that follow the rune argument to the statement, after
+    /// the source `;` when there is one — the placement esrap gives them once
+    /// the wrapper call that held them is gone. Returns the (possibly extended)
+    /// replacement end.
+    fn append_comments_past_semicolon(
+        &self,
+        spans: &[(u32, u32)],
+        call_end: u32,
+        replacement: &mut String,
+    ) -> u32 {
+        if spans.is_empty() {
+            return call_end;
+        }
+        let bytes = self.source.as_bytes();
+        let mut j = call_end as usize;
+        while j < bytes.len() && matches!(bytes[j], b' ' | b'\t') {
+            j += 1;
+        }
+        let end = if j < bytes.len() && bytes[j] == b';' {
+            replacement.push(';');
+            (j + 1) as u32
+        } else {
+            call_end
+        };
+        // A comment the source put on its own line becomes a leading comment of
+        // the next statement, so esrap prints it after the statement break.
+        let indent = self.line_indent(call_end);
+        for &(start, cend) in spans {
+            if starts_its_own_line(bytes, start as usize) {
+                replacement.push_str("\n\n");
+                replacement.push_str(indent);
+            } else {
+                replacement.push(' ');
+            }
+            replacement.push_str(&self.source[start as usize..cend as usize]);
+        }
+        end
+    }
+
+    /// The leading whitespace of the line `offset` sits on.
+    fn line_indent(&self, offset: u32) -> &str {
+        let head = &self.source[..offset as usize];
+        let line_start = head.rfind('\n').map_or(0, |p| p + 1);
+        let rest = &self.source[line_start..];
+        &rest[..rest.len() - rest.trim_start_matches([' ', '\t']).len()]
+    }
+
+    /// Whether a blank line separates well: previous non-ws char before
+    /// `line_start` opens a block or the previous line is already blank.
+    fn margin_before_allowed(&self, line_start: u32) -> bool {
+        let head = self.source[..line_start as usize].trim_end();
+        !head.ends_with('{') && !self.source[head.len()..line_start as usize].contains("\n\n")
+    }
+
+    fn margin_after_allowed(&self, new_end: u32) -> bool {
+        let tail = &self.source[new_end as usize..];
+        let after_line = tail.strip_prefix('\n').unwrap_or(tail);
+        let next = after_line.trim_start();
+        !next.starts_with('}') && !next.is_empty() && !after_line.starts_with('\n')
+    }
+
     /// Add a replacement.
     fn add_replacement(&mut self, start: u32, end: u32, text: String) {
+        if self.replacements.last().is_some_and(|last| last.start > start) {
+            self.replacements_sorted = false;
+        }
         self.replacements.push(Replacement { start, end, text });
     }
 
@@ -605,20 +1130,40 @@ impl<'a, 's> StateVarCollector<'a, 's> {
     /// match the text-path behaviour exactly.
     ///
     /// Folding the tag wrap into the declarator handlers means the post-AST
-    /// `wrap_state_derived_with_tag` re-scan in `transform_client_with_visitors`
+    /// `wrap_state_derived_with_tag` re-scan in `transform_client`
     /// no longer has to walk the script in dev mode, eliminating one
     /// O(text_len) buffer pass per component.
     fn maybe_tag_declarator(&self, var_name: &str, replacement: String) -> String {
+        self.maybe_tag_declarator_with_lead(var_name, replacement, "").0
+    }
+
+    /// [`Self::maybe_tag_declarator`], with the declarator's leading comment run
+    /// placed just inside the tag call and a flag saying whether a wrap
+    /// happened — the caller needs it to decide whether its replacement span
+    /// has to swallow those comments.
+    ///
+    /// `lead` only belongs inside the wrap for `$.state(`: upstream builds that
+    /// callee with the source `$state` callee's `loc`, so esrap flushes the
+    /// comments right before it. `$.proxy(` is built with a plain string callee
+    /// and carries no `loc`, which puts the comments before its argument
+    /// instead — its caller folds them into the argument text rather than
+    /// passing them here.
+    fn maybe_tag_declarator_with_lead(
+        &self,
+        var_name: &str,
+        replacement: String,
+        lead: &str,
+    ) -> (String, bool) {
         if !self.dev {
-            return replacement;
+            return (replacement, false);
         }
         let head = replacement.as_str();
         if head.starts_with("$.state(") || head.starts_with("$.derived(") {
-            format!("$.tag({}, '{}')", replacement, var_name)
+            (format!("$.tag({lead}{replacement}, '{var_name}')"), true)
         } else if head.starts_with("$.proxy(") {
-            format!("$.tag_proxy({}, '{}')", replacement, var_name)
+            (format!("$.tag_proxy({replacement}, '{var_name}')"), true)
         } else {
-            replacement
+            (replacement, false)
         }
     }
 
@@ -642,6 +1187,7 @@ impl<'a, 's> StateVarCollector<'a, 's> {
         let Some(init) = &declarator.init else {
             return false;
         };
+        let (init, init_span) = init_without_parens(init);
         if !self.is_state_raw_or_frozen_init(init) {
             return false;
         }
@@ -667,27 +1213,42 @@ impl<'a, 's> StateVarCollector<'a, 's> {
         // them into the outer text — matching the behaviour the text pipeline
         // produced indirectly (it emitted `$.state(arg)` which the AST then
         // visited and rewrote inner refs of).
+        let mut pre_comments = String::new();
+        let mut post_comments: Vec<(u32, u32)> = Vec::new();
+        let mut arg_end = call.span.end;
         let arg_text = if let Some(arg) = call.arguments.first() {
             self.visit_argument(arg);
             let arg_span = arg.span();
+            let (pre, post) = self.rune_call_comment_slots(call, arg_span, init_span);
+            pre_comments = self.flush_trivia_comments(&pre, arg_span.start, true);
+            post_comments = post;
+            arg_end = arg_span.end;
             let transformed = self.apply_and_drain_inner_replacements(arg_span.start, arg_span.end);
-            if transformed.trim().is_empty() {
-                "void 0".to_string()
-            } else {
-                transformed
-            }
+            if transformed.trim().is_empty() { "void 0".to_string() } else { transformed }
         } else {
             "void 0".to_string()
         };
+        let arg_text = format!("{pre_comments}{arg_text}");
 
-        let replacement = if is_non_reactive {
-            arg_text
+        let (trailing, spilled) = if is_non_reactive {
+            (String::new(), post_comments)
         } else {
-            format!("$.state({})", arg_text)
+            self.split_trailing_comments(&post_comments, arg_end)
         };
 
-        let replacement = self.maybe_tag_declarator(var_name, replacement);
-        self.add_replacement(call.span.start, call.span.end, replacement);
+        let replacement =
+            if is_non_reactive { arg_text } else { format!("$.state({arg_text}{trailing})") };
+
+        let lead_spans = self.declarator_lead_comment_spans(id.span().end, call.span.start);
+        let lead = self.flush_trivia_comments(&lead_spans, call.span.start, true);
+        let (mut replacement, tagged) =
+            self.maybe_tag_declarator_with_lead(var_name, replacement, &lead);
+        let start = match lead_spans.first() {
+            Some(&(first, _)) if tagged => first,
+            _ => call.span.start,
+        };
+        let end = self.append_comments_past_semicolon(&spilled, call.span.end, &mut replacement);
+        self.add_replacement(start, end, replacement);
         true
     }
 
@@ -698,7 +1259,7 @@ impl<'a, 's> StateVarCollector<'a, 's> {
     /// |                    | non-reactive (in `non_reactive_vars`)        | reactive                                      |
     /// | `$state()` (empty) | `void 0`                                     | `$.state(void 0)`                             |
     /// | `$state(prim)`     | `prim`                                       | `$.state(prim)`                               |
-    /// | `$state(undefined)`| `void 0` (special case, matches text)        | `$.state(undefined)` (literal kept)           |
+    /// | `$state(undefined)`| `undefined` (source spelling kept, #3049)    | `$.state(undefined)` (literal kept)           |
     /// | `$state(obj/arr/…)`| `$.proxy(obj/arr/…)` if `should_proxy_ast`   | `$.state($.proxy(obj/arr/…))`                 |
     ///
     /// Proxy decision uses `should_proxy_ast(arg, &[])` — the text pipeline
@@ -708,6 +1269,7 @@ impl<'a, 's> StateVarCollector<'a, 's> {
         let Some(init) = &declarator.init else {
             return false;
         };
+        let (init, init_span) = init_without_parens(init);
         if !self.is_state_call_init(init) {
             return false;
         }
@@ -731,18 +1293,12 @@ impl<'a, 's> StateVarCollector<'a, 's> {
         // Snapshot a few facts from the original argument AST *before* walking,
         // because the walk drains/replaces inner spans that we want to query
         // by node kind here (not by post-rewrite text).
-        let (needs_proxy, is_explicit_undefined) = if let Some(arg) = call.arguments.first() {
-            let arg_expr = arg.as_expression();
-            let needs_proxy = arg_expr
-                .map(|e| should_proxy_ast(e, self.non_proxy_vars))
-                .unwrap_or(false);
-            let is_undef = matches!(
-                arg_expr,
-                Some(Expression::Identifier(id)) if id.name == "undefined"
-            );
-            (needs_proxy, is_undef)
+        let needs_proxy = if let Some(arg) = call.arguments.first() {
+            arg.as_expression()
+                .map(|e| should_proxy_ast(e, self.non_proxy_vars, self.dev))
+                .unwrap_or(false)
         } else {
-            (false, false)
+            false
         };
 
         // Walk the argument first so any inner state-var refs get `$.get(...)`
@@ -751,39 +1307,70 @@ impl<'a, 's> StateVarCollector<'a, 's> {
         // produced indirectly: it emitted `$.state(arg)` (or `$.proxy(arg)`)
         // which the existing AST pass then re-visited and rewrote inner
         // refs of.
+        let mut pre_comments = String::new();
+        let mut post_comments: Vec<(u32, u32)> = Vec::new();
+        let mut arg_end = call.span.end;
         let arg_text = if let Some(arg) = call.arguments.first() {
             self.visit_argument(arg);
             let arg_span = arg.span();
+            let (pre, post) = self.rune_call_comment_slots(call, arg_span, init_span);
+            pre_comments = self.flush_trivia_comments(&pre, arg_span.start, true);
+            post_comments = post;
+            arg_end = arg_span.end;
             let transformed = self.apply_and_drain_inner_replacements(arg_span.start, arg_span.end);
-            if transformed.trim().is_empty() {
-                "void 0".to_string()
-            } else {
-                transformed
-            }
+            if transformed.trim().is_empty() { "void 0".to_string() } else { transformed }
         } else {
             "void 0".to_string()
+        };
+        // `$.proxy` is the only wrapper here built with a plain string callee,
+        // so it carries no `loc` and the declarator's leading comments flush
+        // before its ARGUMENT rather than before the call.
+        let lead_spans = self.declarator_lead_comment_spans(id.span().end, call.span.start);
+        let proxy_is_head = is_non_reactive && needs_proxy;
+        let lead_before_arg = if proxy_is_head {
+            self.flush_trivia_comments(&lead_spans, call.span.start, true)
+        } else {
+            String::new()
+        };
+        let arg_text = format!("{lead_before_arg}{pre_comments}{arg_text}");
+
+        let bare = is_non_reactive && !needs_proxy;
+        // A wrapper call keeps same-line trailing comments inside its parens
+        // (the argument node still precedes a `)`); the bare-argument form has
+        // no node after them, so they land after the statement's `;`.
+        let (trailing, spilled) = if bare {
+            (String::new(), post_comments)
+        } else {
+            self.split_trailing_comments(&post_comments, arg_end)
         };
 
         let replacement = if is_non_reactive {
             if needs_proxy {
-                format!("$.proxy({})", arg_text)
-            } else if is_explicit_undefined {
-                // Special case from the old text path: in the non-reactive
-                // branch, `$state(undefined)` → `void 0` (not `undefined`).
-                // The reactive branch keeps the literal as-is, so we only
-                // apply this rewrite when non-reactive.
-                "void 0".to_string()
+                format!("$.proxy({arg_text}{trailing})")
             } else {
+                // Upstream keeps the spelling the source used — an explicit
+                // `$state(undefined)` stays `undefined`, never `void 0` (#3049).
                 arg_text
             }
         } else if needs_proxy {
-            format!("$.state($.proxy({}))", arg_text)
+            format!("$.state($.proxy({arg_text}{trailing}))")
         } else {
-            format!("$.state({})", arg_text)
+            format!("$.state({arg_text}{trailing})")
         };
 
-        let replacement = self.maybe_tag_declarator(var_name, replacement);
-        self.add_replacement(call.span.start, call.span.end, replacement);
+        let lead_before_call = if proxy_is_head {
+            String::new()
+        } else {
+            self.flush_trivia_comments(&lead_spans, call.span.start, true)
+        };
+        let (mut replacement, tagged) =
+            self.maybe_tag_declarator_with_lead(var_name, replacement, &lead_before_call);
+        let start = match lead_spans.first() {
+            Some(&(first, _)) if proxy_is_head || tagged => first,
+            _ => call.span.start,
+        };
+        let end = self.append_comments_past_semicolon(&spilled, call.span.end, &mut replacement);
+        self.add_replacement(start, end, replacement);
         true
     }
 
@@ -808,6 +1395,7 @@ impl<'a, 's> StateVarCollector<'a, 's> {
         let Some(init) = &declarator.init else {
             return false;
         };
+        let (init, init_span) = init_without_parens(init);
 
         // Determine $state vs $state.raw (text path doesn't handle frozen
         // destructuring, so we match the same shapes only).
@@ -855,11 +1443,7 @@ impl<'a, 's> StateVarCollector<'a, 's> {
             c.set(cur + 1);
             cur
         });
-        let tmp_name = if tmp_idx == 0 {
-            "tmp".to_string()
-        } else {
-            format!("tmp_{}", tmp_idx)
-        };
+        let tmp_name = if tmp_idx == 0 { "tmp".to_string() } else { format!("tmp_{}", tmp_idx) };
 
         let mut declarations = vec![format!("{} = {}", tmp_name, source_text.trim())];
 
@@ -883,7 +1467,7 @@ impl<'a, 's> StateVarCollector<'a, 's> {
 
         let replacement = declarations.join(", ");
         let start = declarator.id.span().start;
-        let end = call.span.end;
+        let end = init_span.end;
         self.add_replacement(start, end, replacement);
         true
     }
@@ -909,8 +1493,8 @@ impl<'a, 's> StateVarCollector<'a, 's> {
 
     /// Walk an ObjectPattern and append `name = $.state(...)` declarations
     /// for each property. Returns false if any property is unsupported
-    /// (computed key, nested pattern beyond simple identifier targets,
-    /// etc.) so the caller can bail back to the text path.
+    /// (nested pattern beyond simple identifier targets, etc.) so the caller
+    /// can bail back to the text path.
     fn collect_state_object_pattern(
         &mut self,
         obj: &ObjectPattern<'_>,
@@ -927,28 +1511,20 @@ impl<'a, 's> StateVarCollector<'a, 's> {
                 BindingPattern::AssignmentPattern(_) => &prop.value,
                 _ => return false,
             };
-            // Drop AssignmentPattern wrapper — the text path ignores the
-            // default value, only using the left-hand identifier.
-            let var_ident = match value_pattern {
-                BindingPattern::BindingIdentifier(id) => id,
+            let (var_ident, default_span) = match value_pattern {
+                BindingPattern::BindingIdentifier(id) => (id, None),
                 BindingPattern::AssignmentPattern(assign) => match &assign.left {
-                    BindingPattern::BindingIdentifier(id) => id,
+                    BindingPattern::BindingIdentifier(id) => (id, Some(assign.right.span())),
                     _ => return false,
                 },
                 _ => return false,
             };
             let var_name = var_ident.name.as_str();
 
-            // Resolve the source-side key text.
-            let key_text = match &prop.key {
-                PropertyKey::StaticIdentifier(id) => id.name.as_str().to_string(),
-                PropertyKey::StringLiteral(s) => s.value.as_str().to_string(),
-                _ => return false,
-            };
-
             let is_skip = self.is_state_destructure_skip(var_name);
-            let member_access = format!("{}.{}", tmp_name, key_text);
-            let value_expr = wrap_state_value(&member_access, is_raw, is_skip);
+            let member_access = self.state_key_access(tmp_name, prop);
+            let access = self.apply_pattern_default(member_access, default_span);
+            let value_expr = wrap_state_value(&access, is_raw, is_skip);
             let value_expr = self.maybe_tag_declarator(var_name, value_expr);
             declarations.push(format!("{} = {}", var_name, value_expr));
         }
@@ -960,7 +1536,9 @@ impl<'a, 's> StateVarCollector<'a, 's> {
             };
             let var_name = var_ident.name.as_str();
             let is_skip = self.is_state_destructure_skip(var_name);
-            let access = format!("{}.{}", tmp_name, var_name);
+            let keys: Vec<String> =
+                obj.properties.iter().map(|prop| self.state_exclude_key_literal(prop)).collect();
+            let access = format!("$.exclude_from_object({}, [{}])", tmp_name, keys.join(", "));
             let value_expr = if is_raw {
                 access
             } else if is_skip {
@@ -972,6 +1550,53 @@ impl<'a, 's> StateVarCollector<'a, 's> {
             declarations.push(format!("{} = {}", var_name, value_expr));
         }
         true
+    }
+
+    /// Member access for a destructured `$state` property key, mirroring
+    /// upstream's
+    /// `b.member(expression, prop.key, prop.computed || prop.key.type !== 'Identifier')`.
+    /// The key's source text is reused verbatim so a literal keeps its original
+    /// quoting, as upstream's printer does.
+    fn state_key_access(&self, tmp_name: &str, prop: &BindingProperty<'_>) -> String {
+        if !prop.computed
+            && let PropertyKey::StaticIdentifier(id) = &prop.key
+        {
+            return format!("{}.{}", tmp_name, id.name);
+        }
+        let span = prop.key.span();
+        format!("{}[{}]", tmp_name, self.source[span.start as usize..span.end as usize].trim())
+    }
+
+    /// The `$.exclude_from_object(tmp, [...])` entry for a non-rest property key.
+    /// Upstream turns identifier and `Literal` keys into string literals and every
+    /// other computed key into `String(<expr>)`, so the rest subtracts it at runtime.
+    fn state_exclude_key_literal(&self, prop: &BindingProperty<'_>) -> String {
+        if !prop.computed
+            && let PropertyKey::StaticIdentifier(id) = &prop.key
+        {
+            return format!("'{}'", escape_js_string(id.name.as_str()));
+        }
+        match &prop.key {
+            PropertyKey::StringLiteral(s) => format!("'{}'", escape_js_string(s.value.as_str())),
+            PropertyKey::NumericLiteral(n) => format!("'{}'", js_number_to_string(n.value)),
+            key => {
+                let span = key.span();
+                format!("String({})", self.source[span.start as usize..span.end as usize].trim())
+            }
+        }
+    }
+
+    /// Wrap a destructured access in `$.fallback(...)` when the pattern element
+    /// carried a default, mirroring upstream's `AssignmentPattern` →
+    /// `build_fallback` step in `extract_paths`.
+    fn apply_pattern_default(&self, access: String, default_span: Option<Span>) -> String {
+        match default_span {
+            Some(span) => build_fallback_string(
+                &access,
+                self.source[span.start as usize..span.end as usize].trim(),
+            ),
+            None => access,
+        }
     }
 
     /// Walk an ArrayPattern and append the `$$array = $.derived(() => $.to_array(...))`
@@ -1002,17 +1627,23 @@ impl<'a, 's> StateVarCollector<'a, 's> {
         } else {
             format!("$.to_array({}, {})", tmp_name, element_count)
         };
-        declarations.push(format!(
-            "{} = $.derived(() => {})",
-            array_var, to_array_args
-        ));
+        // The temp holding the iterable is labelled by pattern kind, not by a
+        // binding name — it has none. `collect_state_array_pattern` only ever
+        // runs for a top-level array pattern, so the kind is fixed; the sibling
+        // form upstream can emit is `'[$state object]'`.
+        let array_init = if self.dev {
+            format!("$.tag($.derived(() => {}), '[$state iterable]')", to_array_args)
+        } else {
+            format!("$.derived(() => {})", to_array_args)
+        };
+        declarations.push(format!("{} = {}", array_var, array_init));
 
         for (index, elem_opt) in arr.elements.iter().enumerate() {
             let Some(elem) = elem_opt else { continue };
-            let var_ident = match elem {
-                BindingPattern::BindingIdentifier(id) => id,
+            let (var_ident, default_span) = match elem {
+                BindingPattern::BindingIdentifier(id) => (id, None),
                 BindingPattern::AssignmentPattern(assign) => match &assign.left {
-                    BindingPattern::BindingIdentifier(id) => id,
+                    BindingPattern::BindingIdentifier(id) => (id, Some(assign.right.span())),
                     _ => return false,
                 },
                 _ => return false,
@@ -1020,6 +1651,7 @@ impl<'a, 's> StateVarCollector<'a, 's> {
             let var_name = var_ident.name.as_str();
             let is_skip = self.is_state_destructure_skip(var_name);
             let element_access = format!("$.get({})[{}]", array_var, index);
+            let element_access = self.apply_pattern_default(element_access, default_span);
             let value_expr = wrap_state_value(&element_access, is_raw, is_skip);
             let value_expr = self.maybe_tag_declarator(var_name, value_expr);
             declarations.push(format!("{} = {}", var_name, value_expr));
@@ -1077,6 +1709,7 @@ impl<'a, 's> StateVarCollector<'a, 's> {
         let Some(init) = &declarator.init else {
             return false;
         };
+        let (init, init_span) = init_without_parens(init);
         if !self.is_derived_call_init(init) {
             return false;
         }
@@ -1104,9 +1737,7 @@ impl<'a, 's> StateVarCollector<'a, 's> {
         let source_orig = self.source[arg_span.start as usize..arg_span.end as usize].to_string();
         let source_orig_trimmed = source_orig.trim();
         let source_is_identifier = !source_orig_trimmed.is_empty()
-            && source_orig_trimmed
-                .chars()
-                .all(|c| c.is_alphanumeric() || c == '_' || c == '$');
+            && source_orig_trimmed.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '$');
         let contains_await = contains_direct_await_in_expression(source_orig_trimmed);
 
         // Walk the source argument so inner state-var refs get `$.get(...)`
@@ -1116,10 +1747,14 @@ impl<'a, 's> StateVarCollector<'a, 's> {
         let wrapped_source = self.apply_and_drain_inner_replacements(arg_span.start, arg_span.end);
 
         // Extract the destructured pattern's source text — the recursive
-        // text helper walks this string.
+        // text helper walks this string. Walk it first so a default value
+        // carries the same rewrites any other expression would (the dev
+        // equality instrumentation, above all); binding names are visited as
+        // declarations, not references, so they stay untouched.
         let pattern_span = declarator.id.span();
+        self.visit_binding_pattern(&declarator.id);
         let pattern_text =
-            self.source[pattern_span.start as usize..pattern_span.end as usize].to_string();
+            self.apply_and_drain_inner_replacements(pattern_span.start, pattern_span.end);
         let pattern_text = pattern_text.trim().to_string();
 
         let mut declarations: Vec<String> = Vec::new();
@@ -1130,11 +1765,7 @@ impl<'a, 's> StateVarCollector<'a, 's> {
             DERIVED_TMP_COUNTER.with(|c| {
                 let n = c.get();
                 c.set(n + 1);
-                if n == 0 {
-                    "$$d".to_string()
-                } else {
-                    format!("$$d_{}", n)
-                }
+                if n == 0 { "$$d".to_string() } else { format!("$$d_{}", n) }
             })
         };
 
@@ -1142,22 +1773,26 @@ impl<'a, 's> StateVarCollector<'a, 's> {
             wrapped_source.clone()
         } else if contains_await {
             // Async derived destructuring — mirror the text path's
-            // `await $.async_derived(...)` emission.
+            // `await $.async_derived(...)` emission. Upstream's
+            // `VariableDeclaration.js` passes the value through unchanged; only
+            // `create_derived` (`{@const}`) wraps it in `$.save(...)`.
             let saved_content = wrap_await_with_save_in_async_derived(wrapped_source.trim());
             let inner_expr = strip_top_level_await_from_expr(&saved_content);
             let inner_has_nested_await = contains_direct_await_in_expression(&inner_expr);
+            let is_array_pattern = matches!(&declarator.id, BindingPattern::ArrayPattern(_));
+            let label = destructured_label(is_array_pattern);
+            let lookup_name = first_bound_name(&declarator.id).unwrap_or_default();
+            let dev_tail = dev_args(self.async_derived_locations, label, &lookup_name);
 
             if inner_has_nested_await {
                 let is_object = saved_content.trim().starts_with('{');
                 let stmt = if is_object {
                     format!(
-                        "{} = await $.async_derived(async () => ({}))",
-                        d_name, saved_content
+                        "{d_name} = await $.async_derived(async () => ({saved_content}){dev_tail})"
                     )
                 } else {
                     format!(
-                        "{} = await $.async_derived(async () => {})",
-                        d_name, saved_content
+                        "{d_name} = await $.async_derived(async () => {saved_content}{dev_tail})"
                     )
                 };
                 declarations.push(stmt);
@@ -1166,12 +1801,12 @@ impl<'a, 's> StateVarCollector<'a, 's> {
                 let inner_is_object = inner_trimmed.starts_with('{');
                 if inner_is_object {
                     declarations.push(format!(
-                        "{} = await $.async_derived(() => ({}))",
-                        d_name, inner_expr
+                        "{d_name} = await $.async_derived(() => ({inner_expr}){dev_tail})"
                     ));
                 } else {
                     let thunk_arg = unthunk_string(&inner_expr);
-                    declarations.push(format!("{} = await $.async_derived({})", d_name, thunk_arg));
+                    declarations
+                        .push(format!("{d_name} = await $.async_derived({thunk_arg}{dev_tail})"));
                 }
             }
             format!("$.get({})", d_name)
@@ -1179,10 +1814,7 @@ impl<'a, 's> StateVarCollector<'a, 's> {
             // Object literal needs paren-wrap so the arrow body isn't
             // parsed as a block.
             if wrapped_source.trim_start().starts_with('{') {
-                declarations.push(format!(
-                    "{} = $.derived(() => ({}))",
-                    d_name, wrapped_source
-                ));
+                declarations.push(format!("{} = $.derived(() => ({}))", d_name, wrapped_source));
             } else {
                 let derived_arg = unthunk_string(&wrapped_source);
                 declarations.push(format!("{} = $.derived({})", d_name, derived_arg));
@@ -1190,12 +1822,27 @@ impl<'a, 's> StateVarCollector<'a, 's> {
             format!("$.get({})", d_name)
         };
 
+        // When destructuring `$derived(props)` where `props` is a `...rest`
+        // binding (`$.rest_props($$props, …)`), named members read straight from
+        // `$$props` — mirroring upstream's rest-prop member rewrite
+        // (`props.ssr` → `$$props.ssr`) — while the top-level `...rest` element
+        // keeps `props` for `$.exclude_from_object(props, …)`.
+        let member_base = if source_is_identifier && self.is_active_rest_prop(source_orig_trimmed) {
+            "$$props".to_string()
+        } else {
+            base_expr.clone()
+        };
+
+        let insert_label = derived_insert_label(self.dev, &pattern_text);
         let mut array_counter: usize = 0;
         if process_derived_destructuring_pattern(
             &pattern_text,
             &base_expr,
+            &member_base,
             &mut declarations,
             &mut array_counter,
+            insert_label,
+            "$$array",
         )
         .is_none()
         {
@@ -1204,12 +1851,13 @@ impl<'a, 's> StateVarCollector<'a, 's> {
         if declarations.is_empty() {
             return false;
         }
+        tag_derived_leaves(&mut declarations, self.dev);
 
         // Replacement covers [pattern_start, init_end] so the keyword and
         // optional trailing pieces of the VariableDeclaration remain.
         let replacement = declarations.join(",\n\t");
         let start = pattern_span.start;
-        let end = call.span.end;
+        let end = init_span.end;
         self.add_replacement(start, end, replacement);
         true
     }
@@ -1230,6 +1878,7 @@ impl<'a, 's> StateVarCollector<'a, 's> {
         let Some(init) = &declarator.init else {
             return false;
         };
+        let (init, init_span) = init_without_parens(init);
         if !self.is_derived_by_init(init) {
             return false;
         }
@@ -1262,22 +1911,22 @@ impl<'a, 's> StateVarCollector<'a, 's> {
         let d_name = DERIVED_TMP_COUNTER.with(|c| {
             let n = c.get();
             c.set(n + 1);
-            if n == 0 {
-                "$$d".to_string()
-            } else {
-                format!("$$d_{}", n)
-            }
+            if n == 0 { "$$d".to_string() } else { format!("$$d_{}", n) }
         });
 
         let mut declarations: Vec<String> =
             vec![format!("{} = $.derived({})", d_name, wrapped_source)];
         let base_expr = format!("$.get({})", d_name);
+        let insert_label = derived_insert_label(self.dev, &pattern_text);
         let mut array_counter: usize = 0;
         if process_derived_destructuring_pattern(
             &pattern_text,
             &base_expr,
+            &base_expr,
             &mut declarations,
             &mut array_counter,
+            insert_label,
+            "$$array",
         )
         .is_none()
         {
@@ -1286,10 +1935,11 @@ impl<'a, 's> StateVarCollector<'a, 's> {
         if declarations.is_empty() {
             return false;
         }
+        tag_derived_leaves(&mut declarations, self.dev);
 
         let replacement = declarations.join(",\n\t");
         let start = pattern_span.start;
-        let end = call.span.end;
+        let end = init_span.end;
         self.add_replacement(start, end, replacement);
         true
     }
@@ -1315,6 +1965,7 @@ impl<'a, 's> StateVarCollector<'a, 's> {
         let Some(init) = &declarator.init else {
             return false;
         };
+        let (init, init_span) = init_without_parens(init);
         let Expression::CallExpression(call) = init else {
             return false;
         };
@@ -1349,6 +2000,13 @@ impl<'a, 's> StateVarCollector<'a, 's> {
         // becomes `$.get(state1)` in the helper input, and the helper
         // copies it verbatim into the emitted `$.prop(...)` default arg.
         walk::walk_variable_declarator(self, declarator);
+        // The shared text helper matches `= $props()`, so redundant parens
+        // around the call are dropped here rather than in the helper — esrap
+        // reprints the declaration and never keeps them either (#3248).
+        if init_span != call.span {
+            self.add_replacement(init_span.start, call.span.start, String::new());
+            self.add_replacement(call.span.end, init_span.end, String::new());
+        }
         let decl_span = decl.span;
         let walked_source = self.apply_and_drain_inner_replacements(decl_span.start, decl_span.end);
 
@@ -1396,13 +2054,10 @@ impl<'a, 's> StateVarCollector<'a, 's> {
         if end < bytes.len() && bytes[end] == b';' {
             end += 1;
         }
-        // The helper's trailing `;\n` is now redundant — we consumed
-        // the source's `;` ourselves and the per-statement-loop
-        // appends a fresh `\n`. Strip them.
-        let mut stripped = transformed
-            .trim_end_matches('\n')
-            .trim_end_matches(';')
-            .to_string();
+        // The replacement has to terminate itself: the range above swallowed the
+        // source's `;`, and what follows is a line break only when the next
+        // statement is on the next line.
+        let mut stripped = transformed.trim_end_matches('\n').to_string();
 
         // When the helper returns an empty replacement (read-only
         // `{ name } = $props()` with no defaults), and the component
@@ -1443,6 +2098,7 @@ impl<'a, 's> StateVarCollector<'a, 's> {
         let Some(init) = &declarator.init else {
             return false;
         };
+        let (init, init_span) = init_without_parens(init);
         if !self.is_derived_by_init(init) {
             return false;
         }
@@ -1468,11 +2124,23 @@ impl<'a, 's> StateVarCollector<'a, 's> {
         let arg = &call.arguments[0];
         self.visit_argument(arg);
         let arg_span = arg.span();
+        let (mut pre_spans, post_spans) = self.rune_call_comment_slots(call, arg_span, init_span);
+        // `$.derived` is built with a plain string callee and takes the user's
+        // own function unchanged, so the declarator's leading comments flush
+        // before that argument just like the ones written inside the parens.
+        let lead_spans = self.declarator_lead_comment_spans(id.span().end, call.span.start);
+        let start = lead_spans.first().map_or(call.span.start, |&(first, _)| first);
+        pre_spans.splice(0..0, lead_spans);
+        let lead_comments = self.flush_trivia_comments(&pre_spans, arg_span.start, true);
         let transformed_arg = self.apply_and_drain_inner_replacements(arg_span.start, arg_span.end);
 
-        let replacement = format!("$.derived({})", transformed_arg);
-        let replacement = self.maybe_tag_declarator(var_name, replacement);
-        self.add_replacement(call.span.start, call.span.end, replacement);
+        // No thunk is synthesized here, so the argument stays the last located
+        // node inside the call and esrap flushes its trailing comment there.
+        let (trail, spilled) = self.split_trailing_comments(&post_spans, arg_span.end);
+        let replacement = format!("$.derived({lead_comments}{transformed_arg}{trail})");
+        let mut replacement = self.maybe_tag_declarator(var_name, replacement);
+        let end = self.append_comments_past_semicolon(&spilled, call.span.end, &mut replacement);
+        self.add_replacement(start, end, replacement);
         true
     }
 
@@ -1507,6 +2175,7 @@ impl<'a, 's> StateVarCollector<'a, 's> {
         let Some(init) = &declarator.init else {
             return false;
         };
+        let (init, init_span) = init_without_parens(init);
         if !self.is_derived_call_init(init) {
             return false;
         }
@@ -1537,9 +2206,22 @@ impl<'a, 's> StateVarCollector<'a, 's> {
 
         // Drop a trailing comma inside `$derived(expr,)` — the old text
         // path stripped it because `() => (expr,)` is a SyntaxError.
-        let arg_for_check = arg_source_trimmed
-            .strip_suffix(',')
-            .map_or(arg_source_trimmed, |s| s.trim_end());
+        let arg_for_check =
+            arg_source_trimmed.strip_suffix(',').map_or(arg_source_trimmed, |s| s.trim_end());
+
+        // Comments between the call's `(` and the argument ride along: into the
+        // synthesized thunk's empty parameter parens (where esrap flushes them
+        // — the params sequence runs until the body's start), or straight
+        // before the argument when no thunk is added. The ones written between
+        // the declarator's `=` and `$derived(` reach the same slot, because
+        // upstream builds `$.derived` with a plain string callee that carries
+        // no `loc` of its own.
+        let (mut pre_spans, post_spans) = self.rune_call_comment_slots(call, arg_span, init_span);
+        let lead_spans = self.declarator_lead_comment_spans(id.span().end, call.span.start);
+        let start = lead_spans.first().map_or(call.span.start, |&(first, _)| first);
+        pre_spans.splice(0..0, lead_spans);
+        let param_comments = self.flush_trivia_comments(&pre_spans, arg_span.start, false);
+        let lead_comments = self.flush_trivia_comments(&pre_spans, arg_span.start, true);
 
         // Walk the argument once so inner state-var refs get `$.get(...)`,
         // then drain those inner replacements into a transformed string we
@@ -1548,9 +2230,8 @@ impl<'a, 's> StateVarCollector<'a, 's> {
         self.visit_argument(arg);
         let walked_arg = self.apply_and_drain_inner_replacements(arg_span.start, arg_span.end);
         let walked_trimmed = walked_arg.trim();
-        let walked_for_emit = walked_trimmed
-            .strip_suffix(',')
-            .map_or(walked_trimmed, |s| s.trim_end());
+        let walked_for_emit =
+            walked_trimmed.strip_suffix(',').map_or(walked_trimmed, |s| s.trim_end());
 
         // Case 1: arg is already a function/arrow. The old text path's
         // condition was `starts_with("()") || starts_with("function")`,
@@ -1560,10 +2241,15 @@ impl<'a, 's> StateVarCollector<'a, 's> {
         // byte-identical in edge cases.
         let starts_as_function =
             arg_source_trimmed.starts_with("()") || arg_source_trimmed.starts_with("function");
+        // A synthesized thunk ends the call with an unlocated node, so esrap
+        // carries the argument's trailing comment past the statement's `;`;
+        // without one the comment stays inside the call.
         if starts_as_function {
-            let replacement = format!("$.derived(() => {})", walked_for_emit);
-            let replacement = self.maybe_tag_declarator(var_name, replacement);
-            self.add_replacement(call.span.start, call.span.end, replacement);
+            let replacement = format!("$.derived(({param_comments}) => {walked_for_emit})");
+            let mut replacement = self.maybe_tag_declarator(var_name, replacement);
+            let end =
+                self.append_comments_past_semicolon(&post_spans, call.span.end, &mut replacement);
+            self.add_replacement(start, end, replacement);
             return true;
         }
 
@@ -1574,7 +2260,8 @@ impl<'a, 's> StateVarCollector<'a, 's> {
         // here either — `maybe_tag_declarator` rejects the
         // `await $.async_derived(...)` prefix.
         if contains_direct_await_in_expression(arg_for_check) {
-            let inner_expr = strip_top_level_await_from_expr(walked_for_emit);
+            let saved_for_emit = wrap_await_with_save_in_async_derived(walked_for_emit);
+            let inner_expr = strip_top_level_await_from_expr(&saved_for_emit);
             let inner_trimmed = inner_expr.trim();
             let inner_has_nested_await = contains_direct_await_in_expression(inner_trimmed);
             // Svelte 5.56.0 (#18299 commit `0da9f9e2a` "fix: disallow effect
@@ -1586,38 +2273,45 @@ impl<'a, 's> StateVarCollector<'a, 's> {
             // boundary inside a deriver are now an error rather than a
             // silently-restored context. Keep `should_save = false` for parity.
             let should_save = false;
+            let dev_tail = dev_args(self.async_derived_locations, var_name, var_name);
             let async_derived_call = if inner_has_nested_await {
-                let is_obj = walked_for_emit.starts_with('{');
+                let is_obj = saved_for_emit.starts_with('{');
                 if is_obj {
-                    format!("$.async_derived(async () => ({}))", walked_for_emit)
+                    format!("$.async_derived(async () => ({saved_for_emit}){dev_tail})")
                 } else {
-                    format!("$.async_derived(async () => {})", walked_for_emit)
+                    format!("$.async_derived(async () => {saved_for_emit}{dev_tail})")
                 }
             } else {
                 let inner_is_object = inner_trimmed.starts_with('{');
                 if inner_is_object {
-                    format!("$.async_derived(() => ({}))", inner_expr)
+                    format!("$.async_derived(() => ({inner_expr}){dev_tail})")
                 } else {
                     let thunk_arg = unthunk_string(&inner_expr);
-                    format!("$.async_derived({})", thunk_arg)
+                    format!("$.async_derived({thunk_arg}{dev_tail})")
                 }
             };
-            let replacement = if should_save {
+            let mut replacement = if should_save {
                 // Unreachable post-5.56.0; kept inert to mirror the upstream
                 // structure of `should_save ? save(call) : b.await(call)`.
                 format!("(await $.save({}))()", async_derived_call)
             } else {
                 format!("await {}", async_derived_call)
             };
-            self.add_replacement(call.span.start, call.span.end, replacement);
+            let end =
+                self.append_comments_past_semicolon(&post_spans, call.span.end, &mut replacement);
+            // The async form drops the thunk parens the leading comments would
+            // have gone into, so they keep their source position here.
+            self.add_replacement(call.span.start, end, replacement);
             return true;
         }
 
         // Case 3: object literal — paren-wrap so the body isn't parsed as a block.
         if matches!(arg_expr_opt, Some(Expression::ObjectExpression(_))) {
-            let replacement = format!("$.derived(() => ({}))", walked_for_emit);
-            let replacement = self.maybe_tag_declarator(var_name, replacement);
-            self.add_replacement(call.span.start, call.span.end, replacement);
+            let replacement = format!("$.derived(({param_comments}) => ({walked_for_emit}))");
+            let mut replacement = self.maybe_tag_declarator(var_name, replacement);
+            let end =
+                self.append_comments_past_semicolon(&post_spans, call.span.end, &mut replacement);
+            self.add_replacement(start, end, replacement);
             return true;
         }
 
@@ -1628,9 +2322,12 @@ impl<'a, 's> StateVarCollector<'a, 's> {
         if let Some(Expression::Identifier(ident)) = arg_expr_opt {
             let name = ident.name.as_str();
             if self.store_sub_vars.contains(name) || self.prop_source_vars.contains(name) {
-                let replacement = format!("$.derived({})", name);
-                let replacement = self.maybe_tag_declarator(var_name, replacement);
-                self.add_replacement(call.span.start, call.span.end, replacement);
+                let (trail, spilled) = self.split_trailing_comments(&post_spans, arg_span.end);
+                let replacement = format!("$.derived({lead_comments}{name}{trail})");
+                let mut replacement = self.maybe_tag_declarator(var_name, replacement);
+                let end =
+                    self.append_comments_past_semicolon(&spilled, call.span.end, &mut replacement);
+                self.add_replacement(start, end, replacement);
                 return true;
             }
         }
@@ -1638,9 +2335,20 @@ impl<'a, 's> StateVarCollector<'a, 's> {
         // Case 5: default — unthunk if the walked arg is a `name()` /
         // `$.foo()` shape, otherwise wrap in a thunk.
         let derived_arg = unthunk_string(walked_for_emit);
-        let replacement = format!("$.derived({})", derived_arg);
-        let replacement = self.maybe_tag_declarator(var_name, replacement);
-        self.add_replacement(call.span.start, call.span.end, replacement);
+        let (thunked, derived_arg) = if let Some(body) = derived_arg.strip_prefix("() => ") {
+            (true, format!("({param_comments}) => {body}"))
+        } else {
+            (false, format!("{lead_comments}{derived_arg}"))
+        };
+        let (trail, spilled) = if thunked {
+            (String::new(), post_spans)
+        } else {
+            self.split_trailing_comments(&post_spans, arg_span.end)
+        };
+        let replacement = format!("$.derived({derived_arg}{trail})");
+        let mut replacement = self.maybe_tag_declarator(var_name, replacement);
+        let end = self.append_comments_past_semicolon(&spilled, call.span.end, &mut replacement);
+        self.add_replacement(start, end, replacement);
         true
     }
 
@@ -1725,53 +2433,87 @@ impl<'a, 's> StateVarCollector<'a, 's> {
             format!("() => {}", arg_txt.trim())
         } else {
             let before_block_post = &self.source[..body.span.start as usize];
-            let default_label_owned = extract_enclosing_function_name(before_block_post)
-                .map(str::to_string)
+            let trace_pos = self.trace_source_position(before_block_post);
+            let default_label_owned = self
+                .trace_function_label
+                .clone()
+                .or_else(|| extract_enclosing_function_name(before_block_post).map(str::to_string))
                 .or_else(|| {
-                    self.analysis_source.and_then(|src| {
-                        extract_trace_call_label(before_block_post, src).map(str::to_string)
+                    self.analysis_source.zip(trace_pos).and_then(|(src, trace_pos)| {
+                        extract_trace_call_label(src, trace_pos).map(str::to_string)
                     })
                 })
                 .unwrap_or_else(|| "trace".to_string());
             let default_label = default_label_owned.as_str();
-            let source_pos = self
-                .analysis_source
-                .and_then(|src| find_trace_source_location(before_block_post, src, default_label));
+            let source_pos = self.analysis_source.zip(trace_pos).and_then(|(src, trace_pos)| {
+                find_trace_source_location(src, trace_pos, self.trace_in_class_method)
+            });
             match (source_pos, self.filename) {
                 (Some((line, col)), Some(filename)) => {
+                    // `locate_node()` runs the path through `sanitize_location()`.
+                    let filename = filename.replace('/', "/\u{200b}");
                     format!("() => '{} ({}:{}:{})'", default_label, filename, line, col)
                 }
                 _ => format!("() => '{}'", default_label),
             }
         };
 
+        let (awaited, asyncness) =
+            if self.trace_function_is_async { ("await ", "async ") } else { ("", "") };
         let replacement = format!(
-            "{{return $.trace({}, () => {{\n{}\n}});\n}}",
-            trace_thunk, remaining_trimmed
+            "{{return {awaited}$.trace({trace_thunk}, {asyncness}() => {{\n{remaining_trimmed}\n}});\n}}"
         );
         self.add_replacement(body.span.start, body.span.end, replacement);
         true
     }
 
-    /// Dev-mode rewrite of `a === b` / `a !== b` BinaryExpressions to
-    /// `$.strict_equals(a, b)` / `!$.strict_equals(a, b)`. Mirrors the
-    /// official Svelte compiler's `BinaryExpression` visitor — runtime
-    /// hook that surfaces signal-vs-proxy comparison footguns to the user.
-    /// Replaces the text-based pass formerly in
+    /// Match the trace call in the transformed script to the same code-only
+    /// occurrence in the original instance script. The original-source offset
+    /// is what `locate_node` measures; transformed AST spans may have shifted.
+    fn trace_source_position(&self, before_block: &str) -> Option<usize> {
+        const TRACE: &[u8] = b"$inspect.trace(";
+        let mut ordinal = 0;
+        let mut from = 0;
+        while let Some(at) = find_code_from(before_block.as_bytes(), TRACE, from) {
+            ordinal += 1;
+            from = at + TRACE.len();
+        }
+
+        let source = self.analysis_source?;
+        let script = self.analysis?.instance_script_content.as_ref()?;
+        let start = script.start as usize;
+        let end = script.end as usize;
+        let bytes = source.get(start..end)?.as_bytes();
+        let mut from = 0;
+        for _ in 0..ordinal {
+            let at = find_code_from(bytes, TRACE, from)?;
+            from = at + TRACE.len();
+        }
+        find_code_from(bytes, TRACE, from).map(|at| start + at)
+    }
+
+    /// Dev-mode rewrite of the four equality BinaryExpressions into their
+    /// instrumented calls — `$.strict_equals` for `===` / `!==`, `$.equals`
+    /// for `==` / `!=`, with a trailing `false` argument marking the negated
+    /// forms. Mirrors the official Svelte compiler's `BinaryExpression`
+    /// visitor — runtime hook that surfaces signal-vs-proxy comparison
+    /// footguns to the user. Replaces the text-based pass formerly in
     /// `rune_transforms::transform_strict_equals` for component instance
     /// scripts. Returns `true` when the expression was rewritten.
     fn try_rewrite_strict_equals_binary(&mut self, expr: &BinaryExpression<'_>) -> bool {
         if !self.dev {
             return false;
         }
-        let is_neq = match expr.operator {
-            BinaryOperator::StrictEquality => false,
-            BinaryOperator::StrictInequality => true,
+        let (helper, negated) = match expr.operator {
+            BinaryOperator::StrictEquality => ("$.strict_equals", false),
+            BinaryOperator::StrictInequality => ("$.strict_equals", true),
+            BinaryOperator::Equality => ("$.equals", false),
+            BinaryOperator::Inequality => ("$.equals", true),
             _ => return false,
         };
 
         // Walk both operands so inner state-var refs (and nested
-        // `===` / `!==` rewrites) register their replacements, then
+        // equality rewrites) register their replacements, then
         // drain those into the operand-local text. Each drain yields
         // the fully-transformed operand substring that the outer
         // replacement carries verbatim.
@@ -1783,22 +2525,112 @@ impl<'a, 's> StateVarCollector<'a, 's> {
         let left_text = self.apply_and_drain_inner_replacements(left_span.start, left_span.end);
         let right_text = self.apply_and_drain_inner_replacements(right_span.start, right_span.end);
 
-        let replacement = if is_neq {
-            format!(
-                "!$.strict_equals({}, {})",
-                left_text.trim(),
-                right_text.trim()
-            )
-        } else {
-            format!(
-                "$.strict_equals({}, {})",
-                left_text.trim(),
-                right_text.trim()
-            )
-        };
+        let replacement = format!(
+            "{}({}, {}{})",
+            helper,
+            left_text.trim(),
+            right_text.trim(),
+            if negated { ", false" } else { "" }
+        );
 
         self.add_replacement(expr.span.start, expr.span.end, replacement);
         true
+    }
+
+    /// Dev-mode rewrite of `await X` to `(await $.track_reactivity_loss(X))()`,
+    /// mirroring the official compiler's `AwaitExpression` visitor: values read
+    /// inside a reactive expression are noted but not tracked across the await
+    /// boundary. Suppressed by a leading `svelte-ignore await_reactivity_loss`.
+    /// Returns `true` when the expression was rewritten.
+    fn try_rewrite_await_reactivity_loss(&mut self, expr: &AwaitExpression<'_>) -> bool {
+        if !self.dev
+            || self.is_await_reactivity_loss_ignored(expr.span.start)
+            || super::await_reactivity_loss_ast::is_save_call(&expr.argument)
+            || super::await_reactivity_loss_ast::is_destructuring_iife_call(&expr.argument)
+        {
+            return false;
+        }
+
+        // Walk the argument so inner state-var refs (and nested awaits)
+        // register their replacements, then drain them into the argument text.
+        self.visit_expression(&expr.argument);
+        // Copy from just past the `await` keyword, not from the argument's own
+        // start: the trivia between them holds comments upstream keeps inside
+        // the call. Widening only the start is safe because the drained inner
+        // replacements are re-based on whatever start is passed here.
+        let arg_start = expr.span.start + "await".len() as u32;
+        let arg_text = self.apply_and_drain_inner_replacements(arg_start, expr.span.end);
+
+        let wrap = |argument: &str| format!("(await $.track_reactivity_loss({argument}))()");
+        // The `;` rides inside this replacement rather than being appended to
+        // the statement before it, which may have no replacement of its own.
+        let (start, replacement) = match self.await_separators.get(&expr.span.start) {
+            Some(&prev_end) => (
+                prev_end,
+                format!(
+                    ";{}{}",
+                    &self.source[prev_end as usize..expr.span.start as usize],
+                    wrap(arg_text.trim())
+                ),
+            ),
+            // A statement whose own start is the `await` is exactly the shape
+            // that keeps its leading comments outside, so the two never mix.
+            None => match self.await_comment_runs.relocatable_run(self.source, expr.span.start) {
+                Some((run_start, comments)) => {
+                    (run_start, wrap(&format!("{comments}{}", arg_text.trim())))
+                }
+                None => (expr.span.start, wrap(arg_text.trim())),
+            },
+        };
+        self.add_replacement(start, expr.span.end, replacement);
+        true
+    }
+
+    /// Dev-mode rewrite of `for await (… of X)` to
+    /// `for await (… of $.for_await_track_reactivity_loss(X))`, mirroring the
+    /// official compiler's `ForOfStatement` visitor. Returns `true` when the
+    /// statement was rewritten (the caller then skips the default walk).
+    fn try_rewrite_for_await_reactivity_loss(&mut self, stmt: &ForOfStatement<'_>) -> bool {
+        if !self.dev
+            || !super::await_reactivity_loss_ast::is_for_await_instrumentable(
+                stmt,
+                self.analysis.is_some_and(|a| a.experimental_async),
+                self.is_await_reactivity_loss_ignored(stmt.span.start),
+            )
+        {
+            return false;
+        }
+
+        self.visit_for_statement_left(&stmt.left);
+        self.visit_expression(&stmt.right);
+        let right_span = stmt.right.span();
+        let right_text = self.apply_and_drain_inner_replacements(right_span.start, right_span.end);
+        self.add_replacement(
+            right_span.start,
+            right_span.end,
+            super::await_reactivity_loss_ast::for_await_track_reactivity_loss_wrap(
+                right_text.trim(),
+            ),
+        );
+        self.visit_statement(&stmt.body);
+        true
+    }
+
+    fn is_await_reactivity_loss_ignored(&self, offset: u32) -> bool {
+        self.await_ignore_ranges.contains(offset)
+    }
+
+    fn collect_await_ignore_ranges(&mut self, program: &Program<'_>) {
+        if !self.dev || !super::await_reactivity_loss_ast::source_has_await(self.source) {
+            return;
+        }
+        self.await_ignore_ranges = super::await_reactivity_loss_ast::collect_await_ignore_ranges(
+            program,
+            self.source,
+            self.is_runes,
+        );
+        self.await_comment_runs =
+            super::await_reactivity_loss_ast::AwaitCommentRuns::collect(program);
     }
 
     /// Walk every argument of a `CallExpression` so inner state-var refs
@@ -1824,6 +2656,30 @@ impl<'a, 's> StateVarCollector<'a, 's> {
         parts.join(", ")
     }
 
+    fn inspect_args_with_trailing_comment(&self, end: u32, args: String) -> (u32, String) {
+        let tail = &self.source[end as usize..];
+        let spaces = tail.len() - tail.trim_start_matches([' ', '\t']).len();
+        let tail = &tail[spaces..];
+        let Some(after_semicolon) = tail.strip_prefix(';') else {
+            return (end, args);
+        };
+        let spaces_after_semicolon =
+            after_semicolon.len() - after_semicolon.trim_start_matches([' ', '\t']).len();
+        let comment = &after_semicolon[spaces_after_semicolon..];
+        if let Some(line) = comment.strip_prefix("//") {
+            let len = line.find('\n').unwrap_or(line.len());
+            let comment_end = end as usize + spaces + 1 + spaces_after_semicolon + 2 + len;
+            return (comment_end as u32, format!("{args}, //{}\n", &line[..len]));
+        }
+        if let Some(block) = comment.strip_prefix("/*")
+            && let Some(close) = block.find("*/")
+        {
+            let comment_end = end as usize + spaces + 1 + spaces_after_semicolon + 2 + close + 2;
+            return (comment_end as u32, format!("{args} /*{}*/", &block[..close]));
+        }
+        (end, args)
+    }
+
     /// Apply any pending replacements that fall within [range_start, range_end)
     /// to the given source text, remove them from the replacements list, and
     /// return the transformed substring.
@@ -1831,13 +2687,7 @@ impl<'a, 's> StateVarCollector<'a, 's> {
     /// This is used when an outer replacement (e.g., assignment) needs the
     /// already-transformed text of an inner region (e.g., the RHS expression).
     fn apply_and_drain_inner_replacements(&mut self, range_start: u32, range_end: u32) -> String {
-        // Partition: collect inner replacements, keep the rest
-        let (inner, outer): (Vec<Replacement>, Vec<Replacement>) = self
-            .replacements
-            .drain(..)
-            .partition(|r| r.start >= range_start && r.end <= range_end);
-
-        self.replacements = outer;
+        let inner = self.take_inner_replacements(range_start, range_end);
 
         if inner.is_empty() {
             return self.source[range_start as usize..range_end as usize].to_string();
@@ -1857,6 +2707,38 @@ impl<'a, 's> StateVarCollector<'a, 's> {
         result
     }
 
+    /// Remove every pending replacement contained in `[range_start, range_end]`
+    /// and return them, preserving the relative order of both the removed and
+    /// the retained entries.
+    ///
+    /// Walking in source order keeps `replacements` sorted by `start`, so the
+    /// contained entries are one contiguous window that binary search locates
+    /// without touching the entries before it. Rescanning the whole list on
+    /// every call is quadratic in a component's rune declaration count.
+    fn take_inner_replacements(&mut self, range_start: u32, range_end: u32) -> Vec<Replacement> {
+        let contained = |r: &Replacement| r.start >= range_start && r.end <= range_end;
+
+        if !self.replacements_sorted {
+            let (inner, outer): (Vec<Replacement>, Vec<Replacement>) =
+                self.replacements.drain(..).partition(contained);
+            self.replacements = outer;
+            self.replacements_sorted = self.replacements.is_sorted_by_key(|r| r.start);
+            return inner;
+        }
+
+        let lo = self.replacements.partition_point(|r| r.start < range_start);
+        let hi = lo + self.replacements[lo..].partition_point(|r| r.start <= range_end);
+        if lo == hi {
+            return Vec::new();
+        }
+        let (inner, kept): (Vec<Replacement>, Vec<Replacement>) =
+            self.replacements.drain(lo..hi).partition(contained);
+        if !kept.is_empty() {
+            self.replacements.splice(lo..lo, kept);
+        }
+        inner
+    }
+
     /// Collect all binding identifiers from a BindingPattern into the current scope.
     fn collect_binding_names(&mut self, pattern: &BindingPattern<'_>) {
         self.collect_binding_names_inner(pattern, false);
@@ -1869,6 +2751,36 @@ impl<'a, 's> StateVarCollector<'a, 's> {
         self.collect_binding_names_inner(pattern, true);
     }
 
+    fn collect_active_state_binding_names(&mut self, pattern: &BindingPattern<'_>) {
+        match pattern {
+            BindingPattern::BindingIdentifier(id) => {
+                self.active_state_vars
+                    .last_mut()
+                    .expect("scope stacks stay aligned")
+                    .insert(id.name.to_string());
+            }
+            BindingPattern::ObjectPattern(object) => {
+                for property in &object.properties {
+                    self.collect_active_state_binding_names(&property.value);
+                }
+                if let Some(rest) = &object.rest {
+                    self.collect_active_state_binding_names(&rest.argument);
+                }
+            }
+            BindingPattern::ArrayPattern(array) => {
+                for element in array.elements.iter().flatten() {
+                    self.collect_active_state_binding_names(element);
+                }
+                if let Some(rest) = &array.rest {
+                    self.collect_active_state_binding_names(&rest.argument);
+                }
+            }
+            BindingPattern::AssignmentPattern(assignment) => {
+                self.collect_active_state_binding_names(&assignment.left);
+            }
+        }
+    }
+
     /// Check if a name is any known transform variable (state, prop, store, read-only, rest-prop)
     /// that should not be registered as shadowed at program scope.
     fn is_any_known_transform_var(&self, name: &str) -> bool {
@@ -1879,45 +2791,25 @@ impl<'a, 's> StateVarCollector<'a, 's> {
             || self.rest_prop_vars.contains(name)
     }
 
-    /// Check if a binding pattern contains any name that is a non-reactive variable.
-    /// Used to detect when a nested $.state() declaration shadows a non-reactive outer variable.
-    fn has_non_reactive_binding_name(&self, pattern: &BindingPattern<'_>) -> bool {
-        match pattern {
-            BindingPattern::BindingIdentifier(id) => {
-                self.non_reactive_vars.contains(id.name.as_str())
-            }
-            BindingPattern::ObjectPattern(obj) => {
-                obj.properties
-                    .iter()
-                    .any(|prop| self.has_non_reactive_binding_name(&prop.value))
-                    || obj
-                        .rest
-                        .as_ref()
-                        .is_some_and(|r| self.has_non_reactive_binding_name(&r.argument))
-            }
-            BindingPattern::ArrayPattern(arr) => {
-                arr.elements
-                    .iter()
-                    .flatten()
-                    .any(|elem| self.has_non_reactive_binding_name(elem))
-                    || arr
-                        .rest
-                        .as_ref()
-                        .is_some_and(|r| self.has_non_reactive_binding_name(&r.argument))
-            }
-            BindingPattern::AssignmentPattern(assign) => {
-                self.has_non_reactive_binding_name(&assign.left)
-            }
-        }
-    }
-
     /// Inner implementation for collecting binding names.
     /// When `skip_state_vars` is true, names that are in `self.state_vars` are not registered.
     fn collect_binding_names_inner(&mut self, pattern: &BindingPattern<'_>, skip_state_vars: bool) {
         match pattern {
             BindingPattern::BindingIdentifier(id) => {
-                if skip_state_vars && self.is_any_known_transform_var(&id.name) {
-                    // Don't register - this is a known transform variable at program scope
+                // A destructuring pattern can mix reactive and non-reactive
+                // bindings, so the shadow decision has to be per name.
+                let shadows_non_reactive =
+                    self.scoped_vars.len() > 1 && self.non_reactive_vars.contains(id.name.as_str());
+                if skip_state_vars
+                    && self.is_any_known_transform_var(&id.name)
+                    && !shadows_non_reactive
+                {
+                    if self.state_vars.contains(id.name.as_str()) {
+                        self.active_state_vars
+                            .last_mut()
+                            .expect("scope stacks stay aligned")
+                            .insert(id.name.to_string());
+                    }
                 } else {
                     self.declare_in_current_scope(&id.name);
                 }
@@ -2002,29 +2894,12 @@ impl<'a, 's, 'ast> Visit<'ast> for StateVarCollector<'a, 's> {
         }
 
         // Register declared names in the current scope for shadowing detection.
-        // For each declarator, check if it's a state variable declaration
-        // (initialized with $.state(), $.derived(), etc.). If so, skip registering
-        // the name - it IS the state variable we want to transform, and registering
-        // it would cause is_shadowed() to return true, preventing all transforms.
-        // Regular declarations with the same name (e.g., `let count = 0` inside
-        // a nested function) correctly shadow the outer state variable.
-        //
-        // EXCEPTION: When we're in a nested scope and the variable name is ALREADY
-        // a non-reactive state variable (in non_reactive_vars), this inner declaration
-        // SHADOWS the outer one. In this case, register it normally so that references
-        // within the inner scope are not transformed with $.get()/$.set().
+        // A state declaration must not register its own names — that would make
+        // `is_shadowed()` true and suppress every transform for them.
         for declarator in &decl.declarations {
-            let is_state_decl = self.is_known_transform_declaration(declarator);
-            if is_state_decl {
-                // Check if any declared name in this declarator is a non-reactive var.
-                // Non-reactive vars are already stripped of $.state() by the rune transform,
-                // so they don't need transforms. If a same-named $.state() declaration
-                // appears in a nested scope, it's shadowing the outer non-reactive var
-                // and should be treated as a regular (shadowing) declaration.
-                let is_shadowing_non_reactive = self.scoped_vars.len() > 1
-                    && self.has_non_reactive_binding_name(&declarator.id);
-                if is_shadowing_non_reactive {
-                    self.collect_binding_names(&declarator.id);
+            if self.is_known_transform_declaration(declarator) {
+                if self.is_reactive_transform_declaration(declarator) {
+                    self.collect_active_state_binding_names(&declarator.id);
                 } else {
                     self.collect_binding_names_skip_state(&declarator.id);
                 }
@@ -2069,7 +2944,11 @@ impl<'a, 's, 'ast> Visit<'ast> for StateVarCollector<'a, 's> {
         if self.try_rewrite_derived_call_declarator(declarator) {
             return;
         }
+        let saved = self.trace_parent_label.take();
+        self.trace_parent_label =
+            declarator.id.get_binding_identifier().map(|id| id.name.to_string());
         walk::walk_variable_declarator(self, declarator);
+        self.trace_parent_label = saved;
     }
 
     fn visit_function_body(&mut self, body: &FunctionBody<'ast>) {
@@ -2102,14 +2981,46 @@ impl<'a, 's, 'ast> Visit<'ast> for StateVarCollector<'a, 's> {
         // `(await $.save($.async_derived(…)))()` (nested function, depth ≥ 1)
         // — mirrors upstream `context.state.scope.function_depth > 1`.
         self.function_depth += 1;
+        let saved_label = self.trace_function_label.take();
+        let saved_async = self.trace_function_is_async;
+        let saved_class_method = self.trace_in_class_method;
+        self.trace_in_class_method = self.trace_next_function_is_class_method;
+        self.trace_next_function_is_class_method = false;
+        self.trace_function_label = it
+            .id
+            .as_ref()
+            .map(|id| id.name.to_string())
+            .or_else(|| self.trace_parent_label.clone());
+        self.trace_function_is_async = it.r#async;
         walk::walk_function(self, it, flags);
+        self.trace_function_label = saved_label;
+        self.trace_function_is_async = saved_async;
+        self.trace_in_class_method = saved_class_method;
         self.function_depth -= 1;
     }
 
     fn visit_arrow_function_expression(&mut self, it: &ArrowFunctionExpression<'ast>) {
         self.function_depth += 1;
+        let saved_label = self.trace_function_label.take();
+        let saved_async = self.trace_function_is_async;
+        let saved_class_method = self.trace_in_class_method;
+        self.trace_in_class_method = false;
+        self.trace_function_label = self.trace_parent_label.clone();
+        self.trace_function_is_async = it.r#async;
         walk::walk_arrow_function_expression(self, it);
+        self.trace_function_label = saved_label;
+        self.trace_function_is_async = saved_async;
+        self.trace_in_class_method = saved_class_method;
         self.function_depth -= 1;
+    }
+
+    fn visit_method_definition(&mut self, it: &MethodDefinition<'ast>) {
+        let saved_parent_label = self.trace_parent_label.take();
+        let saved_next_class_method = self.trace_next_function_is_class_method;
+        self.trace_next_function_is_class_method = true;
+        walk::walk_method_definition(self, it);
+        self.trace_next_function_is_class_method = saved_next_class_method;
+        self.trace_parent_label = saved_parent_label;
     }
 
     fn visit_binary_expression(&mut self, expr: &BinaryExpression<'ast>) {
@@ -2118,6 +3029,26 @@ impl<'a, 's, 'ast> Visit<'ast> for StateVarCollector<'a, 's> {
         // walk to avoid double-visiting the operands.
         if !self.try_rewrite_strict_equals_binary(expr) {
             walk::walk_binary_expression(self, expr);
+        }
+    }
+
+    fn visit_statements(&mut self, stmts: &oxc_allocator::Vec<'ast, Statement<'ast>>) {
+        self.await_separators
+            .extend(super::await_reactivity_loss_ast::separator_positions(stmts, self.source));
+        walk::walk_statements(self, stmts);
+    }
+
+    fn visit_await_expression(&mut self, expr: &AwaitExpression<'ast>) {
+        // Same contract as the binary hook: the helper walks and drains the
+        // argument itself when it matches.
+        if !self.try_rewrite_await_reactivity_loss(expr) {
+            walk::walk_await_expression(self, expr);
+        }
+    }
+
+    fn visit_for_of_statement(&mut self, stmt: &ForOfStatement<'ast>) {
+        if !self.try_rewrite_for_await_reactivity_loss(stmt) {
+            walk::walk_for_of_statement(self, stmt);
         }
     }
 
@@ -2264,15 +3195,14 @@ impl<'a, 's, 'ast> Visit<'ast> for StateVarCollector<'a, 's> {
                                 return;
                             }
                             "pending" if expr.arguments.is_empty() => {
-                                // Whole-call rewrite: `$effect.pending()` becomes
-                                // `$.eager(() => $.pending())`, matching upstream
-                                // (`$.eager` receives a thunk that calls
-                                // `$.pending()`). The entire CallExpression span is
-                                // replaced.
+                                // Whole-call rewrite. Upstream builds
+                                // `b.thunk(b.call('$.pending'))`, and `thunk`
+                                // unthunks a zero-argument call of an identifier,
+                                // so the argument is the bare reference.
                                 self.add_replacement(
                                     expr.span.start,
                                     expr.span.end,
-                                    "$.eager(() => $.pending())".to_string(),
+                                    "$.eager($.pending)".to_string(),
                                 );
                                 return;
                             }
@@ -2358,7 +3288,10 @@ impl<'a, 's, 'ast> Visit<'ast> for StateVarCollector<'a, 's> {
             self.add_replacement(
                 expr.span.start,
                 expr.span.end,
-                format!("$.eager(() => {})", transformed_arg),
+                format!(
+                    "$.eager({})",
+                    super::destructure_transforms::unthunk_string(&transformed_arg)
+                ),
             );
             return;
         }
@@ -2396,12 +3329,20 @@ impl<'a, 's, 'ast> Visit<'ast> for StateVarCollector<'a, 's> {
                 self.visit_argument(cb_arg);
                 let cb_span = cb_arg.span();
                 let cb_text = self.apply_and_drain_inner_replacements(cb_span.start, cb_span.end);
+                let inspector =
+                    if cb_arg.as_expression().is_none_or(super::inspect_rune_ast::needs_parens) {
+                        format!("({cb_text})")
+                    } else {
+                        cb_text
+                    };
+                let (replacement_end, args_text) =
+                    self.inspect_args_with_trailing_comment(expr.span.end, args_text);
+                let suffix = if replacement_end == expr.span.end { "" } else { ";" };
                 self.add_replacement(
                     expr.span.start,
-                    expr.span.end,
+                    replacement_end,
                     format!(
-                        "$.inspect(() => [{}], (...$$args) => ({})(...$$args))",
-                        args_text, cb_text
+                        "$.inspect(() => [{args_text}], (...$$args) => {inspector}(...$$args)){suffix}"
                     ),
                 );
                 return;
@@ -2413,11 +3354,14 @@ impl<'a, 's, 'ast> Visit<'ast> for StateVarCollector<'a, 's> {
                 && callee_ident.name == "$inspect"
             {
                 let args_text = self.walk_and_drain_args_as_text(expr);
+                let (replacement_end, args_text) =
+                    self.inspect_args_with_trailing_comment(expr.span.end, args_text);
+                let suffix = if replacement_end == expr.span.end { "" } else { ";" };
                 self.add_replacement(
                     expr.span.start,
-                    expr.span.end,
+                    replacement_end,
                     format!(
-                        "$.inspect(() => [{}], (...$$args) => console.log(...$$args), true)",
+                        "$.inspect(() => [{}], (...$$args) => console.log(...$$args), true){suffix}",
                         args_text
                     ),
                 );
@@ -2535,6 +3479,14 @@ impl<'a, 's, 'ast> Visit<'ast> for StateVarCollector<'a, 's> {
     // -----------------------------------------------------------------------
 
     fn visit_assignment_expression(&mut self, expr: &AssignmentExpression<'ast>) {
+        // Suppress the `rest.x -> $$props.x` rewrite for a RHS that is itself a bare
+        // single-level `rest.x` member — its grandparent is this assignment, so
+        // upstream keeps `rest.x` (e.g. `ctx.globalAlpha *= rest.opacity`). Recorded
+        // before any child is visited so it is seen when the member is reached.
+        if let Some(start) = self.direct_rest_member_operand_start(&expr.right) {
+            self.rest_operand_member_starts.insert(start);
+        }
+
         // Check if the left side is a simple identifier
         if let AssignmentTarget::AssignmentTargetIdentifier(ident) = &expr.left {
             let name = ident.name.as_str();
@@ -2560,7 +3512,9 @@ impl<'a, 's, 'ast> Visit<'ast> for StateVarCollector<'a, 's> {
                         let needs_proxy = self.is_runes
                             && !is_raw
                             && !is_derived
-                            && should_proxy_ast(&expr.right, self.reassign_non_proxy_vars);
+                            && self.ident_rhs_site_decision(&expr.right).unwrap_or_else(|| {
+                                should_proxy_ast(&expr.right, self.reassign_non_proxy_vars, false)
+                            });
 
                         let replacement = if needs_proxy {
                             format!("$.set({}, {}, true)", name, rhs_text)
@@ -2599,7 +3553,9 @@ impl<'a, 's, 'ast> Visit<'ast> for StateVarCollector<'a, 's> {
                             && self.is_runes
                             && !is_raw
                             && !is_derived
-                            && should_proxy_ast(&expr.right, self.reassign_non_proxy_vars);
+                            && self.ident_rhs_site_decision(&expr.right).unwrap_or_else(|| {
+                                should_proxy_ast(&expr.right, self.reassign_non_proxy_vars, false)
+                            });
 
                         let replacement = if needs_proxy {
                             format!(
@@ -2607,10 +3563,7 @@ impl<'a, 's, 'ast> Visit<'ast> for StateVarCollector<'a, 's> {
                                 name, getter, name, op_str, rhs_str
                             )
                         } else {
-                            format!(
-                                "$.set({}, {}({}) {} {})",
-                                name, getter, name, op_str, rhs_str
-                            )
+                            format!("$.set({}, {}({}) {} {})", name, getter, name, op_str, rhs_str)
                         };
                         self.add_replacement(full_start, full_end, replacement);
                     }
@@ -2763,6 +3716,20 @@ impl<'a, 's, 'ast> Visit<'ast> for StateVarCollector<'a, 's> {
             self.add_replacement(full_start, full_end, replacement);
             return;
         }
+        // Nested/keyed/defaulted patterns the two narrow helpers above don't
+        // cover (e.g. `({ b: o.p } = src)`, `({ a: { value } } = src)`).
+        if matches!(
+            &expr.left,
+            AssignmentTarget::ObjectAssignmentTarget(_)
+                | AssignmentTarget::ArrayAssignmentTarget(_)
+        ) && expr.operator == AssignmentOperator::Assign
+            && let Some(replacement) =
+                self.try_build_nested_destructure_prop_assignment(&expr.left, &expr.right)
+        {
+            let (full_start, full_end) = self.effective_span(expr.span.start, expr.span.end);
+            self.add_replacement(full_start, full_end, replacement);
+            return;
+        }
         if matches!(
             &expr.left,
             AssignmentTarget::ObjectAssignmentTarget(_)
@@ -2782,38 +3749,72 @@ impl<'a, 's, 'ast> Visit<'ast> for StateVarCollector<'a, 's> {
     // -----------------------------------------------------------------------
 
     fn visit_update_expression(&mut self, expr: &UpdateExpression<'ast>) {
+        // `rest.x++` keeps `rest.x` (member grandparent is the UpdateExpression).
+        if let SimpleAssignmentTarget::StaticMemberExpression(member) = &expr.argument
+            && let Expression::Identifier(obj) = &member.object
+            && self.is_active_rest_prop(obj.name.as_str())
+        {
+            self.rest_operand_member_starts.insert(member.span.start);
+        }
+
+        // --- Prop member updates (bindable props): `p.a++` →
+        // `p(p().a++, true)`, mirroring the assignment branch (#3048). ---
+        let member_object = match &expr.argument {
+            SimpleAssignmentTarget::StaticMemberExpression(m) => Some(&m.object),
+            SimpleAssignmentTarget::ComputedMemberExpression(m) => Some(&m.object),
+            _ => None,
+        };
+        if let Some(object) = member_object
+            && let Some(obj_name) = Self::extract_root_object_from_expr(object)
+            && self.is_active_prop_var(&obj_name)
+            && !self.non_bindable_prop_vars.contains(&obj_name)
+        {
+            let (full_start, full_end) = self.effective_span(expr.span.start, expr.span.end);
+            walk::walk_update_expression(self, expr);
+            let full_text = self.apply_and_drain_inner_replacements(full_start, full_end);
+            let replacement = format!("{}({}, true)", obj_name, full_text);
+            self.add_replacement(full_start, full_end, replacement);
+            return;
+        }
+
         if let SimpleAssignmentTarget::AssignmentTargetIdentifier(ident) = &expr.argument {
             let name = ident.name.as_str();
             let (full_start, full_end) = self.effective_span(expr.span.start, expr.span.end);
 
             // --- State variable updates ---
             if self.is_any_state_var(name) {
-                match (expr.prefix, expr.operator) {
-                    (true, UpdateOperator::Increment) => {
-                        self.add_replacement(
-                            full_start,
-                            full_end,
-                            format!("$.update_pre({})", name),
-                        );
-                    }
-                    (true, UpdateOperator::Decrement) => {
-                        self.add_replacement(
-                            full_start,
-                            full_end,
-                            format!("$.update_pre({}, -1)", name),
-                        );
-                    }
-                    (false, UpdateOperator::Increment) => {
-                        self.add_replacement(full_start, full_end, format!("$.update({})", name));
-                    }
-                    (false, UpdateOperator::Decrement) => {
-                        self.add_replacement(
-                            full_start,
-                            full_end,
-                            format!("$.update({}, -1)", name),
-                        );
-                    }
+                let callee = if expr.prefix { "$.update_pre" } else { "$.update" };
+                let decrement = expr.operator == UpdateOperator::Decrement;
+                if let Some(tc) = self.trailing_update_comment(full_start, full_end) {
+                    let text = match (decrement, tc.is_line) {
+                        (false, false) => format!("{callee}({name} {});", tc.comment),
+                        (true, false) => format!("{callee}({name}, {} -1);", tc.comment),
+                        (false, true) => {
+                            format!("{callee}({name} {}\n{});", tc.comment, tc.indent)
+                        }
+                        (true, true) => {
+                            // Multiline argument list; esrap puts a blank line
+                            // on each side of a multiline statement.
+                            if tc.stmt_starts_line && self.margin_before_allowed(tc.line_start) {
+                                self.add_replacement(tc.line_start, tc.line_start, "\n".into());
+                            }
+                            let margin_after =
+                                if self.margin_after_allowed(tc.new_end) { "\n" } else { "" };
+                            format!(
+                                "{callee}(\n{i}\t{name}, {}\n{i}\t-1\n{i});{margin_after}",
+                                tc.comment,
+                                i = tc.indent
+                            )
+                        }
+                    };
+                    self.add_replacement(full_start, tc.new_end, text);
+                    return;
                 }
+                let text = match decrement {
+                    false => format!("{callee}({name})"),
+                    true => format!("{callee}({name}, -1)"),
+                };
+                self.add_replacement(full_start, full_end, text);
                 return;
             }
 
@@ -2942,6 +3943,9 @@ impl<'a, 's, 'ast> Visit<'ast> for StateVarCollector<'a, 's> {
         }
         if let Expression::Identifier(obj) = unwrapped
             && self.is_active_rest_prop(obj.name.as_str())
+            // Suppressed when this `rest.x` is a direct Assignment/Update operand
+            // (upstream keeps `rest.x` there, e.g. `ctx.globalAlpha *= rest.opacity`).
+            && !self.rest_operand_member_starts.contains(&expr.span.start)
         {
             // Replace the entire object span (including wrappers/parens) with $$props
             let obj_start = expr.object.span().start;
@@ -2956,13 +3960,18 @@ impl<'a, 's, 'ast> Visit<'ast> for StateVarCollector<'a, 's> {
     }
 
     fn visit_new_expression(&mut self, expr: &NewExpression<'ast>) {
-        // A `new X.Y(args)` whose callee member-spine bottoms out in a state var
-        // (rewritten to `$.get(name)`) gains a CallExpression in the callee after
-        // transformation, so it must be parenthesised — `new ($.get(x).Y)(args)` —
-        // else `(args)` parses as the `new` arguments. esrap/codegen apply this
-        // for proper AST `new` nodes, but this Raw-text state path can't, so we
-        // insert the parens here. The inserts are added AFTER the walk so the
-        // inner `name -> $.get(name)` replacement (which shares the callee start
+        // A `new X.Y(args)` whose callee member-spine bottoms out in a reactive
+        // getter gains a CallExpression after transformation:
+        //
+        //   state.Y       -> $.get(state).Y
+        //   prop.Y        -> prop().Y
+        //   $store.Y      -> $store().Y
+        //
+        // The callee must therefore be parenthesised — `new (prop().Y)(args)` —
+        // else `(args)` parses as arguments to the newly introduced getter call.
+        // esrap/codegen apply this for proper AST `new` nodes, but this Raw-text
+        // path can't, so insert the parens here. The inserts are added AFTER the
+        // walk so the inner getter replacement (which shares the callee start
         // offset) is applied first; the right-to-left, stable-sorted apply then
         // places `(` immediately before the rewritten callee.
         let mut leftmost = &expr.callee;
@@ -2970,7 +3979,12 @@ impl<'a, 's, 'ast> Visit<'ast> for StateVarCollector<'a, 's> {
             match leftmost {
                 Expression::StaticMemberExpression(m) => leftmost = &m.object,
                 Expression::ComputedMemberExpression(m) => leftmost = &m.object,
-                Expression::Identifier(id) => break self.is_active_state_var(id.name.as_str()),
+                Expression::Identifier(id) => {
+                    let name = id.name.as_str();
+                    break self.is_active_state_var(name)
+                        || self.is_active_prop_var(name)
+                        || self.is_active_store_sub(name);
+                }
                 _ => break false,
             }
         };
@@ -3102,10 +4116,7 @@ impl<'a, 's> StateVarCollector<'a, 's> {
                 continue;
             };
             // No default values supported here (rare and requires more care).
-            if matches!(
-                element,
-                AssignmentTargetMaybeDefault::AssignmentTargetWithDefault(_)
-            ) {
+            if matches!(element, AssignmentTargetMaybeDefault::AssignmentTargetWithDefault(_)) {
                 return None;
             }
             let target = element.as_assignment_target()?;
@@ -3168,11 +4179,7 @@ impl<'a, 's> StateVarCollector<'a, 's> {
         let transformed_member_texts: Vec<Option<String>> = targets
             .iter()
             .map(|t| {
-                if let ArrayTarget::MemberOnProp {
-                    prop_name,
-                    full_text,
-                } = t
-                {
+                if let ArrayTarget::MemberOnProp { prop_name, full_text } = t {
                     // Replace leading `prop_name` with `prop_name()` (getter) for the
                     // reference used inside the member assignment. This mirrors how
                     // prop reads are transformed in the final emitted script text.
@@ -3191,20 +4198,12 @@ impl<'a, 's> StateVarCollector<'a, 's> {
         let array_name = SCRIPT_ARRAY_COUNTER.with(|c| {
             let n = c.get();
             c.set(n + 1);
-            if n == 0 {
-                "$$array".to_string()
-            } else {
-                format!("$$array_{}", n)
-            }
+            if n == 0 { "$$array".to_string() } else { format!("$$array_{}", n) }
         });
 
         let length = arr.elements.len();
         let mut body = String::new();
-        let _ = writeln!(
-            body,
-            "\t\t\tvar {} = $.to_array($$value, {});",
-            array_name, length
-        );
+        let _ = writeln!(body, "\t\t\tvar {} = $.to_array($$value, {});", array_name, length);
 
         for (i, target) in targets.iter().enumerate() {
             match target {
@@ -3223,11 +4222,7 @@ impl<'a, 's> StateVarCollector<'a, 's> {
             }
         }
 
-        Some(format!(
-            "(($$value) => {{\n{}\t\t}})({})",
-            body,
-            rhs_text.trim()
-        ))
+        Some(format!("(($$value) => {{\n{}\t\t}})({})", body, rhs_text.trim()))
     }
 
     fn root_identifier_of_static_member<'ast>(
@@ -3310,35 +4305,128 @@ impl<'a, 's> StateVarCollector<'a, 's> {
         let rhs_trimmed = rhs_text.trim();
 
         let is_simple_ident = matches!(rhs, Expression::Identifier(_));
-        let access_base: String = if is_simple_ident {
-            rhs_trimmed.to_string()
-        } else {
-            "$$value".to_string()
-        };
+        let access_base: String =
+            if is_simple_ident { rhs_trimmed.to_string() } else { "$$value".to_string() };
 
-        let assignments: Vec<String> = targets
-            .iter()
-            .map(|name| format!("{}({}.{})", name, access_base, name))
-            .collect();
+        let assignments: Vec<String> =
+            targets.iter().map(|name| format!("{}({}.{})", name, access_base, name)).collect();
 
         if is_simple_ident {
             if assignments.len() == 1 {
-                Some(assignments.into_iter().next().unwrap())
+                // Upstream always lowers through `b.sequence(assignments)` — a real
+                // `SequenceExpression`, unconditionally, even with one element — and
+                // esrap always self-parenthesizes a `SequenceExpression`. The marker
+                // call keeps that "must be a sequence" decision alive across the
+                // eventual raw-text reparse. See
+                // `SINGLE_TARGET_DESTRUCTURE_SEQUENCE_MARKER`.
+                Some(format!(
+                    "{}({})",
+                    SINGLE_TARGET_DESTRUCTURE_SEQUENCE_MARKER,
+                    assignments.into_iter().next().unwrap()
+                ))
             } else {
                 Some(format!("({})", assignments.join(", ")))
             }
         } else {
             // Non-identifier RHS: generate an IIFE that caches it in $$value.
-            let body = assignments
-                .iter()
-                .map(|a| format!("\t\t\t{};", a))
-                .collect::<Vec<_>>()
-                .join("\n");
+            let body =
+                assignments.iter().map(|a| format!("\t\t\t{};", a)).collect::<Vec<_>>().join("\n");
             Some(format!(
                 "(($$value) => {{\n{}\n\t\t\treturn $$value;\n\t\t}})({})",
                 body, rhs_trimmed
             ))
         }
+    }
+
+    /// Fallback for destructuring-assignment targets the two narrow helpers
+    /// above don't cover — nested patterns, renamed (`{ a: b }`) properties,
+    /// and defaults. Reuses the shared text-based `extract_destructure_paths`
+    /// pattern-walker (the same one the declaration-lowering path uses) to get
+    /// one `(target, initializer)` pair per bound leaf, then wraps prop-var
+    /// leaves in `name(...)` calls the way the narrow helpers above do — this
+    /// function's output is spliced in as final text and never re-walked, so
+    /// prop writes must be wrapped here rather than left for a later pass.
+    fn try_build_nested_destructure_prop_assignment<'ast>(
+        &mut self,
+        target: &AssignmentTarget<'ast>,
+        rhs: &Expression<'ast>,
+    ) -> Option<String> {
+        let target_span = target.span();
+        let pattern_text =
+            self.source[target_span.start as usize..target_span.end as usize].to_string();
+
+        let rhs_start = rhs.span().start;
+        let rhs_end = rhs.span().end;
+        self.visit_expression(rhs);
+        let rhs_text = self.apply_and_drain_inner_replacements(rhs_start, rhs_end);
+        let rhs_trimmed = rhs_text.trim();
+
+        let is_simple_ident = matches!(rhs, Expression::Identifier(_));
+        let access_base: String =
+            if is_simple_ident { rhs_trimmed.to_string() } else { "$$value".to_string() };
+
+        let mut paths: Vec<(String, String)> = Vec::new();
+        let mut inserts: Vec<(String, String)> = Vec::new();
+        extract_destructure_paths(
+            &pattern_text,
+            &access_base,
+            ArrayHelperRead::Value,
+            &mut paths,
+            &mut inserts,
+        );
+
+        if paths.is_empty() {
+            return None;
+        }
+
+        // Only fire when at least one bound leaf is a prop var — otherwise
+        // there's nothing for this pass to rewrite, and the untransformed
+        // fallback (which leaves non-reactive destructuring verbatim) is correct.
+        let mut changed = false;
+        let assignments: Vec<String> = paths
+            .iter()
+            .map(|(target_text, init_text)| {
+                if !target_text.contains('.')
+                    && !target_text.contains('[')
+                    && self.is_active_prop_var(target_text)
+                {
+                    changed = true;
+                    format!("{}({})", target_text, init_text)
+                } else {
+                    format!("{} = {}", target_text, init_text)
+                }
+            })
+            .collect();
+
+        if !changed {
+            return None;
+        }
+
+        if inserts.is_empty() && is_simple_ident {
+            return Some(if assignments.len() == 1 {
+                // See the sequence-marker comment on the shorthand helper above —
+                // the same "always a real SequenceExpression" rule applies here.
+                format!(
+                    "{}({})",
+                    SINGLE_TARGET_DESTRUCTURE_SEQUENCE_MARKER,
+                    assignments.into_iter().next().unwrap()
+                )
+            } else {
+                format!("({})", assignments.join(", "))
+            });
+        }
+
+        let mut body = String::new();
+        for (var_name, init) in &inserts {
+            let _ = writeln!(body, "\t\t\tvar {} = {};", var_name, init);
+        }
+        for assignment in &assignments {
+            let _ = writeln!(body, "\t\t\t{};", assignment);
+        }
+        if !is_simple_ident {
+            let _ = writeln!(body, "\t\t\treturn $$value;");
+        }
+        Some(format!("(($$value) => {{\n{}\t\t}})({})", body, rhs_trimmed))
     }
 
     /// Check if an assignment target is a direct rest-prop member assignment.
@@ -3531,10 +4619,7 @@ fn needs_compound_parens(expr: &str, _op: &str) -> bool {
     }
 
     // Simple identifiers never need parens
-    if trimmed
-        .chars()
-        .all(|c| c.is_alphanumeric() || c == '_' || c == '$')
-    {
+    if trimmed.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '$') {
         return false;
     }
 
@@ -3640,6 +4725,9 @@ pub(super) struct AstTransformConfig<'a> {
     /// The component filename (used in the `$inspect.trace()` label
     /// suffix together with `analysis_source`).
     pub filename: Option<&'a str>,
+    /// Dev-mode `$.async_derived(thunk, label, location)` locations, keyed by
+    /// bound name. `None` outside dev, where upstream emits neither argument.
+    pub async_derived_locations: Option<&'a AsyncDerivedLocations>,
     pub prop_source_vars: &'a [String],
     pub prop_assignment_transform_vars: &'a [String],
     pub non_bindable_prop_vars: &'a [String],
@@ -3656,20 +4744,10 @@ pub(super) struct AstTransformConfig<'a> {
     pub exported_names: &'a [String],
 }
 
-pub(super) fn transform_state_vars_ast(
-    script: &str,
-    config: &AstTransformConfig,
-) -> Option<String> {
+fn has_state_transform_candidate(script: &str, config: &AstTransformConfig) -> bool {
     let state_vars = config.state_vars;
-    let non_reactive_vars = config.non_reactive_vars;
-    let raw_state_vars = config.raw_state_vars;
-    let derived_vars = config.derived_vars;
-    let non_proxy_vars = config.non_proxy_vars;
-    let reassign_non_proxy_vars = config.reassign_non_proxy_vars;
     let is_runes = config.is_runes;
-    let prop_source_vars = config.prop_source_vars;
     let prop_assignment_transform_vars = config.prop_assignment_transform_vars;
-    let non_bindable_prop_vars = config.non_bindable_prop_vars;
     let store_sub_vars = config.store_sub_vars;
     let read_only_props = config.read_only_props;
     let rest_prop_vars = config.rest_prop_vars;
@@ -3702,13 +4780,17 @@ pub(super) fn transform_state_vars_ast(
     let has_host_calls = is_runes
         && !store_sub_vars.iter().any(|v| v == "$host")
         && memchr::memmem::find(script.as_bytes(), b"$host").is_some();
-    // Dev-mode `===` / `!==` → `$.strict_equals(...)` rewrite (formerly
-    // `rune_transforms::transform_strict_equals`). The visitor walks
+    // Dev-mode equality → `$.strict_equals(...)` / `$.equals(...)` rewrite
+    // (formerly `rune_transforms::transform_strict_equals`). The visitor walks
     // every BinaryExpression so we only need a byte probe to know
     // whether to enter the AST pass at all.
-    let has_strict_equals = config.dev
-        && (memchr::memmem::find(script.as_bytes(), b"===").is_some()
-            || memchr::memmem::find(script.as_bytes(), b"!==").is_some());
+    let has_strict_equals = config.dev && super::strict_equals_ast::source_has_equality_op(script);
+    // Dev-mode `await X` → `(await $.track_reactivity_loss(X))()` rewrite.
+    let has_await = config.dev && memchr::memmem::find(script.as_bytes(), b"await").is_some();
+    // Dev-mode `$inspect(...)` → `$.inspect(...)`; without its own probe the
+    // rewrite only fires once some other rune has opened the pass.
+    let has_inspect =
+        config.dev && config.is_runes && super::inspect_rune_ast::source_has_inspect_rune(script);
 
     if !has_state
         && !has_props
@@ -3721,8 +4803,10 @@ pub(super) fn transform_state_vars_ast(
         && !has_props_calls
         && !has_host_calls
         && !has_strict_equals
+        && !has_await
+        && !has_inspect
     {
-        return None;
+        return false;
     }
 
     // Quick check: if none of the variable names appear as identifiers in the text, skip.
@@ -3754,7 +4838,7 @@ pub(super) fn transform_state_vars_ast(
         }
         set
     };
-    let has_any_match = (has_state && state_vars.iter().any(|v| script_ids.contains(v.as_str())))
+    (has_state && state_vars.iter().any(|v| script_ids.contains(v.as_str())))
         || (has_props
             && prop_assignment_transform_vars
                 .iter()
@@ -3776,66 +4860,505 @@ pub(super) fn transform_state_vars_ast(
         || (has_derived_calls && script_ids.contains("$derived"))
         || (has_props_calls && script_ids.contains("$props"))
         || (has_host_calls && script_ids.contains("$host"))
-        || has_strict_equals;
+        || has_strict_equals
+        // `await` is a keyword, not an identifier, so it can only be carried by
+        // its own probe here.
+        || has_await
+        || has_inspect
+}
 
-    if !has_any_match {
+fn state_assignment_needs_semantic(program: &Program<'_>, state_vars: &FxHashSet<&str>) -> bool {
+    if state_vars.is_empty() {
+        return false;
+    }
+
+    struct Finder<'a> {
+        state_vars: &'a FxHashSet<&'a str>,
+        found: bool,
+    }
+
+    impl<'a, 'ast> Visit<'ast> for Finder<'a> {
+        fn visit_assignment_expression(&mut self, expression: &AssignmentExpression<'ast>) {
+            if self.found {
+                return;
+            }
+            let AssignmentTarget::AssignmentTargetIdentifier(target) = &expression.left else {
+                walk::walk_assignment_expression(self, expression);
+                return;
+            };
+            let needs_site_resolution =
+                matches!(
+                    expression.operator,
+                    AssignmentOperator::Assign
+                        | AssignmentOperator::LogicalOr
+                        | AssignmentOperator::LogicalAnd
+                        | AssignmentOperator::LogicalNullish
+                ) && matches!(expression.right.get_inner_expression(), Expression::Identifier(_));
+            if needs_site_resolution && self.state_vars.contains(target.name.as_str()) {
+                self.found = true;
+                return;
+            }
+            walk::walk_assignment_expression(self, expression);
+        }
+    }
+
+    let mut finder = Finder { state_vars, found: false };
+    finder.visit_program(program);
+    finder.found
+}
+
+fn projected_statement_is_type_only(statement: &Statement<'_>) -> bool {
+    match statement {
+        Statement::ImportDeclaration(_)
+        | Statement::TSTypeAliasDeclaration(_)
+        | Statement::TSInterfaceDeclaration(_)
+        | Statement::TSEnumDeclaration(_)
+        | Statement::TSExternalModuleDeclaration(_)
+        | Statement::TSNamespaceDeclaration(_) => true,
+        Statement::VariableDeclaration(declaration) => declaration.declare,
+        Statement::FunctionDeclaration(function) => {
+            function.r#type == FunctionType::TSDeclareFunction
+                || function.declare
+                || function.body.is_none()
+        }
+        Statement::ClassDeclaration(class) => class.declare,
+        Statement::ExportNamedDeclaration(export) => export.export_kind == ImportOrExportKind::Type,
+        Statement::ExportFromDeclaration(export) => export.export_kind == ImportOrExportKind::Type,
+        Statement::ExportDeclaration(export) => {
+            let declaration = &export.declaration;
+            // oxc derives this from the declaration instead of storing it.
+            export.export_kind() == ImportOrExportKind::Type
+                || matches!(
+                    declaration,
+                    Declaration::TSTypeAliasDeclaration(_)
+                        | Declaration::TSInterfaceDeclaration(_)
+                        | Declaration::TSEnumDeclaration(_)
+                        | Declaration::TSExternalModuleDeclaration(_)
+                        | Declaration::TSNamespaceDeclaration(_)
+                )
+                || matches!(
+                    declaration,
+                    Declaration::FunctionDeclaration(function)
+                        if function.r#type == FunctionType::TSDeclareFunction
+                            || function.declare
+                            || function.body.is_none()
+                )
+                || matches!(
+                    declaration,
+                    Declaration::VariableDeclaration(declaration) if declaration.declare
+                )
+                || matches!(
+                    declaration,
+                    Declaration::ClassDeclaration(class) if class.declare
+                )
+        }
+        Statement::ExportDefaultDeclaration(export) => {
+            matches!(&export.declaration, ExportDefaultDeclarationKind::TSInterfaceDeclaration(_))
+                || matches!(
+                    &export.declaration,
+                    ExportDefaultDeclarationKind::FunctionDeclaration(function)
+                        if function.r#type == FunctionType::TSDeclareFunction
+                            || function.declare
+                            || function.body.is_none()
+                )
+                || matches!(
+                    &export.declaration,
+                    ExportDefaultDeclarationKind::ClassDeclaration(class) if class.declare
+                )
+        }
+        Statement::ExportAllDeclaration(export) => export.export_kind == ImportOrExportKind::Type,
+        _ => false,
+    }
+}
+
+fn projected_state_transform_requires_fallback(
+    program: &Program<'_>,
+    state_vars: &[String],
+    projection: &ScriptProjection,
+) -> bool {
+    struct Finder<'a> {
+        state_vars: &'a [String],
+        projection: &'a ScriptProjection,
+        found: bool,
+    }
+
+    impl Finder<'_> {
+        fn target_crosses_omitted_source(&self, start: u32, end: u32) -> bool {
+            let source = start..end;
+            self.projection.output_range_for_source(source.clone()).is_none()
+                && self
+                    .projection
+                    .copied_chunks
+                    .iter()
+                    .any(|chunk| source.start < chunk.source.end && source.end > chunk.source.start)
+        }
+    }
+
+    impl<'a, 'ast> Visit<'ast> for Finder<'a> {
+        fn visit_assignment_expression(&mut self, expression: &AssignmentExpression<'ast>) {
+            if self.found {
+                return;
+            }
+            let target_span = expression.left.span();
+            if self.target_crosses_omitted_source(target_span.start, target_span.end) {
+                self.found = true;
+                return;
+            }
+            if let AssignmentTarget::AssignmentTargetIdentifier(target) = &expression.left {
+                let needs_site_resolution = matches!(
+                    expression.operator,
+                    AssignmentOperator::Assign
+                        | AssignmentOperator::LogicalOr
+                        | AssignmentOperator::LogicalAnd
+                        | AssignmentOperator::LogicalNullish
+                ) && matches!(
+                    expression.right.get_inner_expression(),
+                    Expression::Identifier(_)
+                );
+                if needs_site_resolution
+                    && self.state_vars.iter().any(|name| name == target.name.as_str())
+                {
+                    self.found = true;
+                    return;
+                }
+            }
+            walk::walk_assignment_expression(self, expression);
+        }
+
+        fn visit_update_expression(&mut self, expression: &UpdateExpression<'ast>) {
+            if self.found {
+                return;
+            }
+            let target_span = expression.argument.span();
+            if self.target_crosses_omitted_source(target_span.start, target_span.end) {
+                self.found = true;
+                return;
+            }
+            walk::walk_update_expression(self, expression);
+        }
+
+        fn visit_variable_declarator(&mut self, declarator: &VariableDeclarator<'ast>) {
+            if self.found {
+                return;
+            }
+            let Some(init) = &declarator.init else {
+                return;
+            };
+
+            // A line comment between `=` and `$props()` can make the script
+            // projection omit part of the declaration while still mapping
+            // later identifier replacements. Silently dropping the whole-
+            // declaration replacement then returns a partially transformed
+            // script. Reparse the emitted script whenever that replacement
+            // cannot be projected as one source range.
+            if let Expression::CallExpression(call) = init.get_inner_expression()
+                && matches!(
+                    &call.callee,
+                    Expression::Identifier(identifier) if identifier.name == "$props"
+                )
+                && self.target_crosses_omitted_source(declarator.span.start, declarator.span.end)
+            {
+                self.found = true;
+                return;
+            }
+
+            if !matches!(
+                init,
+                Expression::TSAsExpression(_)
+                    | Expression::TSSatisfiesExpression(_)
+                    | Expression::TSNonNullExpression(_)
+                    | Expression::TSTypeAssertion(_)
+                    | Expression::TSInstantiationExpression(_)
+            ) {
+                walk::walk_variable_declarator(self, declarator);
+                return;
+            }
+            let Expression::CallExpression(call) = init.get_inner_expression() else {
+                walk::walk_variable_declarator(self, declarator);
+                return;
+            };
+            let rune_name = match &call.callee {
+                Expression::Identifier(identifier) => Some(identifier.name.as_str()),
+                Expression::StaticMemberExpression(member) => match &member.object {
+                    Expression::Identifier(object) => Some(object.name.as_str()),
+                    _ => None,
+                },
+                _ => None,
+            };
+            self.found = rune_name
+                .is_some_and(|name| matches!(name, "$state" | "$derived" | "$props" | "$bindable"));
+            if !self.found {
+                walk::walk_variable_declarator(self, declarator);
+            }
+        }
+    }
+
+    let mut finder = Finder { state_vars, projection, found: false };
+    finder.visit_program(program);
+    finder.found
+}
+
+pub(super) fn transform_state_vars_ast(
+    script: &str,
+    config: &AstTransformConfig,
+) -> Option<String> {
+    if !has_state_transform_candidate(script, config) {
         return None;
     }
 
-    let var_set: FxHashSet<&str> = state_vars.iter().map(|s| s.as_str()).collect();
-    let non_reactive_set: FxHashSet<&str> = non_reactive_vars.iter().map(|s| s.as_str()).collect();
-    let raw_set: FxHashSet<&str> = raw_state_vars.iter().map(|s| s.as_str()).collect();
-
     with_ast_transform_allocator(|alloc| {
         let source_type = SourceType::mjs();
+        let _pt = super::super::profile::timer_start();
         let parsed = Parser::new(alloc, script, source_type).parse();
+        super::super::profile::record_direct_parse(
+            super::super::profile::timer_elapsed(_pt),
+            script.len(),
+        );
 
         if parsed.panicked || !parsed.diagnostics.is_empty() {
             // Parse error - fall back to text-based transform
             return None;
         }
 
-        let mut collector = StateVarCollector::new(
+        transform_state_vars_ast_from_program_unchecked(
             script,
-            &var_set,
-            &non_reactive_set,
-            &raw_set,
-            derived_vars,
-            non_proxy_vars,
-            reassign_non_proxy_vars,
-            is_runes,
-            config.dev,
-            config.analysis_source,
-            config.filename,
-            prop_source_vars,
-            non_bindable_prop_vars,
-            store_sub_vars,
-            read_only_props,
-            rest_prop_vars,
-            prop_assignment_transform_vars,
-            config.analysis,
-            config.exported_names,
-        );
-        collector.visit_program(&parsed.program);
-
-        if collector.replacements.is_empty() {
-            return None;
-        }
-
-        // Sort replacements by start position descending (right-to-left)
-        // so that applying them doesn't invalidate earlier positions
-        collector
-            .replacements
-            .sort_by_key(|r| std::cmp::Reverse(r.start));
-
-        // Apply replacements
-        let mut result = script.to_string();
-        for rep in &collector.replacements {
-            result.replace_range(rep.start as usize..rep.end as usize, &rep.text);
-        }
-
-        Some(result)
+            &parsed.program,
+            0..script.len(),
+            config,
+        )
     })
+}
+
+#[cfg(test)]
+pub(super) fn transform_state_vars_ast_from_program(
+    script: &str,
+    program: &Program<'_>,
+    config: &AstTransformConfig,
+) -> Option<String> {
+    debug_assert_eq!(script, program.source_text);
+    if !has_state_transform_candidate(script, config) {
+        return None;
+    }
+
+    transform_state_vars_ast_from_program_unchecked(script, program, 0..script.len(), config)
+}
+
+pub(super) fn transform_state_vars_ast_range_from_program(
+    script: &str,
+    program: &Program<'_>,
+    candidate: &str,
+    output_range: std::ops::Range<usize>,
+    config: &AstTransformConfig,
+) -> Option<String> {
+    debug_assert_eq!(script, program.source_text);
+    if !has_state_transform_candidate(candidate, config) {
+        return None;
+    }
+
+    transform_state_vars_ast_from_program_unchecked(script, program, output_range, config)
+}
+
+pub(super) fn transform_state_vars_ast_projected_from_program(
+    script: &str,
+    program: &Program<'_>,
+    candidate: &str,
+    projection: &ScriptProjection,
+    projection_output_range: std::ops::Range<usize>,
+    config: &AstTransformConfig,
+) -> Result<Option<String>, ()> {
+    debug_assert_eq!(script, program.source_text);
+    if !has_state_transform_candidate(candidate, config) {
+        return Ok(None);
+    }
+    if projection.source_len as usize != script.len()
+        || projection_output_range.end > projection.output_len as usize
+        || projection_output_range.end - projection_output_range.start != candidate.len()
+    {
+        return Err(());
+    }
+
+    if projected_state_transform_requires_fallback(program, config.state_vars, projection) {
+        return Err(());
+    }
+
+    let mut mapped = Vec::new();
+    for replacement in collect_state_var_replacements_without_semantic_scan(script, program, config)
+    {
+        let source_range = replacement.start..replacement.end;
+        if let Some(output_range) = projection.output_range_for_source(source_range.clone()) {
+            let output_start = output_range.start as usize;
+            let output_end = output_range.end as usize;
+            if output_end <= projection_output_range.start
+                || output_start >= projection_output_range.end
+            {
+                continue;
+            }
+            if output_start < projection_output_range.start
+                || output_end > projection_output_range.end
+            {
+                return Err(());
+            }
+            let candidate_start = output_start - projection_output_range.start;
+            let candidate_end = output_end - projection_output_range.start;
+            if script.get(source_range.start as usize..source_range.end as usize)
+                != candidate.get(candidate_start..candidate_end)
+            {
+                return Err(());
+            }
+            mapped.push(Replacement {
+                start: candidate_start as u32,
+                end: candidate_end as u32,
+                text: replacement.text,
+            });
+            continue;
+        }
+
+        let overlaps_copied_source = projection.copied_chunks.iter().any(|chunk| {
+            source_range.start < chunk.source.end && source_range.end > chunk.source.start
+        });
+        if source_range.is_empty() || overlaps_copied_source {
+            return Err(());
+        }
+    }
+
+    if mapped.is_empty() {
+        return Ok(None);
+    }
+    mapped.sort_by_key(|replacement| std::cmp::Reverse(replacement.start));
+    let mut output = candidate.to_string();
+    for replacement in mapped {
+        output
+            .replace_range(replacement.start as usize..replacement.end as usize, &replacement.text);
+    }
+    Ok(Some(output))
+}
+
+fn transform_state_vars_ast_from_program_unchecked(
+    script: &str,
+    program: &Program<'_>,
+    output_range: std::ops::Range<usize>,
+    config: &AstTransformConfig,
+) -> Option<String> {
+    let mut replacements = collect_state_var_replacements(script, program, config);
+    replacements.retain(|replacement| {
+        replacement.start as usize >= output_range.start
+            && replacement.end as usize <= output_range.end
+    });
+    if replacements.is_empty() {
+        return None;
+    }
+
+    replacements.sort_by_key(|r| std::cmp::Reverse(r.start));
+
+    let mut result = script[output_range.clone()].to_string();
+    for rep in &replacements {
+        result.replace_range(
+            rep.start as usize - output_range.start..rep.end as usize - output_range.start,
+            &rep.text,
+        );
+    }
+
+    Some(result)
+}
+
+fn collect_state_var_replacements(
+    script: &str,
+    program: &Program<'_>,
+    config: &AstTransformConfig,
+) -> Vec<Replacement> {
+    let var_set: FxHashSet<&str> = config.state_vars.iter().map(String::as_str).collect();
+    let non_reactive_set: FxHashSet<&str> =
+        config.non_reactive_vars.iter().map(String::as_str).collect();
+    let raw_set: FxHashSet<&str> = config.raw_state_vars.iter().map(String::as_str).collect();
+    let semantic_ret = state_assignment_needs_semantic(program, &var_set).then(|| {
+        super::super::profile::semantic_build(
+            super::super::profile::SEM_AST_STATE_TRANSFORM,
+            program.source_text.len(),
+            || oxc_semantic::SemanticBuilder::new().with_build_nodes(true).build(program),
+        )
+    });
+
+    let mut collector = StateVarCollector::new(
+        script,
+        &var_set,
+        &non_reactive_set,
+        &raw_set,
+        config.derived_vars,
+        config.non_proxy_vars,
+        config.reassign_non_proxy_vars,
+        config.is_runes,
+        config.dev,
+        config.analysis_source,
+        config.filename,
+        config.async_derived_locations,
+        config.prop_source_vars,
+        config.non_bindable_prop_vars,
+        config.store_sub_vars,
+        config.read_only_props,
+        config.rest_prop_vars,
+        config.prop_assignment_transform_vars,
+        config.analysis,
+        config.exported_names,
+    );
+    collector.semantic = semantic_ret.as_ref().map(|ret| &ret.semantic);
+    collector.collect_await_ignore_ranges(program);
+    collector.visit_program(program);
+    collector.replacements
+}
+
+fn collect_state_var_replacements_without_semantic_scan(
+    script: &str,
+    program: &Program<'_>,
+    config: &AstTransformConfig,
+) -> Vec<Replacement> {
+    let var_set: FxHashSet<&str> = config.state_vars.iter().map(String::as_str).collect();
+    let non_reactive_set: FxHashSet<&str> =
+        config.non_reactive_vars.iter().map(String::as_str).collect();
+    let raw_set: FxHashSet<&str> = config.raw_state_vars.iter().map(String::as_str).collect();
+    let mut collector = StateVarCollector::new(
+        script,
+        &var_set,
+        &non_reactive_set,
+        &raw_set,
+        config.derived_vars,
+        config.non_proxy_vars,
+        config.reassign_non_proxy_vars,
+        config.is_runes,
+        config.dev,
+        config.analysis_source,
+        config.filename,
+        config.async_derived_locations,
+        config.prop_source_vars,
+        config.non_bindable_prop_vars,
+        config.store_sub_vars,
+        config.read_only_props,
+        config.rest_prop_vars,
+        config.prop_assignment_transform_vars,
+        config.analysis,
+        config.exported_names,
+    );
+    collector.collect_await_ignore_ranges(program);
+    for statement in &program.body {
+        if !projected_statement_is_type_only(statement) {
+            collector.visit_statement(statement);
+        }
+    }
+    collector.replacements
+}
+
+/// Is the byte at `at` the first non-whitespace on its line?
+fn starts_its_own_line(bytes: &[u8], at: usize) -> bool {
+    let mut i = at;
+    while i > 0 {
+        i -= 1;
+        if bytes[i] == b'\n' {
+            return true;
+        }
+        if !bytes[i].is_ascii_whitespace() {
+            return false;
+        }
+    }
+    true
 }
 
 #[cfg(test)]
@@ -3856,6 +5379,7 @@ mod tests {
             dev: false,
             analysis_source: None,
             filename: None,
+            async_derived_locations: None,
             prop_source_vars: &[],
             prop_assignment_transform_vars: &[],
             non_bindable_prop_vars: &[],
@@ -3887,10 +5411,42 @@ mod tests {
             dev: false,
             analysis_source: None,
             filename: None,
+            async_derived_locations: None,
             prop_source_vars: &[],
             prop_assignment_transform_vars: &[],
             non_bindable_prop_vars: &[],
             store_sub_vars: &[],
+            read_only_props: &[],
+            rest_prop_vars: &[],
+            analysis: None,
+            exported_names: &[],
+        };
+        transform_state_vars_ast(script, &config).unwrap_or_else(|| script.to_string())
+    }
+
+    fn transform_with_reactive_getters(
+        script: &str,
+        prop_vars: &[&str],
+        store_vars: &[&str],
+    ) -> String {
+        let prop_vars: Vec<String> = prop_vars.iter().map(|s| s.to_string()).collect();
+        let store_vars: Vec<String> = store_vars.iter().map(|s| s.to_string()).collect();
+        let config = AstTransformConfig {
+            state_vars: &[],
+            non_reactive_vars: &[],
+            raw_state_vars: &[],
+            derived_vars: &[],
+            non_proxy_vars: &[],
+            reassign_non_proxy_vars: &[],
+            is_runes: true,
+            dev: false,
+            analysis_source: None,
+            filename: None,
+            async_derived_locations: None,
+            prop_source_vars: &prop_vars,
+            prop_assignment_transform_vars: &prop_vars,
+            non_bindable_prop_vars: &[],
+            store_sub_vars: &store_vars,
             read_only_props: &[],
             rest_prop_vars: &[],
             analysis: None,
@@ -3906,6 +5462,135 @@ mod tests {
     #[test]
     fn test_simple_get_wrapping() {
         assert_eq!(transform("count", &["count"]), "$.get(count)");
+    }
+
+    #[test]
+    fn comment_between_state_declaration_and_read_keeps_reactivity() {
+        let script = "const multiplier = () => {\n\tlet multiplier = $state(2);\n\t// } comment\n\tlet multiple = $derived(count * multiplier);\n\treturn multiple;\n};";
+        let output = transform(script, &["multiplier"]);
+        assert!(output.contains("$.get(multiplier)"), "{output}");
+    }
+
+    #[test]
+    fn destructured_async_derived_saves_non_final_awaits() {
+        let output = transform("const { a, b } = $derived((await p) + (await q));", &[]);
+
+        assert!(
+            output.contains("$.save(p)") && output.contains("await q"),
+            "non-final await must preserve reactive context: {output}"
+        );
+        assert!(
+            !output.contains("$.save(q)"),
+            "the final await must not be save-wrapped: {output}"
+        );
+    }
+
+    #[test]
+    fn async_derived_saves_non_final_awaits() {
+        let output = transform("const a = $derived((await p) + (await q));", &[]);
+
+        assert!(
+            output.contains("$.save(p)") && output.contains("await q"),
+            "non-final await must preserve reactive context: {output}"
+        );
+        assert!(
+            !output.contains("$.save(q)"),
+            "the final await must not be save-wrapped: {output}"
+        );
+    }
+
+    #[test]
+    fn retained_program_matches_reparsed_output_and_whitespace() {
+        let script = "\n\nlet count = $state(0);\nconst read = () => count;\n\n";
+        let state_vars = vec!["count".to_string()];
+        let config = AstTransformConfig {
+            state_vars: &state_vars,
+            non_reactive_vars: &[],
+            raw_state_vars: &[],
+            derived_vars: &[],
+            non_proxy_vars: &[],
+            reassign_non_proxy_vars: &[],
+            is_runes: true,
+            dev: false,
+            analysis_source: None,
+            filename: None,
+            async_derived_locations: None,
+            prop_source_vars: &[],
+            prop_assignment_transform_vars: &[],
+            non_bindable_prop_vars: &[],
+            store_sub_vars: &[],
+            read_only_props: &[],
+            rest_prop_vars: &[],
+            analysis: None,
+            exported_names: &[],
+        };
+        let allocator = Allocator::default();
+        let parsed = Parser::new(&allocator, script, SourceType::mjs()).parse();
+        assert!(parsed.diagnostics.is_empty());
+
+        let retained =
+            transform_state_vars_ast_from_program(script, &parsed.program, &config).unwrap();
+        let reparsed = transform_state_vars_ast(script, &config).unwrap();
+
+        assert_eq!(retained, reparsed);
+        assert!(retained.starts_with("\n\n"));
+        assert!(retained.ends_with("\n\n"));
+    }
+
+    #[test]
+    fn projected_typescript_type_declaration_does_not_shadow_runtime_state() {
+        let script = "type count = number;\nenum Removed { Value = count }\nlet count = $state(0);\nconst read = () => count;\n";
+        let allocator = Allocator::default();
+        let parsed = Parser::new(&allocator, script, SourceType::ts()).parse();
+        assert!(parsed.diagnostics.is_empty());
+        let (candidate, projection) =
+            crate::compiler::phases::phase2_analyze::types::strip_typescript_from_program_with_projection(
+                script,
+                &parsed.program,
+            );
+        let projection = projection.expect("type declaration must be omitted");
+        let state_vars = vec!["count".to_string()];
+        let config = AstTransformConfig {
+            state_vars: &state_vars,
+            non_reactive_vars: &[],
+            raw_state_vars: &[],
+            derived_vars: &[],
+            non_proxy_vars: &[],
+            reassign_non_proxy_vars: &[],
+            is_runes: true,
+            dev: false,
+            analysis_source: None,
+            filename: None,
+            async_derived_locations: None,
+            prop_source_vars: &[],
+            prop_assignment_transform_vars: &[],
+            non_bindable_prop_vars: &[],
+            store_sub_vars: &[],
+            read_only_props: &[],
+            rest_prop_vars: &[],
+            analysis: None,
+            exported_names: &[],
+        };
+        let runtime_start = script.find("let count").unwrap() as u32;
+        assert!(
+            collect_state_var_replacements_without_semantic_scan(script, &parsed.program, &config)
+                .iter()
+                .all(|replacement| replacement.start >= runtime_start),
+            "removed enum initializers must not participate in runtime state transforms"
+        );
+
+        let transformed = transform_state_vars_ast_projected_from_program(
+            script,
+            &parsed.program,
+            &candidate,
+            &projection,
+            0..candidate.len(),
+            &config,
+        )
+        .expect("type-only omission is safe to project")
+        .expect("runtime state references must be transformed");
+
+        assert_eq!(transformed, "\n\nlet count = $.state(0);\nconst read = () => $.get(count);\n");
     }
 
     #[test]
@@ -3931,9 +5616,30 @@ mod tests {
 
     #[test]
     fn test_no_transform_for_non_reactive() {
+        assert_eq!(transform_with_non_reactive("count + 1", &["count"], &["count"]), "count + 1");
+    }
+
+    #[test]
+    fn new_callee_parenthesises_prop_getter_call() {
         assert_eq!(
-            transform_with_non_reactive("count + 1", &["count"], &["count"]),
-            "count + 1"
+            transform_with_reactive_getters(
+                "const instance = new Constructor({ value: 1 });",
+                &["Constructor"],
+                &[],
+            ),
+            "const instance = new (Constructor())({ value: 1 });"
+        );
+    }
+
+    #[test]
+    fn new_member_callee_parenthesises_store_getter_call() {
+        assert_eq!(
+            transform_with_reactive_getters(
+                "const instance = new $constructors.Current();",
+                &[],
+                &["$constructors"],
+            ),
+            "const instance = new ($constructors().Current)();"
         );
     }
 
@@ -3967,19 +5673,30 @@ mod tests {
     }
 
     #[test]
-    fn test_compound_addition() {
-        assert_eq!(
-            transform("count += 1", &["count"]),
-            "$.set(count, $.get(count) + 1)"
+    fn test_bare_assignment_rhs_uses_site_semantics() {
+        let local = transform(
+            r#"items.forEach((item) => {
+                const id = `${item}`;
+                highlighted = id;
+            });"#,
+            &["highlighted"],
         );
+        assert!(local.contains("$.set(highlighted, id)"));
+        assert!(!local.contains("$.set(highlighted, id, true)"));
+
+        let parameter =
+            transform("const handler = (id) => { highlighted = id; };", &["highlighted"]);
+        assert!(parameter.contains("$.set(highlighted, id, true)"));
+    }
+
+    #[test]
+    fn test_compound_addition() {
+        assert_eq!(transform("count += 1", &["count"]), "$.set(count, $.get(count) + 1)");
     }
 
     #[test]
     fn test_compound_subtraction() {
-        assert_eq!(
-            transform("count -= 1", &["count"]),
-            "$.set(count, $.get(count) - 1)"
-        );
+        assert_eq!(transform("count -= 1", &["count"]), "$.set(count, $.get(count) - 1)");
     }
 
     #[test]
@@ -4020,19 +5737,13 @@ mod tests {
     #[test]
     fn test_compound_addition_does_not_proxy() {
         // Coercive operators always produce a primitive — no proxy flag.
-        assert_eq!(
-            transform("count += other", &["count"]),
-            "$.set(count, $.get(count) + other)"
-        );
+        assert_eq!(transform("count += other", &["count"]), "$.set(count, $.get(count) + other)");
     }
 
     #[test]
     fn test_compound_nullish_literal_rhs_no_proxy() {
         // A primitive literal RHS is never proxied even for logical operators.
-        assert_eq!(
-            transform("count ??= 5", &["count"]),
-            "$.set(count, $.get(count) ?? 5)"
-        );
+        assert_eq!(transform("count ??= 5", &["count"]), "$.set(count, $.get(count) ?? 5)");
     }
 
     // -----------------------------------------------------------------------
@@ -4073,10 +5784,7 @@ mod tests {
 
     #[test]
     fn test_arrow_param_shadows() {
-        assert_eq!(
-            transform("(count) => count + 1", &["count"]),
-            "(count) => count + 1"
-        );
+        assert_eq!(transform("(count) => count + 1", &["count"]), "(count) => count + 1");
     }
 
     #[test]
@@ -4139,6 +5847,7 @@ mod tests {
             dev: false,
             analysis_source: None,
             filename: None,
+            async_derived_locations: None,
             prop_source_vars: &[],
             prop_assignment_transform_vars: &[],
             non_bindable_prop_vars: &[],
@@ -4155,6 +5864,18 @@ mod tests {
         let config = empty_config();
         let result = transform_state_vars_ast("count + 1", &config);
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn inspect_moves_a_trailing_comment_into_its_observed_array() {
+        let mut config = empty_config();
+        config.dev = true;
+        let result =
+            transform_state_vars_ast("$inspect(a); // c\nconsole.log(2);", &config).unwrap();
+        assert_eq!(
+            result,
+            "$.inspect(() => [a, // c\n], (...$$args) => console.log(...$$args), true);\nconsole.log(2);"
+        );
     }
 
     #[test]
@@ -4180,36 +5901,24 @@ mod tests {
 
     #[test]
     fn test_function_call_with_state_arg() {
-        assert_eq!(
-            transform("console.log(count)", &["count"]),
-            "console.log($.get(count))"
-        );
+        assert_eq!(transform("console.log(count)", &["count"]), "console.log($.get(count))");
     }
 
     #[test]
     fn test_template_literal_with_state() {
-        assert_eq!(
-            transform("`count is ${count}`", &["count"]),
-            "`count is ${$.get(count)}`"
-        );
+        assert_eq!(transform("`count is ${count}`", &["count"]), "`count is ${$.get(count)}`");
     }
 
     #[test]
     fn test_assignment_in_rhs_wraps_state_read() {
         // `count = count + 1` should become `$.set(count, $.get(count) + 1)`
-        assert_eq!(
-            transform("count = count + 1", &["count"]),
-            "$.set(count, $.get(count) + 1)"
-        );
+        assert_eq!(transform("count = count + 1", &["count"]), "$.set(count, $.get(count) + 1)");
     }
 
     #[test]
     fn test_multiple_assignments() {
         // Both a and b are state vars, both assigned
-        assert_eq!(
-            transform("a = 1; b = 2", &["a", "b"]),
-            "$.set(a, 1); $.set(b, 2)"
-        );
+        assert_eq!(transform("a = 1; b = 2", &["a", "b"]), "$.set(a, 1); $.set(b, 2)");
     }
 
     #[test]
@@ -4251,6 +5960,36 @@ mod tests {
         let expected =
             "function wrap(initial) {\nlet _value = $.state(initial);\nreturn $.get(_value);\n}";
         assert_eq!(transform(input, &["_value"]), expected);
+    }
+
+    #[test]
+    fn local_derived_shadows_same_named_outer_prop() {
+        let prop_vars = vec!["ref".to_string()];
+        let config = AstTransformConfig {
+            state_vars: &[],
+            non_reactive_vars: &[],
+            raw_state_vars: &[],
+            derived_vars: &[],
+            non_proxy_vars: &[],
+            reassign_non_proxy_vars: &[],
+            is_runes: true,
+            dev: false,
+            analysis_source: None,
+            filename: None,
+            async_derived_locations: None,
+            prop_source_vars: &prop_vars,
+            prop_assignment_transform_vars: &prop_vars,
+            non_bindable_prop_vars: &[],
+            store_sub_vars: &[],
+            read_only_props: &[],
+            rest_prop_vars: &[],
+            analysis: None,
+            exported_names: &[],
+        };
+        let input = "function setup(value) { const ref = $derived(value); return ref; } ref;";
+        let expected = "function setup(value) { const ref = $.derived(() => value); return $.get(ref); } ref();";
+
+        assert_eq!(transform_state_vars_ast(input, &config).unwrap(), expected);
     }
 
     #[test]

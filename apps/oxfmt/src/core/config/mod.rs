@@ -17,8 +17,6 @@ use std::{
 
 use editorconfig_parser::EditorConfig;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
-#[cfg(feature = "napi")]
-use rustc_hash::FxHashSet;
 use serde_json::Value;
 use tracing::instrument;
 
@@ -54,112 +52,6 @@ pub fn config_discovery() -> ConfigDiscovery {
         OXFMT_CONFIG_FILE_NAMES,
         cfg!(feature = "napi") && utils::vp_version().is_some(),
     )
-}
-
-const EXTERNAL_PLUGIN_SPEC_WITH_RESOLVE_FROM_PREFIX: &str = "__OXFMT_PLUGIN_SPEC__";
-const REGISTERED_EXTERNAL_PLUGIN_SPEC_PREFIX: &str = "__OXFMT_REGISTERED_PLUGIN__";
-
-fn is_relative_external_plugin_path_spec(spec: &str) -> bool {
-    matches!(spec, "." | "..")
-        || spec.starts_with("./")
-        || spec.starts_with("../")
-        || spec.starts_with(".\\")
-        || spec.starts_with("..\\")
-}
-
-fn is_windows_absolute_plugin_path_spec(spec: &str) -> bool {
-    let bytes = spec.as_bytes();
-    bytes.len() >= 3
-        && bytes[0].is_ascii_alphabetic()
-        && bytes[1] == b':'
-        && matches!(bytes[2], b'/' | b'\\')
-}
-
-fn encode_external_plugin_spec_with_resolve_from(spec: &str, base_dir: &Path) -> String {
-    format!(
-        "{EXTERNAL_PLUGIN_SPEC_WITH_RESOLVE_FROM_PREFIX}{}",
-        serde_json::json!({
-            "spec": spec,
-            "resolveFrom": base_dir.to_string_lossy(),
-        })
-    )
-}
-
-fn resolve_external_plugin_spec(spec: &str, base_dir: Option<&Path>) -> String {
-    if spec.starts_with(EXTERNAL_PLUGIN_SPEC_WITH_RESOLVE_FROM_PREFIX)
-        || spec.starts_with(REGISTERED_EXTERNAL_PLUGIN_SPEC_PREFIX)
-    {
-        return spec.to_string();
-    }
-
-    let Some(base_dir) = base_dir else { return spec.to_string() };
-
-    if spec.starts_with("file:") || is_windows_absolute_plugin_path_spec(spec) {
-        return spec.to_string();
-    }
-
-    let path = Path::new(spec);
-    if path.is_absolute() || is_relative_external_plugin_path_spec(spec) {
-        return utils::normalize_relative_path(base_dir, path).to_string_lossy().to_string();
-    }
-
-    encode_external_plugin_spec_with_resolve_from(spec, base_dir)
-}
-
-fn resolve_external_plugin_paths(config: &mut FormatConfig, base_dir: Option<&Path>) {
-    let Some(plugins) = &mut config.plugins else { return };
-
-    for plugin in plugins {
-        *plugin = resolve_external_plugin_spec(plugin, base_dir);
-    }
-}
-
-#[cfg(feature = "napi")]
-fn extract_external_plugin_specs(raw_config: &Value, base_dir: Option<&Path>) -> Vec<String> {
-    let mut specs = extract_external_plugin_specs_from_options(raw_config, base_dir);
-
-    if let Some(overrides) =
-        raw_config.as_object().and_then(|obj| obj.get("overrides")).and_then(Value::as_array)
-    {
-        for override_entry in overrides {
-            let Some(options) = override_entry.as_object().and_then(|entry| entry.get("options"))
-            else {
-                continue;
-            };
-            specs.extend(extract_external_plugin_specs_from_options(options, base_dir));
-        }
-    }
-
-    let mut seen = FxHashSet::default();
-    specs.retain(|spec| seen.insert(spec.clone()));
-    #[cfg(feature = "svelte-rsvelte-backend")]
-    specs.retain(|spec| !is_svelte_external_plugin_spec(spec));
-    specs
-}
-
-#[cfg(feature = "napi")]
-#[cfg(feature = "svelte-rsvelte-backend")]
-fn is_svelte_external_plugin_spec(spec: &str) -> bool {
-    spec.contains("prettier-plugin-svelte")
-}
-
-#[cfg(feature = "napi")]
-fn extract_external_plugin_specs_from_options(
-    raw_config: &Value,
-    base_dir: Option<&Path>,
-) -> Vec<String> {
-    let Some(obj) = raw_config.as_object() else { return vec![] };
-    let Some(plugins) = obj.get("plugins") else { return vec![] };
-
-    match plugins {
-        Value::String(spec) => vec![resolve_external_plugin_spec(spec, base_dir)],
-        Value::Array(items) => items
-            .iter()
-            .filter_map(Value::as_str)
-            .map(|spec| resolve_external_plugin_spec(spec, base_dir))
-            .collect(),
-        _ => vec![],
-    }
 }
 
 /// Build a `ConfigResolver` from a single discovered config file (no ancestor walk,
@@ -227,6 +119,11 @@ pub fn build_resolver_from_discovered(
 pub enum ResolveOutcome {
     /// Ready to format with this strategy.
     Format(FormatStrategy),
+    /// The file's parser requires a plugin that the resolved config did NOT enable.
+    /// The payload carries the missing config key (e.g. `"svelte"`)
+    /// so callers can construct a friendly error or log message.
+    #[cfg_attr(not(feature = "napi"), expect(dead_code))]
+    MissingPlugin(&'static str),
 }
 
 /// Resolve options for a pre-classified file and build a [`ResolveOutcome`].
@@ -326,11 +223,6 @@ pub struct ConfigResolver {
 }
 
 impl ConfigResolver {
-    #[cfg(feature = "napi")]
-    pub fn external_plugin_specs(&self) -> Vec<String> {
-        extract_external_plugin_specs(&self.raw_config, self.config_dir.as_deref())
-    }
-
     /// Shared internal constructor used by both:
     /// - `from_json_config()` (JSON/JSONC)
     /// - and `from_config()` (JS/TS config evaluated externally)
@@ -529,7 +421,6 @@ impl ConfigResolver {
         if let Some(config_dir) = &self.config_dir {
             format_config.resolve_tailwind_paths(config_dir);
         }
-        resolve_external_plugin_paths(&mut format_config, self.config_dir.as_deref());
 
         // Eagerly validate; see method doc for the rationale.
         // The snapshot and its gate artifacts are cached as one pair for the fast path.
@@ -615,7 +506,6 @@ impl ConfigResolver {
         if let Some(config_dir) = &self.config_dir {
             format_config.resolve_tailwind_paths(config_dir);
         }
-        resolve_external_plugin_paths(&mut format_config, self.config_dir.as_deref());
 
         // Validate the merged config;
         // see method doc for what kinds of errors are caught and why this is the single gate.
@@ -731,9 +621,10 @@ mod tests_slow_path_validation {
         // Slow path triggers because the override matches.
         let kind = FileKind::Prettier {
             path: Arc::from(PathBuf::from("data.json").as_path()),
-            parser_name: std::borrow::Cow::Borrowed("json"),
+            parser_name: "json",
             supports_tailwind: false,
             supports_oxfmt: false,
+            supports_svelte: false,
         };
         let err = resolver.resolve(kind).unwrap_err();
         assert!(err.contains("printWidth"), "expected printWidth validation error, got: {err}");
@@ -773,9 +664,10 @@ mod tests_slow_path_validation {
     fn resolve_for_api_rejects_invalid_value_for_prettier() {
         let kind = FileKind::Prettier {
             path: Arc::from(PathBuf::from("page.vue").as_path()),
-            parser_name: std::borrow::Cow::Borrowed("vue"),
+            parser_name: "vue",
             supports_tailwind: true,
             supports_oxfmt: true,
+            supports_svelte: false,
         };
         let err = resolve_for_api(serde_json::json!({ "printWidth": 1000 }), kind, Path::new("."))
             .unwrap_err();

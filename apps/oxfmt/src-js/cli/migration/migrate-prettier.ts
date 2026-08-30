@@ -58,65 +58,12 @@ export async function runMigratePrettier() {
     return exitWithError(`Failed to parse: ${prettierConfigPath}`);
   }
 
-  // Start with blank, then fill in from `prettierConfig`.
-  const oxfmtrc = await createBlankOxfmtrcFile(cwd);
-
-  let hasTailwindcssPlugin = false;
-  let hasSortPackageJsonPlugin = false;
-  let hasSveltePlugin = false;
-  for (const [key, value] of Object.entries(prettierConfig ?? {})) {
-    // Handle plugins - check for known plugins and warn about others
-    if (key === "plugins" && Array.isArray(value)) {
-      for (const plugin of (value as Options["plugins"])!) {
-        if (plugin === "prettier-plugin-tailwindcss") {
-          hasTailwindcssPlugin = true;
-        } else if (plugin === "prettier-plugin-packagejson") {
-          hasSortPackageJsonPlugin = true;
-        } else if (plugin === "prettier-plugin-svelte") {
-          hasSveltePlugin = true;
-        } else if (typeof plugin === "string") {
-          console.error(`  - plugins: "${plugin}" is not supported, skipping...`);
-        } else {
-          console.error(`  - plugins: custom plugin module is not supported, skipping...`);
-        }
-      }
-      continue;
-    }
-    // Per-file options that should not appear in a shared config; drop if leaked in
-    if (key === "parser" || key === "filepath") {
-      continue;
-    }
-    // Prettier-only options without an Oxfmt equivalent
-    if (key === "requirePragma" || key === "insertPragma") {
-      console.error(`  - "${key}" is not supported, skipping...`);
-      continue;
-    }
-    // Oxfmt does not support this, fallback to default
-    if (key === "endOfLine" && value === "auto") {
-      console.error(`  - "endOfLine: auto" is not supported, skipping...`);
-      continue;
-    }
-    // Oxfmt does not support this experimental option yet
-    if (key === "experimentalTernaries") {
-      console.error(`  - "${key}" is not supported yet`);
-      continue;
-    }
-
-    // Skip plugin-specific options - handled separately
-    if (key.startsWith("tailwind") || key.startsWith("svelte")) {
-      continue;
-    }
-
-    // Otherwise, copy the value.
-    // This may include options that do not affect Oxfmt, like `vueIndentScriptAndStyle`.
-    oxfmtrc[key] = value;
-  }
-
-  // `printWidth` has different default between Prettier and Oxfmt.
-  // Oxfmt default is 100, Prettier default is 80.
-  if (typeof oxfmtrc.printWidth !== "number") {
-    console.error(
-      `  - "printWidth" is not set in Prettier config, defaulting to 80 (Oxfmt default: 100)`,
+  let prettierConfig;
+  let useRawConfigFallback = usedManualConfigDiscovery;
+  if (usedManualConfigDiscovery) {
+    warnMigration(
+      { applyDefaults: true },
+      `Prettier did not discover ${basename(prettierConfigPath)} automatically; migrating from the raw config instead.`,
     );
     console.log("Found Prettier configuration at:", prettierConfigPath);
   } else {
@@ -1428,26 +1375,27 @@ function migrateTailwindOptions(
   const tailwindOptions: Record<string, unknown> = {};
   for (const [oxfmtKey, prettierKey] of Object.entries(TAILWIND_OPTION_MAPPING)) {
     const value = prettierConfig[prettierKey];
-    if (value === undefined) continue;
-    result[oxfmtKey] = transform ? transform(prettierKey, value) : value;
-  }
-  return result;
-}
-
-// `tailwindFunctions` / `tailwindAttributes` accept regex strings (e.g. `/^tw-/`)
-// which Oxfmt does not support. Drop them and warn.
-function filterTailwindRegex(prettierKey: string, value: unknown): unknown {
-  if (
-    (prettierKey !== "tailwindFunctions" && prettierKey !== "tailwindAttributes")
-    || !Array.isArray(value)
-  ) {
-    return value;
-  }
-  return (value as unknown[]).filter((item): item is string => {
-    if (typeof item !== "string") return false;
-    const isRegex = item.startsWith("/") && item.endsWith("/");
-    if (isRegex) {
-      console.warn(`  - Regexp in "${prettierKey}" option is not supported, skipping: ${item}`);
+    if (value !== undefined) {
+      if (
+        (prettierKey === "tailwindFunctions" || prettierKey === "tailwindAttributes") &&
+        Array.isArray(value)
+      ) {
+        tailwindOptions[oxfmtKey] = value.filter((item): item is string => {
+          if (typeof item !== "string") {
+            return false;
+          }
+          if (item.startsWith("/") && item.endsWith("/")) {
+            warnMigration(
+              scope,
+              `Regexp in "${prettierKey}" option is not supported, skipping: ${item}`,
+            );
+            return false;
+          }
+          return true;
+        });
+        continue;
+      }
+      tailwindOptions[oxfmtKey] = value;
     }
   }
 

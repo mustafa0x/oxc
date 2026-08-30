@@ -91,10 +91,7 @@ pub fn transform_private_field_assign_ast(
             &MODULE_PRIVATE_FIELD_ASSIGN_ALLOC,
             src,
             SourceType::mjs(),
-            ParseOptions {
-                allow_return_outside_function: true,
-                ..ParseOptions::default()
-            },
+            ParseOptions { allow_return_outside_function: true, ..ParseOptions::default() },
             true,
             |program| {
                 let mut collector = PrivateFieldAssignCollector {
@@ -147,14 +144,10 @@ impl<'a, 'ast> Visit<'ast> for PrivateFieldAssignCollector<'a> {
 
         let rewrite = match op_str {
             None => format!("$.set({}, {})", qualified, rhs_text),
-            Some(op) => format!(
-                "$.set({}, $.get({}) {} {})",
-                qualified, qualified, op, rhs_text
-            ),
+            Some(op) => format!("$.set({}, $.get({}) {} {})", qualified, qualified, op, rhs_text),
         };
 
-        self.replacements
-            .push((expr.span.start, expr.span.end, rewrite));
+        self.replacements.push((expr.span.start, expr.span.end, rewrite));
     }
 
     fn visit_update_expression(&mut self, expr: &UpdateExpression<'ast>) {
@@ -182,8 +175,7 @@ impl<'a, 'ast> Visit<'ast> for PrivateFieldAssignCollector<'a> {
             (UpdateOperator::Decrement, true) => format!("$.update_pre({}, -1)", qualified),
         };
 
-        self.replacements
-            .push((expr.span.start, expr.span.end, rewrite));
+        self.replacements.push((expr.span.start, expr.span.end, rewrite));
     }
 }
 
@@ -381,10 +373,7 @@ mod tests {
             &ssv(&["this.#a", "this.#b"]),
         )
         .unwrap();
-        assert_eq!(
-            out,
-            "$.set(this.#a, 1); $.set(this.#b, $.get(this.#b) + 2);"
-        );
+        assert_eq!(out, "$.set(this.#a, 1); $.set(this.#b, $.get(this.#b) + 2);");
     }
 
     #[test]

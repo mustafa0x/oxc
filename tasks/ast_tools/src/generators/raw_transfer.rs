@@ -144,9 +144,9 @@ fn generate_deserializers(
     #[rustfmt::skip]
     let mut code = format!("
         /* IF LINTER */
-        import {{ tokens, initTokens }} from '../plugins/tokens.ts';
-        import {{ comments, initComments }} from '../plugins/comments.ts';
-        import {{ getNodeLoc }} from '../plugins/location.ts';
+        import {{ tokens, initTokens }} from '../plugins/tokens.js';
+        import {{ comments, initComments }} from '../plugins/comments.js';
+        import {{ getNodeLoc }} from '../plugins/location.js';
         /* END_IF */
 
         let uint8, int32, float64, sourceText, sourceTextLatin,

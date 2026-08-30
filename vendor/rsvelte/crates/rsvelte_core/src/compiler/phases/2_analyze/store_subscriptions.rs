@@ -8,6 +8,7 @@
 use super::AnalysisError;
 use super::RESERVED;
 use super::errors;
+use super::pattern_ids::collect_pattern_identifiers_json;
 use super::scope::{Binding, BindingKind, DeclarationKind};
 use super::types::ComponentAnalysis;
 use super::visitors::shared::function::is_rune;
@@ -16,6 +17,7 @@ use crate::ast::template::{
     Attribute, AttributeValue, AttributeValuePart, AwaitBlock, EachBlock, Fragment, IfBlock,
     KeyBlock, RegularElement, Root, Script, SnippetBlock, TemplateNode,
 };
+use crate::compiler::phases::phase1_parse::parser::is_js_whitespace;
 use rustc_hash::FxHashSet;
 
 /// A store reference with location context
@@ -27,6 +29,11 @@ struct StoreRef {
     position: usize,
     /// Whether this is in a module script (vs instance or template)
     in_module: bool,
+    /// Whether the identifier's immediate parent is a call expression.
+    ///
+    /// This includes both the callee (`$state()`) and a direct argument
+    /// (`fn($state)`), but not a member/unary wrapper around the reference.
+    parent_is_call_expression: bool,
 }
 
 /// Detect store subscriptions and create synthetic bindings.
@@ -52,7 +59,12 @@ pub fn detect_store_subscriptions(
     analysis: &mut ComponentAnalysis,
     options_runes: Option<bool>,
     is_module_file: bool,
+    retained_scripts: Option<&crate::ast::oxc_program::RetainedScripts<'_>>,
 ) -> Result<(), AnalysisError> {
+    if memchr::memchr(b'$', analysis.source.as_bytes()).is_none() {
+        return Ok(());
+    }
+
     // Collect all $xxx references from the AST with context
     let mut store_refs: Vec<StoreRef> = Vec::new();
     let mut template_refs: Vec<StoreRef> = Vec::new();
@@ -65,6 +77,7 @@ pub fn detect_store_subscriptions(
             &mut store_refs,
             false,
             analysis.is_typescript,
+            retained_scripts.and_then(|scripts| scripts.instance.as_ref()),
         );
     }
 
@@ -75,6 +88,7 @@ pub fn detect_store_subscriptions(
             &mut store_refs,
             true,
             analysis.is_typescript,
+            retained_scripts.and_then(|scripts| scripts.module.as_ref()),
         );
     }
 
@@ -101,16 +115,32 @@ pub fn detect_store_subscriptions(
     for store_ref in &store_refs {
         let ref_name = &store_ref.name;
 
-        // Skip reserved names ($$props, $$restProps, $$slots)
+        // Skip reserved names ($$props, $$restProps, $$slots). The first two are
+        // illegal in runes mode, but that is not known yet — auto-detection runs
+        // after this scan — so record the position and let the caller report it.
         if RESERVED.contains(&ref_name.as_str()) {
+            if analysis.root.find_binding_any_scope(ref_name).is_none() {
+                let span =
+                    (store_ref.position as u32, (store_ref.position + ref_name.len()) as u32);
+                let slot = match ref_name.as_str() {
+                    "$$props" => &mut analysis.legacy_props_ref,
+                    "$$restProps" => &mut analysis.legacy_rest_props_ref,
+                    _ => continue,
+                };
+                slot.get_or_insert(span);
+            }
             continue;
         }
 
         // Check for invalid $$ references ($$xxx is illegal)
         // Corresponds to Svelte's L266-269 and L351-352 in 2-analyze/index.js
         // Note: bare $ detection is handled in Identifier visitor via proper AST analysis
-        if ref_name.starts_with("$$") {
-            return Err(errors::global_reference_invalid(ref_name));
+        // Only an UNRESOLVED reference is illegal — upstream reads the module
+        // scope's leftover references, so a `$$x` bound by the template (an
+        // each item, a snippet parameter) never reaches this rule.
+        if ref_name.starts_with("$$") && analysis.root.find_binding_any_scope(ref_name).is_none() {
+            return Err(errors::global_reference_invalid(ref_name)
+                .at(store_ref.position as u32, (store_ref.position + ref_name.len()) as u32));
         }
 
         // Skip names that don't start with $ or bare $
@@ -155,7 +185,9 @@ pub fn detect_store_subscriptions(
         if is_rune(ref_name) && is_module_file {
             continue;
         }
-        if is_rune(ref_name) {
+        // Upstream opens the condition with `runes_option === false ||`, so an
+        // explicit legacy mode makes every rune-named reference a store.
+        if is_rune(ref_name) && options_runes != Some(false) {
             // Look for a binding in the instance scope AND module scope (scope 0).
             // The official Svelte compiler uses `instance.scope.get(store_name)` which
             // traverses the scope chain: instance -> module -> root.
@@ -199,60 +231,49 @@ pub fn detect_store_subscriptions(
                 // with $state(), $state.raw(), or $derived() - so $name IS a rune, not a store.
                 // If the binding is an import or normal let/const without rune init,
                 // then $name should be a store subscription.
-                let is_rune_init = matches!(
-                    binding.kind,
-                    BindingKind::State | BindingKind::RawState | BindingKind::Derived
-                );
-
-                if is_rune_init {
-                    // The binding IS a rune initialization - skip, $name is a rune
+                // 写経 the `(get_rune(init, instance.scope) === null || (store_name
+                // !== 'props' && get_rune(init, instance.scope) === '$props'))`
+                // half of the condition: the store sub is skipped whenever the
+                // DECLARATION'S OWN initializer is a rune call — with the one
+                // exception that `$props()` only claims the name `$props`
+                // (`let state = $props()` still makes `$state` a store sub).
+                //
+                // `binding.kind` is the fallback for the rune families whose
+                // initializer the scope builder records as a kind rather than as
+                // `init_rune`.
+                let init_rune = binding.init_rune.as_deref();
+                let init_is_rune_call = init_rune.is_some()
+                    || matches!(
+                        binding.kind,
+                        BindingKind::State | BindingKind::RawState | BindingKind::Derived
+                    );
+                if init_is_rune_call && (store_name == "props" || init_rune != Some("$props")) {
                     continue;
                 }
 
-                // Special case from official compiler (2-analyze/index.js L366-368):
-                // "rune-like names received as props are valid too (but we have to protect
-                //  against $props as store)"
-                //
-                // When `let props = $props()` is used (Identifier pattern), the `props`
-                // binding has kind RestProp. In this case `$props` must NOT be treated as
-                // a store subscription - it is still the $props rune.
-                //
-                // However, if someone writes `let state = $props()`, the `state` binding
-                // also has kind Prop/RestProp, but `$state` references elsewhere SHOULD
-                // still be treated as store subscriptions (per official compiler logic):
-                //   get_rune(init) === '$props' && store_name === 'props'  -> skip (rune)
-                //   get_rune(init) === '$props' && store_name !== 'props'  -> create store
-                //
-                // We replicate this by checking binding kind is Prop/RestProp/BindableProp
-                // (i.e., init was $props()) AND store_name == "props".
-                // Also detect the `let { props } = $props()` case. Prop binding kinds are
-                // assigned during the later visitor walk, which runs AFTER store subscription
-                // detection, so at this point the binding kind may still be the default
-                // (Normal). As a fallback, scan the instance script source for any
-                // `= $props(` initializer — if one exists and `store_name == "props"`, then
-                // `$props` refers to the rune (not a store subscription).
-                let instance_has_props_rune_init = ast
-                    .instance
-                    .as_ref()
-                    .and_then(|inst| {
-                        let s = inst.content.start().unwrap_or(0) as usize;
-                        let e = inst.content.end().unwrap_or(0) as usize;
-                        if e > s && e <= analysis.source.len() {
-                            Some(&analysis.source[s..e])
-                        } else {
-                            None
-                        }
-                    })
-                    .map(|src| src.contains("$props(") || src.contains("$props.bindable("))
-                    .unwrap_or(false);
-                let is_props_rune_init = (matches!(
+                // Upstream skips the store sub whenever `get_rune(init, scope)`
+                // is non-null — i.e. for ANY rune-call initializer, not only the
+                // $state/$derived family the binding KIND records. `const host =
+                // $host()` leaves a Normal binding, but `$host` is still the
+                // rune. The one exception is its own name: `let state =
+                // $props()` still makes `$state` a store subscription, while
+                // `let { props } = $props()` keeps `$props` a rune.
+                if binding
+                    .init_rune
+                    .as_deref()
+                    .is_some_and(|r| r != "$props" || store_name == "props")
+                {
+                    continue;
+                }
+
+                // A `$props()` destructuring assigns its binding kinds in the
+                // later visitor walk, which runs after this pass, so the kind is
+                // still the default here even though `init_rune` is already set.
+                if matches!(
                     binding.kind,
                     BindingKind::Prop | BindingKind::RestProp | BindingKind::BindableProp
-                ) || instance_has_props_rune_init)
-                    && store_name == "props";
-
-                if is_props_rune_init {
-                    // The binding is `let props = $props()` - $props is the rune, not a store
+                ) && store_name == "props"
+                {
                     continue;
                 }
 
@@ -275,26 +296,14 @@ pub fn detect_store_subscriptions(
                 // Corresponds to Svelte's 2-analyze/index.js L398-407
                 //
                 // The official compiler iterates over references for this name and checks
-                // `path.at(-1)?.type === 'CallExpression'` - we approximate by checking if
-                // this specific reference position is followed by `(` in the source.
-                if options_runes != Some(false) {
+                // `path.at(-1)?.type === 'CallExpression'`. The lexical collector records
+                // that immediate-parent fact for both callees and direct arguments.
+                if options_runes != Some(false) && store_ref.parent_is_call_expression {
                     let pos = store_ref.position + ref_name.len();
-                    let source_bytes = analysis.source.as_bytes();
-                    // Skip whitespace after the identifier
-                    let mut check_pos = pos;
-                    while check_pos < source_bytes.len()
-                        && (source_bytes[check_pos] == b' '
-                            || source_bytes[check_pos] == b'\t'
-                            || source_bytes[check_pos] == b'\n'
-                            || source_bytes[check_pos] == b'\r')
-                    {
-                        check_pos += 1;
-                    }
-                    if check_pos < source_bytes.len() && source_bytes[check_pos] == b'(' {
-                        analysis
-                            .warnings
-                            .push(warnings::store_rune_conflict(store_name));
-                    }
+                    analysis.warnings.push(
+                        warnings::store_rune_conflict(store_name)
+                            .at(store_ref.position as u32, pos as u32),
+                    );
                 }
             } else {
                 // No binding in instance scope - skip rune names (it's a real rune)
@@ -318,123 +327,10 @@ pub fn detect_store_subscriptions(
         let binding_idx = binding_from_instance
             .or_else(|| analysis.root.scope.declarations.get(store_name).copied());
 
-        if let Some(binding_idx) = binding_idx {
-            let binding = &analysis.root.bindings[binding_idx];
-
-            // Check if the binding is in a nested scope (not module or instance scope)
-            // This catches cases like {#each items as item} ... {$item} ... {/each}
-            // where `item` is declared in the each block scope, not at top level
-            //
-            // Store subscriptions are only valid when the store binding is in
-            // the module scope (0) or instance scope.
-            if binding.scope_index != 0 && binding.scope_index != instance_scope {
-                // This is a scoped subscription - the store is not at top level
-                return Err(errors::store_invalid_scoped_subscription());
-            }
-
-            // Check for bindings that represent local variables (EachItem, SnippetParam, etc.)
-            // These are inherently scoped even if scope_index might be 0 due to how
-            // declarations are collected into root scope
-            if matches!(
-                binding.kind,
-                BindingKind::EachItem
-                    | BindingKind::EachIndex
-                    | BindingKind::SnippetParam
-                    | BindingKind::AwaitThen
-                    | BindingKind::AwaitCatch
-            ) {
-                return Err(errors::store_invalid_scoped_subscription());
-            }
-
-            // NOTE: We previously had a check here that errored if the store name was
-            // shadowed in ANY nested scope. This was too aggressive - it would error even
-            // when the $store reference itself was at the top level (e.g., in template).
-            //
-            // The proper context-aware shadowing check is done in walk_js_expression()
-            // in visitors/shared/utils.rs, which tracks function_depth and only errors
-            // when a $store reference is actually INSIDE a scope where the variable is shadowed.
-            //
-            // Example where this matters:
-            //   let store = writable({action: (node, text) => { ... }});
-            //   let text = writable('hello');
-            //   <div use:$store.action={$text}>  <!-- $text here is valid! -->
-            //
-            // The arrow function parameter `text` should NOT cause an error for template
-            // references to $text.
-
-            // Check if the reference is inside a module script
-            // Store subscriptions are not allowed in module scripts
-            // Corresponds to Svelte's L410-420 in 2-analyze/index.js
-            if store_ref.in_module {
-                // For rune names ($state, $effect, etc.) used as rune calls in module context,
-                // don't error - just let it fall through to create the store sub.
-                // The official Svelte compiler checks get_rune(path.at(-1), module.scope) !== null.
-                // We approximate by checking if the reference is followed by '(' (i.e., a call).
-                if is_rune(ref_name) {
-                    let pos = store_ref.position + ref_name.len();
-                    let source_bytes = analysis.source.as_bytes();
-                    let mut check_pos = pos;
-                    while check_pos < source_bytes.len()
-                        && matches!(source_bytes[check_pos], b' ' | b'\t' | b'\n' | b'\r')
-                    {
-                        check_pos += 1;
-                    }
-                    let is_call = check_pos < source_bytes.len() && source_bytes[check_pos] == b'(';
-                    if is_call {
-                        // It's a rune call like $state({...}) - don't error, but still
-                        // create the store sub (the official compiler does this)
-                    } else {
-                        // Rune name used as a non-call reference in module context
-                        // This would be invalid, but since it's a rune name, just skip
-                        continue;
-                    }
-                } else {
-                    // Non-rune store reference in module context
-                    // For .svelte.js module files, don't error here - let
-                    // check_module_store_subscriptions() handle it with the correct
-                    // store_invalid_subscription_module error code.
-                    // For <script module> in .svelte files, error with store_invalid_subscription.
-                    if !is_module_file {
-                        return Err(errors::store_invalid_subscription());
-                    }
-                }
-            }
-
-            // Check if we already have a binding for $xxx in the top-level scopes.
-            // We only check bindings in scope 0 (module) or scope 1 (instance),
-            // not nested scopes. A function parameter like `function bar($derived, $effect)`
-            // creates a binding for `$effect` in a nested scope, but should NOT prevent
-            // creating a StoreSub for the top-level `$effect` store subscription.
-            if let Some(binding_idx) = analysis.root.find_binding_any_scope(ref_name) {
-                let binding = &analysis.root.bindings[binding_idx];
-                let instance_scope2 = analysis.root.instance_scope_index;
-                if binding.scope_index == 0 || binding.scope_index == instance_scope2 {
-                    continue;
-                }
-            }
-
-            // Create a synthetic StoreSub binding
-            let new_binding_idx = analysis.root.bindings.len();
-            let new_binding = Binding::with_declaration_kind(
-                ref_name.clone(),
-                BindingKind::StoreSub,
-                DeclarationKind::Synthetic,
-                0, // Root scope
-            );
-            analysis.root.bindings.push(new_binding);
-            analysis
-                .root
-                .scope
-                .declarations
-                .insert(ref_name.clone(), new_binding_idx);
-            // Also add to all_scopes[0] so get_binding() can find it via scope chain traversal.
-            // self.scope is a clone of all_scopes[0], so we need to keep both in sync.
-            if let Some(root_scope) = analysis.root.all_scopes.first_mut() {
-                root_scope
-                    .declarations
-                    .insert(ref_name.clone(), new_binding_idx);
-            }
-        } else if options_runes != Some(false) {
+        // Upstream declares the synthetic binding whether or not `store_name`
+        // resolves; only the `runes_option !== false` arm turns an unresolved
+        // lowercase name into `global_reference_invalid`.
+        if binding_idx.is_none() && options_runes != Some(false) {
             // When options.runes is not explicitly false (i.e., undefined/auto or true),
             // if no binding exists for a lowercase $xxx name, it's an invalid global reference.
             // This matches Svelte's behavior: `if (options.runes !== false) { ... }`
@@ -454,13 +350,134 @@ pub fn detect_store_subscriptions(
                 // `$page` in the template and as `($page) => …` in `.subscribe()` —
                 // still creates its StoreSub (it never reaches this branch because
                 // the unprefixed `page` binding exists).
-                if analysis.root.bindings.iter().any(|b| {
+                if !analysis.root.bindings.iter().any(|b| {
                     &b.name == ref_name && b.declaration_kind != DeclarationKind::Synthetic
                 }) {
+                    return Err(errors::global_reference_invalid(ref_name).at(
+                        store_ref.position as u32,
+                        (store_ref.position + ref_name.len()) as u32,
+                    ));
+                }
+            }
+            continue;
+        } else if let Some(binding_idx) = binding_idx {
+            let binding = &analysis.root.bindings[binding_idx];
+
+            // Check if the binding is in a nested scope (not module or instance scope)
+            // This catches cases like {#each items as item} ... {$item} ... {/each}
+            // where `item` is declared in the each block scope, not at top level
+            //
+            // Store subscriptions are only valid when the store binding is in
+            // the module scope (0) or instance scope.
+            if binding.scope_index != 0 && binding.scope_index != instance_scope {
+                // This is a scoped subscription - the store is not at top level
+                return Err(errors::store_invalid_scoped_subscription()
+                    .at(store_ref.position as u32, (store_ref.position + ref_name.len()) as u32));
+            }
+
+            // Check for bindings that represent local variables (EachItem, SnippetParam, etc.)
+            // These are inherently scoped even if scope_index might be 0 due to how
+            // declarations are collected into root scope
+            if matches!(
+                binding.kind,
+                BindingKind::EachItem
+                    | BindingKind::EachIndex
+                    | BindingKind::SnippetParam
+                    | BindingKind::AwaitThen
+                    | BindingKind::AwaitCatch
+            ) {
+                return Err(errors::store_invalid_scoped_subscription()
+                    .at(store_ref.position as u32, (store_ref.position + ref_name.len()) as u32));
+            }
+        }
+
+        // NOTE: We previously had a check here that errored if the store name was
+        // shadowed in ANY nested scope. This was too aggressive - it would error even
+        // when the $store reference itself was at the top level (e.g., in template).
+        //
+        // The proper context-aware shadowing check is done in walk_js_expression()
+        // in visitors/shared/utils.rs, which tracks function_depth and only errors
+        // when a $store reference is actually INSIDE a scope where the variable is shadowed.
+        //
+        // Example where this matters:
+        //   let store = writable({action: (node, text) => { ... }});
+        //   let text = writable('hello');
+        //   <div use:$store.action={$text}>  <!-- $text here is valid! -->
+        //
+        // The arrow function parameter `text` should NOT cause an error for template
+        // references to $text.
+
+        // Check if the reference is inside a module script
+        // Store subscriptions are not allowed in module scripts
+        // Corresponds to Svelte's L410-420 in 2-analyze/index.js
+        if store_ref.in_module {
+            // For rune names ($state, $effect, etc.) used as rune calls in module context,
+            // don't error - just let it fall through to create the store sub.
+            // The official Svelte compiler checks get_rune(path.at(-1), module.scope) !== null.
+            // We approximate by checking if the reference is followed by '(' (i.e., a call).
+            if is_rune(ref_name) {
+                let pos = store_ref.position + ref_name.len();
+                let source_bytes = analysis.source.as_bytes();
+                let mut check_pos = pos;
+                while check_pos < source_bytes.len()
+                    && matches!(source_bytes[check_pos], b' ' | b'\t' | b'\n' | b'\r')
+                {
+                    check_pos += 1;
+                }
+                let is_call = check_pos < source_bytes.len() && source_bytes[check_pos] == b'(';
+                if !is_call {
+                    // Rune name used as a non-call reference in module context
+                    // This would be invalid, but since it's a rune name, just skip
                     continue;
                 }
-                return Err(errors::global_reference_invalid(ref_name));
+            } else {
+                // Non-rune store reference in module context
+                // For .svelte.js module files, don't error here - let
+                // check_module_store_subscriptions() handle it with the correct
+                // store_invalid_subscription_module error code.
+                // For <script module> in .svelte files, error with store_invalid_subscription.
+                if !is_module_file {
+                    return Err(errors::store_invalid_subscription().at(
+                        store_ref.position as u32,
+                        (store_ref.position + ref_name.len()) as u32,
+                    ));
+                }
             }
+        }
+
+        // Check if we already have a binding for $xxx in the top-level scopes.
+        // We only check bindings in scope 0 (module) or scope 1 (instance),
+        // not nested scopes. A function parameter like `function bar($derived, $effect)`
+        // creates a binding for `$effect` in a nested scope, but should NOT prevent
+        // creating a StoreSub for the top-level `$effect` store subscription.
+        if let Some(binding_idx) = analysis.root.find_binding_any_scope(ref_name) {
+            let binding = &analysis.root.bindings[binding_idx];
+            let instance_scope2 = analysis.root.instance_scope_index;
+            if binding.scope_index == 0 || binding.scope_index == instance_scope2 {
+                continue;
+            }
+        }
+
+        // Create a synthetic StoreSub binding
+        let mut new_binding = Binding::with_declaration_kind(
+            ref_name.clone(),
+            BindingKind::StoreSub,
+            DeclarationKind::Synthetic,
+            0, // Root scope
+        );
+        new_binding.add_reference(
+            store_ref.position as u32,
+            (store_ref.position + ref_name.len()) as u32,
+            false,
+            false,
+            false,
+        );
+        let new_binding_idx = analysis.root.push_binding(new_binding);
+        analysis.root.scope.declarations.insert(ref_name.clone(), new_binding_idx);
+        // Also add to all_scopes[0] so get_binding() can find it via scope chain traversal.
+        // self.scope is a clone of all_scopes[0], so we need to keep both in sync.
+        if let Some(root_scope) = analysis.root.all_scopes.first_mut() {
+            root_scope.declarations.insert(ref_name.clone(), new_binding_idx);
         }
     }
 
@@ -474,6 +491,7 @@ fn collect_dollar_refs_from_script_with_context(
     refs: &mut Vec<StoreRef>,
     in_module: bool,
     is_typescript: bool,
+    retained: Option<&crate::ast::oxc_program::RetainedProgram<'_>>,
 ) {
     let start = script.content.start().unwrap_or(0) as usize;
     let end = script.content.end().unwrap_or(0) as usize;
@@ -490,7 +508,41 @@ fn collect_dollar_refs_from_script_with_context(
     // scope analysis, so it must not produce a `$$Props` store ref (which would
     // trigger `global_reference_invalid`). Blanking preserves byte positions.
     if is_typescript {
-        let blanked = super::types::blank_typescript(content);
+        // Reuse the parse the compiler already did for this exact script rather
+        // than making a third one; pointer identity is what proves it is the
+        // same bytes, since only then do the collected spans line up.
+        // Byte equality, not pointer identity: `analysis.source` is a copy of the
+        // component source, so the retained program's slice never shares an
+        // address with this one even when it holds the very same script.
+        let reusable = retained.filter(|program| {
+            use super::profile::Reject;
+            if program.panicked() {
+                super::profile::record_reject(Reject::Panicked);
+                return false;
+            }
+            if !program.diagnostics().is_empty() {
+                super::profile::record_reject(Reject::Diagnostics);
+                return false;
+            }
+            if program.source() != content {
+                super::profile::record_reject(Reject::SourceDiffers);
+                return false;
+            }
+            true
+        });
+        if retained.is_none() {
+            super::profile::record_reject(super::profile::Reject::Absent);
+        }
+        let blanked = match reusable {
+            Some(program) => {
+                super::profile::record_ts_script(false, content.len());
+                super::types::blank_typescript_from_program(content, program.program())
+            }
+            None => {
+                super::profile::record_ts_script(true, content.len());
+                super::types::blank_typescript(content)
+            }
+        };
         collect_dollar_identifiers_from_js_with_context(&blanked, start, refs, in_module);
         return;
     }
@@ -514,7 +566,7 @@ fn collect_dollar_refs_from_script_with_context(
 fn arrow_body_range(chars: &[char], from: usize) -> (usize, usize) {
     let len = chars.len();
     let mut s = from;
-    while s < len && (chars[s] == ' ' || chars[s] == '\t' || chars[s] == '\n' || chars[s] == '\r') {
+    while s < len && is_js_whitespace(chars[s]) {
         s += 1;
     }
     if s >= len {
@@ -548,9 +600,10 @@ fn dollar_param_body_range(
 ) -> Option<(usize, usize)> {
     let len = chars.len();
 
-    // Skip whitespace after the ident.
+    // Skip whitespace after the ident. Newlines count: a destructured param list
+    // often spans multiple lines (`([\n\t$a,\n\t$b\n]) => …`).
     let mut j = ident_end;
-    while j < len && (chars[j] == ' ' || chars[j] == '\t') {
+    while j < len && is_js_whitespace(chars[j]) {
         j += 1;
     }
 
@@ -564,7 +617,7 @@ fn dollar_param_body_range(
     // by one of `) , ] }`, and the enclosing `(...)` is followed by `=>`.
     if ident_start > 0 {
         let mut k = ident_start as isize - 1;
-        while k >= 0 && (chars[k as usize] == ' ' || chars[k as usize] == '\t') {
+        while k >= 0 && is_js_whitespace(chars[k as usize]) {
             k -= 1;
         }
         let preceded_ok = k >= 0 && matches!(chars[k as usize], '(' | ',' | '[' | '{');
@@ -580,7 +633,7 @@ fn dollar_param_body_range(
                     ')' => {
                         if paren_depth == 0 {
                             let mut n = m + 1;
-                            while n < len && (chars[n] == ' ' || chars[n] == '\t') {
+                            while n < len && is_js_whitespace(chars[n]) {
                                 n += 1;
                             }
                             if n + 1 < len && chars[n] == '=' && chars[n + 1] == '>' {
@@ -599,6 +652,161 @@ fn dollar_param_body_range(
     None
 }
 
+/// The body range of an ordinary `function` whose parameter list contains the
+/// `$name` starting at `ident_start`. Unlike an arrow parameter, a typed
+/// ordinary-function parameter can be followed by `: Type`, so recognition is
+/// anchored at the enclosing parameter-list opening rather than at the token
+/// following the identifier.
+fn dollar_function_param_body_range(
+    chars: &[char],
+    ident_start: usize,
+    paren_open: Option<usize>,
+) -> Option<(usize, usize)> {
+    let len = chars.len();
+    let open = paren_open?;
+    if ident_start <= open {
+        return None;
+    }
+
+    // `function name(` / `function* name(` / `function (`. The lexical scan
+    // sees TypeScript with annotations blanked, so the same test covers typed
+    // parameters without teaching this scanner TypeScript grammar.
+    let mut k = open as isize - 1;
+    while k >= 0 && is_js_whitespace(chars[k as usize]) {
+        k -= 1;
+    }
+    let token_end = k;
+    while k >= 0 && is_identifier_char(chars[k as usize]) {
+        k -= 1;
+    }
+    if keyword_ends_at(chars, token_end, "function") {
+        k = token_end;
+    } else {
+        while k >= 0 && is_js_whitespace(chars[k as usize]) {
+            k -= 1;
+        }
+        if k >= 0 && chars[k as usize] == '*' {
+            k -= 1;
+            while k >= 0 && is_js_whitespace(chars[k as usize]) {
+                k -= 1;
+            }
+        }
+    }
+    if !keyword_ends_at(chars, k, "function") {
+        return None;
+    }
+
+    let mut paren_depth = 0usize;
+    let mut close = None;
+    for (m, c) in chars.iter().enumerate().skip(open) {
+        match c {
+            '(' => paren_depth += 1,
+            ')' => {
+                paren_depth = paren_depth.saturating_sub(1);
+                if paren_depth == 0 {
+                    close = Some(m);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut body_start = close? + 1;
+    while body_start < len && is_js_whitespace(chars[body_start]) {
+        body_start += 1;
+    }
+    if body_start >= len || chars[body_start] != '{' {
+        return None;
+    }
+
+    let mut brace_depth = 0usize;
+    for (m, c) in chars.iter().enumerate().skip(body_start) {
+        match c {
+            '{' => brace_depth += 1,
+            '}' => {
+                brace_depth = brace_depth.saturating_sub(1);
+                if brace_depth == 0 {
+                    return Some((body_start, m + 1));
+                }
+            }
+            _ => {}
+        }
+    }
+    Some((body_start, len))
+}
+
+/// The `catch (…)` parameter binding, and the range of the block it scopes.
+///
+/// A catch parameter is a declaration slot, so upstream's `scope.references` —
+/// which this scan stands in for — never holds it, and a `$name` read inside the
+/// block resolves to it rather than to a store. `dollar_param_body_range` cannot
+/// answer this because it requires the parenthesised list to be followed by
+/// `=>`, and a catch clause is followed by `{`.
+fn dollar_catch_param_body_range(
+    chars: &[char],
+    ident_start: usize,
+    ident_end: usize,
+) -> Option<(usize, usize)> {
+    let len = chars.len();
+    let mut k = ident_start as isize - 1;
+    while k >= 0 && is_js_whitespace(chars[k as usize]) {
+        k -= 1;
+    }
+    if k < 0 || chars[k as usize] != '(' {
+        return None;
+    }
+    let mut j = k - 1;
+    while j >= 0 && is_js_whitespace(chars[j as usize]) {
+        j -= 1;
+    }
+    if !keyword_ends_at(chars, j, "catch") {
+        return None;
+    }
+    let mut m = ident_end;
+    while m < len && is_js_whitespace(chars[m]) {
+        m += 1;
+    }
+    if m >= len || chars[m] != ')' {
+        return None;
+    }
+    let mut b = m + 1;
+    while b < len && is_js_whitespace(chars[b]) {
+        b += 1;
+    }
+    if b >= len || chars[b] != '{' {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut e = b;
+    while e < len {
+        match chars[e] {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((b, e + 1));
+                }
+            }
+            _ => {}
+        }
+        e += 1;
+    }
+    Some((b, len))
+}
+
+/// The target of a `break` / `continue`, which names a LABEL rather than a
+/// binding. ESTree keeps labels out of the reference set, so upstream never sees
+/// one; counting it made `break $state;` read as a rune use and flipped the
+/// component into runes mode.
+fn is_dollar_ident_jump_label(chars: &[char], ident_start: usize) -> bool {
+    let mut k = ident_start as isize - 1;
+    while k >= 0 && is_js_whitespace(chars[k as usize]) {
+        k -= 1;
+    }
+    keyword_ends_at(chars, k, "break") || keyword_ends_at(chars, k, "continue")
+}
+
 /// Check if a `$xxx` identifier at `ident_end` is being used as an object property key.
 ///
 /// Returns true if `$xxx` is followed (ignoring whitespace) by `:` but NOT `::`.
@@ -608,7 +816,8 @@ fn dollar_param_body_range(
 /// A ternary consequent (`cond ? $x : y`) is also `$x` followed by `:`, but `$x`
 /// there is a real reference, not a property key. Such a `$x` is preceded
 /// (ignoring whitespace) by `?`, which never precedes a property key in a runtime
-/// object literal, so we exclude it (issue #1229).
+/// object literal, so we exclude it (issue #1229). A `switch` case test
+/// (`case $x:`) is excluded for the same reason.
 fn is_dollar_ident_object_property_key(
     chars: &[char],
     ident_start: usize,
@@ -628,15 +837,29 @@ fn is_dollar_ident_object_property_key(
             return false;
         }
         // Exclude a ternary consequent: `cond ? $x : y`. Walk back over
-        // whitespace (incl. newlines, for multi-line ternaries) from the
+        // whitespace (incl. newlines, for multi-line ternaries) and any leading
+        // unary-only prefix operators (`!`/`~`, e.g. `cond ? !$x : y`) from the
         // identifier; a leading `?` means this is the `then` branch of a
         // conditional expression, not a property key.
         let mut k = ident_start as isize - 1;
-        while k >= 0 && chars[k as usize].is_whitespace() {
+        while k >= 0
+            && (chars[k as usize].is_whitespace() || matches!(chars[k as usize], '!' | '~'))
+        {
             k -= 1;
         }
         if k >= 0 && chars[k as usize] == '?' {
             return false;
+        }
+        // Exclude a `switch` case test: `case $x:` is a value expression, not a
+        // property key.
+        if k >= 3 {
+            let pos = k as usize;
+            if chars[pos - 3..=pos].iter().collect::<String>() == "case" {
+                let before = if pos >= 4 { chars[pos - 4] } else { ' ' };
+                if !before.is_alphanumeric() && before != '_' && before != '$' {
+                    return false;
+                }
+            }
         }
         return true;
     }
@@ -679,6 +902,112 @@ fn is_dollar_ident_variable_declaration(chars: &[char], ident_start: usize) -> b
         if !before.is_alphanumeric() && before != '_' && before != '$' {
             return true;
         }
+    }
+    false
+}
+
+/// Index of the `{` or `[` that opens the pattern enclosing `from`, or `None`
+/// when the scan leaves the pattern before finding one.
+fn enclosing_pattern_open(chars: &[char], from: usize) -> Option<usize> {
+    let (mut curly, mut square) = (0usize, 0usize);
+    let mut k = from as isize - 1;
+    while k >= 0 {
+        match chars[k as usize] {
+            '}' => curly += 1,
+            ']' => square += 1,
+            '{' if curly > 0 => curly -= 1,
+            '[' if square > 0 => square -= 1,
+            '{' | '[' => return Some(k as usize),
+            // A `(` means a parameter list or a parenthesised expression, neither
+            // of which this helper answers for; `;` ends the statement.
+            '(' | ')' | ';' => return None,
+            _ => {}
+        }
+        k -= 1;
+    }
+    None
+}
+
+/// `const { $from } = …` and `const [$a] = …` declare the name, while the same
+/// shorthand inside an object *literal* (`const x = { $store }`) reads it — the
+/// two are told apart by what precedes the pattern's opening bracket.
+fn is_dollar_ident_destructuring_declaration(chars: &[char], ident_start: usize) -> bool {
+    let mut from = ident_start;
+    while let Some(open) = enclosing_pattern_open(chars, from) {
+        if sits_in_a_default_value(chars, from, open) {
+            return false;
+        }
+        if is_dollar_ident_variable_declaration(chars, open) {
+            return true;
+        }
+        from = open;
+    }
+    false
+}
+
+/// Whether a plain `=` separates `pos` from its element's start, i.e. `{ value =
+/// $page }` reads `$page` rather than binding it.
+fn sits_in_a_default_value(chars: &[char], pos: usize, open: usize) -> bool {
+    let mut k = pos as isize - 1;
+    while k > open as isize {
+        let c = chars[k as usize];
+        if c == ',' {
+            return false;
+        }
+        if c == '=' {
+            let next = chars.get(k as usize + 1).copied().unwrap_or(' ');
+            let prev = chars[k as usize - 1];
+            if next != '='
+                && next != '>'
+                && !matches!(
+                    prev,
+                    '=' | '!' | '<' | '>' | '+' | '-' | '*' | '/' | '%' | '&' | '|' | '^'
+                )
+            {
+                return true;
+            }
+        }
+        k -= 1;
+    }
+    false
+}
+
+/// Whether `kw` ends at `end` (inclusive) and is not part of a longer word.
+fn keyword_ends_at(chars: &[char], end: isize, kw: &str) -> bool {
+    let n = kw.chars().count() as isize;
+    if end < n - 1 {
+        return false;
+    }
+    let start = (end - n + 1) as usize;
+    if !chars[start..=end as usize].iter().copied().eq(kw.chars()) {
+        return false;
+    }
+    start == 0 || !is_identifier_char(chars[start - 1])
+}
+
+/// `import { $foo as bar }` names a module export rather than reading a store,
+/// and a bare `import { $foo }` declares the name outright.
+fn is_dollar_ident_import_specifier(chars: &[char], ident_start: usize) -> bool {
+    let Some(open) = enclosing_pattern_open(chars, ident_start) else {
+        return false;
+    };
+    if chars[open] != '{' {
+        return false;
+    }
+    let mut k = open as isize - 1;
+    while k >= 0 && chars[k as usize].is_whitespace() {
+        k -= 1;
+    }
+    if keyword_ends_at(chars, k, "import") {
+        return true;
+    }
+    // `import type { … }`
+    if keyword_ends_at(chars, k, "type") {
+        k -= 4;
+        while k >= 0 && chars[k as usize].is_whitespace() {
+            k -= 1;
+        }
+        return keyword_ends_at(chars, k, "import");
     }
     false
 }
@@ -735,8 +1064,10 @@ fn collect_dollar_identifiers_from_js_with_context(
     // space. A param `$x` only suppresses references inside its own arrow body
     // `[start, end)`; a `let/const/var $x` declaration spans the whole script.
     let mut declared: Vec<(String, usize, usize)> = Vec::new();
-    collect_dollar_identifiers_pass(js, base_offset, refs, in_module, true, &mut declared);
-    collect_dollar_identifiers_pass(js, base_offset, refs, in_module, false, &mut declared);
+    // Both passes scan the same text, so decode it once.
+    let chars: Vec<char> = js.chars().collect();
+    collect_dollar_identifiers_pass(js, &chars, base_offset, refs, in_module, true, &mut declared);
+    collect_dollar_identifiers_pass(js, &chars, base_offset, refs, in_module, false, &mut declared);
 }
 
 /// One scan over `js`. With `collect_declared` set, only fills `declared`
@@ -744,19 +1075,22 @@ fn collect_dollar_identifiers_from_js_with_context(
 /// skipping declared names.
 fn collect_dollar_identifiers_pass(
     js: &str,
+    chars: &[char],
     base_offset: usize,
     refs: &mut Vec<StoreRef>,
     in_module: bool,
     collect_declared: bool,
     declared: &mut Vec<(String, usize, usize)>,
 ) {
-    // Simple regex-like scanning for $xxx identifiers
-    // We look for $ followed by valid identifier characters
-    let chars: Vec<char> = js.chars().collect();
     // Byte offset of each character, so a `StoreRef.position` (consumed
     // downstream as a byte index into the source) stays correct when multi-byte
-    // characters precede the reference (M-005).
-    let char_byte_offsets: Vec<usize> = js.char_indices().map(|(b, _)| b).collect();
+    // characters precede the reference (M-005). Only the reference-collecting
+    // pass reads it, and only a non-ASCII script needs it at all — otherwise a
+    // char index already is the byte offset.
+    // The regex skip below indexes bytes too, so the table is built for every
+    // non-ASCII script rather than only for the reference-collecting pass.
+    let char_byte_offsets: Option<Vec<usize>> =
+        if js.is_ascii() { None } else { Some(js.char_indices().map(|(b, _)| b).collect()) };
     let len = chars.len();
     let mut i = 0;
     let mut in_string: Option<char> = None; // track if inside a string literal
@@ -772,6 +1106,21 @@ fn collect_dollar_identifiers_pass(
     // and brace depth matches, we pop back into template literal mode.
     let mut template_stack: Vec<usize> = Vec::new();
     let mut brace_depth: usize = 0;
+    let mut bracket_depth: usize = 0;
+    // `(open char index, is CallExpression arguments, brace depth, bracket depth)`.
+    // This is enough to distinguish a direct call argument from an identifier
+    // wrapped in an object, array, unary expression or grouping expression.
+    let mut paren_stack: Vec<(usize, bool, usize, usize)> = Vec::new();
+    // A class member NAME is a declaration slot, never a reference, so upstream's
+    // `scope.references` — which this scan stands in for — never holds one.
+    // Each entry is the brace depth of one open class body's member level.
+    let mut class_bodies: Vec<usize> = Vec::new();
+    let mut pending_class_body_at: Option<usize> = None;
+    // Index of the last significant code character, i.e. the previous token's
+    // last char with whitespace, comments and string interiors skipped. A member
+    // name slot is decided from it, so `a = 1⏎$abc() {}` — where ASI ends the
+    // field — reads the same as `a = 1;⏎$abc() {}`.
+    let mut prev_code: Option<usize> = None;
 
     while i < len {
         let c = chars[i];
@@ -804,6 +1153,7 @@ fn collect_dollar_identifiers_pass(
                 continue;
             } else if c == quote {
                 in_string = None;
+                prev_code = Some(i);
                 i += 1;
                 continue;
             } else if quote == '`' && c == '$' && i + 1 < len && chars[i + 1] == '{' {
@@ -812,6 +1162,7 @@ fn collect_dollar_identifiers_pass(
                 template_stack.push(brace_depth);
                 brace_depth += 1;
                 in_string = None;
+                prev_code = Some(i + 1);
                 i += 2;
                 continue;
             }
@@ -832,13 +1183,33 @@ fn collect_dollar_identifiers_pass(
             }
         }
 
+        // A regex literal is opaque, so `/\$mystore/` names no store. Whether a
+        // `/` opens one is the previous token's question, and js_scan already
+        // answers it — a second implementation here would be free to disagree.
+        if c == '/'
+            && let Some(end) =
+                regex_literal_end(js, chars, char_byte_offsets.as_deref(), i, prev_code)
+        {
+            prev_code = Some(end - 1);
+            i = end;
+            continue;
+        }
+
         // Track brace depth for template literal interpolations
         if c == '{' {
             brace_depth += 1;
+            if pending_class_body_at == Some(i) {
+                class_bodies.push(brace_depth);
+                pending_class_body_at = None;
+            }
+            prev_code = Some(i);
             i += 1;
             continue;
         }
         if c == '}' {
+            if class_bodies.last() == Some(&brace_depth) {
+                class_bodies.pop();
+            }
             brace_depth = brace_depth.saturating_sub(1);
             // If we just closed a template interpolation, go back into template
             // literal string mode.
@@ -848,7 +1219,45 @@ fn collect_dollar_identifiers_pass(
                 template_stack.pop();
                 in_string = Some('`');
             }
+            prev_code = Some(i);
             i += 1;
+            continue;
+        }
+
+        if c == '[' {
+            bracket_depth += 1;
+            prev_code = Some(i);
+            i += 1;
+            continue;
+        }
+        if c == ']' {
+            bracket_depth = bracket_depth.saturating_sub(1);
+            prev_code = Some(i);
+            i += 1;
+            continue;
+        }
+        if c == '(' {
+            paren_stack.push((
+                i,
+                paren_opens_call_expression(chars, prev_code),
+                brace_depth,
+                bracket_depth,
+            ));
+            prev_code = Some(i);
+            i += 1;
+            continue;
+        }
+        if c == ')' {
+            paren_stack.pop();
+            prev_code = Some(i);
+            i += 1;
+            continue;
+        }
+
+        if c == 'c' && class_keyword_at(chars, i) {
+            pending_class_body_at = class_body_open(chars, i + 5);
+            prev_code = Some(i + 4);
+            i += 5;
             continue;
         }
 
@@ -900,9 +1309,23 @@ fn collect_dollar_identifiers_pass(
                 // Only add if we have more than just $
                 // (bare $ detection is handled separately via proper AST analysis)
                 if ident.len() > 1 {
-                    let param_range = dollar_param_body_range(&chars, ident_start, i);
-                    let is_var_decl = is_dollar_ident_variable_declaration(&chars, ident_start);
-                    let is_declaration = param_range.is_some() || is_var_decl;
+                    let param_range = dollar_param_body_range(chars, ident_start, i)
+                        .or_else(|| {
+                            dollar_function_param_body_range(
+                                chars,
+                                ident_start,
+                                paren_stack.last().map(|(open, _, _, _)| *open),
+                            )
+                        })
+                        .or_else(|| dollar_catch_param_body_range(chars, ident_start, i));
+                    let is_var_decl = is_dollar_ident_variable_declaration(chars, ident_start)
+                        || is_dollar_ident_destructuring_declaration(chars, ident_start);
+                    let is_class_member_name = class_bodies.last() == Some(&brace_depth)
+                        && starts_a_class_member(chars, prev_code);
+                    let is_declaration = param_range.is_some()
+                        || is_var_decl
+                        || is_class_member_name
+                        || is_dollar_ident_import_specifier(chars, ident_start);
                     if collect_declared {
                         if let Some((bs, be)) = param_range {
                             // A param shadows only inside its own arrow body.
@@ -918,30 +1341,290 @@ fn collect_dollar_identifiers_pass(
                         && !declared
                             .iter()
                             .any(|(n, s, e)| n == &ident && ident_start >= *s && ident_start < *e)
-                        && !is_dollar_ident_object_property_key(&chars, ident_start, i)
-                        && !is_dollar_ident_type_declaration(&chars, ident_start)
+                        && !is_dollar_ident_object_property_key(chars, ident_start, i)
+                        && !is_dollar_ident_jump_label(chars, ident_start)
+                        && !is_dollar_ident_type_declaration(chars, ident_start)
                     {
+                        let is_direct_call_argument = paren_stack.last().is_some_and(
+                            |(open, is_call, call_brace_depth, call_bracket_depth)| {
+                                *is_call
+                                    && *call_brace_depth == brace_depth
+                                    && *call_bracket_depth == bracket_depth
+                                    && prev_code.is_some_and(|p| p == *open || chars[p] == ',')
+                                    && matches!(next_code_char(chars, i), Some(',' | ')'))
+                            },
+                        );
+                        let is_call_callee = next_code_char(chars, i) == Some('(');
+                        let byte_offset = match &char_byte_offsets {
+                            Some(offsets) => offsets.get(ident_start).copied(),
+                            // ASCII: char index == byte index, with the same
+                            // in-bounds condition the offset table would apply.
+                            None => (ident_start < len).then_some(ident_start),
+                        };
                         refs.push(StoreRef {
                             name: ident,
-                            position: base_offset
-                                + char_byte_offsets
-                                    .get(ident_start)
-                                    .copied()
-                                    .unwrap_or(js.len()),
+                            position: base_offset + byte_offset.unwrap_or(js.len()),
                             in_module,
+                            parent_is_call_expression: is_call_callee || is_direct_call_argument,
                         });
                     }
                 }
+                prev_code = Some(i - 1);
                 continue;
             }
+        }
+        if !c.is_whitespace() {
+            prev_code = Some(i);
         }
         i += 1;
     }
 }
 
+/// Whether `(` after the previous significant token begins call arguments.
+/// Control-flow headers are the important negative case: their preceding token
+/// is also an identifier, but `if ($state)` does not give `$state` a
+/// `CallExpression` parent.
+fn paren_opens_call_expression(chars: &[char], prev_code: Option<usize>) -> bool {
+    let Some(end) = prev_code else {
+        return false;
+    };
+    match chars[end] {
+        ')' | ']' | '}' => true,
+        c if is_identifier_char(c) => {
+            let mut start = end;
+            while start > 0 && is_identifier_char(chars[start - 1]) {
+                start -= 1;
+            }
+            let word = &chars[start..=end];
+            !["if", "for", "while", "switch", "catch", "with"]
+                .iter()
+                .any(|keyword| word.iter().copied().eq(keyword.chars()))
+        }
+        _ => false,
+    }
+}
+
+/// The next significant code character after an identifier. Comments are
+/// opaque just like whitespace, so `$state /* explanation */ ()` is still a
+/// call expression.
+fn next_code_char(chars: &[char], mut i: usize) -> Option<char> {
+    while i < chars.len() {
+        if chars[i].is_whitespace() {
+            i += 1;
+        } else if chars.get(i..i + 2) == Some(&['/', '/']) {
+            i += 2;
+            while i < chars.len() && chars[i] != '\n' {
+                i += 1;
+            }
+        } else if chars.get(i..i + 2) == Some(&['/', '*']) {
+            i += 2;
+            while i + 1 < chars.len() && chars[i..i + 2] != ['*', '/'] {
+                i += 1;
+            }
+            i = (i + 2).min(chars.len());
+        } else {
+            return Some(chars[i]);
+        }
+    }
+    None
+}
+
+/// Char index just past the regex literal opening at `at`, or `None` when that
+/// `/` is a division, a comment or an unterminated literal.
+fn regex_literal_end(
+    js: &str,
+    chars: &[char],
+    offsets: Option<&[usize]>,
+    at: usize,
+    prev_code: Option<usize>,
+) -> Option<usize> {
+    let to_byte = |ci: usize| match offsets {
+        Some(table) => table.get(ci).copied(),
+        None => Some(ci),
+    };
+    // JS spells no operator outside ASCII, so a non-ASCII code char is an
+    // identifier char — which is what decides division over regex.
+    let prev = match prev_code {
+        Some(p) => Some(match chars.get(p)? {
+            c if c.is_ascii() => *c as u8,
+            _ => b'x',
+        }),
+        None => None,
+    };
+    let start = to_byte(at)?;
+    let (end, was_comment) =
+        crate::compiler::phases::phase3_transform::shared::js_scan::skip_opaque(
+            js.as_bytes(),
+            start,
+            prev,
+        )?;
+    if was_comment {
+        return None;
+    }
+    Some(match offsets {
+        Some(table) => table.partition_point(|&b| b < end),
+        None => end,
+    })
+}
+
 /// Check if a character is a valid JavaScript identifier character.
 fn is_identifier_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_' || c == '$'
+}
+
+/// Whether `class` starts at `i` as a keyword rather than as a property key,
+/// a member name or part of a longer identifier.
+fn class_keyword_at(chars: &[char], i: usize) -> bool {
+    if chars.len() < i + 5 || !chars[i..i + 5].iter().copied().eq("class".chars()) {
+        return false;
+    }
+    if chars.get(i + 5).copied().is_some_and(is_identifier_char) {
+        return false;
+    }
+    match i.checked_sub(1).map(|p| chars[p]) {
+        Some(prev) => !is_identifier_char(prev) && prev != '.',
+        None => true,
+    }
+}
+
+/// Index of the `{` that opens the body of the class whose `class` keyword ends
+/// at `after_kw`, or `None` when the keyword is not a class declaration or
+/// expression. An `extends` clause may itself contain braces, so only a `{` at
+/// paren/bracket depth zero opens the body.
+fn class_body_open(chars: &[char], after_kw: usize) -> Option<usize> {
+    let len = chars.len();
+    let mut i = after_kw;
+    let mut depth = 0i32;
+    let mut first = true;
+    while i < len {
+        let c = chars[i];
+        if c.is_whitespace() {
+            i += 1;
+            continue;
+        }
+        if c == '/' && i + 1 < len && chars[i + 1] == '/' {
+            while i < len && chars[i] != '\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if c == '/' && i + 1 < len && chars[i + 1] == '*' {
+            i += 2;
+            while i + 1 < len && !(chars[i] == '*' && chars[i + 1] == '/') {
+                i += 1;
+            }
+            i += 2;
+            continue;
+        }
+        if first {
+            // A class keyword is followed by its name, `extends`, or the body.
+            if c != '{' && c != '_' && c != '$' && !c.is_alphabetic() {
+                return None;
+            }
+            first = false;
+        }
+        match c {
+            '"' | '\'' | '`' => {
+                let quote = c;
+                i += 1;
+                while i < len && chars[i] != quote {
+                    if chars[i] == '\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+            }
+            '(' | '[' => depth += 1,
+            ')' | ']' => {
+                if depth == 0 {
+                    return None;
+                }
+                depth -= 1;
+            }
+            '{' if depth == 0 => return Some(i),
+            ';' | ',' | '}' | '=' if depth == 0 => return None,
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Modifiers that may precede a class member's name, so a `*` after one is a
+/// generator marker rather than multiplication.
+const MEMBER_MODIFIERS: [&str; 12] = [
+    "static",
+    "get",
+    "set",
+    "async",
+    "accessor",
+    "declare",
+    "readonly",
+    "override",
+    "public",
+    "private",
+    "protected",
+    "abstract",
+];
+
+/// Keywords an expression can continue through, so the identifier after one is
+/// a reference (`x = new $Store()`) rather than the next member's name.
+const EXPRESSION_PREFIX_KEYWORDS: [&str; 12] = [
+    "new",
+    "typeof",
+    "void",
+    "delete",
+    "await",
+    "yield",
+    "return",
+    "throw",
+    "case",
+    "in",
+    "instanceof",
+    "of",
+];
+
+/// The identifier ending at `end` (inclusive), or `""` when that is not one.
+fn word_ending_at(chars: &[char], end: usize) -> String {
+    if !is_identifier_char(chars[end]) {
+        return String::new();
+    }
+    let mut start = end;
+    while start > 0 && is_identifier_char(chars[start - 1]) {
+        start -= 1;
+    }
+    chars[start..=end].iter().collect()
+}
+
+/// Whether a token beginning after the significant character at `prev_code`
+/// opens a new class member, given that the scan is at a class body's member
+/// level. An expression can never continue into an identifier across a token
+/// that ends a value, so ASI is answered by the same test as an explicit `;`.
+fn starts_a_class_member(chars: &[char], prev_code: Option<usize>) -> bool {
+    let Some(k) = prev_code else {
+        return false;
+    };
+    match chars[k] {
+        // `{` is the class body's own brace: an object literal's would be deeper.
+        '{' | '}' | ';' | ')' | ']' | '"' | '\'' | '`' => true,
+        // A generator marker only where a member could start; otherwise a `*` is
+        // multiplication and what follows it is part of a value.
+        '*' => {
+            let mut j = k as isize - 1;
+            while j >= 0 && is_js_whitespace(chars[j as usize]) {
+                j -= 1;
+            }
+            j >= 0
+                && (matches!(chars[j as usize], '{' | '}' | ';')
+                    || MEMBER_MODIFIERS.contains(&word_ending_at(chars, j as usize).as_str()))
+        }
+        c if is_identifier_char(c) => {
+            !EXPRESSION_PREFIX_KEYWORDS.contains(&word_ending_at(chars, k).as_str())
+        }
+        // Every other significant character — `= , ( [ @ . : ?` and the operators
+        // — continues an expression into what follows.
+        _ => false,
+    }
 }
 
 /// Check if a given name is imported from 'svelte/store' in the source code.
@@ -972,6 +1655,38 @@ fn collect_dollar_refs_from_fragment(fragment: &Fragment, source: &str, refs: &m
     for node in &fragment.nodes {
         collect_dollar_refs_from_node(node, source, refs);
     }
+}
+
+/// Collect references from a fragment while removing names introduced by the
+/// template block that owns it. Upstream reads scope-resolved references, so a
+/// local named `$store` never reaches the store-subscription loop even when an
+/// unrelated top-level `store` binding exists.
+fn collect_dollar_refs_from_scoped_fragment(
+    fragment: &Fragment,
+    source: &str,
+    refs: &mut Vec<StoreRef>,
+    bindings: impl IntoIterator<Item = String>,
+) {
+    let bindings: FxHashSet<String> = bindings.into_iter().collect();
+    let first = refs.len();
+    collect_dollar_refs_from_fragment(fragment, source, refs);
+    remove_scoped_refs(refs, first, &bindings);
+}
+
+fn remove_scoped_refs(refs: &mut Vec<StoreRef>, first: usize, bindings: &FxHashSet<String>) {
+    if bindings.is_empty() {
+        return;
+    }
+    let scoped = refs.split_off(first);
+    refs.extend(scoped.into_iter().filter(|store_ref| !bindings.contains(&store_ref.name)));
+}
+
+fn pattern_binding_names(pattern: Option<&crate::ast::js::Expression>) -> Vec<String> {
+    let mut names = Vec::new();
+    if let Some(pattern) = pattern {
+        collect_pattern_identifiers_json(pattern.as_json(), &mut names);
+    }
+    names
 }
 
 /// Collect $xxx identifiers from a template node.
@@ -1123,6 +1838,10 @@ fn collect_dollar_refs_from_attributes(
             Attribute::StyleDirective(style_dir) => {
                 // StyleDirective.value is AttributeValue (not Option)
                 match &style_dir.value {
+                    // Shorthand `style:$store` reads the name as the value.
+                    AttributeValue::True(_) => {
+                        push_dollar_directive_name(&style_dir.name, style_dir.start, refs);
+                    }
                     AttributeValue::Expression(expr_tag) => {
                         collect_dollar_refs_from_expression(&expr_tag.expression, source, refs);
                     }
@@ -1137,37 +1856,22 @@ fn collect_dollar_refs_from_attributes(
                             }
                         }
                     }
-                    _ => {}
                 }
             }
             Attribute::UseDirective(use_dir) => {
-                // Check if the directive name contains a store reference
-                // e.g., use:$store.action should create a subscription for $store
-                if use_dir.name.starts_with('$') {
-                    // Extract the store name (before the first . if present)
-                    let store_name = if let Some(dot_pos) = use_dir.name.find('.') {
-                        &use_dir.name[..dot_pos]
-                    } else {
-                        use_dir.name.as_str()
-                    };
-                    if store_name.len() > 1 {
-                        refs.push(StoreRef {
-                            name: store_name.to_string(),
-                            position: use_dir.start as usize,
-                            in_module: false,
-                        });
-                    }
-                }
+                push_dollar_directive_name(&use_dir.name, use_dir.start, refs);
                 if let Some(ref expr) = use_dir.expression {
                     collect_dollar_refs_from_expression(expr, source, refs);
                 }
             }
             Attribute::TransitionDirective(trans_dir) => {
+                push_dollar_directive_name(&trans_dir.name, trans_dir.start, refs);
                 if let Some(ref expr) = trans_dir.expression {
                     collect_dollar_refs_from_expression(expr, source, refs);
                 }
             }
             Attribute::AnimateDirective(anim_dir) => {
+                push_dollar_directive_name(&anim_dir.name, anim_dir.start, refs);
                 if let Some(ref expr) = anim_dir.expression {
                     collect_dollar_refs_from_expression(expr, source, refs);
                 }
@@ -1179,6 +1883,25 @@ fn collect_dollar_refs_from_attributes(
                 collect_dollar_refs_from_expression(&attach.expression, source, refs);
             }
         }
+    }
+}
+
+/// Record the store a directive's *name* refers to, e.g. `transition:$store`.
+///
+/// Upstream reaches this through one shared `SvelteDirective` scope visitor, so
+/// every directive whose name is an identifier has to register it.
+fn push_dollar_directive_name(name: &str, start: u32, refs: &mut Vec<StoreRef>) {
+    if !name.starts_with('$') {
+        return;
+    }
+    let store_name = name.split('.').next().unwrap_or(name);
+    if store_name.len() > 1 {
+        refs.push(StoreRef {
+            name: store_name.to_string(),
+            position: start as usize,
+            in_module: false,
+            parent_is_call_expression: false,
+        });
     }
 }
 
@@ -1219,10 +1942,17 @@ fn collect_dollar_refs_from_if_block(block: &IfBlock, source: &str, refs: &mut V
 /// Collect $xxx identifiers from an each block.
 fn collect_dollar_refs_from_each_block(block: &EachBlock, source: &str, refs: &mut Vec<StoreRef>) {
     collect_dollar_refs_from_expression(&block.expression, source, refs);
-    if let Some(ref key) = block.key {
-        collect_dollar_refs_from_expression(key, source, refs);
+    let mut bindings = pattern_binding_names(block.context.as_ref());
+    if let Some(index) = &block.index {
+        bindings.push(index.to_string());
     }
-    collect_dollar_refs_from_fragment(&block.body, source, refs);
+    if let Some(ref key) = block.key {
+        let first = refs.len();
+        collect_dollar_refs_from_expression(key, source, refs);
+        let binding_set = bindings.iter().cloned().collect();
+        remove_scoped_refs(refs, first, &binding_set);
+    }
+    collect_dollar_refs_from_scoped_fragment(&block.body, source, refs, bindings);
     if let Some(ref fallback) = block.fallback {
         collect_dollar_refs_from_fragment(fallback, source, refs);
     }
@@ -1239,10 +1969,20 @@ fn collect_dollar_refs_from_await_block(
         collect_dollar_refs_from_fragment(pending, source, refs);
     }
     if let Some(ref then) = block.then {
-        collect_dollar_refs_from_fragment(then, source, refs);
+        collect_dollar_refs_from_scoped_fragment(
+            then,
+            source,
+            refs,
+            pattern_binding_names(block.value.as_ref()),
+        );
     }
     if let Some(ref catch) = block.catch {
-        collect_dollar_refs_from_fragment(catch, source, refs);
+        collect_dollar_refs_from_scoped_fragment(
+            catch,
+            source,
+            refs,
+            pattern_binding_names(block.error.as_ref()),
+        );
     }
 }
 
@@ -1258,12 +1998,77 @@ fn collect_dollar_refs_from_snippet_block(
     source: &str,
     refs: &mut Vec<StoreRef>,
 ) {
-    collect_dollar_refs_from_fragment(&block.body, source, refs);
+    let bindings =
+        block.parameters.iter().flat_map(|parameter| pattern_binding_names(Some(parameter)));
+    collect_dollar_refs_from_scoped_fragment(&block.body, source, refs, bindings);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dollar_parameter_scan_uses_javascript_whitespace() {
+        for whitespace in ['\u{a0}', '\u{2003}', '\u{2028}', '\u{feff}'] {
+            let source = format!("$value{whitespace}=>{whitespace}$value");
+            let chars: Vec<char> = source.chars().collect();
+            let (body_start, body_end) = dollar_param_body_range(&chars, 0, "$value".len())
+                .unwrap_or_else(|| {
+                    panic!("U+{:04X} must delimit an arrow parameter", whitespace as u32)
+                });
+            assert_eq!(chars[body_start..body_end].iter().collect::<String>(), "$value");
+        }
+
+        let source = "(\u{2003}$value\u{feff})\u{202f}=>\u{a0}$value";
+        let chars: Vec<char> = source.chars().collect();
+        let ident_start = chars.iter().position(|&c| c == '$').unwrap();
+        let ident_end = ident_start + "$value".len();
+        let (body_start, body_end) = dollar_param_body_range(&chars, ident_start, ident_end)
+            .expect("JavaScript whitespace must be skipped around parenthesized parameters");
+        assert_eq!(chars[body_start..body_end].iter().collect::<String>(), "$value");
+    }
+
+    #[test]
+    fn ordinary_function_dollar_parameter_has_a_scoped_body_range() {
+        let source = "function compare(value, $work: Models.Row) { return $work.value; }";
+        let chars: Vec<char> = source.chars().collect();
+        let ident_start = chars.iter().position(|&c| c == '$').unwrap();
+        let paren_open = chars.iter().position(|&c| c == '(').unwrap();
+        let (body_start, body_end) =
+            dollar_function_param_body_range(&chars, ident_start, Some(paren_open))
+                .expect("ordinary function parameters must shadow inside their body");
+        assert_eq!(
+            chars[body_start..body_end].iter().collect::<String>(),
+            "{ return $work.value; }"
+        );
+    }
+
+    /// The blanked text the lexical scan reads must be reachable without a third
+    /// parse of a script the compiler already parsed — and the two routes must
+    /// agree byte for byte, since the scan indexes into the result.
+    #[test]
+    fn a_typescript_script_is_blanked_without_reparsing_it() {
+        use crate::ast::oxc_program::RetainedProgram;
+        use crate::compiler::phases::phase2_analyze::types::{
+            BLANK_TYPESCRIPT_REPARSES, blank_typescript, blank_typescript_from_program,
+        };
+
+        let source = "interface $$Props { a: string }\nlet foo: $$Props['a'] = $bar;\n";
+        let expected = blank_typescript(source);
+        assert!(
+            expected.contains("$bar") && !expected.contains("$$Props"),
+            "the sample must actually exercise blanking: {expected:?}"
+        );
+
+        let retained = RetainedProgram::parse(source, true);
+        assert!(retained.diagnostics().is_empty());
+        BLANK_TYPESCRIPT_REPARSES.with(|count| count.set(0));
+
+        let reused = blank_typescript_from_program(source, retained.program());
+
+        assert_eq!(reused, expected);
+        BLANK_TYPESCRIPT_REPARSES.with(|count| assert_eq!(count.get(), 0));
+    }
 
     #[test]
     fn test_is_identifier_char() {
@@ -1294,7 +2099,7 @@ mod tests {
 
 <p>{$count}</p>
 "#;
-        let mut ast = parse(source, parse_opts).unwrap();
+        let mut ast = parse(source, &oxc_allocator::Allocator::default(), parse_opts).unwrap();
         let options = CompileOptions::default();
         // SAFETY: `ast` (and thus `ast.arena`) outlives the `analyze_component`
         // call; `clear_serialize_arena()` runs before `ast` is dropped, so the
@@ -1318,7 +2123,7 @@ mod tests {
 
 <p>{value}</p>
 "#;
-        let mut ast2 = parse(source2, parse_opts).unwrap();
+        let mut ast2 = parse(source2, &oxc_allocator::Allocator::default(), parse_opts).unwrap();
         // SAFETY: `ast2` (and thus `ast2.arena`) outlives the `analyze_component`
         // call; `clear_serialize_arena()` runs before `ast2` is dropped, so the
         // installed pointer never dangles.
@@ -1332,10 +2137,7 @@ mod tests {
             .bindings
             .iter()
             .any(|b| b.name == "$state" && matches!(b.kind, BindingKind::StoreSub));
-        assert!(
-            !has_state_store,
-            "Should NOT have a StoreSub binding for $state (it's a rune)"
-        );
+        assert!(!has_state_store, "Should NOT have a StoreSub binding for $state (it's a rune)");
 
         // Test case 3: Store in event handler
         let source3 = r#"<script>
@@ -1345,7 +2147,7 @@ mod tests {
 
 <button onclick={() => $items.push('new')}>Add</button>
 "#;
-        let mut ast3 = parse(source3, parse_opts).unwrap();
+        let mut ast3 = parse(source3, &oxc_allocator::Allocator::default(), parse_opts).unwrap();
         // SAFETY: `ast3` (and thus `ast3.arena`) outlives the `analyze_component`
         // call; `clear_serialize_arena()` runs before `ast3` is dropped, so the
         // installed pointer never dangles.
@@ -1371,7 +2173,8 @@ mod tests {
         use crate::compiler::phases::phase1_parse::{ParseOptions, parse};
         use crate::compiler::phases::phase2_analyze::analyze_component;
 
-        let mut ast = parse(source, ParseOptions::default()).unwrap();
+        let mut ast =
+            parse(source, &oxc_allocator::Allocator::default(), ParseOptions::default()).unwrap();
         let options = CompileOptions::default();
         // SAFETY: `ast` outlives the analyze call; `clear_serialize_arena()` runs
         // before `ast` is dropped, so the installed pointer never dangles.
@@ -1447,12 +2250,112 @@ mod tests {
         // sort emitted $x/$y at the $xGet/$yGet offsets, ahead of their real use.
         assert_eq!(
             store_sub_order(source),
-            vec![
-                "$xGet".to_string(),
-                "$yGet".to_string(),
-                "$y".to_string(),
-                "$x".to_string(),
-            ],
+            vec!["$xGet".to_string(), "$yGet".to_string(), "$y".to_string(), "$x".to_string(),],
+        );
+    }
+
+    #[test]
+    fn await_destructure_dollar_binding_is_not_a_store_subscription() {
+        let source = r#"<script>
+    import { readable } from 'svelte/store';
+    const gltf = readable(null);
+    const assets = Promise.resolve([]);
+</script>
+
+{#await assets then [$gltf]}
+    <p>{$gltf}</p>
+{/await}
+"#;
+        assert_eq!(store_sub_order(source), Vec::<String>::new());
+    }
+
+    #[test]
+    fn await_destructure_only_shadows_references_in_its_then_fragment() {
+        let source = r#"<script>
+    import { readable } from 'svelte/store';
+    const gltf = readable(null);
+    const assets = Promise.resolve([]);
+</script>
+
+<p>{$gltf}</p>
+{#await assets then [$gltf]}
+    <p>{$gltf}</p>
+{/await}
+"#;
+        assert_eq!(store_sub_order(source), vec!["$gltf".to_string()]);
+    }
+
+    /// A `$name` destructuring parameter spread across multiple lines
+    /// (`derived([...], ([\n  $a,\n  $b\n]) => …)`) is a local binding, not a
+    /// store subscription — the same as the single-line `([$a]) =>` case. The
+    /// param whitespace scan must skip newlines to recognize it (LayerCake's
+    /// `extents_d` derived). The param name (and body references that resolve to
+    /// it) must never surface as a top-level subscription.
+    #[test]
+    fn test_multiline_destructure_params_not_store_subs() {
+        let source = r#"<script>
+    import { derived, writable } from 'svelte/store';
+    export let flatData = [];
+    export let xDomain = undefined;
+    const _a = writable(1);
+    const extents_d = derived(
+        [_a],
+        ([
+            $flatData,
+            $xDomain
+        ]) => {
+            return [$flatData, $xDomain];
+        }
+    );
+</script>
+<p>{$extents_d}</p>
+"#;
+        let order = store_sub_order(source);
+        assert!(
+            !order.contains(&"$flatData".to_string()),
+            "`$flatData` is only a multi-line destructuring param: {order:?}"
+        );
+        assert!(
+            !order.contains(&"$xDomain".to_string()),
+            "`$xDomain` is only a multi-line destructuring param: {order:?}"
+        );
+        assert!(order.contains(&"$extents_d".to_string()));
+    }
+
+    #[test]
+    fn dollar_named_parameters_are_not_outer_store_subscriptions() {
+        let source = r#"<script lang="ts">
+    let work = $state({ value: 1 });
+    function read($work: { value: number }) {
+        return $work.value;
+    }
+
+    const viewport = { update(fn: (value: { width: number }) => void) { fn({ width: 1 }); } };
+    function update() {
+        viewport.update(($viewport) => {
+            $viewport.width += read(work);
+        });
+    }
+</script>
+"#;
+        assert_eq!(store_sub_order(source), Vec::<String>::new());
+    }
+
+    /// A store in a ternary consequent behind a unary operator
+    /// (`cond ? !$store : y`) must be detected — the `!` must not stop the
+    /// ternary-consequent exclusion so that `$store :` is misread as a property
+    /// key (svelte-ux `AppLayout`: `$: x = BROWSER ? !$mdScreen : false`).
+    #[test]
+    fn test_ternary_consequent_unary_store_subscription_detected() {
+        let source = r#"<script>
+    import { mdScreen } from 'x';
+    $: temporaryDrawer = true ? !$mdScreen : false;
+</script>
+<p>{temporaryDrawer}</p>
+"#;
+        assert!(
+            store_sub_order(source).contains(&"$mdScreen".to_string()),
+            "ternary consequent `? !$mdScreen :` should be detected as a store"
         );
     }
 
@@ -1473,7 +2376,9 @@ mod tests {
         let options = CompileOptions::default();
 
         let analyze = |source: &str| {
-            let mut ast = parse(source, ParseOptions::default()).unwrap();
+            let mut ast =
+                parse(source, &oxc_allocator::Allocator::default(), ParseOptions::default())
+                    .unwrap();
             // SAFETY: `ast` (and thus `ast.arena`) outlives the
             // `analyze_component` call; `clear_serialize_arena()` runs before
             // `ast` is dropped, so the installed pointer never dangles.

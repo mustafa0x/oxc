@@ -57,8 +57,9 @@ thread_local! {
 
 /// Wrap reads of derived bindings to getter calls. `derived_names` is the set
 /// of derived binding names in this script, `derived_var_names` the subset
-/// declared with `var` (→ `name?.()`), and `extra_derived` cross-context
-/// deriveds read here but declared elsewhere (unresolved references).
+/// declared with `var` (→ `name?.()`), `derived_declarators` the exact source
+/// ranges of those declarations, and `extra_derived` cross-context deriveds
+/// read here but declared elsewhere (unresolved references).
 ///
 /// Returns `Some(rewritten)` when at least one read was wrapped, `None` on a
 /// parse failure or when nothing matched (caller falls back to the byte
@@ -67,6 +68,7 @@ pub(crate) fn wrap_derived_reads_ast(
     script: &str,
     derived_names: &FxHashSet<String>,
     derived_var_names: &FxHashSet<String>,
+    derived_declarators: &[(usize, usize, String)],
     extra_derived: &FxHashSet<String>,
 ) -> Option<String> {
     if derived_names.is_empty() && extra_derived.is_empty() {
@@ -77,18 +79,27 @@ pub(crate) fn wrap_derived_reads_ast(
         &DERIVED_READ_ALLOC,
         script,
         SourceType::mjs(),
-        ParseOptions {
-            allow_return_outside_function: true,
-            ..ParseOptions::default()
-        },
+        ParseOptions { allow_return_outside_function: true, ..ParseOptions::default() },
         |program| {
-            let semantic_ret = SemanticBuilder::new().build(program);
+            let semantic_ret = super::super::profile::semantic_build(
+                super::super::profile::SEM_SERVER_DERIVED_READS,
+                program.source_text.len(),
+                // `is_shadowed` resolves a symbol's declaration through the
+                // semantic node table. Building scopes alone is not enough:
+                // crates.io oxc_semantic 0.145 leaves that table empty unless
+                // nodes are requested explicitly.
+                || SemanticBuilder::new().with_build_nodes(true).build(program),
+            );
             let semantic = &semantic_ret.semantic;
 
             let mut collector = DerivedReadCollector {
                 semantic,
                 derived_names,
                 derived_var_names,
+                derived_declarator_spans: derived_declarators
+                    .iter()
+                    .map(|&(start, end, _)| (start as u32, end as u32))
+                    .collect(),
                 extra_derived,
                 edits: Vec::new(),
                 skip_spans: FxHashSet::default(),
@@ -115,6 +126,10 @@ struct DerivedReadCollector<'a, 'sem> {
     semantic: &'sem Semantic<'sem>,
     derived_names: &'a FxHashSet<String>,
     derived_var_names: &'a FxHashSet<String>,
+    /// Exact identifier ranges for declarations found by the rune scanner.
+    /// Symbol identity, rather than scope depth, distinguishes a function-local
+    /// derived declaration from a same-named parameter/local shadow.
+    derived_declarator_spans: FxHashSet<(u32, u32)>,
     extra_derived: &'a FxHashSet<String>,
     /// `(start, end, replacement)` edits applied right-to-left. Most are
     /// zero-width inserts (`end == start`) of the `()` / `?.()` suffix; the
@@ -130,11 +145,7 @@ impl<'a, 'sem> DerivedReadCollector<'a, 'sem> {
     /// The getter suffix for a derived name: `?.()` for `var`-declared
     /// deriveds (upstream `b.maybe_call`), `()` otherwise (`b.call`).
     fn suffix(&self, name: &str) -> &'static str {
-        if self.derived_var_names.contains(name) {
-            "?.()"
-        } else {
-            "()"
-        }
+        if self.derived_var_names.contains(name) { "?.()" } else { "()" }
     }
 
     /// True when `name` is a derived binding this pass should wrap.
@@ -142,10 +153,11 @@ impl<'a, 'sem> DerivedReadCollector<'a, 'sem> {
         self.derived_names.contains(name) || self.extra_derived.contains(name)
     }
 
-    /// True when this reference binds to a symbol in an inner (non-root) scope
-    /// — i.e. a local declaration / parameter shadowing the derived. An
-    /// unresolved reference (a cross-context derived from `extra_derived`) is
-    /// not shadowed.
+    /// True when this reference resolves to a symbol other than the exact
+    /// derived declarator found in the transformed source. This matters for
+    /// function-local runes: scope depth alone cannot distinguish the rune's
+    /// own symbol from a same-named parameter/local shadow. An unresolved
+    /// reference (a cross-context derived from `extra_derived`) is not shadowed.
     fn is_shadowed(&self, ident: &IdentifierReference) -> bool {
         let Some(reference_id) = ident.reference_id.get() else {
             return false;
@@ -154,8 +166,24 @@ impl<'a, 'sem> DerivedReadCollector<'a, 'sem> {
         let Some(symbol_id) = reference.symbol_id() else {
             return false;
         };
-        let symbol_scope = self.semantic.scoping().symbol_scope_id(symbol_id);
-        symbol_scope != self.semantic.scoping().root_scope_id()
+        let scoping = self.semantic.scoping();
+        let declaration_id = scoping.symbol_declaration(symbol_id);
+        if let oxc_ast::AstKind::VariableDeclarator(declarator) =
+            self.semantic.nodes().get_node(declaration_id).kind()
+        {
+            let span = declarator.id.span();
+            if self.derived_declarator_spans.contains(&(span.start, span.end)) {
+                return false;
+            }
+        }
+
+        // Callers that do not have declaration ranges (notably focused unit
+        // tests and cross-slice transforms) retain the former root-binding
+        // behaviour. Production supplies exact ranges for every local rune.
+        if self.derived_declarator_spans.is_empty() {
+            return scoping.symbol_scope_id(symbol_id) != scoping.root_scope_id();
+        }
+        true
     }
 }
 
@@ -169,8 +197,7 @@ impl<'a, 'sem, 'ast> Visit<'ast> for DerivedReadCollector<'a, 'sem> {
         }
         let suffix = self.suffix(&ident.name);
         // Zero-width insert of the suffix immediately after the identifier.
-        self.edits
-            .push((ident.span.end, ident.span.end, suffix.to_string()));
+        self.edits.push((ident.span.end, ident.span.end, suffix.to_string()));
     }
 
     fn visit_object_property(&mut self, prop: &ObjectProperty<'ast>) {
@@ -233,18 +260,11 @@ impl<'a, 'sem, 'ast> Visit<'ast> for DerivedReadCollector<'a, 'sem> {
                 && !self.derived_var_names.contains(name)
                 && !self.is_shadowed(id)
             {
-                let helper = if update.prefix {
-                    "$.update_derived_pre"
-                } else {
-                    "$.update_derived"
-                };
+                let helper =
+                    if update.prefix { "$.update_derived_pre" } else { "$.update_derived" };
                 // `--` decrements via a `, -1` second argument (upstream
                 // `b.call(helper, node, op === '--' && b.literal(-1))`).
-                let neg = if update.operator == UpdateOperator::Decrement {
-                    ", -1"
-                } else {
-                    ""
-                };
+                let neg = if update.operator == UpdateOperator::Decrement { ", -1" } else { "" };
                 self.edits.push((
                     update.span.start,
                     update.span.end,
@@ -301,8 +321,7 @@ impl<'a, 'sem, 'ast> Visit<'ast> for DerivedReadCollector<'a, 'sem> {
                 };
                 let rhs_span = assign.right.span();
                 self.edits.push((id.span.end, rhs_span.start, gap));
-                self.edits
-                    .push((rhs_span.end, rhs_span.end, ")".to_string()));
+                self.edits.push((rhs_span.end, rhs_span.end, ")".to_string()));
             }
         }
         // Walk so RHS reads / nested derived assignments are rewritten; the LHS
@@ -324,16 +343,14 @@ mod tests {
             script,
             &names(derived),
             &FxHashSet::default(),
+            &[],
             &FxHashSet::default(),
         )
     }
 
     #[test]
     fn wraps_bare_read() {
-        assert_eq!(
-            wrap("let x = count + 1;", &["count"]).unwrap(),
-            "let x = count() + 1;"
-        );
+        assert_eq!(wrap("let x = count + 1;", &["count"]).unwrap(), "let x = count() + 1;");
     }
 
     #[test]
@@ -344,10 +361,7 @@ mod tests {
 
     #[test]
     fn wraps_member_base() {
-        assert_eq!(
-            wrap("let x = count.foo;", &["count"]).unwrap(),
-            "let x = count().foo;"
-        );
+        assert_eq!(wrap("let x = count.foo;", &["count"]).unwrap(), "let x = count().foo;");
     }
 
     #[test]
@@ -363,10 +377,7 @@ mod tests {
 
     #[test]
     fn expands_shorthand() {
-        assert_eq!(
-            wrap("let o = { count };", &["count"]).unwrap(),
-            "let o = { count: count() };"
-        );
+        assert_eq!(wrap("let o = { count };", &["count"]).unwrap(), "let o = { count: count() };");
     }
 
     #[test]
@@ -386,10 +397,7 @@ mod tests {
 
     #[test]
     fn lowers_compound_assignment() {
-        assert_eq!(
-            wrap("count += 1;", &["count"]).unwrap(),
-            "count(count() + 1);"
-        );
+        assert_eq!(wrap("count += 1;", &["count"]).unwrap(), "count(count() + 1);");
         assert_eq!(
             wrap("count -= other;", &["count", "other"]).unwrap(),
             "count(count() - other());"
@@ -398,14 +406,8 @@ mod tests {
 
     #[test]
     fn lowers_logical_assignment() {
-        assert_eq!(
-            wrap("flag &&= x;", &["flag"]).unwrap(),
-            "flag(flag() && x);"
-        );
-        assert_eq!(
-            wrap("flag ??= x;", &["flag"]).unwrap(),
-            "flag(flag() ?? x);"
-        );
+        assert_eq!(wrap("flag &&= x;", &["flag"]).unwrap(), "flag(flag() && x);");
+        assert_eq!(wrap("flag ??= x;", &["flag"]).unwrap(), "flag(flag() ?? x);");
     }
 
     #[test]
@@ -416,10 +418,7 @@ mod tests {
     #[test]
     fn assignment_wraps_rhs_reads() {
         // `count = other` — the RHS read of another derived is still wrapped.
-        assert_eq!(
-            wrap("count = other;", &["count", "other"]).unwrap(),
-            "count(other());"
-        );
+        assert_eq!(wrap("count = other;", &["count", "other"]).unwrap(), "count(other());");
     }
 
     #[test]
@@ -428,6 +427,7 @@ mod tests {
             "count += 1;",
             &names(&["count"]),
             &names(&["count"]),
+            &[],
             &FxHashSet::default(),
         )
         .unwrap();
@@ -439,10 +439,7 @@ mod tests {
     fn assignment_member_target_left_to_read_wrap() {
         // `obj.count = 1` — member target, not a bare derived; the derived `obj`
         // base is wrapped as a read but the assignment is not lowered.
-        assert_eq!(
-            wrap("obj.count = 1;", &["obj"]).unwrap(),
-            "obj().count = 1;"
-        );
+        assert_eq!(wrap("obj.count = 1;", &["obj"]).unwrap(), "obj().count = 1;");
     }
 
     #[test]
@@ -465,6 +462,7 @@ mod tests {
             "let x = count;",
             &names(&["count"]),
             &names(&["count"]),
+            &[],
             &FxHashSet::default(),
         )
         .unwrap();
@@ -478,11 +476,51 @@ mod tests {
     }
 
     #[test]
+    fn function_local_var_derived_is_not_mistaken_for_a_shadow() {
+        let script =
+            "function probe(flag) { if (flag) var value = $.derived(() => 1); return value; }";
+        let start = script.find("value =").unwrap();
+        let declarators = vec![(start, start + "value".len(), "value".to_string())];
+        let out = wrap_derived_reads_ast(
+            script,
+            &names(&["value"]),
+            &names(&["value"]),
+            &declarators,
+            &FxHashSet::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            "function probe(flag) { if (flag) var value = $.derived(() => 1); return value?.(); }"
+        );
+    }
+
+    #[test]
+    fn same_named_parameter_still_shadows_function_local_derived() {
+        let script = "function probe() { var value = $.derived(() => 1); function nested(value) { return value; } return value; }";
+        let start = script.find("value =").unwrap();
+        let declarators = vec![(start, start + "value".len(), "value".to_string())];
+        let out = wrap_derived_reads_ast(
+            script,
+            &names(&["value"]),
+            &names(&["value"]),
+            &declarators,
+            &FxHashSet::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            "function probe() { var value = $.derived(() => 1); function nested(value) { return value; } return value?.(); }"
+        );
+    }
+
+    #[test]
     fn extra_derived_unresolved_is_wrapped() {
         let out = wrap_derived_reads_ast(
             "let x = d + 1;",
             &FxHashSet::default(),
             &FxHashSet::default(),
+            &[],
             &names(&["d"]),
         )
         .unwrap();
@@ -491,26 +529,14 @@ mod tests {
 
     #[test]
     fn lowers_postfix_update() {
-        assert_eq!(
-            wrap("count++;", &["count"]).unwrap(),
-            "$.update_derived(count);"
-        );
-        assert_eq!(
-            wrap("count--;", &["count"]).unwrap(),
-            "$.update_derived(count, -1);"
-        );
+        assert_eq!(wrap("count++;", &["count"]).unwrap(), "$.update_derived(count);");
+        assert_eq!(wrap("count--;", &["count"]).unwrap(), "$.update_derived(count, -1);");
     }
 
     #[test]
     fn lowers_prefix_update() {
-        assert_eq!(
-            wrap("++count;", &["count"]).unwrap(),
-            "$.update_derived_pre(count);"
-        );
-        assert_eq!(
-            wrap("--count;", &["count"]).unwrap(),
-            "$.update_derived_pre(count, -1);"
-        );
+        assert_eq!(wrap("++count;", &["count"]).unwrap(), "$.update_derived_pre(count);");
+        assert_eq!(wrap("--count;", &["count"]).unwrap(), "$.update_derived_pre(count, -1);");
     }
 
     #[test]
@@ -532,6 +558,7 @@ mod tests {
             "count++;",
             &names(&["count"]),
             &names(&["count"]),
+            &[],
             &FxHashSet::default(),
         )
         .unwrap();
@@ -552,9 +579,6 @@ mod tests {
 
     #[test]
     fn wraps_inside_template_interpolation() {
-        assert_eq!(
-            wrap("let s = `a${count}b`;", &["count"]).unwrap(),
-            "let s = `a${count()}b`;"
-        );
+        assert_eq!(wrap("let s = `a${count}b`;", &["count"]).unwrap(), "let s = `a${count()}b`;");
     }
 }

@@ -18,13 +18,6 @@
 //! 1_parse/
 //! ├── mod.rs              # Public API: parse(), ParseOptions
 //! ├── parser.rs           # Parser struct + helper methods
-//! ├── estree_compat/      # ESTree compatibility layer (test-only)
-//! │   ├── mod.rs          # Public API: convert_to_estree()
-//! │   ├── expression.rs   # Expression node conversion
-//! │   ├── statement.rs    # Statement node conversion
-//! │   ├── pattern.rs      # Pattern node conversion
-//! │   ├── typescript.rs   # TypeScript annotation conversion
-//! │   └── utils.rs        # Position calculation utilities
 //! ├── read/               # Reading specific constructs
 //! │   ├── mod.rs
 //! │   ├── context.rs      # Pattern parsing for {#each} and {#snippet}
@@ -51,8 +44,7 @@
 //! Note: Legacy AST conversion is in `compiler/legacy.rs` (matches Svelte's
 //! `svelte/packages/svelte/src/compiler/legacy.js`).
 
-pub mod estree_compat;
-mod parser;
+pub(crate) mod parser;
 pub(crate) mod read;
 pub mod remove_typescript_nodes;
 pub(crate) mod resolve_lazy;
@@ -74,7 +66,7 @@ pub(crate) use read::expression;
 use crate::ast::Root;
 use crate::error::ParseResult;
 
-pub use parser::Parser;
+pub use parser::{MAX_NESTING_DEPTH, Parser};
 
 /// Parse options.
 #[derive(Debug, Clone, Copy, Default)]
@@ -119,9 +111,33 @@ pub struct ParseOptions {
     /// When true, the parse arena records each node's
     /// `leadingComments`/`trailingComments` so they survive the typed AST
     /// round-trip in `parse()` output (the public AST API / parser fixtures set
-    /// this). The compiler leaves it `false`: codegen strips comments, and
-    /// keeping the side table off avoids any per-node recording on the hot path.
+    /// this). The compiler leaves it `false`, and what that avoids is not a
+    /// per-node *recording* but the whole `add_comments` walk: one comment
+    /// anywhere in a script or a template expression materializes that entire
+    /// program or expression as `serde_json::Value` and walks every node of it,
+    /// so the cost is all-or-nothing per unit rather than per comment.
+    /// `Root.comments` is unaffected — it is recorded outside this gate.
     pub capture_comments: bool,
+    /// When true, a `{/…}` whose tail is not shaped like a block close
+    /// (`/word}`) is read as an expression tag instead of a block close. The
+    /// compiler keeps this `false` (official rejects `{/^x/y.test(a)}` with
+    /// `block_unexpected_close`); the *formatter*'s re-parse sets it, because
+    /// the JS printer legally strips the parens off `{(/^x/y).test(a)}` and the
+    /// collapse pass must still be able to re-read its own output.
+    pub reparse_leading_slash_expression: bool,
+}
+
+impl ParseOptions {
+    /// Options shared by every public `parse()` binding.
+    ///
+    /// Compilation deliberately skips the all-or-nothing JS comment attachment
+    /// walk, but a public AST must retain `leadingComments` and
+    /// `trailingComments` like `svelte/compiler` does. Keeping that decision
+    /// here prevents the NAPI, raw-envelope, and wasm entry points from
+    /// silently drifting apart.
+    pub fn public_api() -> Self {
+        Self { capture_comments: true, ..Self::default() }
+    }
 }
 
 /// Extended parse options with filename (separate to keep ParseOptions Copy).
@@ -132,7 +148,17 @@ pub struct ParseOptionsWithFilename {
 }
 
 /// Parse a Svelte component source into an AST.
-pub fn parse(source: &str, options: ParseOptions) -> ParseResult<Root> {
+///
+/// `_alloc` is the caller-owned arena that M5-B/C will use to allocate the
+/// borrowed AST; M5-A accepts it but does not yet allocate into it, so it takes
+/// an independent lifetime (the returned `Root<'a>` borrows only `source`).
+pub fn parse<'a>(
+    source: &'a str,
+    _alloc: &oxc_allocator::Allocator,
+    options: ParseOptions,
+) -> ParseResult<Root<'a>> {
+    // Already stripped on the compile path; this covers the standalone parse API.
+    let source = crate::compiler::remove_bom(source);
     let mut parser = Parser::new(source, options);
     // RAII install so to_value() calls during parsing
     // (e.g. build_const_variable_declaration) can resolve JsNodeIds.
@@ -142,9 +168,7 @@ pub fn parse(source: &str, options: ParseOptions) -> ParseResult<Root> {
     //
     // Enable node-comment capture (thread-local; restored on drop) only for the
     // AST-output path — the compiler leaves `capture_comments` false.
-    let _capture = options
-        .capture_comments
-        .then(crate::ast::arena::CommentCaptureGuard::new);
+    let _capture = options.capture_comments.then(crate::ast::arena::CommentCaptureGuard::new);
     // SAFETY: `parser.arena` lives until `parser` is dropped, which
     // happens after `_guard`.
     let _guard = unsafe { crate::ast::arena::SerializeArenaGuard::new(&parser.arena as *const _) };
@@ -158,12 +182,10 @@ pub fn parse(source: &str, options: ParseOptions) -> ParseResult<Root> {
 /// in a `.svelte` file with no `lang="ts"` doesn't fail) while keeping template
 /// expressions (e.g. snippet parameters) JS-only when there's no `lang="ts"`.
 /// The compiler's `parse` keeps full `lang="ts"` enforcement.
-pub fn parse_script_ts(source: &str, options: ParseOptions) -> ParseResult<Root> {
+pub fn parse_script_ts<'a>(source: &'a str, options: ParseOptions) -> ParseResult<Root<'a>> {
     let mut parser = Parser::new(source, options);
     parser.script_ts = true;
-    let _capture = options
-        .capture_comments
-        .then(crate::ast::arena::CommentCaptureGuard::new);
+    let _capture = options.capture_comments.then(crate::ast::arena::CommentCaptureGuard::new);
     // SAFETY: see `parse`.
     let _guard = unsafe { crate::ast::arena::SerializeArenaGuard::new(&parser.arena as *const _) };
     parser.parse()
@@ -175,11 +197,9 @@ pub fn parse_reuse<'a>(
     parser: &mut Parser<'a>,
     source: &'a str,
     options: ParseOptions,
-) -> ParseResult<Root> {
+) -> ParseResult<Root<'a>> {
     parser.reset(source, options);
-    let _capture = options
-        .capture_comments
-        .then(crate::ast::arena::CommentCaptureGuard::new);
+    let _capture = options.capture_comments.then(crate::ast::arena::CommentCaptureGuard::new);
     // SAFETY: `parser.arena` lives until the caller drops `parser`,
     // which can only happen after this function returns.
     let _guard = unsafe { crate::ast::arena::SerializeArenaGuard::new(&parser.arena as *const _) };
@@ -203,6 +223,19 @@ pub fn compute_line_offsets(source: &str, skip: bool) -> Vec<usize> {
     offsets
 }
 
+/// Move comments collected while resolving deferred expressions and scripts
+/// into the public root comment list. The initial parser drains the same sink
+/// when it builds `Root`, but compilation performs these JavaScript parses only
+/// afterward during analysis.
+pub(crate) fn merge_deferred_comments(ast: &mut Root<'_>) {
+    let comments = read::expression::take_expr_comments();
+    if comments.is_empty() {
+        return;
+    }
+    ast.comments.extend(comments);
+    ast.comments.sort_by_key(|comment| comment.start);
+}
+
 /// Parse a standalone JavaScript / TypeScript module source into an
 /// ESTree-compatible JSON program (offsets are byte positions in `source`).
 ///
@@ -221,13 +254,17 @@ pub fn parse_module_to_estree(source: &str, is_typescript: bool) -> serde_json::
     crate::ast::arena::with_serialize_arena(&arena, || {
         let (program, _parse_error) = expression::parse_program_with_error(
             &arena,
-            source,
-            0,
-            &line_offsets,
-            is_typescript,
-            &[],
-            0,
-            source.len(),
+            expression::ProgramParseParams {
+                content: source,
+                offset: 0,
+                line_offsets: &line_offsets,
+                is_typescript,
+                // A `.svelte.(js|ts)` module, not a component <script>.
+                is_script: false,
+                leading_comments: &[],
+                script_tag_start: 0,
+                script_tag_end: source.len(),
+            },
         );
         program.as_json().clone()
     })
@@ -243,13 +280,17 @@ pub fn ts_snippet_is_valid(source: &str, is_typescript: bool) -> bool {
     crate::ast::arena::with_serialize_arena(&arena, || {
         let (_program, parse_error) = expression::parse_program_with_error(
             &arena,
-            source,
-            0,
-            &line_offsets,
-            is_typescript,
-            &[],
-            0,
-            source.len(),
+            expression::ProgramParseParams {
+                content: source,
+                offset: 0,
+                line_offsets: &line_offsets,
+                is_typescript,
+                // A synthesized type-alias snippet, which cannot export.
+                is_script: false,
+                leading_comments: &[],
+                script_tag_start: 0,
+                script_tag_end: source.len(),
+            },
         );
         parse_error.is_none()
     })
@@ -258,11 +299,11 @@ pub fn ts_snippet_is_valid(source: &str, is_typescript: bool) -> bool {
 /// Parse multiple Svelte components in parallel.
 ///
 /// Uses rayon to parse files concurrently for maximum performance.
-#[cfg(feature = "native")]
+#[cfg(feature = "parallel")]
 pub fn parse_parallel<'a>(
     sources: impl IntoIterator<Item = (&'a str, &'a str)> + Send,
     options: ParseOptions,
-) -> Vec<(&'a str, ParseResult<Root>)>
+) -> Vec<(&'a str, ParseResult<Root<'a>>)>
 where
     ParseOptions: Clone + Send + Sync,
 {
@@ -274,9 +315,23 @@ where
         .into_par_iter()
         .map(|(filename, source)| {
             let opts = options;
-            (filename, parse(source, opts))
+            // Per-worker, file-scoped arena. Unused in M5-A (Root borrows only
+            // `source`); M5-B/C will allocate the borrowed AST into it.
+            let alloc = oxc_allocator::Allocator::default();
+            (filename, parse(source, &alloc, opts))
         })
         .collect()
+}
+
+/// Drop a leading byte order mark. Upstream's `compiler/index.js` calls this at
+/// every public entry (`compile`, `compileModule`, `parse`, `parseCss`) before
+/// anything sees the source, so every position it reports is relative to the
+/// trimmed text. Deliberately *not* called inside [`parse`]: the formatter and
+/// the linter parse a string they also slice, and stripping under them would
+/// shift every span they hold by three bytes.
+#[must_use]
+pub fn remove_bom(source: &str) -> &str {
+    source.strip_prefix('\u{feff}').unwrap_or(source)
 }
 
 #[cfg(test)]
@@ -292,8 +347,8 @@ mod tests {
         assert_eq!(result.fragment.nodes.len(), 1);
         match &result.fragment.nodes[0] {
             TemplateNode::Text(text) => {
-                assert_eq!(text.data.as_str(), "hello world");
-                assert_eq!(text.raw.as_str(), "hello world");
+                assert_eq!(text.data.as_ref(), "hello world");
+                assert_eq!(text.raw.as_ref(), "hello world");
             }
             _ => panic!("Expected Text node"),
         }
@@ -305,6 +360,44 @@ mod tests {
         let result = parser.parse().unwrap();
 
         assert!(result.fragment.nodes.is_empty());
+    }
+
+    #[test]
+    fn test_scss_interpolation_in_custom_property_matches_css_error() {
+        let source = r#"<style lang="scss">.x { --value: #{$value}; }</style>"#;
+        let mut parser = Parser::new(source, ParseOptions::default());
+        let error = parser.parse().unwrap_err();
+
+        match error {
+            crate::error::ParseError::SvelteError { code, span, .. } => {
+                assert_eq!(code, "css_expected_identifier");
+                assert_eq!(span, (32, 32));
+            }
+            other => panic!("expected css_expected_identifier, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_scss_interpolation_in_comma_atrule_requires_semicolon() {
+        let source = r#"<style lang="scss">@media #{a}, #{b} {}</style>"#;
+        let mut parser = Parser::new(source, ParseOptions::default());
+        let error = parser.parse().unwrap_err();
+
+        match error {
+            crate::error::ParseError::SvelteError { code, span, .. } => {
+                assert_eq!(code, "expected_token");
+                assert_eq!(span, (33, 33));
+            }
+            other => panic!("expected expected_token, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_standard_custom_property_value_still_parses() {
+        let source = r#"<style>.x { --value: var(--x); }</style>"#;
+        let mut parser = Parser::new(source, ParseOptions::default());
+
+        assert!(parser.parse().is_ok());
     }
 
     #[test]
@@ -390,11 +483,7 @@ mod tests {
 </p>"#;
         let mut parser = Parser::new(source, ParseOptions::default());
         let result = parser.parse();
-        assert!(
-            result.is_ok(),
-            "Failed to parse component inside <p>: {:?}",
-            result.err()
-        );
+        assert!(result.is_ok(), "Failed to parse component inside <p>: {:?}", result.err());
     }
 
     #[test]
@@ -420,12 +509,8 @@ mod tests {
         // Bug: chars().nth() was used with byte index, causing wrong quote detection
         let source = "<script lang=\"ts\">\n  interface Props {\n    /** あ */\n    content: string;\n  }\n  const { content }: Props = $props();\n</script>\n\n<div style:width=\"100%\">{content}</div>";
 
-        assert_ne!(
-            source.len(),
-            source.chars().count(),
-            "Source should contain multibyte chars"
-        );
-        let result = parse(source, ParseOptions::default());
+        assert_ne!(source.len(), source.chars().count(), "Source should contain multibyte chars");
+        let result = parse(source, &oxc_allocator::Allocator::default(), ParseOptions::default());
         assert!(
             result.is_ok(),
             "style:width with multibyte chars should parse: {:?}",
@@ -456,12 +541,8 @@ mod tests {
         );
 
         assert_ne!(source.len(), source.chars().count());
-        let result = parse(source, ParseOptions::default());
-        assert!(
-            result.is_ok(),
-            "Complex template with multibyte should parse: {:?}",
-            result.err()
-        );
+        let result = parse(source, &oxc_allocator::Allocator::default(), ParseOptions::default());
+        assert!(result.is_ok(), "Complex template with multibyte should parse: {:?}", result.err());
     }
 
     #[test]
@@ -474,11 +555,17 @@ mod tests {
 >
     hello
 </ul>"#;
-        let result = parse(source, ParseOptions::default());
-        assert!(
-            result.is_ok(),
-            "Should parse // in HTML attributes: {:?}",
-            result.err()
-        );
+        let result = parse(source, &oxc_allocator::Allocator::default(), ParseOptions::default());
+        assert!(result.is_ok(), "Should parse // in HTML attributes: {:?}", result.err());
+    }
+
+    #[test]
+    fn public_parse_options_capture_node_comments() {
+        let public = ParseOptions::public_api();
+        assert!(public.capture_comments);
+
+        // The compiler hot path keeps the expensive whole-program comment
+        // attachment walk disabled; only public AST entry points opt into it.
+        assert!(!ParseOptions::default().capture_comments);
     }
 }

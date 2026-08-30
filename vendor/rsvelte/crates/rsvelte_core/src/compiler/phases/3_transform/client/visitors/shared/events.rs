@@ -5,8 +5,11 @@
 
 use compact_str::CompactString;
 
+use crate::ast::arena::ParseArena;
 use crate::ast::js::Expression;
 use crate::ast::template::OnDirective;
+use crate::ast::typed_expr::JsNode;
+use crate::compiler::phases::phase2_analyze::for_each_js_child;
 use crate::compiler::phases::phase3_transform::client::types::*;
 use crate::compiler::phases::phase3_transform::client::visitors::expression_converter::convert_expression;
 use crate::compiler::phases::phase3_transform::js_ast::builders as b;
@@ -58,33 +61,17 @@ pub fn build_event(
     b::call(arena, b::member_path(arena, callee), args)
 }
 
-/// Build a delegated event assignment: `element.__eventname = handler`
-/// Reference: events.js lines 34-42 in the official compiler
-pub fn build_delegated_event_assignment(
-    arena: &crate::compiler::phases::phase3_transform::js_ast::arena::JsArena,
-
-    event_name: &str,
-    node: &JsExpr,
-    handler: JsExpr,
-) -> JsExpr {
-    b::call(
-        arena,
-        b::member_path(arena, "$.delegated"),
-        vec![b::string(event_name), node.clone(), handler],
-    )
-}
-
 /// In dev mode, convert arrow function event handlers to named function expressions
 /// for better debugging (stack traces show the event name).
 /// Reference: events.js `build_event` in the official Svelte compiler.
 pub fn convert_arrow_to_named_function(handler: JsExpr, name: CompactString) -> JsExpr {
     if let JsExpr::Arrow(arrow) = handler {
         let body = match arrow.body {
-            JsArrowBody::Expression(expr) => JsBlockStatement {
-                body: vec![JsStatement::Return(JsReturnStatement {
+            JsArrowBody::Expression(expr) => {
+                JsBlockStatement::with_body(vec![JsStatement::Return(JsReturnStatement {
                     argument: Some(expr),
-                })],
-            },
+                })])
+            }
             JsArrowBody::Block(block) => block,
         };
         JsExpr::Function(JsFunctionExpression {
@@ -101,11 +88,40 @@ pub fn convert_arrow_to_named_function(handler: JsExpr, name: CompactString) -> 
 
 /// True when the handler expression (or any descendant outside a function
 /// body) contains a `CallExpression`. Phase 3 memoises any handler that
-/// contains a call, regardless of whether the callee is "pure" — see
-/// `expression_tag_has_call` in `shared/element.rs` for the same broad
-/// semantics applied to `ExpressionTag`.
+/// contains a call, regardless of whether the callee is "pure". This is
+/// deliberately broader than Phase 2's `has_call` metadata.
 fn expression_has_any_call(expr: &Expression) -> bool {
+    // The typed walk needs the serialize arena to resolve child ids; without one
+    // installed there is nothing to walk but the JSON.
+    if let Some(node) = expr.try_as_node_ref()
+        && let Some(found) = crate::ast::arena::try_with_current_serialize_arena(|arena| {
+            typed_walk_for_call(node, arena)
+        })
+    {
+        return found;
+    }
     json_walk_for_call(expr.as_json())
+}
+
+/// Typed counterpart of `json_walk_for_call`, including its function boundary:
+/// a function node answers `false` without its body, params or id being looked
+/// at, even when it is the root.
+fn typed_walk_for_call(node: &JsNode, arena: &ParseArena) -> bool {
+    match node {
+        JsNode::CallExpression { .. } => return true,
+        JsNode::ArrowFunctionExpression { .. }
+        | JsNode::FunctionExpression { .. }
+        | JsNode::FunctionDeclaration { .. } => return false,
+        _ => {}
+    }
+
+    let mut found = false;
+    for_each_js_child(node, arena, &mut |child| {
+        if !found {
+            found = typed_walk_for_call(child, arena);
+        }
+    });
+    found
 }
 
 fn json_walk_for_call(val: &serde_json::Value) -> bool {
@@ -175,8 +191,7 @@ pub fn build_event_handler(
     let expression = expression.unwrap();
 
     // Check if expression has a call (for memoization). Phase 3 uses the
-    // broad "any CallExpression in the tree" semantics — see
-    // `expression_tag_has_call` in `shared/element.rs` — instead of Phase 2's
+    // broad "any CallExpression in the tree" semantics instead of Phase 2's
     // narrower has_call (which only fires for non-pure calls).
     let _ = node;
     let has_call = expression_has_any_call(expression);
@@ -192,41 +207,49 @@ pub fn build_event_handler(
     metadata.set_has_state(true); // Conservative: assume handlers may reference state
     let handler = build_expression(context, &handler, &metadata);
 
+    // Source-map spans wrap source expressions without changing their handler kind.
+    let mut unspanned = &handler;
+    while let JsExpr::Spanned(inner, _, _) = unspanned {
+        unspanned = context.arena.get_expr(*inner);
+    }
+
     // For inline handlers (arrow or function expression), return directly after transforms
-    if matches!(handler, JsExpr::Arrow(_) | JsExpr::Function(_)) {
+    if matches!(unspanned, JsExpr::Arrow(_) | JsExpr::Function(_)) {
         return handler;
     }
 
-    // For other handlers, continue processing
-    let mut handler = handler;
-
     // Function declared in the script
-    if let JsExpr::Identifier(name) = &handler {
+    if let JsExpr::Identifier(name) = unspanned {
         // Mirrors the official compiler in `events.js`:
         //
         //   if (binding?.is_function()) return handler;
         //   if (!dev && binding?.declaration_kind !== 'import') return handler;
         //
         // i.e. attach the handler directly when (a) it's a function
-        // declaration / hoisted function, or (b) it's any locally-declared
-        // const/let/var binding (the value won't change between mounts), or
-        // (c) it isn't in scope at all (assume a global like `window.alert`
-        // or an untracked helper). Only imports get wrapped in
-        // `function (...$$args) { handler?.apply(this, $$args); }`, which
-        // copes with hot-reload swapping the imported binding.
+        // declaration / hoisted function, or (b) outside dev, any binding that
+        // is not an import — a locally-declared const/let/var whose value will
+        // not change between mounts, or a name that is not in scope at all
+        // (assume a global like `window.alert`). An import gets wrapped so it
+        // copes with hot-reload swapping the binding, and dev wraps everything
+        // else too so a throwing handler can still be reported.
         use crate::compiler::phases::phase2_analyze::scope::DeclarationKind;
-        match context.state.get_binding(name) {
-            Some(binding) if binding.is_function() => return handler,
-            None => return handler,
-            Some(binding) => {
-                let is_import = matches!(binding.declaration_kind, DeclarationKind::Import);
-                if !context.state.options.dev && !is_import {
-                    return handler;
-                }
-                // Falls through to the wrapping path below.
-            }
+        // `resolve_shadowing_snippet_binding` (not a plain `get_binding`) so a
+        // block-local `{#snippet}` that shadows a same-named outer function
+        // correctly resolves to the snippet — see its doc comment for why
+        // `get_binding` alone can't be trusted here.
+        let binding = super::utils::resolve_shadowing_snippet_binding(name, context);
+        if binding.is_some_and(|b| b.is_function()) {
+            return handler;
+        }
+        if !context.state.options.dev
+            && binding.is_none_or(|b| b.declaration_kind != DeclarationKind::Import)
+        {
+            return handler;
         }
     }
+
+    // For other handlers, continue processing.
+    let mut handler = handler;
 
     // If the handler contains a call expression, we need to memoize it with $.derived
     // This is important for cases like: on:click={saySomething('Tama').handler}
@@ -252,12 +275,50 @@ pub fn build_event_handler(
 
     // For complex expressions, wrap in a function that calls the expression
     // This handles cases like: onclick={obj.method} or onclick={expr()}
-    // handler?.apply(this, $$args) - use optional chaining for safety
-    let call_expr = b::call(
-        arena,
-        b::optional_member(arena, handler, "apply"),
-        vec![b::this(), b::id("$$args")],
-    );
+    let call_expr = if context.state.dev {
+        // Dev routes the call through `$.apply` so a handler that throws can be
+        // reported with the component and the source position of the attribute.
+        let (line, column) = match expression.start() {
+            Some(start) => crate::compiler::phases::phase3_transform::utils::locate_in_source(
+                &context.state.analysis.source,
+                start as usize,
+            ),
+            None => (0, 0),
+        };
+        let side_effects = super::super::attribute::expression_has_side_effects(expression);
+        let remove_parens = super::super::attribute::expression_is_removable_call(
+            expression,
+            context.state.parse_arena,
+        );
+
+        let mut apply_args = vec![
+            b::thunk(arena, handler),
+            b::this(),
+            b::id("$$args"),
+            b::id(&context.state.analysis.name),
+            b::array(vec![b::number(line as f64), b::number(column as f64)]),
+        ];
+        // The trailing flags are positional, so a set `remove_parens` forces the
+        // `has_side_effects` slot to be filled even when it is false.
+        if side_effects || remove_parens {
+            apply_args.push(if side_effects { b::boolean(true) } else { b::undefined(arena) });
+        }
+        if remove_parens {
+            apply_args.push(b::boolean(true));
+        }
+
+        b::call(arena, b::member_path(arena, "$.apply"), apply_args)
+    } else {
+        // handler?.apply(this, $$args) - use optional chaining for safety.
+        // Upstream's handler is still its own `ChainExpression`, so the `apply`
+        // member lands outside the chain and the printer parenthesises it.
+        let handler = b::close_optional_chain(arena, handler);
+        b::call(
+            arena,
+            b::optional_member(arena, handler, "apply"),
+            vec![b::this(), b::id("$$args")],
+        )
+    };
 
     b::function_expr(
         None,
@@ -266,127 +327,12 @@ pub fn build_event_handler(
     )
 }
 
-/// Build an event listener attachment.
-///
-/// Creates a call to attach an event listener to an element.
-///
-/// # Arguments
-///
-/// * `element` - The element to attach the listener to
-/// * `event_name` - The name of the event (e.g., "click", "input")
-/// * `handler` - The handler function
-/// * `options` - Event listener options (capture, passive, once, etc.)
-///
-/// # Returns
-///
-/// Returns a statement that attaches the event listener.
-pub fn build_event_listener(
-    arena: &crate::compiler::phases::phase3_transform::js_ast::arena::JsArena,
-
-    element: JsExpr,
-    event_name: &str,
-    handler: JsExpr,
-    options: Option<EventListenerOptions>,
-) -> JsStatement {
-    if let Some(opts) = options {
-        // Build options object
-        let mut props = Vec::new();
-
-        if opts.capture {
-            props.push(b::prop(arena, "capture", b::boolean(true)));
-        }
-        if opts.passive {
-            props.push(b::prop(arena, "passive", b::boolean(true)));
-        }
-        if opts.once {
-            props.push(b::prop(arena, "once", b::boolean(true)));
-        }
-
-        let options_obj = b::object(props);
-
-        b::stmt(
-            arena,
-            b::call(
-                arena,
-                b::member_path(arena, "$.listen"),
-                vec![element, b::string(event_name), handler, options_obj],
-            ),
-        )
-    } else {
-        // No options
-        b::stmt(
-            arena,
-            b::call(
-                arena,
-                b::member_path(arena, "$.listen"),
-                vec![element, b::string(event_name), handler],
-            ),
-        )
-    }
-}
-
-/// Event listener options.
-#[derive(Debug, Clone, Default)]
-pub struct EventListenerOptions {
-    /// Whether to use capture phase
-    pub capture: bool,
-
-    /// Whether the listener is passive
-    pub passive: bool,
-
-    /// Whether the listener should be called only once
-    pub once: bool,
-}
-
-impl EventListenerOptions {
-    /// Create new event listener options.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Set capture option.
-    pub fn with_capture(mut self, capture: bool) -> Self {
-        self.capture = capture;
-        self
-    }
-
-    /// Set passive option.
-    pub fn with_passive(mut self, passive: bool) -> Self {
-        self.passive = passive;
-        self
-    }
-
-    /// Set once option.
-    pub fn with_once(mut self, once: bool) -> Self {
-        self.once = once;
-        self
-    }
-}
-
-/// Build delegated event setup.
-///
-/// For events that can be delegated (like click), this creates
-/// the delegation setup code.
-pub fn build_delegated_event(
-    arena: &crate::compiler::phases::phase3_transform::js_ast::arena::JsArena,
-    event_name: &str,
-) -> JsStatement {
-    b::stmt(
-        arena,
-        b::call(
-            arena,
-            b::member_path(arena, "$.delegate"),
-            vec![b::string(event_name)],
-        ),
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::rc::Rc;
 
-    fn create_test_on_directive() -> crate::ast::template::OnDirective {
+    fn create_test_on_directive<'a>() -> crate::ast::template::OnDirective<'a> {
         use compact_str::CompactString;
         crate::ast::template::OnDirective {
             start: 0,
@@ -435,40 +381,80 @@ mod tests {
 
     // Note: Removed test_build_event_handler_function as it requires Expression type which is complex to create
 
-    #[test]
-    fn test_build_event_listener_simple() {
-        let arena = crate::compiler::phases::phase3_transform::js_ast::arena::JsArena::new();
-        let element = b::id("button");
-        let handler = b::id("handleClick");
+    /// `(typed, json)` call-search answers for the handler in `<div onclick={…}>`.
+    fn both_walk_for_call(expr_src: &str) -> (bool, bool) {
+        let input = format!("<div onclick={{{expr_src}}}></div>");
+        let allocator = oxc_allocator::Allocator::default();
+        let mut result = crate::parse(&input, &allocator, Default::default()).unwrap();
+        // `parse()` may leave attribute expressions deferred; both walks need a
+        // resolved `Expression::Typed`.
+        assert!(
+            crate::compiler::phases::phase1_parse::resolve_lazy::resolve_lazy_expressions(
+                &mut result,
+                &input,
+            )
+            .is_none(),
+            "`{expr_src}` should parse"
+        );
 
-        let stmt = build_event_listener(&arena, element, "click", handler, None);
+        let expr = result
+            .fragment
+            .nodes
+            .iter()
+            .find_map(|node| match node {
+                crate::ast::template::TemplateNode::RegularElement(el) => {
+                    el.attributes.iter().find_map(|attr| match attr {
+                        crate::ast::template::Attribute::Attribute(a) => match &a.value {
+                            crate::ast::template::AttributeValue::Expression(tag) => {
+                                Some(&tag.expression)
+                            }
+                            _ => None,
+                        },
+                        _ => None,
+                    })
+                }
+                _ => None,
+            })
+            .expect("expression attribute");
 
-        // Should generate $.listen(button, "click", handleClick)
-        match stmt {
-            JsStatement::Expression(_) => {
-                // Success
-            }
-            _ => panic!("Expected expression statement"),
-        }
+        crate::ast::arena::with_serialize_arena(&result.arena, || {
+            (
+                typed_walk_for_call(expr.as_node_ref(), &result.arena),
+                json_walk_for_call(expr.as_json()),
+            )
+        })
     }
 
     #[test]
-    fn test_build_event_listener_with_options() {
-        let arena = crate::compiler::phases::phase3_transform::js_ast::arena::JsArena::new();
-        let element = b::id("button");
-        let handler = b::id("handleClick");
-        let options = EventListenerOptions::new()
-            .with_capture(true)
-            .with_once(true);
+    fn typed_walk_for_call_agrees_with_the_json_walk() {
+        // (expression, expected answer) — expectations are spelled out as well
+        // as compared, so a walk that never finds anything can't pass by
+        // agreeing with an equally broken oracle.
+        let cases: &[(&str, bool)] = &[
+            ("handler", false),
+            ("obj.handler", false),
+            ("handler()", true),
+            ("obj.handler(1)", true),
+            ("a?.b()", true),
+            ("new Foo(bar())", true),
+            ("new Foo()", false),
+            ("[a, b(), c]", true),
+            ("({ k: v() })", true),
+            ("cond ? a() : b", true),
+            ("`x${a()}`", true),
+            // Function boundary — the walk stops before the body, even at the root.
+            ("() => other()", false),
+            ("(function () { other(); })", false),
+            // …but a sibling outside the function is still seen.
+            ("[() => other(), more()]", true),
+            // A call in a nested function's body stays invisible.
+            ("[() => other(), plain]", false),
+        ];
 
-        let stmt = build_event_listener(&arena, element, "click", handler, Some(options));
-
-        // Should generate $.listen(button, "click", handleClick, { capture: true, once: true })
-        match stmt {
-            JsStatement::Expression(_) => {
-                // Success
-            }
-            _ => panic!("Expected expression statement"),
+        for (src, expected) in cases {
+            let (typed, json) = both_walk_for_call(src);
+            assert_eq!(typed, json, "typed and JSON walks disagree on `{src}`");
+            assert_eq!(&typed, expected, "unexpected call search for `{src}`");
         }
     }
 }

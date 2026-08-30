@@ -91,6 +91,13 @@ impl Rule for NoExtraNonNullAssertion {
 
         let is_extra_non_null_assertion = match parent.kind() {
             AstKind::TSNonNullExpression(_) => true,
+            _ if let Some(member_expr) = parent.kind().as_member_expression_kind() => {
+                member_expr.optional()
+                    && matches!(
+                        member_expr.object().without_parentheses(),
+                        Expression::TSNonNullExpression(expr) if expr.span == non_null_expr.span
+                    )
+            }
             AstKind::CallExpression(expr) if expr.optional => {
                 matches!(
                     expr.callee.without_parentheses(),
@@ -114,13 +121,7 @@ impl Rule for NoExtraNonNullAssertion {
                 }
                 _ => false,
             },
-            _ => parent.kind().as_member_expression_kind().is_some_and(|member_expr| {
-                member_expr.optional()
-                    && matches!(
-                        member_expr.object().without_parentheses(),
-                        Expression::TSNonNullExpression(expr) if expr.span == non_null_expr.span
-                    )
-            }),
+            _ => false,
         };
 
         if is_extra_non_null_assertion {

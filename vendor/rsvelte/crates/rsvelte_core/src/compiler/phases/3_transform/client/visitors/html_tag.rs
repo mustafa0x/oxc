@@ -4,6 +4,7 @@
 //! `svelte/packages/svelte/src/compiler/phases/3-transform/client/visitors/HtmlTag.js`.
 
 use crate::ast::template::HtmlTag;
+use crate::compiler::phases::phase3_transform::client::source_anchor::CommentRegion;
 use crate::compiler::phases::phase3_transform::client::types::*;
 use crate::compiler::phases::phase3_transform::client::visitors::expression_converter::convert_expression;
 use crate::compiler::phases::phase3_transform::client::visitors::shared::utils::build_expression;
@@ -52,21 +53,22 @@ pub fn html_tag(node: &HtmlTag, context: &mut ComponentContext) -> JsStatement {
     // reactivity wrapping (deep_read_state/untrack) based on metadata from phase 2.
     // This matches the official compiler's: build_expression(context, node.expression, node.metadata.expression)
     let metadata = ExpressionMetadata::from_template_metadata(&node.metadata.expression);
-    let built_expression = build_expression(context, &expression, &metadata);
+    let mut built_expression = build_expression(context, &expression, &metadata);
+    if let (Some(start), Some(end)) = (node.expression.start(), node.expression.end())
+        && let Some(region) =
+            CommentRegion::between(&context.state, node.start + 7, end, node.start + 7)
+    {
+        built_expression = region.anchor(&context.arena, built_expression, start, end);
+    }
 
     // Check blocker_map for blocked identifiers referenced in the built expression
-    let blocker_exprs_for_html = context
-        .state
-        .get_blockers_for_expr(&built_expression, &context.arena);
+    let blocker_exprs_for_html =
+        context.state.get_blockers_for_expr(&built_expression, &context.arena);
     let has_blockers = !blocker_exprs_for_html.is_empty();
 
     // When has_await, the html uses $.get($$html) instead of the original expression
     let html_expr = if has_await {
-        b::call(
-            &context.arena,
-            b::member_path(&context.arena, "$.get"),
-            vec![b::id("$$html")],
-        )
+        b::call(&context.arena, b::member_path(&context.arena, "$.get"), vec![b::id("$$html")])
     } else {
         built_expression.clone()
     };
@@ -81,11 +83,7 @@ pub fn html_tag(node: &HtmlTag, context: &mut ComponentContext) -> JsStatement {
 
     // Check for hydration_html_changed ignore (only in dev mode, matching official compiler)
     let ignore_hydration = context.state.options.dev
-        && node
-            .metadata
-            .ignored_codes
-            .iter()
-            .any(|c| c == "hydration_html_changed");
+        && node.metadata.ignored_codes.iter().any(|c| c == "hydration_html_changed");
 
     // Build arguments: $.html(node, thunked, is_controlled?, is_svg?, is_mathml?, ignore_hydration?)
     //
@@ -97,25 +95,13 @@ pub fn html_tag(node: &HtmlTag, context: &mut ComponentContext) -> JsStatement {
     let mut html_args = vec![context.state.node.clone(), thunked];
 
     if is_controlled || is_svg || is_mathml || ignore_hydration {
-        html_args.push(if is_controlled {
-            b::boolean(true)
-        } else {
-            b::undefined(&context.arena)
-        });
+        html_args.push(if is_controlled { b::boolean(true) } else { b::undefined(&context.arena) });
     }
     if is_svg || is_mathml || ignore_hydration {
-        html_args.push(if is_svg {
-            b::boolean(true)
-        } else {
-            b::undefined(&context.arena)
-        });
+        html_args.push(if is_svg { b::boolean(true) } else { b::undefined(&context.arena) });
     }
     if is_mathml || ignore_hydration {
-        html_args.push(if is_mathml {
-            b::boolean(true)
-        } else {
-            b::undefined(&context.arena)
-        });
+        html_args.push(if is_mathml { b::boolean(true) } else { b::undefined(&context.arena) });
     }
     if ignore_hydration {
         html_args.push(b::boolean(true));
@@ -123,21 +109,14 @@ pub fn html_tag(node: &HtmlTag, context: &mut ComponentContext) -> JsStatement {
 
     let html_statement = b::stmt(
         &context.arena,
-        b::call(
-            &context.arena,
-            b::member_path(&context.arena, "$.html"),
-            html_args,
-        ),
+        b::call(&context.arena, b::member_path(&context.arena, "$.html"), html_args),
     );
 
     // If the expression has await or blockers, wrap in $.async()
     if has_await || has_blockers {
         // $.async(node, blockers, async_values, callback)
-        let blockers_expr = if has_blockers {
-            b::array(blocker_exprs_for_html)
-        } else {
-            b::array(vec![])
-        };
+        let blockers_expr =
+            if has_blockers { b::array(blocker_exprs_for_html) } else { b::array(vec![]) };
 
         let async_values = if has_await {
             // Strip the top-level await from the expression since $.async handles
@@ -167,12 +146,7 @@ pub fn html_tag(node: &HtmlTag, context: &mut ComponentContext) -> JsStatement {
             b::call(
                 &context.arena,
                 b::member_path(&context.arena, "$.async"),
-                vec![
-                    context.state.node.clone(),
-                    blockers_expr,
-                    async_values,
-                    callback,
-                ],
+                vec![context.state.node.clone(), blockers_expr, async_values, callback],
             ),
         )
     } else {

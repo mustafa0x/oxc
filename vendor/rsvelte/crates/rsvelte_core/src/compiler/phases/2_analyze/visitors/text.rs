@@ -29,18 +29,31 @@ pub fn visit(text: &Text, context: &mut VisitorContext) -> Result<(), AnalysisEr
         && REGEX_NOT_WHITESPACE.is_match(&text.data)
         && let Some(message) = is_tag_valid_with_parent("#text", parent_element)
     {
-        return Err(errors::node_invalid_placement(&message));
+        return Err(errors::node_invalid_placement(&message).at(text.start, text.end));
     }
 
-    // Check for bidirectional control characters
-    for _m in REGEX_BIDIRECTIONAL_CONTROL_CHARACTERS.find_iter(&text.data) {
-        context.emit_warning(warnings::bidirectional_control_characters());
-    }
+    check_bidirectional_control_characters(&text.data, text.start, context);
 
     Ok(())
 }
 
-/// Alias for visit function.
-pub fn visit_text(text: &Text, context: &mut VisitorContext) -> Result<(), AnalysisError> {
-    visit(text, context)
+/// Scan one `Text` node's data for bidirectional control characters.
+///
+/// Upstream's `Text` visitor is reached for every `Text` in the AST, which
+/// includes the ones inside an attribute or directive value, so this is shared
+/// with the attribute walk rather than living in the fragment path.
+///
+/// Upstream offsets the match into `node.data`, not `node.raw`, so an entity
+/// ahead of the match shifts the reported range — mirrored deliberately.
+pub fn check_bidirectional_control_characters(
+    data: &str,
+    node_start: u32,
+    context: &mut VisitorContext,
+) {
+    for m in REGEX_BIDIRECTIONAL_CONTROL_CHARACTERS.find_iter(data) {
+        let start = node_start + m.start() as u32;
+        context.emit_warning(
+            warnings::bidirectional_control_characters().at(start, start + m.len() as u32),
+        );
+    }
 }

@@ -6,11 +6,19 @@ use std::fmt::Write as _;
 
 use crate::compiler::phases::phase2_analyze::ComponentAnalysis;
 use crate::compiler::phases::phase2_analyze::scope::BindingKind;
+use crate::compiler::phases::phase3_transform::shared::js_scan::{
+    after_keywords, code_bytes, skip_opaque,
+};
+use crate::compiler::phases::phase3_transform::shared::offsets::{
+    ByteOffset, CharOffset, CharToByte,
+};
+use crate::compiler::utils::{is_escaped, is_escaped_char};
 
+use super::scan_index::{ScanIndex, ScanIndexBuilder};
 use super::{
     extract_destructured_prop_names, find_matching_paren, get_or_compile_regex,
-    is_explicit_property_key, is_inside_string_literal, is_shadowed_by_function_param,
-    is_shorthand_object_property,
+    is_destructured_param_binding, is_explicit_property_key, is_inside_string_literal,
+    is_shadowed_by_function_param, is_shorthand_object_property,
 };
 
 /// True when the identifier at `var_start` (len `var_len`) is a *binding* in an
@@ -18,7 +26,72 @@ use super::{
 /// …`. Such positions declare a new local that shadows a like-named prop and
 /// must not be wrapped as a prop read. Mirrors the `in_param_position` guard the
 /// AST version (`prop_source_reads_ast`) applies.
-fn is_arrow_param_binding(chars: &[char], var_start: usize, var_len: usize) -> bool {
+fn is_arrow_param_binding(
+    index: &ScanIndex,
+    chars: &[char],
+    var_start: usize,
+    var_len: usize,
+) -> bool {
+    let answer = is_arrow_param_binding_indexed(index, chars, var_start, var_len);
+    if super::super::profile::index_oracle_enabled() {
+        super::super::profile::record_index_oracle(
+            answer == is_arrow_param_binding_by_scan(chars, var_start, var_len),
+        );
+    }
+    answer
+}
+
+fn is_arrow_param_binding_indexed(
+    index: &ScanIndex,
+    chars: &[char],
+    var_start: usize,
+    var_len: usize,
+) -> bool {
+    let after = var_start + var_len;
+
+    // `name => …`  (single param, no parens)
+    {
+        let mut k = after;
+        while k < chars.len() && chars[k].is_whitespace() {
+            k += 1;
+        }
+        if k + 1 < chars.len() && chars[k] == '=' && chars[k + 1] == '>' {
+            return true;
+        }
+    }
+
+    // `( … name … ) => …`. A `;` at the same nesting level rules out a parameter
+    // list, and the enclosing bracket has to be a `(` rather than an array or
+    // object literal.
+    if index.prev_semicolon(var_start).is_some() {
+        return false;
+    }
+    let Some(open) = index.enclosing_any(var_start).filter(|&o| chars[o] == '(') else {
+        return false;
+    };
+
+    // Must be at a parameter *name* position (preceded by `(` or `,`), not a
+    // default-value expression like `(a = prop) =>` where `prop` is a read.
+    let mut p = var_start;
+    while p > 0 && chars[p - 1].is_whitespace() {
+        p -= 1;
+    }
+    if !(p == 0 || chars[p - 1] == '(' || chars[p - 1] == ',') {
+        return false;
+    }
+
+    // matching `)` then `=>`
+    let Some(close) = index.closer_of(open).filter(|&c| chars[c] == ')') else {
+        return false;
+    };
+    let mut k = close + 1;
+    while k < chars.len() && chars[k].is_whitespace() {
+        k += 1;
+    }
+    k + 1 < chars.len() && chars[k] == '=' && chars[k + 1] == '>'
+}
+
+fn is_arrow_param_binding_by_scan(chars: &[char], var_start: usize, var_len: usize) -> bool {
     let after = var_start + var_len;
 
     // `name => …`  (single param, no parens)
@@ -93,26 +166,75 @@ fn is_arrow_param_binding(chars: &[char], var_start: usize, var_len: usize) -> b
 ///
 /// For example, `a + b` where `a` and `b` are props becomes `a() + b()`.
 pub(super) fn transform_prop_reads_in_expr(expr: &str, prop_vars: &[String]) -> String {
+    #[cfg(feature = "measure-prop-reads")]
+    crate::measure_prop_reads::record_call();
     if prop_vars.is_empty() {
+        #[cfg(feature = "measure-prop-reads")]
+        crate::measure_prop_reads::record_empty_props();
         return expr.to_string();
+    }
+
+    // Most callers hand us a complete JavaScript expression or statement. Let
+    // the AST rewriter handle those in one traversal; this scanner remains only
+    // for the incomplete fragments that cannot be parsed in program context.
+    if let Some(rewritten) = super::prop_source_reads_ast::wrap_prop_source_reads_ast(
+        expr,
+        prop_vars,
+        &[],
+        super::prop_source_reads_ast::ParseGoal::Expression,
+    ) {
+        return rewritten;
     }
 
     // Quick pre-check: if none of the prop vars appear as identifiers, skip expensive transforms
     let var_set: FxHashSet<&str> = prop_vars.iter().map(|v| v.as_str()).collect();
     if !super::utils::text_contains_any_identifier(expr, &var_set) {
+        #[cfg(feature = "measure-prop-reads")]
+        crate::measure_prop_reads::record_no_match();
         return expr.to_string();
     }
+
+    #[cfg(feature = "measure-prop-reads")]
+    crate::measure_prop_reads::record_slow(expr.chars().count(), prop_vars.len());
 
     let mut result = expr.to_string();
 
     for prop_name in prop_vars {
+        // The walk below pushes every character it reads, so a name that does
+        // not occur rebuilds the expression unchanged -- at the cost of a
+        // `Vec<char>`, an offset table, a scan index and a `String` per name.
+        if memmem::find(result.as_bytes(), prop_name.as_bytes()).is_none() {
+            continue;
+        }
+
+        // Every use below indexes `chars`, so the name's length has to be a
+        // character count; `prop_name.len()` is bytes and overshoots for a
+        // non-ASCII prop name.
+        let prop_len = prop_name.chars().count();
+
         // Use word boundary matching to replace identifier references
         // But avoid replacing function calls that already have ()
         // Note: Rust's regex crate doesn't support lookahead, so we use a different approach:
         // Match the identifier and check the context manually
 
         let mut new_result = String::with_capacity(result.len() * 2);
-        let chars: Vec<char> = result.chars().collect();
+        // The character vector feeds the scanner and the byte table feeds every
+        // string slice, keeping those two coordinate systems distinct.
+        let mut chars: Vec<char> = Vec::with_capacity(result.len());
+        let mut char_boundaries = Vec::with_capacity(result.len());
+        let mut builder = ScanIndexBuilder::new();
+        let mut prev = None;
+        for (byte, c) in result.char_indices() {
+            char_boundaries.push(ByteOffset::new(byte));
+            builder.feed(chars.len(), c, prev);
+            chars.push(c);
+            prev = Some(c);
+        }
+        let char_to_byte =
+            CharToByte::from_boundaries(char_boundaries, ByteOffset::end_of(&result));
+        let index = builder.finish(&chars);
+        #[cfg(feature = "measure-prop-reads")]
+        crate::measure_prop_reads::record_pass(chars.len());
         let mut i = 0;
 
         // Track whether we're inside a string literal to avoid transforming
@@ -155,10 +277,7 @@ pub(super) fn transform_prop_reads_in_expr(expr: &str, prop_vars: &[String]) -> 
                         *depth += 1;
                     }
                 } else if c == '}' {
-                    let should_pop = template_brace_depth
-                        .last()
-                        .map(|d| *d == 0)
-                        .unwrap_or(false);
+                    let should_pop = template_brace_depth.last().map(|d| *d == 0).unwrap_or(false);
                     if should_pop {
                         template_brace_depth.pop();
                         in_string = Some('`');
@@ -171,6 +290,49 @@ pub(super) fn transform_prop_reads_in_expr(expr: &str, prop_vars: &[String]) -> 
                 }
             }
 
+            // A quote inside a comment is text: an apostrophe in `// it's not
+            // defined` would otherwise open a string that nothing closes, and
+            // every identifier after it would be left untransformed.
+            if c == '/' && i + 1 < chars.len() && (chars[i + 1] == '/' || chars[i + 1] == '*') {
+                let line = chars[i + 1] == '/';
+                new_result.push(c);
+                new_result.push(chars[i + 1]);
+                i += 2;
+                while i < chars.len() {
+                    if line {
+                        if chars[i] == '\n' {
+                            break;
+                        }
+                    } else if chars[i] == '*' && i + 1 < chars.len() && chars[i + 1] == '/' {
+                        new_result.push(chars[i]);
+                        new_result.push(chars[i + 1]);
+                        i += 2;
+                        break;
+                    }
+                    new_result.push(chars[i]);
+                    i += 1;
+                }
+                continue;
+            }
+
+            // A regex literal is not code either: the escaped slash and the
+            // closing slash of `/^https?:\/\//` sit next to each other, so
+            // without this the `//` reads as a comment and every identifier
+            // after it is left untransformed.
+            let byte_at = char_to_byte.byte(CharOffset::new(i));
+            if c == '/'
+                && let Some((end, false)) = skip_opaque(
+                    result.as_bytes(),
+                    byte_at.get(),
+                    prev_code_byte(result.as_bytes(), byte_at.get()),
+                )
+            {
+                let literal = byte_at.to(ByteOffset::new(end), &result);
+                new_result.push_str(literal);
+                i += literal.chars().count();
+                continue;
+            }
+
             // Check for string literal start
             if c == '\'' || c == '"' || c == '`' {
                 in_string = Some(c);
@@ -180,11 +342,7 @@ pub(super) fn transform_prop_reads_in_expr(expr: &str, prop_vars: &[String]) -> 
             }
 
             // Check if we're at the start of the identifier
-            let remaining = &result[result
-                .char_indices()
-                .nth(i)
-                .map(|(idx, _)| idx)
-                .unwrap_or(i)..];
+            let remaining = char_to_byte.byte(CharOffset::new(i)).after(&result);
             if remaining.starts_with(prop_name) {
                 // Check character before (must be non-identifier char or start of string)
                 let before_ok = if i == 0 {
@@ -202,7 +360,7 @@ pub(super) fn transform_prop_reads_in_expr(expr: &str, prop_vars: &[String]) -> 
                 };
 
                 // Check character after (must be non-identifier char)
-                let after_idx = i + prop_name.len();
+                let after_idx = i + prop_len;
                 let after_ok = if after_idx >= chars.len() {
                     true
                 } else {
@@ -248,11 +406,7 @@ pub(super) fn transform_prop_reads_in_expr(expr: &str, prop_vars: &[String]) -> 
                 // After transform_prop_update_expressions runs, we get $.update_prop(x)
                 // and we must not convert x to x() inside that call
                 let is_inside_update_call = {
-                    let prefix_str = &result[..result
-                        .char_indices()
-                        .nth(i)
-                        .map(|(idx, _)| idx)
-                        .unwrap_or(i)];
+                    let prefix_str = char_to_byte.byte(CharOffset::new(i)).before(&result);
                     prefix_str.ends_with("$.update_prop(")
                         || prefix_str.ends_with("$.update_pre_prop(")
                         || prefix_str.ends_with("$.update_prop(")
@@ -264,11 +418,7 @@ pub(super) fn transform_prop_reads_in_expr(expr: &str, prop_vars: &[String]) -> 
                 // where propName is a prop source (getter function) that's equivalent to the
                 // derived computation. In this case we must NOT append `()`.
                 let is_sole_derived_arg = {
-                    let prefix_str = &result[..result
-                        .char_indices()
-                        .nth(i)
-                        .map(|(idx, _)| idx)
-                        .unwrap_or(i)];
+                    let prefix_str = char_to_byte.byte(CharOffset::new(i)).before(&result);
                     if prefix_str.ends_with("$.derived(") {
                         // Check that after the identifier is just `)` (possibly preceded by whitespace)
                         let mut k = after_idx;
@@ -281,35 +431,45 @@ pub(super) fn transform_prop_reads_in_expr(expr: &str, prop_vars: &[String]) -> 
                     }
                 };
 
-                // Check if this identifier is shadowed by a function parameter
-                let is_shadowed = is_shadowed_by_function_param(&chars, i, prop_name);
-
-                // Check if this identifier is an explicit object-literal property
-                // KEY (`{ foo: bar }`). A key is not a value read and must not be
-                // wrapped — `{ foo(): bar }` is invalid JS. (Shorthand `{ foo }`
-                // is handled below by expanding to `{ foo: foo() }`.)
-                let is_property_key = is_explicit_property_key(&chars, i, prop_name.len());
-
-                // Check if this identifier is the BINDING in an arrow-function
-                // parameter list (`name =>`, `(a, name) =>`). That declares a new
-                // local shadowing the prop and must not be wrapped as a read —
-                // `(name()) =>` is invalid syntax.
-                let is_arrow_param = is_arrow_param_binding(&chars, i, prop_name.len());
+                // The remaining guards are the expensive ones, so they sit behind
+                // the cheap character checks rather than beside them:
+                // - shadowed by a function parameter;
+                // - an explicit object-literal property KEY (`{ foo: bar }`),
+                //   which is not a value read — `{ foo(): bar }` is invalid JS
+                //   (shorthand `{ foo }` is expanded to `{ foo: foo() }` below);
+                // - the BINDING in an arrow-function parameter list (`name =>`,
+                //   `(a, name) =>`), which declares a new local shadowing the
+                //   prop — `(name()) =>` is invalid syntax;
+                // - a binding slot of a DESTRUCTURING parameter pattern
+                //   (`({ name }) =>`, `([name]) =>`), which is the same
+                //   declaration one bracket in — `({ name: name() }) =>` is not
+                //   a binding pattern.
+                // Under the oracle every guard is asked at every candidate
+                // position, not only where the cheap checks let the question
+                // through, so the comparison covers the guards themselves rather
+                // than the subset of call sites that survive short-circuiting.
+                if super::super::profile::index_oracle_enabled() {
+                    is_shadowed_by_function_param(&index, &chars, i, prop_name);
+                    is_explicit_property_key(&index, &chars, i, prop_len);
+                    is_arrow_param_binding(&index, &chars, i, prop_len);
+                    is_shorthand_object_property(&index, &chars, i, prop_len);
+                }
 
                 if before_ok
                     && after_ok
                     && !is_update_target
                     && !is_assignment_target
                     && !is_inside_update_call
-                    && !is_shadowed
                     && !is_sole_derived_arg
-                    && !is_property_key
-                    && !is_arrow_param
+                    && !is_shadowed_by_function_param(&index, &chars, i, prop_name)
+                    && !is_explicit_property_key(&index, &chars, i, prop_len)
+                    && !is_arrow_param_binding(&index, &chars, i, prop_len)
+                    && !is_destructured_param_binding(&index, &chars, i)
                 {
                     // Check if this is a shorthand property in an object literal.
                     // e.g., `{ value }` should become `{ value: value() }` not `{ value() }`
                     // because `{ value() }` is a method definition, not a property.
-                    let is_shorthand = is_shorthand_object_property(&chars, i, prop_name.len());
+                    let is_shorthand = is_shorthand_object_property(&index, &chars, i, prop_len);
 
                     if is_shorthand {
                         // Expand shorthand: { foo } -> { foo: foo() }
@@ -322,7 +482,7 @@ pub(super) fn transform_prop_reads_in_expr(expr: &str, prop_vars: &[String]) -> 
                         new_result.push_str(prop_name);
                         new_result.push_str("()");
                     }
-                    i += prop_name.len();
+                    i += prop_len;
                     continue;
                 }
             }
@@ -395,11 +555,7 @@ pub(super) fn transform_let_with_reexported_props(
                     .is_some_and(|b| b.kind == BindingKind::BindableProp)
             })
         } else {
-            let name = if let Some(eq_pos) = decl.find('=') {
-                decl[..eq_pos].trim()
-            } else {
-                decl
-            };
+            let name = if let Some(eq_pos) = decl.find('=') { decl[..eq_pos].trim() } else { decl };
             analysis
                 .root
                 .find_binding_any_scope(name)
@@ -596,6 +752,14 @@ pub(super) fn transform_let_with_reexported_props(
 /// e.g.: `export let click_1 = () => { logs.push('click_1'); }`
 /// where `logs` is a prop and should become `logs()` inside the default value.
 pub(super) fn apply_prop_reads_in_prop_default_values(line: &str, prop_vars: &[String]) -> String {
+    if let Some(rewritten) =
+        super::prop_source_reads_ast::wrap_prop_reads_in_defaults_ast(line, prop_vars)
+    {
+        return rewritten;
+    }
+
+    // A malformed intermediate cannot be parsed into spans. Keep this legacy
+    // path only for that explicitly unparseable fallback.
     // Split $.prop() calls into prefix + default-value + suffix, transform the default value only.
     // The pattern is: $.prop($$props, 'name', N, DEFAULT)
     // We find each $.prop( and extract the 4th argument.
@@ -614,20 +778,10 @@ pub(super) fn apply_prop_reads_in_prop_default_values(line: &str, prop_vars: &[S
         let mut i = 0;
         let mut depth = 1i32;
         let mut arg_count = 0;
-        let mut fourth_arg_start: Option<usize> = None;
-        let mut fourth_arg_end: Option<usize> = None;
+        let mut fourth_arg_start: Option<CharOffset> = None;
+        let mut fourth_arg_end: Option<CharOffset> = None;
         let mut in_string: Option<char> = None;
-        let mut char_byte_positions: Vec<usize> = Vec::new();
-
-        // Build char->byte mapping
-        {
-            let mut byte_pos = 0;
-            for ch in after_prop.chars() {
-                char_byte_positions.push(byte_pos);
-                byte_pos += ch.len_utf8();
-            }
-            char_byte_positions.push(byte_pos);
-        }
+        let char_to_byte = CharToByte::new(after_prop);
 
         while i < chars.len() {
             let c = chars[i];
@@ -655,7 +809,7 @@ pub(super) fn apply_prop_reads_in_prop_default_values(line: &str, prop_vars: &[S
                     if depth == 0 {
                         // End of $.prop() call
                         if fourth_arg_start.is_some() {
-                            fourth_arg_end = Some(i);
+                            fourth_arg_end = Some(CharOffset::new(i));
                         }
                         break;
                     }
@@ -669,7 +823,7 @@ pub(super) fn apply_prop_reads_in_prop_default_values(line: &str, prop_vars: &[S
                         while j < chars.len() && chars[j].is_whitespace() {
                             j += 1;
                         }
-                        fourth_arg_start = Some(j);
+                        fourth_arg_start = Some(CharOffset::new(j));
                     }
                 }
                 _ => {}
@@ -679,11 +833,10 @@ pub(super) fn apply_prop_reads_in_prop_default_values(line: &str, prop_vars: &[S
 
         // Now reconstruct the $.prop() call with transformed 4th arg
         if let (Some(start_char), Some(end_char)) = (fourth_arg_start, fourth_arg_end) {
-            let start_byte = char_byte_positions[start_char];
-            let end_byte = char_byte_positions[end_char];
-            let before_default = &after_prop[..start_byte];
-            let default_val = &after_prop[start_byte..end_byte];
-            let _after_default = &after_prop[end_byte..];
+            let start_byte = char_to_byte.byte(start_char);
+            let end_byte = char_to_byte.byte(end_char);
+            let before_default = start_byte.before(after_prop);
+            let default_val = start_byte.to(end_byte, after_prop);
 
             // A default value that is EXACTLY a bare prop identifier is the lazy
             // getter reference upstream passes directly (`get_prop_source`
@@ -700,6 +853,7 @@ pub(super) fn apply_prop_reads_in_prop_default_values(line: &str, prop_vars: &[S
                     default_val,
                     prop_vars,
                     &[],
+                    super::prop_source_reads_ast::ParseGoal::Expression,
                 )
                 .unwrap_or_else(|| default_val.to_string())
             };
@@ -707,9 +861,9 @@ pub(super) fn apply_prop_reads_in_prop_default_values(line: &str, prop_vars: &[S
             result.push_str(before_default);
             result.push_str(&transformed_default);
             // Continue parsing from after the closing paren
-            let close_byte = char_byte_positions[end_char + 1];
-            result.push_str(&after_prop[end_byte..close_byte]);
-            search_from = abs_pos + 7 + close_byte;
+            let close_byte = char_to_byte.byte(end_char.next());
+            result.push_str(end_byte.to(close_byte, after_prop));
+            search_from = abs_pos + 7 + close_byte.get();
         } else {
             // No 4th arg found, copy $.prop(...) as-is
             result.push_str("$.prop(");
@@ -731,7 +885,7 @@ pub(super) fn apply_prop_reads_in_prop_default_values(line: &str, prop_vars: &[S
                         ')' | ']' | '}' => {
                             d -= 1;
                             if d == 0 {
-                                ec = Some(ci);
+                                ec = Some(CharOffset::new(ci));
                                 break;
                             }
                         }
@@ -740,9 +894,9 @@ pub(super) fn apply_prop_reads_in_prop_default_values(line: &str, prop_vars: &[S
                 }
                 ec
             } {
-                let end_byte = char_byte_positions[end_char + 1];
-                result.push_str(&after_prop[..end_byte]);
-                search_from = abs_pos + 7 + end_byte;
+                let end_byte = char_to_byte.byte(end_char.next());
+                result.push_str(end_byte.before(after_prop));
+                search_from = abs_pos + 7 + end_byte.get();
             } else {
                 result.push_str(after_prop);
                 search_from = line.len();
@@ -777,19 +931,10 @@ pub(super) fn apply_store_reads_in_prop_default_values(
         let mut i = 0usize;
         let mut depth: i32 = 1;
         let mut arg_count = 0usize;
-        let mut fourth_arg_start: Option<usize> = None;
-        let mut fourth_arg_end: Option<usize> = None;
+        let mut fourth_arg_start: Option<CharOffset> = None;
+        let mut fourth_arg_end: Option<CharOffset> = None;
         let mut in_string: Option<char> = None;
-
-        let mut char_byte_positions: Vec<usize> = Vec::new();
-        {
-            let mut byte_pos = 0;
-            for ch in after_prop.chars() {
-                char_byte_positions.push(byte_pos);
-                byte_pos += ch.len_utf8();
-            }
-            char_byte_positions.push(byte_pos);
-        }
+        let char_to_byte = CharToByte::new(after_prop);
 
         while i < chars.len() {
             let c = chars[i];
@@ -811,7 +956,7 @@ pub(super) fn apply_store_reads_in_prop_default_values(
                     depth -= 1;
                     if depth == 0 {
                         if fourth_arg_start.is_some() {
-                            fourth_arg_end = Some(i);
+                            fourth_arg_end = Some(CharOffset::new(i));
                         }
                         break;
                     }
@@ -823,7 +968,7 @@ pub(super) fn apply_store_reads_in_prop_default_values(
                         while j < chars.len() && chars[j].is_whitespace() {
                             j += 1;
                         }
-                        fourth_arg_start = Some(j);
+                        fourth_arg_start = Some(CharOffset::new(j));
                     }
                 }
                 _ => {}
@@ -832,10 +977,10 @@ pub(super) fn apply_store_reads_in_prop_default_values(
         }
 
         if let (Some(start_char), Some(end_char)) = (fourth_arg_start, fourth_arg_end) {
-            let start_byte = char_byte_positions[start_char];
-            let end_byte = char_byte_positions[end_char];
-            let before_default = &after_prop[..start_byte];
-            let default_val = &after_prop[start_byte..end_byte];
+            let start_byte = char_to_byte.byte(start_char);
+            let end_byte = char_to_byte.byte(end_char);
+            let before_default = start_byte.before(after_prop);
+            let default_val = start_byte.to(end_byte, after_prop);
 
             // Only transform if default is wrapped in an arrow function.
             let trimmed_default = default_val.trim_start();
@@ -852,9 +997,9 @@ pub(super) fn apply_store_reads_in_prop_default_values(
             result.push_str("$.prop(");
             result.push_str(before_default);
             result.push_str(&transformed_default);
-            let close_byte = char_byte_positions[end_char + 1];
-            result.push_str(&after_prop[end_byte..close_byte]);
-            search_from = abs_pos + 7 + close_byte;
+            let close_byte = char_to_byte.byte(end_char.next());
+            result.push_str(end_byte.to(close_byte, after_prop));
+            search_from = abs_pos + 7 + close_byte.get();
         } else {
             result.push_str("$.prop(");
             let mut d: i32 = 1;
@@ -873,7 +1018,7 @@ pub(super) fn apply_store_reads_in_prop_default_values(
                     ')' | ']' | '}' => {
                         d -= 1;
                         if d == 0 {
-                            ec = Some(ci);
+                            ec = Some(CharOffset::new(ci));
                             break;
                         }
                     }
@@ -881,9 +1026,9 @@ pub(super) fn apply_store_reads_in_prop_default_values(
                 }
             }
             if let Some(end_char) = ec {
-                let end_byte = char_byte_positions[end_char + 1];
-                result.push_str(&after_prop[..end_byte]);
-                search_from = abs_pos + 7 + end_byte;
+                let end_byte = char_to_byte.byte(end_char.next());
+                result.push_str(end_byte.before(after_prop));
+                search_from = abs_pos + 7 + end_byte.get();
             } else {
                 result.push_str(after_prop);
                 search_from = line.len();
@@ -920,10 +1065,13 @@ pub(super) fn transform_export_let(line: &str, analysis: &ComponentAnalysis) -> 
     // Pattern: `export let name = value;` / `export var name = value;` / `export let name;`
     // Upstream keeps the source declaration keyword (`export var` → `var`),
     // rewriting only the initializer to `$.prop(...)`.
-    let kw = if trimmed.starts_with("export let ") {
-        "let"
-    } else if trimmed.starts_with("export var ") {
-        "var"
+    // The separator between `export` and the declaration keyword is any run of
+    // JS whitespace, not the single ASCII space a literal needle bakes in
+    // (#3470).
+    let (kw, declarator_at) = if let Some(at) = after_keywords(trimmed, &["export", "let"]) {
+        ("let", at)
+    } else if let Some(at) = after_keywords(trimmed, &["export", "var"]) {
+        ("var", at)
     } else {
         return line.to_string();
     };
@@ -946,28 +1094,32 @@ pub(super) fn transform_export_let(line: &str, analysis: &ComponentAnalysis) -> 
             // The indentation = leading whitespace of that line.
             let line_content = &line[line_start..export_pos];
             let ws_len = line_content.len()
-                - line_content
-                    .trim_start_matches(|c: char| c.is_ascii_whitespace())
-                    .len();
+                - line_content.trim_start_matches(|c: char| c.is_ascii_whitespace()).len();
             let indent = line[line_start..line_start + ws_len].to_string();
             (prefix, indent)
         } else {
-            (
-                String::new(),
-                line[..line.len() - line.trim_start().len()].to_string(),
-            )
+            (String::new(), line[..line.len() - line.trim_start().len()].to_string())
         }
     } else {
-        (
-            String::new(),
-            line[..line.len() - line.trim_start().len()].to_string(),
-        )
+        (String::new(), line[..line.len() - line.trim_start().len()].to_string())
     };
     let leading_ws = leading_ws_string.as_str();
 
     // Extract the declaration body after `export let ` / `export var `.
     // `trimmed` already points past any leading block comment.
-    let rest_raw = trimmed[11..].trim(); // After "export let " / "export var "
+    let rest_raw = trimmed[declarator_at..].trim();
+
+    // esrap flushes a same-line comment after the source declaration on the
+    // initializer node. Once that initializer becomes the final `$.prop`
+    // argument, the comment therefore belongs inside the generated call. Keep
+    // it separately while the comment-free declaration is split below.
+    let trailing_line_comment = rest_raw.rsplit('\n').next().and_then(|last_line| {
+        let comment_at = find_line_comment_position(last_line)?;
+        last_line[..comment_at]
+            .trim_end()
+            .ends_with(';')
+            .then(|| last_line[comment_at..].trim_end())
+    });
 
     // Strip trailing `// line comment` and `/* block comment */` from the declaration
     // text BEFORE splitting declarators.  Without this, a declaration like:
@@ -979,6 +1131,13 @@ pub(super) fn transform_export_let(line: &str, analysis: &ComponentAnalysis) -> 
     // Handle multiple declarators: export let a, b, c;
     // Split by comma, but be careful of commas inside default values
     let declarators = split_declarators(rest);
+    // Keep the source declarators alongside the comment-free copies used for
+    // semantic decisions. Comments attached to an initializer belong to that
+    // expression in upstream's AST and must survive when it becomes the last
+    // argument of `$.prop(...)`.
+    let raw_declarators = split_declarators(rest_raw);
+    let last_declarator_has_initializer =
+        declarators.last().is_some_and(|declarator| declarator.contains('='));
 
     let mut results = Vec::new();
 
@@ -995,7 +1154,7 @@ pub(super) fn transform_export_let(line: &str, analysis: &ComponentAnalysis) -> 
             .to_string()
     };
 
-    for decl in declarators {
+    for (declarator_index, decl) in declarators.into_iter().enumerate() {
         let decl = decl.trim();
         if decl.is_empty() {
             continue;
@@ -1014,6 +1173,13 @@ pub(super) fn transform_export_let(line: &str, analysis: &ComponentAnalysis) -> 
 
             // Remove trailing semicolon from value (after comment removal)
             let value = value.trim_end_matches(';').trim();
+            let initializer_comment = raw_declarators
+                .get(declarator_index)
+                .and_then(|raw_decl| raw_decl.find('=').map(|at| &raw_decl[at + 1..]))
+                .and_then(leading_initializer_comments);
+            let rendered_value = initializer_comment
+                .map(|comment| format!("{}{}", comment, value))
+                .unwrap_or_else(|| value.to_string());
 
             // Check if the value is a store accessor (e.g., $foo)
             // Store accessors like $foo become $foo() calls after transformation.
@@ -1038,7 +1204,7 @@ pub(super) fn transform_export_let(line: &str, analysis: &ComponentAnalysis) -> 
                     name,
                     prop_key_for(name),
                     flags,
-                    value
+                    rendered_value
                 ));
             } else {
                 // Check if the value is a "simple expression" that can be passed directly
@@ -1098,7 +1264,7 @@ pub(super) fn transform_export_let(line: &str, analysis: &ComponentAnalysis) -> 
                         name,
                         prop_key_for(name),
                         flags,
-                        value
+                        rendered_value
                     ));
                 } else if is_prop_ref {
                     // Prop/state identifier: pass directly (official compiler unwraps no-arg calls)
@@ -1109,7 +1275,7 @@ pub(super) fn transform_export_let(line: &str, analysis: &ComponentAnalysis) -> 
                         name,
                         prop_key_for(name),
                         flags,
-                        value
+                        rendered_value
                     ));
                 } else {
                     // Wrap non-simple values in a thunk: () => value
@@ -1117,6 +1283,9 @@ pub(super) fn transform_export_let(line: &str, analysis: &ComponentAnalysis) -> 
                     // OXC from parsing `() => {...}` as arrow with block body
                     // instead of arrow returning object literal
                     let lazy_arg = make_lazy_prop_arg(value);
+                    let lazy_arg = initializer_comment
+                        .map(|comment| restore_lazy_initializer_comment(&lazy_arg, comment))
+                        .unwrap_or(lazy_arg);
                     results.push(format!(
                         "{}{} {} = $.prop($$props, '{}', {}, {});",
                         leading_ws,
@@ -1144,10 +1313,64 @@ pub(super) fn transform_export_let(line: &str, analysis: &ComponentAnalysis) -> 
         }
     }
 
+    if last_declarator_has_initializer
+        && let Some(comment) = trailing_line_comment
+        && let Some(last) = results.last_mut()
+        && let Some(close) = last.rfind(')')
+    {
+        // A line comment must terminate before the call's closing paren. The
+        // program printer supplies the final indentation and multiline layout.
+        last.insert_str(close, &format!(" {}\n", comment));
+    }
+
     if comment_prefix.is_empty() {
         results.join("\n")
     } else {
         format!("{}{}", comment_prefix, results.join("\n"))
+    }
+}
+
+/// Return the leading comment trivia of an initializer, including the spacing
+/// after it. The caller concatenates this slice with the comment-free value.
+fn leading_initializer_comments(raw_value: &str) -> Option<&str> {
+    let bytes = raw_value.as_bytes();
+    let mut i = 0;
+    while bytes.get(i).is_some_and(u8::is_ascii_whitespace) {
+        i += 1;
+    }
+    let start = i;
+    let mut found = false;
+
+    loop {
+        if bytes.get(i..i + 2) == Some(b"/*") {
+            let close = raw_value[i + 2..].find("*/")?;
+            i += close + 4;
+            found = true;
+        } else if bytes.get(i..i + 2) == Some(b"//") {
+            i = raw_value[i + 2..].find('\n').map_or(bytes.len(), |newline| i + 2 + newline + 1);
+            found = true;
+        } else {
+            break;
+        }
+        while bytes.get(i).is_some_and(u8::is_ascii_whitespace) {
+            i += 1;
+        }
+    }
+
+    found.then(|| &raw_value[start..i])
+}
+
+/// A non-simple prop default is wrapped in a thunk. Its source comment stays
+/// attached to the original expression, so place it inside that wrapper; the
+/// optimized no-argument-call form has no wrapper and keeps the comment before
+/// the surviving callee.
+fn restore_lazy_initializer_comment(lazy_arg: &str, comment: &str) -> String {
+    if let Some(body) = lazy_arg.strip_prefix("() => (") {
+        format!("() => ({}{}", comment, body)
+    } else if let Some(body) = lazy_arg.strip_prefix("() => ") {
+        format!("() => {}{}", comment, body)
+    } else {
+        format!("{}{}", comment, lazy_arg)
     }
 }
 
@@ -1203,10 +1426,8 @@ pub(super) fn transform_destructured_export_let(
     // (which reference them). Reorder to match — `tmp` first, then the array
     // deriveds in creation order, then the prop declarators in walk order.
     let ordered = if let Some((tmp_decl, rest_decls)) = declarations.split_first() {
-        let (array_decls, prop_decls): (Vec<String>, Vec<String>) = rest_decls
-            .iter()
-            .cloned()
-            .partition(|d| d.trim_start().starts_with("$$array"));
+        let (array_decls, prop_decls): (Vec<String>, Vec<String>) =
+            rest_decls.iter().cloned().partition(|d| d.trim_start().starts_with("$$array"));
         let mut ordered = Vec::with_capacity(declarations.len());
         ordered.push(tmp_decl.clone());
         ordered.extend(array_decls);
@@ -1221,49 +1442,26 @@ pub(super) fn transform_destructured_export_let(
 
 /// Find the end position of a destructuring pattern in `{ ... } = RHS` or `[ ... ] = RHS`.
 /// Returns the position after the closing `}` or `]`.
+/// Byte offset just past the pattern's closing bracket, relative to `s` as passed.
 pub(super) fn find_destructuring_pattern_end(s: &str) -> Option<usize> {
-    let s = s.trim();
-    let first = s.chars().next()?;
-    if first != '{' && first != '[' {
+    let trimmed = s.trim_start();
+    let base = s.len() - trimmed.len();
+    if !matches!(trimmed.as_bytes().first(), Some(b'{' | b'[')) {
         return None;
     }
 
-    let chars: Vec<char> = s.chars().collect();
     let mut depth = 0;
-    let mut i = 0;
-    let mut in_string = false;
-    let mut string_char = ' ';
-
-    while i < chars.len() {
-        if in_string {
-            if chars[i] == '\\' {
-                i += 2;
-                continue;
+    for (i, c) in code_bytes(trimmed.as_bytes()) {
+        match c {
+            b'{' | b'[' => depth += 1,
+            b'}' | b']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(base + i + 1);
+                }
             }
-            if chars[i] == string_char {
-                in_string = false;
-            }
-            i += 1;
-            continue;
+            _ => {}
         }
-
-        if chars[i] == '\'' || chars[i] == '"' || chars[i] == '`' {
-            in_string = true;
-            string_char = chars[i];
-            i += 1;
-            continue;
-        }
-
-        if chars[i] == '{' || chars[i] == '[' {
-            depth += 1;
-        } else if chars[i] == '}' || chars[i] == ']' {
-            depth -= 1;
-            if depth == 0 {
-                return Some(i + 1);
-            }
-        }
-
-        i += 1;
     }
     None
 }
@@ -1294,10 +1492,8 @@ pub(super) fn extract_destructured_export_paths(
                 let rest_name = rest_name.trim();
                 let flags = calculate_prop_flags(rest_name, analysis, true);
                 // Rest elements need special handling
-                let body = format!(
-                    "const {{ {} }} = {}; return {};",
-                    rest_name, base_path, rest_name
-                );
+                let body =
+                    format!("const {{ {} }} = {}; return {};", rest_name, base_path, rest_name);
                 declarations.push(format!(
                     "{} = $.prop($$props, '{}', {}, () => {{ {} }})",
                     rest_name, rest_name, flags, body
@@ -1376,10 +1572,7 @@ pub(super) fn extract_destructured_export_paths(
         declarations.push(if has_rest {
             format!("{} = $.derived(() => $.to_array({}))", array_var, base_path)
         } else {
-            format!(
-                "{} = $.derived(() => $.to_array({}, {}))",
-                array_var, base_path, total_count
-            )
+            format!("{} = $.derived(() => $.to_array({}, {}))", array_var, base_path, total_count)
         });
 
         for (idx, elem) in elements.iter().enumerate() {
@@ -1659,9 +1852,8 @@ pub(super) fn flatten_destructured_let_as_declarators(
 /// Returns None if there's no `:` (simple property like `a` or `a = default`).
 /// Handles nested patterns so `b: { c }` splits into `("b", "{ c }")`.
 pub(super) fn split_property_key_value(prop: &str) -> Option<(&str, &str)> {
-    let chars: Vec<char> = prop.chars().collect();
     let mut depth = 0;
-    for (i, &ch) in chars.iter().enumerate() {
+    for (i, ch) in prop.char_indices() {
         match ch {
             '{' | '[' | '(' => depth += 1,
             '}' | ']' | ')' => depth -= 1,
@@ -1693,14 +1885,13 @@ pub(super) fn split_binding_name_default(s: &str) -> (&str, Option<&str>) {
 
 /// Split destructuring properties/elements by comma, respecting nesting depth.
 pub(super) fn split_destructuring_properties(s: &str) -> Vec<&str> {
-    let chars: Vec<char> = s.chars().collect();
     let mut result = Vec::new();
     let mut depth = 0;
     let mut start = 0;
     let mut in_string = false;
     let mut string_char = ' ';
 
-    for (i, &ch) in chars.iter().enumerate() {
+    for (i, ch) in s.char_indices() {
         if in_string {
             if ch == '\\' {
                 continue;
@@ -1831,6 +2022,72 @@ pub(super) fn calculate_prop_flags(
     }
 
     flags
+}
+
+/// The `$.prop($$props, <key>, …)` key exactly as upstream prints it. Upstream
+/// passes `b.literal(key.value)`, so a numeric destructuring key stays a
+/// **number** (and carries its value, not its spelling: `0x10` → `16`).
+pub(super) fn prop_key_js_literal(raw_key: &str, prop_name: &str) -> String {
+    if let Some(digits) = bigint_key_digits(raw_key) {
+        return digits;
+    }
+    if let Some(n) = numeric_key_value(raw_key) {
+        return crate::compiler::phases::phase3_transform::server::evaluate::js_number_to_string(n);
+    }
+    format!("'{}'", prop_name)
+}
+
+/// `Some(decimal digits)` when the raw key text is a BigInt literal. Parsed
+/// rather than pattern-matched, so `0x10n` / `1_000n` carry their value, and an
+/// identifier that merely ends in `n` is not mistaken for one.
+fn bigint_key_digits(raw_key: &str) -> Option<String> {
+    use oxc_allocator::Allocator;
+    use oxc_ast::ast::{Expression, Statement};
+    use oxc_parser::Parser;
+    use oxc_span::SourceType;
+
+    let trimmed = raw_key.trim();
+    if !trimmed.ends_with('n') || !trimmed.starts_with(|c: char| c.is_ascii_digit()) {
+        return None;
+    }
+    let alloc = Allocator::default();
+    let parsed = Parser::new(&alloc, trimmed, SourceType::mjs()).parse();
+    if parsed.panicked || !parsed.diagnostics.is_empty() {
+        return None;
+    }
+    let [Statement::ExpressionStatement(stmt)] = parsed.program.body.as_slice() else {
+        return None;
+    };
+    match &stmt.expression {
+        Expression::BigIntLiteral(lit) => Some(lit.value.to_string()),
+        _ => None,
+    }
+}
+
+/// `Some(value)` when the raw key text is a numeric literal, parsed rather than
+/// pattern-matched so `1e3` / `0x10` / `1_000` carry their value.
+fn numeric_key_value(raw_key: &str) -> Option<f64> {
+    use oxc_allocator::Allocator;
+    use oxc_ast::ast::{Expression, Statement};
+    use oxc_parser::Parser;
+    use oxc_span::SourceType;
+
+    let trimmed = raw_key.trim();
+    if !trimmed.starts_with(|c: char| c.is_ascii_digit() || c == '.') {
+        return None;
+    }
+    let alloc = Allocator::default();
+    let parsed = Parser::new(&alloc, trimmed, SourceType::mjs()).parse();
+    if parsed.panicked || !parsed.diagnostics.is_empty() {
+        return None;
+    }
+    let [Statement::ExpressionStatement(stmt)] = parsed.program.body.as_slice() else {
+        return None;
+    };
+    match &stmt.expression {
+        Expression::NumericLiteral(lit) => Some(lit.value),
+        _ => None,
+    }
 }
 
 /// Check if a string is a valid JavaScript identifier.
@@ -2052,7 +2309,12 @@ fn ast_expr_is_simple(value: &str, analysis: &ComponentAnalysis) -> Option<bool>
     let alloc = Allocator::default();
     // Wrap in parens so an object literal (`{...}`) parses as an expression, not a block.
     let src = format!("({})", value.trim());
+    let _pt = super::super::profile::timer_start();
     let parsed = Parser::new(&alloc, &src, SourceType::mjs()).parse();
+    super::super::profile::record_direct_parse(
+        super::super::profile::timer_elapsed(_pt),
+        src.len(),
+    );
     if parsed.panicked || !parsed.diagnostics.is_empty() {
         return None;
     }
@@ -2060,6 +2322,100 @@ fn ast_expr_is_simple(value: &str, analysis: &ComponentAnalysis) -> Option<bool>
         return None;
     };
     Some(expr_is_simple(&stmt.expression, analysis))
+}
+
+/// Exact `should_proxy` check via the OXC parser, mirroring upstream's
+/// `should_proxy(node, scope)` in
+/// `packages/svelte/src/compiler/phases/3-transform/client/utils.js`.
+///
+/// Returns `Some(false)` when the top-level node is a value upstream never
+/// proxies (`Literal`, `TemplateLiteral`, arrow/function expression,
+/// `UnaryExpression`, `BinaryExpression`, or the `undefined` identifier),
+/// `Some(true)` otherwise, and `None` when the text cannot be parsed as a single
+/// expression (callers then fall back to the string heuristic).
+///
+/// `analysis` enables upstream's one-level scope recursion: a bare identifier
+/// default resolves to its (non-reassigned, non-function) binding's initial and
+/// that initial's node type decides proxy-ability — e.g. `= DEFAULT_ALPHA` where
+/// `const DEFAULT_ALPHA = 1` is not proxied. Rune bindings need special care:
+/// rsvelte stores the rune argument in `binding.initial`, while upstream keeps
+/// the complete `$state(...)` / `$derived(...)` CallExpression, which is always
+/// proxyable. Pass `None` to disable recursion (as upstream does by threading a
+/// null scope on the recursed call), so it is at most one level deep.
+fn ast_should_proxy(value: &str, analysis: Option<&ComponentAnalysis>) -> Option<bool> {
+    use oxc_allocator::Allocator;
+    use oxc_ast::ast::Statement;
+    use oxc_parser::Parser;
+    use oxc_span::SourceType;
+
+    let alloc = Allocator::default();
+    // Wrap in parens so an object literal (`{...}`) parses as an expression.
+    let src = format!("({})", value.trim());
+    let _pt = super::super::profile::timer_start();
+    let parsed = Parser::new(&alloc, &src, SourceType::mjs()).parse();
+    super::super::profile::record_direct_parse(
+        super::super::profile::timer_elapsed(_pt),
+        src.len(),
+    );
+    if parsed.panicked || !parsed.diagnostics.is_empty() {
+        return None;
+    }
+    let Some(Statement::ExpressionStatement(stmt)) = parsed.program.body.first() else {
+        return None;
+    };
+    Some(expr_should_proxy(&stmt.expression, analysis))
+}
+
+/// Node-type predicate matching upstream `should_proxy` (`utils.js`), with the
+/// one-level scope recursion when `analysis` is `Some`.
+fn expr_should_proxy(
+    expr: &oxc_ast::ast::Expression,
+    analysis: Option<&ComponentAnalysis>,
+) -> bool {
+    use oxc_ast::ast::Expression;
+    match expr {
+        Expression::ParenthesizedExpression(p) => expr_should_proxy(&p.expression, analysis),
+        Expression::NumericLiteral(_)
+        | Expression::StringLiteral(_)
+        | Expression::BooleanLiteral(_)
+        | Expression::NullLiteral(_)
+        | Expression::BigIntLiteral(_)
+        | Expression::RegExpLiteral(_)
+        | Expression::TemplateLiteral(_)
+        | Expression::ArrowFunctionExpression(_)
+        | Expression::FunctionExpression(_)
+        | Expression::UnaryExpression(_)
+        | Expression::BinaryExpression(_) => false,
+        Expression::Identifier(id) => {
+            if id.name.as_str() == "undefined" {
+                return false;
+            }
+            // Upstream: recurse into a resolvable, non-reassigned, non-function
+            // binding's initial (with a `null` scope, hence at most one level).
+            if let Some(analysis) = analysis
+                && let Some(idx) = analysis.root.find_binding_any_scope(id.name.as_str())
+                && let Some(binding) = analysis.root.bindings.get(idx)
+                && !binding.reassigned
+                && !binding.initial_is_function
+            {
+                // Upstream recurses into the declaration initializer node. A
+                // rune declaration's initializer is the call itself, not its
+                // argument, so even `$state(1)` is a proxyable CallExpression.
+                // `binding.initial` deliberately stores `1` for other analysis
+                // consumers; `init_rune` preserves the lost outer node shape.
+                if binding.init_rune.is_some() {
+                    return true;
+                }
+                let Some(initial) = binding.initial.as_deref() else {
+                    return true;
+                };
+                // `None` disables further identifier recursion (upstream `null` scope).
+                return ast_should_proxy(initial, None).unwrap_or(true);
+            }
+            true
+        }
+        _ => true,
+    }
 }
 
 /// `true` if `name` is a reactive binding that prop-read transforms rewrite into
@@ -2134,9 +2490,7 @@ pub(super) fn make_lazy_prop_arg(value: &str) -> String {
                 .next()
                 .map(|c| c.is_alphabetic() || c == '_' || c == '$')
                 .unwrap_or(false)
-            && callee
-                .chars()
-                .all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+            && callee.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '$')
         {
             return callee.to_string();
         }
@@ -2237,31 +2591,64 @@ pub(super) fn split_declarators(s: &str) -> Vec<&str> {
     result
 }
 
-/// Find the position of a line comment (//) that is not inside a string.
-pub(super) fn find_line_comment_position(code: &str) -> Option<usize> {
-    let mut in_string = false;
-    let mut string_char = ' ';
-    let mut chars = code.chars().peekable();
-    let mut pos = 0;
+/// The last code byte before `at`, ignoring whitespace.
+fn prev_code_byte(bytes: &[u8], at: usize) -> Option<u8> {
+    let mut end = at;
+    while end > 0 && bytes[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    (end > 0).then(|| bytes[end - 1])
+}
 
-    while let Some(c) = chars.next() {
-        if in_string {
-            if c == '\\' {
-                // Skip escaped character
-                chars.next();
-                pos += 2;
+/// Find the position of a line comment (//) that is not inside a string.
+///
+/// Every delimiter tested for is ASCII, and a UTF-8 continuation byte is never
+/// one of them, so the scan is byte-level while the returned offset stays a
+/// valid char boundary.
+pub(super) fn find_line_comment_position(code: &str) -> Option<usize> {
+    let bytes = code.as_bytes();
+    let len = bytes.len();
+    let mut in_string: Option<u8> = None;
+    let mut prev: Option<u8> = None;
+    let mut i = 0;
+
+    while i < len {
+        let c = bytes[i];
+        if let Some(quote) = in_string {
+            if c == b'\\' {
+                i += 2;
                 continue;
             }
-            if c == string_char {
-                in_string = false;
+            if c == quote {
+                in_string = None;
+                prev = Some(c);
             }
-        } else if c == '"' || c == '\'' || c == '`' {
-            in_string = true;
-            string_char = c;
-        } else if c == '/' && chars.peek() == Some(&'/') {
-            return Some(pos);
+            i += 1;
+            continue;
         }
-        pos += c.len_utf8();
+        if c == b'"' || c == b'\'' || c == b'`' {
+            in_string = Some(c);
+            prev = Some(c);
+            i += 1;
+            continue;
+        }
+        if c == b'/' && bytes.get(i + 1) == Some(&b'/') {
+            return Some(i);
+        }
+        // `/^https?:\/\//` ends in two adjacent slashes that would otherwise
+        // read as the start of a comment.
+        if c == b'/'
+            && let Some((end, false)) = skip_opaque(bytes, i, prev)
+        {
+            // A regex ends an expression, like a closing paren.
+            prev = Some(b')');
+            i = end;
+            continue;
+        }
+        if !c.is_ascii_whitespace() {
+            prev = Some(c);
+        }
+        i += 1;
     }
     None
 }
@@ -2355,6 +2742,119 @@ pub(super) fn strip_js_comments(code: &str) -> String {
 ///
 /// Multiple prop declarations are combined into a single `let` statement with
 /// comma-separated declarators, matching the official compiler output format.
+/// Byte span of the destructuring pattern's braces. A `/** @type {Props} */`
+/// annotation puts braces ahead of the pattern, so only code positions count.
+fn props_pattern_span(trimmed: &str) -> Option<(usize, usize)> {
+    let mut open = None;
+    let mut close = None;
+    for (i, c) in code_bytes(trimmed.as_bytes()) {
+        match c {
+            b'{' if open.is_none() => open = Some(i),
+            b'}' => close = Some(i),
+            _ => {}
+        }
+    }
+    Some((open?, close?))
+}
+
+/// A declarator part's comment layout: comments before its first code token,
+/// the code range between (interior comments included), and comments after the
+/// last code token. All offsets are absolute in the pattern text the parts were
+/// split from; `part_off` is the part's offset there.
+fn scan_part_comments(
+    part_off: usize,
+    part: &str,
+) -> (Vec<(usize, usize)>, Option<(usize, usize)>, Vec<(usize, usize)>) {
+    let bytes = part.as_bytes();
+    let mut comments: Vec<(usize, usize)> = Vec::new();
+    let mut first_code: Option<usize> = None;
+    let mut last_code_end: usize = 0;
+    let mut prev: Option<u8> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        if let Some((next, is_comment)) = skip_opaque(bytes, i, prev) {
+            if is_comment {
+                comments.push((i, next));
+            } else {
+                first_code.get_or_insert(i);
+                last_code_end = next;
+                prev = next.checked_sub(1).and_then(|k| bytes.get(k)).copied();
+            }
+            i = next;
+            continue;
+        }
+        if !bytes[i].is_ascii_whitespace() {
+            first_code.get_or_insert(i);
+            last_code_end = i + 1;
+            prev = Some(bytes[i]);
+        }
+        i += 1;
+    }
+    let Some(first) = first_code else {
+        let all = comments.into_iter().map(|(s, e)| (part_off + s, part_off + e)).collect();
+        return (all, None, Vec::new());
+    };
+    let lead = comments
+        .iter()
+        .filter(|&&(_, e)| e <= first)
+        .map(|&(s, e)| (part_off + s, part_off + e))
+        .collect();
+    let trail = comments
+        .iter()
+        .filter(|&&(s, _)| s >= last_code_end)
+        .map(|&(s, e)| (part_off + s, part_off + e))
+        .collect();
+    (lead, Some((part_off + first, part_off + last_code_end)), trail)
+}
+
+/// esrap's `flush_trailing_comments` for the pattern text: a comment on the
+/// same line as the previous kept declarator's default value lands inside that
+/// `$.prop(...)` call (before its closing paren, a `//` one forcing a line
+/// break); anything else queues to flush before the next kept declarator.
+fn attach_or_pend(
+    comments: &[(usize, usize)],
+    props_str: &str,
+    declarators: &mut [String],
+    pending: &mut Vec<(usize, String)>,
+    prev_value_end: Option<usize>,
+    trail_broken: &mut bool,
+) {
+    for &(start, end) in comments {
+        let text = &props_str[start..end];
+        let attachable = pending.is_empty()
+            && !*trail_broken
+            && prev_value_end.is_some_and(|e| e <= start && !props_str[e..start].contains('\n'));
+        if attachable
+            && let Some(last) = declarators.last_mut()
+            && let Some(pos) = last.rfind(')')
+        {
+            let is_line = text.starts_with("//");
+            let insert = if is_line { format!(" {}\n", text) } else { format!(" {}", text) };
+            last.insert_str(pos, &insert);
+            if is_line {
+                *trail_broken = true;
+            }
+            continue;
+        }
+        pending.push((end, text.to_string()));
+    }
+}
+
+/// Render queued comments ahead of the kept declarator starting at `to`,
+/// keeping each one's source line break toward it.
+fn flush_pending_before(pending: &mut Vec<(usize, String)>, props_str: &str, to: usize) -> String {
+    let mut out = String::new();
+    for (end, text) in pending.drain(..) {
+        out.push_str(&text);
+        if props_str[end..to].contains('\n') {
+            out.push('\n');
+        } else {
+            out.push(' ');
+        }
+    }
+    out
+}
+
 pub(super) fn transform_props_destructuring(
     line: &str,
     prop_source_vars: &[String],
@@ -2363,10 +2863,44 @@ pub(super) fn transform_props_destructuring(
     read_only_props: &[(String, String)],
     dev: bool,
 ) -> Option<String> {
+    // A comment between the declarator's `=` and `$props()` is not part of the
+    // object pattern, but it still participates in esrap's comment cursor.
+    // Save it before canonicalization removes that whole separator. The byte
+    // positions are relative to the original trimmed declaration so we can
+    // distinguish a same-line comment (which may trail a default value inside
+    // `$.prop(...)`) from one that has already crossed a line boundary.
+    let original_trimmed = line.trim();
+    let props_call = original_trimmed.rfind("$props")?;
+    let assignment = code_bytes(&original_trimmed.as_bytes()[..props_call])
+        .filter_map(|(offset, byte)| (byte == b'=').then_some(offset))
+        .last()?;
+    let initializer_comments: Vec<(usize, usize, String)> =
+        crate::compiler::phases::phase3_transform::server::transform_script::extract_comments_from_snippet_with_pos(
+            &original_trimmed[assignment + 1..props_call],
+        )
+        .into_iter()
+        .map(|(start, comment)| {
+            let start = assignment + 1 + start;
+            let end = start + comment.len();
+            (start, end, comment)
+        })
+        .collect();
+
+    // The comments above have to survive in their output slots, but the text
+    // helper's existing shape matchers need to see the declaration as
+    // `= $props()`. Remove only the saved initializer separator from the copy
+    // that is parsed below; all placement decisions keep using offsets into
+    // `original_trimmed`.
+    let mut transform_input = original_trimmed.to_string();
+    if !initializer_comments.is_empty() {
+        transform_input.replace_range(assignment + 1..props_call, " ");
+    }
+
     // Canonicalise spacing in the `$props()` call (`= $props ()` → `= $props()`)
     // so the byte matchers below recognise whitespace variants. The AST detector
     // that gates this helper already confirmed it is a `$props()` rune call.
-    let line = crate::compiler::phases::phase3_transform::utils::canonicalize_props_call(line);
+    let line =
+        crate::compiler::phases::phase3_transform::utils::canonicalize_props_call(&transform_input);
     let trimmed = line.trim();
 
     // Determine the original declaration keyword (let or const) to preserve it
@@ -2396,11 +2930,15 @@ pub(super) fn transform_props_destructuring(
         }
 
         // Always generate $.rest_props() for identifier pattern (no is_prop_source check)
+        // In dev the binding's own name is passed along so unknown-prop warnings
+        // can name it.
+        let dev_name = if dev { format!(", '{}'", var_name) } else { String::new() };
         return Some(format!(
-            "{} {} = $.rest_props($$props, [{}]);\n",
+            "{} {} = $.rest_props($$props, [{}]{});\n",
             decl_keyword,
             var_name,
-            seen.join(", ")
+            seen.join(", "),
+            dev_name
         ));
     }
 
@@ -2410,8 +2948,7 @@ pub(super) fn transform_props_destructuring(
     }
 
     // Extract the part between { and }
-    let open_brace = trimmed.find('{')?;
-    let close_brace = trimmed.rfind('}')?;
+    let (open_brace, close_brace) = props_pattern_span(trimmed)?;
     let props_str = &trimmed[open_brace + 1..close_brace];
 
     // Parse each prop - collect declarators for combining into a single `let` statement
@@ -2420,67 +2957,121 @@ pub(super) fn transform_props_destructuring(
     // Track "seen" prop names for $.rest_props() exclusion list.
     // Reference: VariableDeclaration.js lines 45-46
     // Starts with internal prop names that should always be excluded.
-    let mut seen: Vec<String> = vec![
-        "$$slots".to_string(),
-        "$$events".to_string(),
-        "$$legacy".to_string(),
-    ];
+    // Holds each entry's JS literal spelling, because a numeric key is excluded
+    // as a number upstream (`b.literal(key.value)`), not as a string.
+    let mut seen: Vec<String> =
+        vec!["'$$slots'".to_string(), "'$$events'".to_string(), "'$$legacy'".to_string()];
     if analysis.custom_element.is_some() {
-        seen.push("$$host".to_string());
+        seen.push("'$$host'".to_string());
     }
 
-    for prop_part in split_declarators(props_str) {
-        let prop_part = prop_part.trim();
-        if prop_part.is_empty() {
-            continue;
-        }
+    // Comments that bracket a declarator ride the esrap comment cursor
+    // upstream: a same-line one after a kept default lands inside that
+    // `$.prop(...)` call, everything else flushes before the next kept
+    // declarator, and leftovers spill past the statement's `;`.
+    let mut pending: Vec<(usize, String)> = Vec::new();
+    let mut prev_value_end: Option<usize> = None;
+    let mut trail_broken = false;
 
-        // Strip leading comment lines (e.g., `// eslint-disable-next-line ...`)
-        // These can appear before prop names in destructuring patterns and must not
-        // be included in the prop name string.
-        let prop_part = {
-            let mut s = prop_part;
-            loop {
-                if s.starts_with("//") {
-                    // Single-line comment: skip to end of line
-                    if let Some(newline_pos) = s.find('\n') {
-                        s = s[newline_pos + 1..].trim();
-                        continue;
-                    } else {
-                        // Entire prop_part is a comment - skip it
-                        s = "";
-                        break;
-                    }
-                } else if s.starts_with("/*") {
-                    // Block comment: skip to closing */
-                    if let Some(end_pos) = s.find("*/") {
-                        s = s[end_pos + 2..].trim();
-                        continue;
-                    } else {
-                        s = "";
-                        break;
-                    }
-                }
-                break;
-            }
-            s
+    for raw_part in split_declarators(props_str) {
+        let part_off = raw_part.as_ptr() as usize - props_str.as_ptr() as usize;
+        let (lead, core, trail) = scan_part_comments(part_off, raw_part);
+        attach_or_pend(
+            &lead,
+            props_str,
+            &mut declarators,
+            &mut pending,
+            prev_value_end,
+            &mut trail_broken,
+        );
+        let Some((core_start, core_end)) = core else {
+            continue;
         };
-        if prop_part.is_empty() {
-            continue;
+        let prop_part = &props_str[core_start..core_end];
+        let before_len = declarators.len();
+        let value_located = emit_prop_declarator(
+            prop_part,
+            &mut declarators,
+            &mut seen,
+            prop_source_vars,
+            exported_names,
+            analysis,
+            read_only_props,
+            dev,
+        );
+        if declarators.len() > before_len {
+            if !pending.is_empty() {
+                let prefix = flush_pending_before(&mut pending, props_str, core_start);
+                declarators[before_len].insert_str(0, &prefix);
+            }
+            prev_value_end = value_located.then_some(core_end);
+            trail_broken = false;
         }
+        attach_or_pend(
+            &trail,
+            props_str,
+            &mut declarators,
+            &mut pending,
+            prev_value_end,
+            &mut trail_broken,
+        );
+    }
 
+    // The original initializer comments come after every pattern node. Feed
+    // them through the same trailing-comment rule as comments inside the
+    // pattern. A default value is the final located output node, so a same-line
+    // comment lands before the generated call's `)`; a plain/rest binding has
+    // no located generated initializer and the comment remains pending until
+    // after the declaration statement.
+    for (start, end, text) in initializer_comments {
+        let value_end = prev_value_end.map(|offset| open_brace + 1 + offset);
+        let attachable = pending.is_empty()
+            && !trail_broken
+            && value_end.is_some_and(|value_end| {
+                value_end <= start
+                    && !original_trimmed[value_end..start]
+                        .contains(['\n', '\r', '\u{2028}', '\u{2029}'])
+            });
+        if attachable
+            && let Some(last) = declarators.last_mut()
+            && let Some(pos) = last.rfind(')')
+        {
+            let is_line = text.starts_with("//");
+            let insert = if is_line { format!(" {}\n", text) } else { format!(" {}", text) };
+            last.insert_str(pos, &insert);
+            if is_line {
+                trail_broken = true;
+            }
+        } else {
+            pending.push((end, text));
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_prop_declarator(
+        prop_part: &str,
+        declarators: &mut Vec<String>,
+        seen: &mut Vec<String>,
+        prop_source_vars: &[String],
+        exported_names: &[String],
+        analysis: &ComponentAnalysis,
+        read_only_props: &[(String, String)],
+        dev: bool,
+    ) -> bool {
         // Handle rest element: ...rest
         // Reference: VariableDeclaration.js lines 96-107
         if let Some(rest_name) = prop_part.strip_prefix("...") {
             let rest_name = rest_name.trim();
             // Generate: rest_name = $.rest_props($$props, ['$$slots', '$$events', '$$legacy', ...seen_props])
-            let seen_literals: Vec<String> = seen.iter().map(|s| format!("'{}'", s)).collect();
+            let seen_literals: Vec<String> = seen.clone();
+            let dev_name = if dev { format!(", '{}'", rest_name) } else { String::new() };
             declarators.push(format!(
-                "{} = $.rest_props($$props, [{}])",
+                "{} = $.rest_props($$props, [{}]{})",
                 rest_name,
-                seen_literals.join(", ")
+                seen_literals.join(", "),
+                dev_name
             ));
-            continue;
+            return false;
         }
 
         // Handle: name = default_value (always generate for props with defaults)
@@ -2492,19 +3083,20 @@ pub(super) fn transform_props_destructuring(
             // In destructuring, `disabled: disabledProp = false` means:
             //   prop_name = "disabled" (the actual prop)
             //   local_name = "disabledProp" (the local variable)
-            let (prop_name, local_name) = if let Some(colon_pos) = name_part.find(':') {
-                let pn = name_part[..colon_pos].trim();
+            let (prop_key, local_name) = if let Some(colon_pos) = name_part.find(':') {
+                let raw_key = name_part[..colon_pos].trim();
                 // Strip surrounding quotes from prop name (e.g., 'weird-name': localVar)
-                let pn = pn
+                let pn = raw_key
                     .strip_prefix('\'')
                     .and_then(|s| s.strip_suffix('\''))
-                    .or_else(|| pn.strip_prefix('"').and_then(|s| s.strip_suffix('"')))
-                    .unwrap_or(pn);
+                    .or_else(|| raw_key.strip_prefix('"').and_then(|s| s.strip_suffix('"')))
+                    .unwrap_or(raw_key);
                 let ln = name_part[colon_pos + 1..].trim();
-                (pn, ln)
+                (prop_key_js_literal(raw_key, pn), ln)
             } else {
-                (name_part, name_part)
+                (format!("'{}'", name_part), name_part)
             };
+            let prop_key = prop_key.as_str();
 
             // Strip $bindable() wrapper: $bindable(value) -> value
             // Reference: VariableDeclaration.js - unwrap_bindable()
@@ -2521,8 +3113,28 @@ pub(super) fn transform_props_destructuring(
                     // is NOT a prop source and should NOT get a $.prop() declaration.
                     // Reference: is_prop_source() in utils.js
                     let is_source = if analysis.runes {
-                        // In runes mode, check binding properties
-                        let binding = analysis.root.bindings.iter().find(|b| b.name == local_name);
+                        // In runes mode, check binding properties.
+                        // Resolve to the *prop* binding by kind, not merely by name:
+                        // a same-named binding from another scope (e.g. a module-script
+                        // function parameter `context` sharing the prop's name) can
+                        // otherwise shadow the lookup and hide the prop's `reassigned`
+                        // flag, wrongly demoting a reassigned no-default `$bindable()`
+                        // to a plain `$$props.x` member access. Mirrors upstream's
+                        // scope-based `context.state.scope.get(id.name)` resolution.
+                        let binding = analysis
+                            .root
+                            .bindings
+                            .iter()
+                            .find(|b| {
+                                b.name == local_name
+                                    && matches!(
+                                        b.kind,
+                                        BindingKind::Prop | BindingKind::BindableProp
+                                    )
+                            })
+                            .or_else(|| {
+                                analysis.root.bindings.iter().find(|b| b.name == local_name)
+                            });
                         if let Some(b) = binding {
                             analysis.accessors || b.reassigned || b.initial.is_some() || b.mutated
                         } else {
@@ -2533,15 +3145,15 @@ pub(super) fn transform_props_destructuring(
                         // In legacy mode, all props are sources
                         true
                     };
-                    seen.push(prop_name.to_string());
+                    seen.push(prop_key.to_string());
                     if is_source {
                         let flags = calculate_prop_flags(local_name, analysis, false);
                         declarators.push(format!(
-                            "{} = $.prop($$props, '{}', {})",
-                            local_name, prop_name, flags
+                            "{} = $.prop($$props, {}, {})",
+                            local_name, prop_key, flags
                         ));
                     }
-                    continue;
+                    return false;
                 }
                 inner
             } else {
@@ -2549,7 +3161,7 @@ pub(super) fn transform_props_destructuring(
             };
 
             // Add this prop name to the "seen" list for rest_props exclusion
-            seen.push(prop_name.to_string());
+            seen.push(prop_key.to_string());
 
             // Transform default value: apply read-only prop substitutions
             let default_value = {
@@ -2572,6 +3184,7 @@ pub(super) fn transform_props_destructuring(
                         &dv,
                         prop_source_vars,
                         &[],
+                        super::prop_source_reads_ast::ParseGoal::Expression,
                     )
                     .unwrap_or(dv);
                 }
@@ -2583,7 +3196,7 @@ pub(super) fn transform_props_destructuring(
             // Only $bindable() defaults get proxy-wrapped when should_proxy returns true.
             // Regular prop defaults are NOT proxied.
             // Reference: VariableDeclaration.js lines 80-84
-            let needs_proxy = was_bindable && should_proxy_prop_default(default_value);
+            let needs_proxy = was_bindable && should_proxy_prop_default(default_value, analysis);
             let proxy_wrapped = if needs_proxy {
                 if dev {
                     format!("$.tag_proxy($.proxy({}), '{}')", default_value, local_name)
@@ -2607,8 +3220,8 @@ pub(super) fn transform_props_destructuring(
 
             if is_simple {
                 declarators.push(format!(
-                    "{} = $.prop($$props, '{}', {}, {})",
-                    local_name, prop_name, flags, proxy_wrapped
+                    "{} = $.prop($$props, {}, {}, {})",
+                    local_name, prop_key, flags, proxy_wrapped
                 ));
             } else {
                 // Wrap non-simple values in a thunk: () => value
@@ -2616,28 +3229,30 @@ pub(super) fn transform_props_destructuring(
                 // OXC from parsing `() => {...}` as arrow with block body
                 let lazy_arg = make_lazy_prop_arg(&proxy_wrapped);
                 declarators.push(format!(
-                    "{} = $.prop($$props, '{}', {}, {})",
-                    local_name, prop_name, flags, lazy_arg
+                    "{} = $.prop($$props, {}, {}, {})",
+                    local_name, prop_key, flags, lazy_arg
                 ));
             }
+            true
         } else {
             // No default value - handle rename pattern: `originalProp: localVar`
-            let (prop_name, local_name) = if let Some(colon_pos) = prop_part.find(':') {
-                let pn = prop_part[..colon_pos].trim();
+            let (prop_key, local_name) = if let Some(colon_pos) = prop_part.find(':') {
+                let raw_key = prop_part[..colon_pos].trim();
                 // Strip surrounding quotes from prop name
-                let pn = pn
+                let pn = raw_key
                     .strip_prefix('\'')
                     .and_then(|s| s.strip_suffix('\''))
-                    .or_else(|| pn.strip_prefix('"').and_then(|s| s.strip_suffix('"')))
-                    .unwrap_or(pn);
+                    .or_else(|| raw_key.strip_prefix('"').and_then(|s| s.strip_suffix('"')))
+                    .unwrap_or(raw_key);
                 let ln = prop_part[colon_pos + 1..].trim();
-                (pn, ln)
+                (prop_key_js_literal(raw_key, pn), ln)
             } else {
-                (prop_part, prop_part)
+                (format!("'{}'", prop_part), prop_part)
             };
+            let prop_key = prop_key.as_str();
 
             // Add to seen list for rest_props exclusion
-            seen.push(prop_name.to_string());
+            seen.push(prop_key.to_string());
 
             // Only generate $.prop() if this is a source prop or exported
             let is_exported = exported_names.contains(&local_name.to_string());
@@ -2645,20 +3260,23 @@ pub(super) fn transform_props_destructuring(
                 // Calculate flags using the official logic (no lazy initial for props without defaults)
                 let flags = calculate_prop_flags(local_name, analysis, false);
 
-                declarators.push(format!(
-                    "{} = $.prop($$props, '{}', {})",
-                    local_name, prop_name, flags
-                ));
+                declarators
+                    .push(format!("{} = $.prop($$props, {}, {})", local_name, prop_key, flags));
             }
             // Read-only props without defaults are accessed directly via $$props.propName
+            false
         }
     }
+
+    // Comments left after the last kept declarator flush before whatever
+    // statement follows — past this statement's `;`.
+    let tail: String = pending.iter().map(|(_, text)| format!("\n{}", text)).collect();
 
     // Combine all declarators into a single `let` statement with comma separators
     if declarators.is_empty() {
         Some(String::new())
     } else if declarators.len() == 1 {
-        Some(format!("{} {};\n", decl_keyword, declarators[0]))
+        Some(format!("{} {};{}\n", decl_keyword, declarators[0], tail))
     } else {
         // Multi-prop: combine with comma + newline + tab indent, matching official compiler
         let mut result = format!("{} {}", decl_keyword, declarators[0]);
@@ -2666,7 +3284,9 @@ pub(super) fn transform_props_destructuring(
             result.push_str(",\n\t");
             result.push_str(decl);
         }
-        result.push_str(";\n");
+        result.push(';');
+        result.push_str(&tail);
+        result.push('\n');
         Some(result)
     }
 }
@@ -2705,16 +3325,17 @@ pub(super) fn transform_rest_prop_member_access(line: &str, rest_prop_vars: &[St
                 new_result.push_str(mat.as_str());
             } else {
                 // Find the end of the property name
-                let mut prop_end = 0;
+                let mut prop_end = CharOffset::ZERO;
                 for (i, c) in after_match.chars().enumerate() {
                     if c.is_alphanumeric() || c == '_' || c == '$' {
-                        prop_end = i + 1;
+                        prop_end = CharOffset::new(i).next();
                     } else {
                         break;
                     }
                 }
 
-                let after_prop = &after_match[prop_end..].trim_start();
+                let char_to_byte = CharToByte::new(after_match);
+                let after_prop = char_to_byte.byte(prop_end).after(after_match).trim_start();
                 let is_direct_assignment =
                     after_prop.starts_with('=') && !after_prop.starts_with("==");
                 let has_deeper_access = after_prop.starts_with('.');
@@ -2764,18 +3385,24 @@ pub(super) fn is_valid_js_identifier(s: &str) -> bool {
 /// Reference: validate_mutation() in shared/utils.js
 pub(super) fn wrap_prop_mutation_validation(
     stmt: &str,
-    prop_vars: &[(String, String)], // (var_name, prop_alias)
+    prop_vars: &[(String, Option<String>)], // (var_name, prop_alias)
     source: &str,
 ) -> String {
     let _trimmed = stmt.trim();
 
     let mut result = stmt.to_string();
+    let scan = PropMutationScan::new(source);
 
     for (var_name, prop_alias) in prop_vars {
+        let alias_literal = match prop_alias {
+            Some(alias) => format!("'{}'", alias),
+            None => "null".to_string(),
+        };
         // First, try the runes-mode pattern: `prop().member = value` (not wrapped in prop(..., true))
         // This handles the case where transform_prop_assignments skips member mutation wrapping in runes mode.
         let runes_prefix = format!("{}().", var_name);
         let mut runes_search_from = 0;
+        let mut sites = PropMutationSites::collect(source, var_name, &scan);
 
         while runes_search_from < result.len() {
             let Some(prefix_rel) = result[runes_search_from..].find(&runes_prefix) else {
@@ -2784,23 +3411,28 @@ pub(super) fn wrap_prop_mutation_validation(
             let abs_start = runes_search_from + prefix_rel;
 
             // Check this is a standalone identifier (not part of a longer name)
-            if abs_start > 0 {
-                let prev_char = result.as_bytes()[abs_start - 1] as char;
-                if prev_char.is_alphanumeric() || prev_char == '_' || prev_char == '$' {
-                    runes_search_from = abs_start + runes_prefix.len();
-                    continue;
-                }
+            if crate::compiler::utils::char_before(&result, abs_start)
+                .is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '$')
+            {
+                runes_search_from = abs_start + runes_prefix.len();
+                continue;
             }
 
-            // Check it's not already inside a prop(prop()...) wrapper
+            // Check it's not already inside a prop(prop()...) wrapper. The
+            // printer breaks a long setter call across lines, so the `prop(`
+            // need not be adjacent.
             let before = &result[..abs_start];
-            if before.ends_with(&format!("{}(", var_name)) {
+            if before.trim_end().ends_with(&format!("{}(", var_name)) {
                 runes_search_from = abs_start + runes_prefix.len();
                 continue;
             }
             // Skip if already inside $$ownership_validator.mutation
+            // Only the immediately enclosing call counts: a wrapper emitted earlier in the
+            // program must not suppress later mutations of the same prop.
             if before.ends_with("mutation(")
-                || before.contains(&format!("$$ownership_validator.mutation('{}',", prop_alias))
+                || (before.ends_with("], ")
+                    && before
+                        .contains(&format!("$$ownership_validator.mutation({}, [", alias_literal)))
             {
                 runes_search_from = abs_start + runes_prefix.len();
                 continue;
@@ -2810,7 +3442,7 @@ pub(super) fn wrap_prop_mutation_validation(
             let after_prefix = &result[abs_start + runes_prefix.len()..];
 
             // Parse member chain to find assignment operator
-            let mut path_parts: Vec<String> = vec![format!("'{}'", prop_alias)];
+            let mut path_parts: Vec<String> = vec![format!("'{}'", var_name)];
             let chars: Vec<char> = after_prefix.chars().collect();
             let mut pos = 0;
 
@@ -2912,7 +3544,7 @@ pub(super) fn wrap_prop_mutation_validation(
             let mut in_str: Option<char> = None;
             for (ci, c) in after_expr_start.char_indices() {
                 if let Some(quote) = in_str {
-                    if c == quote && (ci == 0 || after_expr_start.as_bytes()[ci - 1] != b'\\') {
+                    if c == quote && !is_escaped(after_expr_start.as_bytes(), ci) {
                         in_str = None;
                     }
                 } else {
@@ -2935,20 +3567,20 @@ pub(super) fn wrap_prop_mutation_validation(
                 }
             }
 
-            let full_expr = result[expr_start..expr_start + expr_end_pos]
-                .trim_end()
-                .to_string();
+            let full_expr = result[expr_start..expr_start + expr_end_pos].trim_end().to_string();
 
-            // Find source location
-            let (line_num, col_num) = find_prop_mutation_location(source, var_name);
+            // Each mutation reports its own source position.
+            let (line_num, col_num) = sites
+                .take(static_member_names(&path_parts).as_deref(), &full_expr)
+                .unwrap_or_else(|| find_prop_mutation_location(source, var_name));
 
             // Build the path array
             let path_array = format!("[{}]", path_parts.join(", "));
 
             // Build the replacement
             let mut replacement = format!(
-                "$$ownership_validator.mutation('{}', {}, {}",
-                prop_alias, path_array, full_expr,
+                "$$ownership_validator.mutation({}, {}, {}",
+                alias_literal, path_array, full_expr,
             );
             if line_num > 0 {
                 let _ = write!(replacement, ", {}, {}", line_num, col_num);
@@ -2963,40 +3595,53 @@ pub(super) fn wrap_prop_mutation_validation(
             runes_search_from = expr_start + replacement.len();
         }
 
-        // Pattern: `prop(prop().member_chain = value, true)` or `prop(prop()[expr] = value, true)`
-        // We search for `prop(prop()` followed by either `.` or `[`
-        let wrapper_prefix = format!("{}({}()", var_name, var_name);
+        // Pattern: `prop(prop().member_chain = value, true)` or `prop(prop()[expr] = value, true)`.
+        // The assignment may carry one extra wrapping paren when it's consumed as an
+        // expression result rather than a bare statement: `prop((prop().member = value), true)`.
+        let outer_call = format!("{}(", var_name);
+        let inner_call = format!("{}()", var_name);
         let mut search_from = 0;
 
         while search_from < result.len() {
-            let Some(prefix_rel) = result[search_from..].find(&wrapper_prefix) else {
+            let Some(prefix_rel) = result[search_from..].find(&outer_call) else {
                 break;
             };
             let abs_start = search_from + prefix_rel;
-            let after_prefix = abs_start + wrapper_prefix.len();
-            // Check that the next character is `.` or `[` (member access)
-            if after_prefix >= result.len() {
-                search_from = after_prefix;
-                continue;
-            }
-            let next_char = result.as_bytes()[after_prefix] as char;
-            if next_char != '.' && next_char != '[' {
-                search_from = after_prefix;
-                continue;
-            }
-            let wrapper_start_len = wrapper_prefix.len() + 1; // includes the `.` or `[`
+            let after_outer = abs_start + outer_call.len();
 
             // Check this is a standalone identifier (not part of a longer name)
-            if abs_start > 0 {
-                let prev_char = result.as_bytes()[abs_start - 1] as char;
-                if prev_char.is_alphanumeric() || prev_char == '_' || prev_char == '$' {
-                    search_from = abs_start + wrapper_start_len;
-                    continue;
-                }
+            if crate::compiler::utils::char_before(&result, abs_start)
+                .is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '$')
+            {
+                search_from = after_outer;
+                continue;
             }
 
+            let mut inner_probe_start = skip_leading_ws(&result, after_outer);
+            if result.as_bytes().get(inner_probe_start) == Some(&b'(') {
+                inner_probe_start = skip_leading_ws(&result, inner_probe_start + 1);
+            }
+            if !result[inner_probe_start..].starts_with(&inner_call) {
+                search_from = after_outer;
+                continue;
+            }
+            let after_inner_call = inner_probe_start + inner_call.len();
+            // Check that the next character is `.` or `[` (member access)
+            if after_inner_call >= result.len() {
+                search_from = after_outer;
+                continue;
+            }
+            // Sound on a byte: both targets are ASCII, and no byte of a multi-byte
+            // UTF-8 character can equal an ASCII byte.
+            let next_char = result.as_bytes()[after_inner_call] as char;
+            if next_char != '.' && next_char != '[' {
+                search_from = after_outer;
+                continue;
+            }
+            let wrapper_start_len = after_inner_call + 1 - abs_start; // includes the `.` or `[`
+
             // Find the inner assignment: after `prop(` find the matching `, true)`
-            let inner_start = abs_start + var_name.len() + 1; // skip `prop(`
+            let inner_start = after_outer; // skip outer `prop(`
 
             // Find `, true)` that closes this specific prop() call
             // We need to find the matching closing paren, accounting for nesting
@@ -3004,13 +3649,13 @@ pub(super) fn wrap_prop_mutation_validation(
             let mut depth = 1i32; // we're inside prop(
             let mut close_pos = None;
             let rest_chars: Vec<char> = rest.chars().collect();
+            let char_to_byte = CharToByte::new(rest);
             let mut in_str: Option<char> = None;
             let mut ci = 0;
-            let mut byte_i = 0;
             while ci < rest_chars.len() {
                 let c = rest_chars[ci];
                 if let Some(quote) = in_str {
-                    if c == quote && (ci == 0 || rest_chars[ci - 1] != '\\') {
+                    if c == quote && !is_escaped_char(&rest_chars, ci) {
                         in_str = None;
                     }
                     if c == '`'
@@ -3027,34 +3672,47 @@ pub(super) fn wrap_prop_mutation_validation(
                         ')' | ']' | '}' => {
                             depth -= 1;
                             if depth == 0 {
-                                close_pos = Some(byte_i);
+                                close_pos = Some(CharOffset::new(ci));
                                 break;
                             }
                         }
                         _ => {}
                     }
                 }
-                byte_i += c.len_utf8();
                 ci += 1;
             }
 
-            let Some(close_byte_pos) = close_pos else {
+            let Some(close_char_pos) = close_pos else {
                 search_from = abs_start + wrapper_start_len;
                 continue;
             };
 
-            // The content inside prop(...) is rest[..close_byte_pos]
-            let inner_content = &rest[..close_byte_pos];
+            // The content inside prop(...).
+            let close_byte_pos = char_to_byte.byte(close_char_pos);
+            let inner_content = close_byte_pos.before(rest);
 
-            // Check if it ends with `, true`
+            // Check if it ends with `, true` — the comma and the flag may be on
+            // separate lines when the printer broke the call up.
             let inner_trimmed = inner_content.trim_end();
-            if !inner_trimmed.ends_with(", true") {
+            let Some(head) = inner_trimmed
+                .strip_suffix("true")
+                .map(str::trim_end)
+                .and_then(|head| head.strip_suffix(','))
+            else {
                 search_from = abs_start + wrapper_start_len;
                 continue;
-            }
+            };
 
             // Extract the assignment expression (without `, true`)
-            let assignment_expr = inner_trimmed[..inner_trimmed.len() - ", true".len()].trim();
+            let assignment_expr = head.trim();
+            // Some call sites wrap the assignment in an extra pair of parens
+            // (e.g. `(config().padAngle = value)`) when the result is consumed
+            // as an expression; strip one layer before pattern-matching.
+            let assignment_expr = assignment_expr
+                .strip_prefix('(')
+                .and_then(|s| s.strip_suffix(')'))
+                .map(str::trim)
+                .unwrap_or(assignment_expr);
 
             // Parse the member chain from `prop().member_chain`
             // Parse the member chain from `prop().member_chain` or `prop()[expr]`
@@ -3071,7 +3729,7 @@ pub(super) fn wrap_prop_mutation_validation(
                 };
 
             // Parse member identifiers/bracket accesses until we hit an assignment operator
-            let mut path_parts: Vec<String> = vec![format!("'{}'", prop_alias)];
+            let mut path_parts: Vec<String> = vec![format!("'{}'", var_name)];
             let chars: Vec<char> = after_prop_call.chars().collect();
             let mut pos = 0;
 
@@ -3151,36 +3809,764 @@ pub(super) fn wrap_prop_mutation_validation(
                 continue;
             }
 
-            // Find the original source location
-            let (line_num, col_num) = find_prop_mutation_location(source, var_name);
+            // The full original expression is the entire prop(prop().member = value, true) call
+            let end_pos = inner_start + close_byte_pos.next().get();
+            // Upstream builds the `$.invalidate_inner_signals` sequence first and
+            // passes the whole thing to `validate_mutation`, so the sequence has to
+            // go inside the wrap rather than around it.
+            let (abs_start, end_pos) = expand_to_invalidate_sequence(&result, abs_start, end_pos)
+                .unwrap_or((abs_start, end_pos));
+            let full_original_expr = result[abs_start..end_pos].to_string();
+
+            // Each mutation reports its own source position.
+            let (line_num, col_num) = sites
+                .take(static_member_names(&path_parts).as_deref(), &full_original_expr)
+                .unwrap_or_else(|| find_prop_mutation_location(source, var_name));
 
             // Build the path array
             let path_array = format!("[{}]", path_parts.join(", "));
 
-            // The full original expression is the entire prop(prop().member = value, true) call
-            let end_pos = inner_start + close_byte_pos + 1; // +1 for closing paren
-            let full_original_expr = result[abs_start..end_pos].to_string();
-
             // Build the replacement
             let mut replacement = format!(
-                "$$ownership_validator.mutation('{}', {}, {}",
-                prop_alias, path_array, full_original_expr,
+                "$$ownership_validator.mutation({}, {}, {}",
+                alias_literal, path_array, full_original_expr,
             );
             if line_num > 0 {
                 let _ = write!(replacement, ", {}, {}", line_num, col_num);
             }
             replacement.push(')');
-            result = format!(
-                "{}{}{}",
-                &result[..abs_start],
-                replacement,
-                &result[end_pos..]
-            );
+            result = format!("{}{}{}", &result[..abs_start], replacement, &result[end_pos..]);
             search_from = abs_start + replacement.len();
         }
     }
 
     result
+}
+
+/// The byte offset of the first non-whitespace byte at or after `from`.
+fn skip_leading_ws(text: &str, from: usize) -> usize {
+    let rest = &text[from..];
+    from + (rest.len() - rest.trim_start().len())
+}
+
+/// The span of `(<mutation>, $.invalidate_inner_signals(…))` around the
+/// `prop(...)` call at `start..end`, when a legacy indirect binding put one there.
+fn expand_to_invalidate_sequence(text: &str, start: usize, end: usize) -> Option<(usize, usize)> {
+    let open = text[..start].trim_end().len().checked_sub(1)?;
+    if text.as_bytes()[open] != b'(' {
+        return None;
+    }
+    let rest = text[end..].trim_start().strip_prefix(',')?;
+    if !rest.trim_start().starts_with("$.invalidate_inner_signals") {
+        return None;
+    }
+    let mut depth = 0i32;
+    for (offset, ch) in text[open..].char_indices() {
+        match ch {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    let close = open + offset + 1;
+                    return (close > end).then_some((open, close));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// One mutation of a prop as it is written in the source.
+struct PropMutationSite {
+    line: usize,
+    column: usize,
+    /// The member names it writes, or `None` once any element is computed.
+    chain: Option<Vec<String>>,
+    /// The identifier-shaped words of the value it assigns.
+    value_words: Vec<String>,
+    /// Whether it is written inside a `$:` statement.
+    reactive: bool,
+    used: bool,
+}
+
+/// The source mutations of one prop, in source order.
+pub(super) struct PropMutationSites {
+    sites: Vec<PropMutationSite>,
+}
+
+/// The two source-wide scans every prop's site collection needs. Neither
+/// depends on the prop, so recomputing them per prop made the pass quadratic
+/// in the script length.
+pub(super) struct PropMutationScan {
+    reactive: Vec<(usize, usize)>,
+    code: CodeSpans,
+}
+
+impl PropMutationScan {
+    pub(super) fn new(source: &str) -> Self {
+        Self { reactive: reactive_statement_ranges(source), code: CodeSpans::scan(source) }
+    }
+}
+
+impl PropMutationSites {
+    pub(super) fn collect(source: &str, var_name: &str, scan: &PropMutationScan) -> Self {
+        let mut sites = Vec::new();
+        let reactive = &scan.reactive;
+        let bytes = source.as_bytes();
+        let mut search = memchr::memmem::find(bytes, b"<script").unwrap_or(0);
+        while search < source.len() {
+            let Some(rel) = memchr::memmem::find(&bytes[search..], var_name.as_bytes()) else {
+                break;
+            };
+            let start = search + rel;
+            let end = start + var_name.len();
+            search = end;
+            if !scan.code.contains(start) {
+                continue;
+            }
+            if crate::compiler::utils::char_before(source, start)
+                .is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '$' || c == '.')
+            {
+                continue;
+            }
+            if let Some((after, chain)) = scan_prop_mutation_target(source, start, end)
+                && let Some(value_start) = mutation_value_start(source, after).or_else(|| {
+                    // A PREFIX update (`--p.deep.c`) has its operator before
+                    // the identifier; the site's position stays the identifier.
+                    let head = source[..start].trim_end();
+                    (head.ends_with("++") || head.ends_with("--")).then_some(after)
+                })
+            {
+                let (line, column) =
+                    crate::compiler::phases::phase3_transform::utils::locate_in_source(
+                        source, start,
+                    );
+                sites.push(PropMutationSite {
+                    line,
+                    column,
+                    chain,
+                    value_words: identifier_words(
+                        &source[value_start..statement_end(bytes, after)],
+                    ),
+                    reactive: reactive.iter().any(|(from, to)| (*from..*to).contains(&start)),
+                    used: false,
+                });
+            }
+        }
+        // A `$:` body is emitted at the end of the instance script as a
+        // `legacy_pre_effect`, so consuming reactive sites last is what keeps
+        // them lined up with the output when the value cannot tell two
+        // mutations of the same member apart.
+        sites.sort_by_key(|site| site.reactive);
+        Self { sites }
+    }
+
+    /// The source position of the mutation that produced `expression`. Matching
+    /// on the member names and on the words of the assigned value rather than
+    /// on position is what keeps a moved statement — a `$:` body becomes a
+    /// `legacy_pre_effect` at the end of the output — from taking the location
+    /// of whichever mutation happens to be printed before it.
+    pub(super) fn take(
+        &mut self,
+        chain: Option<&[String]>,
+        expression: &str,
+    ) -> Option<(usize, usize)> {
+        let words = identifier_words(assigned_value(expression));
+        let best = self
+            .sites
+            .iter()
+            .enumerate()
+            .filter(|(_, site)| {
+                !site.used
+                    && match (chain, &site.chain) {
+                        (Some(want), Some(have)) => want == have.as_slice(),
+                        _ => false,
+                    }
+            })
+            .max_by_key(|(index, site)| {
+                // Repeated generic words (`prop`, `value`, callback parameters) must not
+                // outscore the discriminating words in the actual RHS. Without deduping,
+                // a later `filter.value = filter.value.filter(...)` can steal the source
+                // location of an earlier assignment merely by repeating `value` more.
+                let unique_words =
+                    site.value_words.iter().enumerate().filter(|(word_index, word)| {
+                        !site.value_words[..*word_index].contains(word)
+                    });
+                let (shared, missing) =
+                    unique_words.fold((0, 0), |(shared, missing), (_, word)| {
+                        if words.contains(word) {
+                            (shared + 1, missing)
+                        } else {
+                            (shared, missing + 1)
+                        }
+                    });
+                // Prefer more evidence from the generated RHS, then fewer source-only
+                // words. Ties keep source order.
+                (shared, std::cmp::Reverse(missing), std::cmp::Reverse(*index))
+            })
+            .map(|(index, _)| index);
+        let index = best.or_else(|| self.sites.iter().position(|site| !site.used))?;
+        self.sites[index].used = true;
+        Some((self.sites[index].line, self.sites[index].column))
+    }
+}
+
+/// The byte ranges of the `$:` statements in the instance script. A `$:` label
+/// is only reactive at the top level, so nested ones are skipped by depth.
+fn reactive_statement_ranges(source: &str) -> Vec<(usize, usize)> {
+    let bytes = source.as_bytes();
+    let script = memchr::memmem::find(bytes, b"<script").unwrap_or(0);
+    let mut ranges = Vec::new();
+    let mut depth = 0i32;
+    let mut i = script;
+    while i + 1 < bytes.len() {
+        match (bytes[i], bytes[i + 1]) {
+            (b'/', b'/') => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            (b'/', b'*') => {
+                i += 2;
+                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                i += 2;
+            }
+            (quote @ (b'"' | b'\'' | b'`'), _) => {
+                i += 1;
+                while i < bytes.len() && bytes[i] != quote {
+                    i += if bytes[i] == b'\\' { 2 } else { 1 };
+                }
+                i += 1;
+            }
+            (b'{' | b'(' | b'[', _) => {
+                depth += 1;
+                i += 1;
+            }
+            (b'}' | b')' | b']', _) => {
+                depth -= 1;
+                i += 1;
+            }
+            (b'$', b':') if depth == 0 => {
+                let mut inner = 0i32;
+                let mut j = i + 2;
+                while j < bytes.len() {
+                    match bytes[j] {
+                        b'{' | b'(' | b'[' => inner += 1,
+                        b'}' | b')' | b']' => inner -= 1,
+                        b';' | b'\n' if inner <= 0 => break,
+                        _ => {}
+                    }
+                    j += 1;
+                }
+                ranges.push((i, j));
+                i = j;
+            }
+            _ => i += 1,
+        }
+    }
+    ranges
+}
+
+/// The value half of an assignment expression. Comparing whole expressions
+/// would count the member chain, which every candidate for the same path
+/// shares, and a value that repeats that chain would then outscore a literal.
+fn assigned_value(expression: &str) -> &str {
+    let bytes = expression.as_bytes();
+    for i in 0..bytes.len() {
+        if bytes[i] != b'=' {
+            continue;
+        }
+        let previous = i.checked_sub(1).map(|p| bytes[p]);
+        if bytes.get(i + 1) != Some(&b'=')
+            && bytes.get(i + 1) != Some(&b'>')
+            && !matches!(previous, Some(b'=') | Some(b'!') | Some(b'<') | Some(b'>'))
+        {
+            return &expression[i + 1..];
+        }
+    }
+    expression
+}
+
+/// The identifier-shaped words of `text`, which is how a source value and the
+/// transformed one the output carries (`x` inside `$.get(x)`) are compared.
+fn identifier_words(text: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    for ch in text.chars() {
+        if ch.is_alphanumeric() || ch == '_' || ch == '$' {
+            current.push(ch);
+        } else if !current.is_empty() {
+            words.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+    words
+}
+
+/// Advance past TypeScript non-null assertions, which sit between an identifier
+/// and the accessor that follows it (`selected!.from`).
+fn skip_non_null_assertions(bytes: &[u8], mut pos: usize) -> usize {
+    while bytes.get(pos) == Some(&b'!') && bytes.get(pos + 1) != Some(&b'=') {
+        pos += 1;
+    }
+    pos
+}
+
+/// Scan a prop mutation target, including a TypeScript assertion that wraps
+/// either the root or an intermediate member chain:
+/// `(result as any)[key] = value` and `(step.params as any)._id = value`.
+fn scan_prop_mutation_target(
+    source: &str,
+    root_start: usize,
+    root_end: usize,
+) -> Option<(usize, Option<Vec<String>>)> {
+    let bytes = source.as_bytes();
+    let chain_start = skip_non_null_assertions(bytes, root_end);
+    let (mut after, mut chain, mut saw_member) = if starts_member_access(bytes, chain_start) {
+        let (after, chain) = scan_member_chain_names(source, chain_start)?;
+        (after, chain, true)
+    } else {
+        (chain_start, Some(Vec::new()), false)
+    };
+
+    if let Some(assertion_end) = parenthesized_ts_assertion_end(source, root_start, after) {
+        after = skip_whitespace_chars(source, assertion_end);
+        if starts_member_access(bytes, after) {
+            let (tail_end, tail_chain) = scan_member_chain_names(source, after)?;
+            chain = match (chain, tail_chain) {
+                (Some(mut head), Some(tail)) => {
+                    head.extend(tail);
+                    Some(head)
+                }
+                _ => None,
+            };
+            after = tail_end;
+            saw_member = true;
+        }
+    }
+
+    saw_member.then_some((after, chain))
+}
+
+/// Return the byte after the closing parenthesis when `root_start..expression_end`
+/// is wrapped in a TypeScript `as` or `satisfies` assertion.
+fn parenthesized_ts_assertion_end(
+    source: &str,
+    root_start: usize,
+    expression_end: usize,
+) -> Option<usize> {
+    let (open, ch) =
+        source[..root_start].char_indices().rev().find(|(_, ch)| !ch.is_whitespace())?;
+    if ch != '(' {
+        return None;
+    }
+    let close =
+        crate::compiler::phases::phase1_parse::utils::find_matching_bracket(source, open + 1, '(')?;
+    if expression_end > close {
+        return None;
+    }
+    let assertion = source[expression_end..close].trim_start();
+    let has_keyword = ["as", "satisfies"].into_iter().any(|keyword| {
+        assertion.strip_prefix(keyword).is_some_and(|tail| {
+            tail.chars().next().is_some_and(|ch| ch.is_whitespace() && !tail.trim().is_empty())
+        })
+    });
+    has_keyword.then_some(close + 1)
+}
+
+/// Whether a member access — plain, computed or optional — starts at `pos`.
+fn starts_member_access(bytes: &[u8], pos: usize) -> bool {
+    match bytes.get(pos) {
+        Some(b'.') | Some(b'[') => true,
+        Some(b'?') => bytes.get(pos + 1) == Some(&b'.'),
+        _ => false,
+    }
+}
+
+/// The offset of the first non-whitespace character at or after `pos`.
+///
+/// Stepping by characters is what keeps a non-ASCII JavaScript space (`U+3000`,
+/// NBSP) recognised — its lead byte Latin-1-decodes to a letter — and is what keeps
+/// the cursor from stranding inside a character whose `0x85`/`0xA0` continuation
+/// byte would read as whitespace on its own.
+fn skip_whitespace_chars(source: &str, mut pos: usize) -> usize {
+    while let Some(c) = crate::compiler::utils::char_at(source, pos) {
+        if !c.is_whitespace() {
+            break;
+        }
+        pos += c.len_utf8();
+    }
+    pos
+}
+
+/// The offset just after the mutation operator at `pos`, or `None` when there
+/// is no operator there.
+fn mutation_value_start(source: &str, mut pos: usize) -> Option<usize> {
+    if !is_mutation_operator(source, pos) {
+        return None;
+    }
+    let bytes = source.as_bytes();
+    pos = skip_whitespace_chars(source, pos);
+    // `++` / `--` write no value of their own.
+    if matches!(bytes.get(pos), Some(b'+') | Some(b'-')) && bytes.get(pos + 1) == bytes.get(pos) {
+        return Some((pos + 2).min(bytes.len()));
+    }
+    while pos < bytes.len() && bytes[pos] != b'=' {
+        pos += 1;
+    }
+    Some((pos + 1).min(bytes.len()))
+}
+
+/// The offset of the `;` or newline that ends the statement starting at `pos`.
+fn statement_end(bytes: &[u8], pos: usize) -> usize {
+    let mut i = pos;
+    while i < bytes.len() && bytes[i] != b';' && bytes[i] != b'\n' {
+        i += 1;
+    }
+    i
+}
+
+/// The member names `'a'`-quoted by the path builders, or `None` when any
+/// element is a computed access that cannot be compared by name.
+fn static_member_names(path_parts: &[String]) -> Option<Vec<String>> {
+    path_parts[1..]
+        .iter()
+        .map(|part| {
+            part.strip_prefix('\'')
+                .and_then(|p| p.strip_suffix('\''))
+                .filter(|p| !p.contains('\''))
+                .map(str::to_string)
+        })
+        .collect()
+}
+
+/// Whether `target` sits in code rather than inside a comment or a string /
+/// template literal. `from` must itself be a code offset — the scan starts
+/// there in the code state, so callers pass the previous confirmed match.
+/// Byte ranges of `source` the comment / string scanner reports as code.
+///
+/// The scanner is deterministic left-to-right, so running it once and looking
+/// a position up beats re-running it from the previous hit for every candidate
+/// occurrence of every prop — which was quadratic in the script length.
+pub(super) struct CodeSpans {
+    /// Sorted, non-overlapping `[start, end)` ranges. Everything before the
+    /// `<script` tag is code, matching the empty scan the old caller did there.
+    spans: Vec<(usize, usize)>,
+}
+
+impl CodeSpans {
+    fn scan(source: &str) -> Self {
+        #[derive(PartialEq)]
+        enum S {
+            Code,
+            Line,
+            Block,
+            Single,
+            Double,
+            Template,
+        }
+        let bytes = source.as_bytes();
+        let mut spans = Vec::new();
+        let mut state = S::Code;
+        let mut code_from = 0usize;
+        let mut i = memchr::memmem::find(bytes, b"<script").unwrap_or(0);
+        while i < bytes.len() {
+            let was_code = state == S::Code;
+            let c = bytes[i];
+            let next = bytes.get(i + 1).copied();
+            match state {
+                S::Code => match (c, next) {
+                    (b'/', Some(b'/')) => {
+                        spans.push((code_from, i + 1));
+                        state = S::Line;
+                        i += 2;
+                        continue;
+                    }
+                    (b'/', Some(b'*')) => {
+                        spans.push((code_from, i + 1));
+                        state = S::Block;
+                        i += 2;
+                        continue;
+                    }
+                    (b'\'', _) => state = S::Single,
+                    (b'"', _) => state = S::Double,
+                    (b'`', _) => state = S::Template,
+                    _ => {}
+                },
+                S::Line => {
+                    if c == b'\n' {
+                        state = S::Code;
+                    }
+                }
+                S::Block => {
+                    if c == b'*' && next == Some(b'/') {
+                        state = S::Code;
+                        // `is_in_code` reported the byte after the `*` as code
+                        // because its two-byte skip overshot the query.
+                        code_from = i + 1;
+                        i += 2;
+                        continue;
+                    }
+                }
+                S::Single | S::Double | S::Template => {
+                    if c == b'\\' {
+                        i += 2;
+                        continue;
+                    }
+                    let closer = match state {
+                        S::Single => b'\'',
+                        S::Double => b'"',
+                        _ => b'`',
+                    };
+                    if c == closer {
+                        state = S::Code;
+                    }
+                }
+            }
+            i += 1;
+            // The old scanner reported the state *at* the queried byte, so a
+            // quote opens its string at the byte after it and closes at the
+            // byte after the closer.
+            match (was_code, state == S::Code) {
+                (true, false) => spans.push((code_from, i)),
+                (false, true) => code_from = i,
+                _ => {}
+            }
+        }
+        if state == S::Code {
+            spans.push((code_from, bytes.len()));
+        }
+        spans.retain(|(from, to)| from < to);
+        Self { spans }
+    }
+
+    fn contains(&self, pos: usize) -> bool {
+        self.spans
+            .binary_search_by(|&(from, to)| {
+                if pos < from {
+                    std::cmp::Ordering::Greater
+                } else if pos >= to {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
+            .is_ok()
+    }
+}
+
+#[cfg(test)]
+mod code_spans_tests {
+    use super::CodeSpans;
+
+    /// The scanner `CodeSpans` replaced, kept verbatim as the oracle.
+    fn is_in_code_reference(source: &str, from: usize, target: usize) -> bool {
+        #[derive(PartialEq)]
+        enum S {
+            Code,
+            Line,
+            Block,
+            Single,
+            Double,
+            Template,
+        }
+        let bytes = source.as_bytes();
+        let mut state = S::Code;
+        let mut i = from;
+        while i < target {
+            let c = bytes[i];
+            let next = bytes.get(i + 1).copied();
+            match state {
+                S::Code => match (c, next) {
+                    (b'/', Some(b'/')) => {
+                        state = S::Line;
+                        i += 2;
+                        continue;
+                    }
+                    (b'/', Some(b'*')) => {
+                        state = S::Block;
+                        i += 2;
+                        continue;
+                    }
+                    (b'\'', _) => state = S::Single,
+                    (b'"', _) => state = S::Double,
+                    (b'`', _) => state = S::Template,
+                    _ => {}
+                },
+                S::Line => {
+                    if c == b'\n' {
+                        state = S::Code;
+                    }
+                }
+                S::Block => {
+                    if c == b'*' && next == Some(b'/') {
+                        state = S::Code;
+                        i += 2;
+                        continue;
+                    }
+                }
+                S::Single | S::Double | S::Template => {
+                    if c == b'\\' {
+                        i += 2;
+                        continue;
+                    }
+                    let closer = match state {
+                        S::Single => b'\'',
+                        S::Double => b'"',
+                        _ => b'`',
+                    };
+                    if c == closer {
+                        state = S::Code;
+                    }
+                }
+            }
+            i += 1;
+        }
+        state == S::Code
+    }
+
+    fn assert_agrees(source: &str) {
+        let script = memchr::memmem::find(source.as_bytes(), b"<script").unwrap_or(0);
+        let spans = CodeSpans::scan(source);
+        for pos in 0..source.len() {
+            let expected =
+                if pos < script { true } else { is_in_code_reference(source, script, pos) };
+            assert_eq!(
+                spans.contains(pos),
+                expected,
+                "byte {pos} ({:?}) in {source:?}",
+                &source[pos..(pos + 1).min(source.len())]
+            );
+        }
+    }
+
+    #[test]
+    fn code_spans_agree_with_the_scanner_they_replaced() {
+        for source in [
+            "<script>let a = 1; // a.b = 2\na.c = 3;</script>",
+            "<script>/* a.b = 1 */ a.c = 2;</script>",
+            "<script>let s = 'a.b = 1'; a.c = 2;</script>",
+            "<script>let s = \"a.b = 1\"; a.c = 2;</script>",
+            "<script>let s = `a.b = ${x.y} 1`; a.c = 2;</script>",
+            "<script>let s = 'it\\'s'; a.c = 2;</script>",
+            // Unterminated: the tail is never code.
+            "<script>let s = 'oops; a.c = 2;</script>",
+            "<script>/* never closed a.c = 2;</script>",
+            // A `//` inside a string must not open a comment.
+            "<script>let s = '// a.b'; a.c = 2;</script>",
+            // Adjacent comment terminators.
+            "<script>/**/a.c = 2;/*x*/</script>",
+            // No script tag at all: everything is code.
+            "<p>a.b = 1</p>",
+        ] {
+            assert_agrees(source);
+        }
+    }
+}
+
+/// Advance past `.name` / `[expr]` accessors, returning the offset just after
+/// the chain plus the names it reads — `None` once a computed access appears.
+fn scan_member_chain_names(source: &str, mut pos: usize) -> Option<(usize, Option<Vec<String>>)> {
+    let bytes = source.as_bytes();
+    let mut names = Some(Vec::new());
+    loop {
+        while pos < bytes.len() && (bytes[pos] == b' ' || bytes[pos] == b'\t') {
+            pos += 1;
+        }
+        pos = skip_non_null_assertions(bytes, pos);
+        // An optional access reads the same member the plain one would; `?.[`
+        // is computed, so land on the `[` rather than on the `.`.
+        if bytes.get(pos) == Some(&b'?') && bytes.get(pos + 1) == Some(&b'.') {
+            pos += if bytes.get(pos + 2) == Some(&b'[') { 2 } else { 1 };
+        }
+        if pos >= bytes.len() {
+            return Some((pos, names));
+        }
+        match bytes[pos] {
+            b'.' => {
+                pos += 1;
+                while pos < bytes.len() && (bytes[pos] == b' ' || bytes[pos] == b'\t') {
+                    pos += 1;
+                }
+                let ident_start = pos;
+                while let Some(c) = crate::compiler::utils::char_at(source, pos) {
+                    if c.is_alphanumeric() || c == '_' || c == '$' {
+                        pos += c.len_utf8();
+                    } else {
+                        break;
+                    }
+                }
+                if pos == ident_start {
+                    return None;
+                }
+                if let Some(names) = names.as_mut() {
+                    names.push(source[ident_start..pos].to_string());
+                }
+            }
+            b'[' => {
+                names = None;
+                let mut depth = 0usize;
+                while pos < bytes.len() {
+                    match bytes[pos] {
+                        b'[' => depth += 1,
+                        b']' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                pos += 1;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    pos += 1;
+                }
+                if depth != 0 {
+                    return None;
+                }
+            }
+            _ => return Some((pos, names)),
+        }
+    }
+}
+
+/// Whether an assignment or update operator starts at `pos`.
+fn is_mutation_operator(source: &str, pos: usize) -> bool {
+    let bytes = source.as_bytes();
+    let mut pos = skip_whitespace_chars(source, pos);
+    if pos >= bytes.len() {
+        return false;
+    }
+    if bytes[pos] == b'+' && bytes.get(pos + 1) == Some(&b'+') {
+        return true;
+    }
+    if bytes[pos] == b'-' && bytes.get(pos + 1) == Some(&b'-') {
+        return true;
+    }
+    let op_start = pos;
+    while pos < bytes.len()
+        && matches!(
+            bytes[pos],
+            b'+' | b'-' | b'*' | b'/' | b'%' | b'&' | b'|' | b'^' | b'?' | b'<' | b'>'
+        )
+    {
+        pos += 1;
+    }
+    if pos >= bytes.len() || bytes[pos] != b'=' {
+        return false;
+    }
+    // `==`, `===`, `<=`, `>=` and `=>` compare rather than assign.
+    if pos == op_start && bytes.get(pos + 1) == Some(&b'=') {
+        return false;
+    }
+    if pos > op_start && matches!(bytes[pos - 1], b'<' | b'>') && pos - op_start == 1 {
+        return false;
+    }
+    bytes.get(pos + 1) != Some(&b'=') && bytes.get(pos + 1) != Some(&b'>')
 }
 
 /// Find the line/column in the original source for a prop mutation.
@@ -3213,21 +4599,7 @@ pub(super) fn find_prop_mutation_location(source: &str, var_name: &str) -> (usiz
         } else {
             relative_offset
         };
-        // Compute line/column from byte offset
-        let mut line = 1usize;
-        let mut col = 0usize;
-        for (i, ch) in source.char_indices() {
-            if i >= offset {
-                break;
-            }
-            if ch == '\n' {
-                line += 1;
-                col = 0;
-            } else {
-                col += 1;
-            }
-        }
-        (line, col)
+        crate::compiler::phases::phase3_transform::utils::locate_in_source(source, offset)
     } else {
         (0, 0)
     }
@@ -3240,25 +4612,21 @@ pub(super) fn find_prop_mutation_location(source: &str, var_name: &str) -> (usiz
 /// The transformation is:
 ///   `console.log(x, y)` -> `console.log(...$.log_if_contains_state("log", x, y))`
 ///
-/// This is only applied when at least one argument could potentially reference
-/// reactive state (i.e., not all arguments are simple literals).
+/// Applied when some argument can evaluate to `UNKNOWN`, which is upstream's
+/// rule; the literal test below is reached only for an argument list that does
+/// not parse on its own.
 ///
 /// Console calls inside `$.inspect()` callbacks are excluded, as those are
 /// already handled by the inspect infrastructure.
 ///
 /// Reference: CallExpression.js in the official Svelte compiler
-pub(super) fn transform_console_calls_dev(stmt: &str) -> String {
-    const CONSOLE_METHODS: &[&str] = &[
-        "debug",
-        "dir",
-        "error",
-        "group",
-        "groupCollapsed",
-        "info",
-        "log",
-        "trace",
-        "warn",
-    ];
+pub(super) fn transform_console_calls_dev(
+    stmt: &str,
+    is_ts: bool,
+    analysis: Option<&crate::compiler::phases::phase2_analyze::ComponentAnalysis>,
+) -> String {
+    const CONSOLE_METHODS: &[&str] =
+        &["debug", "dir", "error", "group", "groupCollapsed", "info", "log", "trace", "warn"];
 
     let mut result = stmt.to_string();
 
@@ -3291,12 +4659,17 @@ pub(super) fn transform_console_calls_dev(stmt: &str) -> String {
             if let Some(args_end) = find_matching_paren(&result[args_start..]) {
                 let args_content = &result[args_start..args_start + args_end];
 
-                // Only wrap if arguments could contain reactive state.
-                // Skip if all arguments are simple literals (strings, numbers, booleans).
-                if !args_content.is_empty() && !all_args_are_literals(args_content) {
+                // Upstream's rule is `scope.evaluate(arg).has_unknown`, not "is a
+                // literal": a binary expression, an arrow, a `!x` and a folded
+                // binding are all known. Ask the shared predicate whenever the
+                // argument list parses on its own.
+                let needs_wrap =
+                    super::console_wrap::args_text_need_wrap(args_content, is_ts, analysis)
+                        .unwrap_or_else(|| !all_args_are_literals(args_content));
+                if !args_content.is_empty() && needs_wrap {
                     // Transform: console.METHOD(args) -> console.METHOD(...$.log_if_contains_state("METHOD", args))
                     let new_call = format!(
-                        "console.{}(...$.log_if_contains_state(\"{}\", {}))",
+                        "console.{}(...$.log_if_contains_state('{}', {}))",
                         method, method, args_content
                     );
                     let call_end = args_start + args_end + 1; // +1 for closing paren
@@ -3350,7 +4723,13 @@ pub(super) fn all_args_are_literals(args: &str) -> bool {
 /// Returns `false` for values known to be primitives (literals, template literals,
 /// arrow functions, function expressions, unary/binary expressions, `undefined`).
 /// Returns `true` for everything else (identifiers, member expressions, call expressions, etc.).
-fn should_proxy_prop_default(value: &str) -> bool {
+fn should_proxy_prop_default(value: &str, analysis: &ComponentAnalysis) -> bool {
+    // Prefer an exact AST-based check that mirrors upstream `should_proxy`
+    // (node-type dispatch + one-level scope recursion). The string heuristic
+    // below is only a fallback for text that cannot be parsed as an expression.
+    if let Some(result) = ast_should_proxy(value, Some(analysis)) {
+        return result;
+    }
     let v = value.trim();
 
     // Empty value means no default
@@ -3466,10 +4845,68 @@ pub(super) fn split_top_level_args(s: &str) -> Vec<String> {
 }
 
 #[cfg(test)]
+mod prop_mutation_location_tests {
+    use super::{find_prop_mutation_location, wrap_prop_mutation_validation};
+
+    /// Issue #2099: the location reported to `$$ownership_validator.mutation`
+    /// counts columns in UTF-16 code units, so an emoji before the mutation
+    /// shifts it by 2 rather than 1.
+    #[test]
+    fn location_columns_are_utf16_code_units() {
+        let astral = "<script>\nlet { item } = $props();\nfunction go() { /*🎉*/ item.name = 1; }\n</script>";
+        let bmp = astral.replace('🎉', "あ");
+        assert_eq!(find_prop_mutation_location(astral, "item"), (3, 23));
+        assert_eq!(find_prop_mutation_location(&bmp, "item"), (3, 22));
+    }
+
+    #[test]
+    fn mutation_wrapper_carries_the_utf16_column() {
+        let source = "<script>\nlet { item } = $props();\nfunction go() { /*🎉*/ item.name = 1; }\n</script>";
+        let prop_vars = vec![("item".to_string(), Some("item".to_string()))];
+        assert_eq!(
+            wrap_prop_mutation_validation("item().name = 1", &prop_vars, source),
+            "$$ownership_validator.mutation('item', ['item', 'name'], item().name = 1, 3, 23)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod rest_prop_fallback_tests {
+    use super::transform_rest_prop_member_access;
+
+    #[test]
+    fn keeps_non_ascii_property_boundaries() {
+        let input = "@ rest.名前 = 1";
+        assert_eq!(transform_rest_prop_member_access(input, &["rest".to_string()]), input,);
+    }
+}
+
+#[cfg(test)]
 mod split_declarators_tests {
     use super::{
-        apply_prop_reads_in_prop_default_values, split_declarators, transform_prop_reads_in_expr,
+        apply_prop_reads_in_prop_default_values, split_declarators, split_destructuring_properties,
+        split_property_key_value, transform_prop_reads_in_expr,
     };
+
+    #[test]
+    fn split_property_key_value_handles_non_ascii_key() {
+        // Non-ASCII prop key before the `:` (e.g. `let { café: renamed } = $props()`)
+        // must not panic on a byte/char index mismatch.
+        assert_eq!(split_property_key_value("café: renamed"), Some(("café", "renamed")));
+        assert_eq!(split_property_key_value("café"), None);
+    }
+
+    #[test]
+    fn split_destructuring_properties_handles_non_ascii() {
+        // `let { café, b } = $props()` — the comma sits past a multi-byte char.
+        assert_eq!(split_destructuring_properties("café, b"), vec!["café", " b"]);
+    }
+
+    #[test]
+    fn prop_reads_keep_char_and_byte_offsets_separate() {
+        let props = vec!["café".to_string()];
+        assert_eq!(transform_prop_reads_in_expr("先頭 + café", &props), "先頭 + café()");
+    }
 
     #[test]
     fn bare_prop_default_stays_a_getter_reference() {
@@ -3494,6 +4931,48 @@ mod split_declarators_tests {
     }
 
     #[test]
+    fn prop_default_reads_use_ast_spans_for_grammar_combinations() {
+        let props = vec!["café".to_string()];
+        assert_eq!(
+            apply_prop_reads_in_prop_default_values(
+                "let value = $.prop($$props, 'value', 24, () => /[,)]/.test(`x${café /* , ) */}`) ? café : '\\\\');\ncafé;",
+                &props,
+            ),
+            "let value = $.prop($$props, 'value', 24, () => /[,)]/.test(`x${café() /* , ) */}`) ? café() : '\\\\');\ncafé;",
+        );
+    }
+
+    #[test]
+    fn prop_default_reads_handle_semicolon_free_generated_statements() {
+        let props = vec!["value".to_string()];
+        assert_eq!(
+            apply_prop_reads_in_prop_default_values(
+                "let current = $.prop($$props, 'current', 24, () => value)\nvalue",
+                &props,
+            ),
+            "let current = $.prop($$props, 'current', 24, () => value())\nvalue",
+        );
+    }
+
+    #[test]
+    fn legacy_default_scanners_keep_offset_units_separate() {
+        assert_eq!(
+            apply_prop_reads_in_prop_default_values(
+                "☃ $.prop($$props, '名', 24, () => logs.push(1));",
+                &["logs".to_string()],
+            ),
+            "☃ $.prop($$props, '名', 24, () => logs().push(1));",
+        );
+        assert_eq!(
+            super::apply_store_reads_in_prop_default_values(
+                "$.prop($$props, '名', 24, () => $items);",
+                &["$items".to_string()],
+            ),
+            "$.prop($$props, '名', 24, () => $items());",
+        );
+    }
+
+    #[test]
     fn splits_top_level_commas() {
         assert_eq!(split_declarators("a, b, c"), vec!["a", " b", " c"]);
     }
@@ -3509,15 +4988,9 @@ mod split_declarators_tests {
     #[test]
     fn ignores_commas_inside_strings() {
         // M-045: a comma inside a string default must not split the list.
-        assert_eq!(
-            split_declarators(r#"a = "x,y", b"#),
-            vec![r#"a = "x,y""#, " b"]
-        );
+        assert_eq!(split_declarators(r#"a = "x,y", b"#), vec![r#"a = "x,y""#, " b"]);
         assert_eq!(split_declarators("a = 'x,y', b"), vec!["a = 'x,y'", " b"]);
-        assert_eq!(
-            split_declarators("a = `x,${y},z`, b"),
-            vec!["a = `x,${y},z`", " b"]
-        );
+        assert_eq!(split_declarators("a = `x,${y},z`, b"), vec!["a = `x,${y},z`", " b"]);
     }
 
     #[test]
@@ -3532,34 +5005,19 @@ mod split_declarators_tests {
         // Trailing line comment after a comma (commas inside it preserved).
         assert_eq!(
             split_declarators("open = void 0, // If undefined, renders inline; else modal\nclose"),
-            vec![
-                "open = void 0",
-                " // If undefined, renders inline; else modal\nclose"
-            ]
+            vec!["open = void 0", " // If undefined, renders inline; else modal\nclose"]
         );
         // Block comment with commas.
-        assert_eq!(
-            split_declarators("a /* x, y, z */, b"),
-            vec!["a /* x, y, z */", " b"]
-        );
+        assert_eq!(split_declarators("a /* x, y, z */, b"), vec!["a /* x, y, z */", " b"]);
         // `/*/` must not self-close on the opener's own star.
-        assert_eq!(
-            split_declarators("a = b /*/, c */ , d"),
-            vec!["a = b /*/, c */ ", " d"]
-        );
+        assert_eq!(split_declarators("a = b /*/, c */ , d"), vec!["a = b /*/, c */ ", " d"]);
         // `//` inside a string is still a string, not a comment.
-        assert_eq!(
-            split_declarators(r#"a = "http://x,y", b"#),
-            vec![r#"a = "http://x,y""#, " b"]
-        );
+        assert_eq!(split_declarators(r#"a = "http://x,y", b"#), vec![r#"a = "http://x,y""#, " b"]);
     }
 
     #[test]
     fn honours_escaped_quote_in_string() {
-        assert_eq!(
-            split_declarators(r#"a = "x\",y", b"#),
-            vec![r#"a = "x\",y""#, " b"]
-        );
+        assert_eq!(split_declarators(r#"a = "x\",y", b"#), vec![r#"a = "x\",y""#, " b"]);
     }
 
     #[test]
@@ -3582,5 +5040,196 @@ mod split_declarators_tests {
             transform_prop_reads_in_expr("cond ? active : 0", &["active".to_string()]),
             "cond ? active() : 0"
         );
+    }
+}
+
+#[cfg(test)]
+mod props_pattern_span_tests {
+    use super::props_pattern_span;
+
+    #[test]
+    fn jsdoc_type_braces_are_not_the_pattern() {
+        // `let /** @type {Props} */ { a, b } = $props();` — idiomatic in JS Svelte.
+        let line = "let /** @type {Props} */ { a, b } = $props();";
+        let (open, close) = props_pattern_span(line).unwrap();
+        assert_eq!(&line[open..=close], "{ a, b }");
+    }
+
+    #[test]
+    fn trailing_comment_brace_is_not_the_closer() {
+        let line = "let { a } = $props(); // }";
+        let (open, close) = props_pattern_span(line).unwrap();
+        assert_eq!(&line[open..=close], "{ a }");
+    }
+
+    #[test]
+    fn plain_pattern_is_unchanged() {
+        let line = "let { a, b } = $props();";
+        let (open, close) = props_pattern_span(line).unwrap();
+        assert_eq!(&line[open..=close], "{ a, b }");
+    }
+}
+
+#[cfg(test)]
+mod pattern_end_unit_tests {
+    use super::find_destructuring_pattern_end;
+
+    #[test]
+    fn pattern_end_is_a_byte_offset() {
+        // Callers slice `&str` with this, so it must be a byte offset. The
+        // leading-space case is the only one where the trim `base` is non-zero.
+        for pattern in ["{ a }", "{ café }", "{ ああ }", "[ あ, い ]", "  { café }"] {
+            let end = find_destructuring_pattern_end(pattern).unwrap();
+            assert_eq!(&pattern[..end], pattern, "pattern {pattern:?}");
+        }
+    }
+}
+
+/// The legacy setter wrap `prop(prop().member = v, true)` is matched as text, but
+/// the printer breaks it across lines once the assigned value is long. The
+/// single-line-only matcher fell through to the runes-mode branch, which cut the
+/// expression at the first newline and spliced the validator call *inside*
+/// `prop(` — leaving an empty argument slot and an orphaned `true`.
+#[cfg(test)]
+mod multiline_setter_wrap_tests {
+    use super::wrap_prop_mutation_validation;
+
+    fn wrap(stmt: &str) -> String {
+        wrap_prop_mutation_validation(
+            stmt,
+            &[("filter".to_string(), None)],
+            "<script>\n  export let filter;\n  filter.onRemove = () => {};\n</script>",
+        )
+    }
+
+    #[test]
+    fn multiline_setter_call_is_wrapped_as_a_whole() {
+        let out = wrap(
+            "filter(\n\tfilter().onRemove = () => {\n\t\tremove(filter().index);\n\t},\n\ttrue\n);",
+        );
+        assert_eq!(
+            out,
+            "$$ownership_validator.mutation(null, ['filter', 'onRemove'], filter(\n\tfilter().onRemove = () => {\n\t\tremove(filter().index);\n\t},\n\ttrue\n), 3, 2);"
+        );
+    }
+
+    /// Control: the single-line shape is unchanged by the tolerance.
+    #[test]
+    fn single_line_setter_call_is_unchanged() {
+        assert_eq!(
+            wrap("filter(filter().onRemove = 1, true);"),
+            "$$ownership_validator.mutation(null, ['filter', 'onRemove'], filter(filter().onRemove = 1, true), 3, 2);"
+        );
+    }
+
+    /// Control: an unrelated call whose argument merely mentions the prop is not
+    /// mistaken for the setter wrap.
+    #[test]
+    fn unrelated_multiline_call_is_left_alone() {
+        assert_eq!(wrap("remove(\n\tfilter().index\n);"), "remove(\n\tfilter().index\n);");
+    }
+}
+
+/// The prop-mutation scans read the character adjacent to a match, not the byte.
+/// Each case pairs a non-ASCII input with the ASCII input it must agree with;
+/// before the fix every non-ASCII row returned the *other* answer.
+#[cfg(test)]
+mod non_ascii_boundary_tests {
+    use super::{
+        PropMutationScan, PropMutationSites, is_mutation_operator, mutation_value_start,
+        scan_member_chain_names, wrap_prop_mutation_validation,
+    };
+
+    /// `名` ends in `0x8D`, which reads as a C1 control — so the letter before
+    /// `count(` looked like a word boundary and a member of an unrelated
+    /// identifier was wrapped in an ownership check that names `count`.
+    #[test]
+    fn a_prop_name_inside_a_longer_non_ascii_identifier_is_not_a_mutation() {
+        let wrap = |stmt: &str| {
+            wrap_prop_mutation_validation(
+                stmt,
+                &[("count".to_string(), None)],
+                "<script>let { count } = $props();</script>",
+            )
+        };
+        // Control: the ASCII form is left alone, before and after the fix.
+        assert_eq!(wrap("x_count().a = 1;"), "x_count().a = 1;");
+        assert_eq!(wrap("\u{540D}count().a = 1;"), "\u{540D}count().a = 1;");
+        assert_eq!(wrap("\u{5D0}count().a = 1;"), "\u{5D0}count().a = 1;");
+        // Control on the other side: a standalone prop mutation is still wrapped.
+        assert!(wrap("count().a = 1;").starts_with("$$ownership_validator.mutation("));
+    }
+
+    /// The same boundary on the legacy `prop(prop().member = v, true)` shape.
+    #[test]
+    fn the_legacy_mutation_shape_honours_the_same_boundary() {
+        let wrap = |stmt: &str| {
+            wrap_prop_mutation_validation(
+                stmt,
+                &[("count".to_string(), None)],
+                "<script>export let count;</script>",
+            )
+        };
+        assert_eq!(wrap("x_count(count().a = 1, true);"), "x_count(count().a = 1, true);");
+        assert_eq!(
+            wrap("\u{540D}count(count().a = 1, true);"),
+            "\u{540D}count(count().a = 1, true);"
+        );
+        assert!(wrap("count(count().a = 1, true);").starts_with("$$ownership_validator.mutation("));
+        assert!(
+            wrap("count(count().名 = 1, true);").starts_with("$$ownership_validator.mutation(")
+        );
+    }
+
+    /// `PropMutationSites::collect` carries the same boundary; a site collected
+    /// here is what gives a dev-mode ownership warning its line and column.
+    #[test]
+    fn a_collected_site_honours_the_same_boundary() {
+        let count = |source: &str| {
+            let scan = PropMutationScan::new(source);
+            PropMutationSites::collect(source, "count", &scan).sites.len()
+        };
+        assert_eq!(count("<script>x_count.a = 1;</script>"), 0);
+        assert_eq!(count("<script>\u{540D}count.a = 1;</script>"), 0);
+        assert_eq!(count("<script>count.a = 1;</script>"), 1);
+    }
+
+    /// A non-ASCII member name is one name, not a replacement character, and the
+    /// offset the scan stops at must stay on a character boundary — the byte scan
+    /// consumed only the lead byte and handed the rest of the pipeline a cursor
+    /// pointing inside the character.
+    #[test]
+    fn a_non_ascii_member_name_is_scanned_whole() {
+        for (source, name) in [
+            ("item.name = 5;", "name"),
+            ("item.\u{540D} = 5;", "\u{540D}"),
+            ("item.\u{E0} = 5;", "\u{E0}"),
+        ] {
+            let (after, names) = scan_member_chain_names(source, 4).unwrap();
+            assert_eq!(names.as_deref(), Some([name.to_string()].as_slice()));
+            assert!(source.is_char_boundary(after), "source {source:?}");
+            assert!(is_mutation_operator(source, after), "source {source:?}");
+            assert!(mutation_value_start(source, after).is_some());
+        }
+    }
+
+    /// `U+3000` and NBSP are JavaScript whitespace. Their lead bytes (`0xE3`,
+    /// `0xC2`) Latin-1-decode to letters, so the byte scan read them as part of
+    /// the member name and then failed to find the `=` behind them.
+    #[test]
+    fn non_ascii_whitespace_separates_a_member_from_its_operator() {
+        for source in
+            ["item.name = 5;", "item.name\u{3000}= 5;", "item.name\u{A0}= 5;", "item.name\t= 5;"]
+        {
+            let (after, names) = scan_member_chain_names(source, 4).unwrap();
+            assert_eq!(
+                names.as_deref(),
+                Some(["name".to_string()].as_slice()),
+                "source {source:?}"
+            );
+            assert!(is_mutation_operator(source, after), "source {source:?}");
+            let value_start = mutation_value_start(source, after).unwrap();
+            assert_eq!(source[value_start..].trim(), "5;", "source {source:?}");
+        }
     }
 }

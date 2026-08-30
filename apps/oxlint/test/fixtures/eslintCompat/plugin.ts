@@ -247,9 +247,7 @@ function createCfgRule(ruleNum: number): Rule {
 
           addEvent("after");
 
-          if (ruleNum === 1 || !visits.some((v) => v.ruleNum === 1 && v.event === "after")) {
-            return;
-          }
+          if (ruleNum === 1) return;
 
           const expectedVisits: typeof visits = [
             { ruleNum: 1, event: "before" },

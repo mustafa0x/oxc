@@ -413,6 +413,7 @@ export type Destructure = "only-when-assigned" | "always" | "never";
 export type NextTickOption = "promise" | "callback";
 export type CaseType2 = "camelCase" | "snake_case";
 export type AllowYoda = "never" | "always";
+export type OxlintOverrides = OxlintOverride[];
 export type JestVersionSchema = number | string;
 export type TagNamePreference =
   | (
@@ -442,7 +443,6 @@ export type CustomComponent =
       name: string;
       [k: string]: unknown | undefined;
     };
-export type OxlintOverrides = OxlintOverride[];
 
 /**
  * Oxlint Configuration File
@@ -695,9 +695,6 @@ export interface Oxlintrc {
 /**
  * Configure an entire category of rules all at once.
  *
- * Use a severity such as `"warn"` or `"error"` to apply every enabled rule in that category.
- * Use `"recommended"` to apply Oxlint's built-in category-default subset for that category (core ESLint plus default built-in plugins) at `"warn"` severity.
- *
  * Rules enabled or disabled this way will be overwritten by individual rules in the `rules` field.
  *
  * Example
@@ -705,8 +702,7 @@ export interface Oxlintrc {
  * {
  *   "$schema": "./node_modules/oxlint/configuration_schema.json",
  *   "categories": {
- *     "correctness": "warn",
- *     "suspicious": "recommended"
+ *     "correctness": "warn"
  *   },
  *   "rules": {
  *     "eslint/no-unused-vars": "error"
@@ -715,13 +711,13 @@ export interface Oxlintrc {
  * ```
  */
 export interface RuleCategories {
-  correctness?: AllowWarnDeny | "recommended";
-  nursery?: AllowWarnDeny | "recommended";
-  pedantic?: AllowWarnDeny | "recommended";
-  perf?: AllowWarnDeny | "recommended";
-  restriction?: AllowWarnDeny | "recommended";
-  style?: AllowWarnDeny | "recommended";
-  suspicious?: AllowWarnDeny | "recommended";
+  correctness?: AllowWarnDeny;
+  nursery?: AllowWarnDeny;
+  pedantic?: AllowWarnDeny;
+  perf?: AllowWarnDeny;
+  restriction?: AllowWarnDeny;
+  style?: AllowWarnDeny;
+  suspicious?: AllowWarnDeny;
 }
 /**
  * Predefine global variables.
@@ -893,11 +889,6 @@ export interface OxlintOverride {
    */
   plugins?: LintPlugins;
   rules?: DummyRuleMap;
-  /**
-   * Plugin-specific configuration for both built-in and custom plugins.
-   */
-  settings?: OxlintPluginSettings;
-  [k: string]: unknown | undefined;
 }
 /**
  * See [Oxlint Rules](https://oxc.rs/docs/guide/usage/linter/rules.html)

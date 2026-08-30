@@ -26,11 +26,7 @@ fn get_rune(node: &Value, context: &VisitorContext) -> Option<String> {
     let callee = node.get("callee")?;
     let keypath = get_global_keypath(callee, context)?;
 
-    if super::shared::function::is_rune(&keypath) {
-        Some(keypath)
-    } else {
-        None
-    }
+    if super::shared::function::is_rune(&keypath) { Some(keypath) } else { None }
 }
 
 /// Get the global keypath of an expression.
@@ -120,9 +116,9 @@ fn get_global_keypath(node: &Value, context: &VisitorContext) -> Option<String> 
 /// // get_parent(context, 2) returns Program
 /// // get_parent(context, 3) returns None
 /// ```
-fn get_parent<'a>(context: &'a VisitorContext, offset: usize) -> Option<&'a Value> {
+fn get_parent<'a>(context: &'a VisitorContext, offset: usize) -> Option<&'a super::JsPathEntry> {
     let index = context.js_path.len().checked_sub(offset + 1)?;
-    context.js_path.get(index).map(|entry| &**entry)
+    context.js_path.get(index)
 }
 
 /// Check if $bindable is in a valid placement.
@@ -152,7 +148,7 @@ fn is_bindable_valid_placement(context: &VisitorContext) -> bool {
         None => return false,
     };
 
-    if parent.get("type").and_then(|t| t.as_str()) != Some("AssignmentPattern") {
+    if parent.get_type_str() != Some("AssignmentPattern") {
         return false;
     }
 
@@ -163,7 +159,7 @@ fn is_bindable_valid_placement(context: &VisitorContext) -> bool {
         None => return false,
     };
 
-    let gp_type = grandparent.get("type").and_then(|t| t.as_str());
+    let gp_type = grandparent.get_type_str();
 
     // If grandparent is Property, skip it and look at the next ancestor
     if gp_type == Some("Property") {
@@ -172,7 +168,7 @@ fn is_bindable_valid_placement(context: &VisitorContext) -> bool {
             Some(p) => p,
             None => return false,
         };
-        let next_type = next_ancestor.get("type").and_then(|t| t.as_str());
+        let next_type = next_ancestor.get_type_str();
         if !matches!(next_type, Some("ObjectPattern") | Some("ArrayPattern")) {
             return false;
         }
@@ -187,17 +183,77 @@ fn is_bindable_valid_placement(context: &VisitorContext) -> bool {
         None => return false,
     };
 
-    if var_declarator.get("type").and_then(|t| t.as_str()) != Some("VariableDeclarator") {
+    if var_declarator.get_type_str() != Some("VariableDeclarator") {
         return false;
     }
 
-    // Check that VariableDeclarator init is $props()
-    if let Some(init) = var_declarator.get("init") {
+    // Check that VariableDeclarator init is $props().
+    //
+    // Read `init` straight off the typed node when there is one: `as_value()`
+    // would lower the whole declarator — including the `$props()` destructuring
+    // pattern, which real components make very large — into a `Value` just to
+    // reach this one field.
+    if let Some(JsNode::VariableDeclarator { init, .. }) = var_declarator.as_js_node() {
+        let Some(init) = init else {
+            return false;
+        };
+        let init_node = context.parse_arena.get_js_node(*init);
+        return get_rune_node(init_node, context).as_deref() == Some("$props");
+    }
+
+    if let Some(init) = var_declarator.as_value().get("init") {
         let rune = get_rune(init, context);
         return rune.as_deref() == Some("$props");
     }
 
     false
+}
+
+/// Typed mirror of [`get_rune`].
+fn get_rune_node(node: &JsNode, context: &VisitorContext) -> Option<String> {
+    let JsNode::CallExpression { callee, .. } = node else {
+        return None;
+    };
+    let callee = context.parse_arena.get_js_node(*callee);
+    let keypath = get_global_keypath_node(callee, context)?;
+    if super::shared::function::is_rune(&keypath) { Some(keypath) } else { None }
+}
+
+/// Typed mirror of [`get_global_keypath`].
+fn get_global_keypath_node(node: &JsNode, context: &VisitorContext) -> Option<String> {
+    let arena = context.parse_arena;
+    let mut n = node;
+    let mut joined = String::new();
+
+    while let JsNode::MemberExpression { object, property, computed, .. } = n {
+        if *computed {
+            return None;
+        }
+        let JsNode::Identifier { name, .. } = arena.get_js_node(*property) else {
+            return None;
+        };
+        joined = format!(".{}{}", name, joined);
+        n = arena.get_js_node(*object);
+    }
+
+    if let JsNode::CallExpression { callee, .. } = n {
+        let callee = arena.get_js_node(*callee);
+        if !matches!(callee, JsNode::Identifier { .. }) {
+            return None;
+        }
+        joined = format!("(){}", joined);
+        n = callee;
+    }
+
+    let JsNode::Identifier { name, .. } = n else {
+        return None;
+    };
+
+    if context.analysis.root.find_binding_any_scope(name.as_str()).is_some() {
+        return None;
+    }
+
+    Some(format!("{}{}", name, joined))
 }
 
 /// Check if $props is in a valid placement.
@@ -227,7 +283,7 @@ fn is_props_valid_placement(context: &VisitorContext) -> bool {
         None => return false,
     };
 
-    if parent.get("type").and_then(|t| t.as_str()) != Some("VariableDeclarator") {
+    if parent.get_type_str() != Some("VariableDeclarator") {
         return false;
     }
 
@@ -243,7 +299,7 @@ fn is_props_valid_placement(context: &VisitorContext) -> bool {
             None => return false,
         };
 
-        let ancestor_type = ancestor.get("type").and_then(|t| t.as_str());
+        let ancestor_type = ancestor.get_type_str();
 
         match ancestor_type {
             Some("Program") => {
@@ -303,12 +359,16 @@ fn is_props_id_valid_placement(context: &VisitorContext) -> bool {
         None => return false,
     };
 
-    if parent.get("type").and_then(|t| t.as_str()) != Some("VariableDeclarator") {
+    if parent.get_type_str() != Some("VariableDeclarator") {
         return false;
     }
 
     // The id field of VariableDeclarator must be an Identifier (not ObjectPattern or ArrayPattern)
-    if let Some(id) = parent.get("id") {
+    if let Some(JsNode::VariableDeclarator { id, .. }) = parent.as_js_node() {
+        if !matches!(context.parse_arena.get_js_node(*id), JsNode::Identifier { .. }) {
+            return false;
+        }
+    } else if let Some(id) = parent.as_value().get("id") {
         let id_type = id.get("type").and_then(|t| t.as_str());
         if id_type != Some("Identifier") {
             return false;
@@ -325,7 +385,7 @@ fn is_props_id_valid_placement(context: &VisitorContext) -> bool {
             None => return false,
         };
 
-        let ancestor_type = ancestor.get("type").and_then(|t| t.as_str());
+        let ancestor_type = ancestor.get_type_str();
 
         match ancestor_type {
             Some("Program") => {
@@ -397,7 +457,7 @@ fn is_state_or_derived_valid_placement(context: &VisitorContext) -> bool {
         None => return false,
     };
 
-    let parent_type = parent.get("type").and_then(|t| t.as_str());
+    let parent_type = parent.get_type_str();
 
     match parent_type {
         Some("VariableDeclarator") => {
@@ -417,20 +477,14 @@ fn is_state_or_derived_valid_placement(context: &VisitorContext) -> bool {
 
         Some("PropertyDefinition") => {
             // Must be non-static and non-computed
-            let is_static = parent
-                .get("static")
-                .and_then(|s| s.as_bool())
-                .unwrap_or(false);
-            let is_computed = parent
-                .get("computed")
-                .and_then(|c| c.as_bool())
-                .unwrap_or(false);
+            let is_static = parent.get_field_bool("static").unwrap_or(false);
+            let is_computed = parent.get_field_bool("computed").unwrap_or(false);
             !is_static && !is_computed
         }
 
         Some("AssignmentExpression") => {
             // Check if this is a valid class property assignment at constructor root
-            is_class_property_assignment_at_constructor_root(parent, context)
+            is_class_property_assignment_at_constructor_root(parent.as_value(), context)
         }
 
         _ => false,
@@ -463,11 +517,11 @@ fn is_class_property_assignment_at_constructor_root(
         None => return false,
     };
 
-    if parent_5.get("type").and_then(|t| t.as_str()) != Some("MethodDefinition") {
+    if parent_5.get_type_str() != Some("MethodDefinition") {
         return false;
     }
 
-    if parent_5.get("kind").and_then(|k| k.as_str()) != Some("constructor") {
+    if parent_5.get_field_str("kind") != Some("constructor") {
         return false;
     }
 
@@ -491,10 +545,7 @@ fn is_class_property_assignment_at_constructor_root(
 
     // Check property type: must be (Identifier && !computed) || PrivateIdentifier || Literal
     // This mirrors the official Svelte compiler's is_class_property_assignment_at_constructor_root
-    let computed = left
-        .get("computed")
-        .and_then(|c| c.as_bool())
-        .unwrap_or(false);
+    let computed = left.get("computed").and_then(|c| c.as_bool()).unwrap_or(false);
     if let Some(property) = left.get("property") {
         let prop_type = property.get("type").and_then(|t| t.as_str());
         match prop_type {
@@ -527,7 +578,7 @@ fn is_effect_valid_placement(context: &VisitorContext) -> bool {
         None => return false,
     };
 
-    parent.get("type").and_then(|t| t.as_str()) == Some("ExpressionStatement")
+    parent.get_type_str() == Some("ExpressionStatement")
 }
 
 /// Check if $inspect.trace is in a valid placement.
@@ -556,7 +607,7 @@ fn is_inspect_trace_valid_placement(context: &VisitorContext) -> bool {
         None => return false,
     };
 
-    if parent.get("type").and_then(|t| t.as_str()) != Some("ExpressionStatement") {
+    if parent.get_type_str() != Some("ExpressionStatement") {
         return false;
     }
 
@@ -566,7 +617,7 @@ fn is_inspect_trace_valid_placement(context: &VisitorContext) -> bool {
         None => return false,
     };
 
-    if grandparent.get("type").and_then(|t| t.as_str()) != Some("BlockStatement") {
+    if grandparent.get_type_str() != Some("BlockStatement") {
         return false;
     }
 
@@ -576,7 +627,7 @@ fn is_inspect_trace_valid_placement(context: &VisitorContext) -> bool {
         None => return false,
     };
 
-    let fn_type = fn_node.get("type").and_then(|t| t.as_str());
+    let fn_type = fn_node.get_type_str();
     if !matches!(
         fn_type,
         Some("FunctionDeclaration") | Some("FunctionExpression") | Some("ArrowFunctionExpression")
@@ -586,11 +637,11 @@ fn is_inspect_trace_valid_placement(context: &VisitorContext) -> bool {
 
     // Check it's the first statement in the block by comparing source positions:
     // distinct AST nodes have distinct `start` offsets within a single parse.
-    if let Some(body) = grandparent.get("body").and_then(|b| b.as_array())
+    if let Some(body) = grandparent.as_value().get("body").and_then(|b| b.as_array())
         && let Some(first) = body.first()
     {
         let first_start = first.get("start").and_then(|s| s.as_u64());
-        let parent_start = parent.get("start").and_then(|s| s.as_u64());
+        let parent_start = parent.get_field_u64("start");
         return first_start.is_some() && first_start == parent_start;
     }
 
@@ -619,10 +670,7 @@ fn is_inside_generator_function(context: &VisitorContext) -> bool {
     for node in context.js_path.iter().rev() {
         let node_type = node.get_type_str();
 
-        if matches!(
-            node_type,
-            Some("FunctionDeclaration") | Some("FunctionExpression")
-        ) {
+        if matches!(node_type, Some("FunctionDeclaration") | Some("FunctionExpression")) {
             if node.get_field_bool("generator").unwrap_or(false) {
                 return true;
             }
@@ -633,12 +681,15 @@ fn is_inside_generator_function(context: &VisitorContext) -> bool {
     false
 }
 
-/// Visit a call expression (typed JsNode path).
-pub fn visit_typed(node: &JsNode, context: &mut VisitorContext) -> Result<(), AnalysisError> {
-    let JsNode::CallExpression {
-        callee, arguments, ..
-    } = node
-    else {
+/// Apply the rune arity and placement rules to one call expression.
+///
+/// Split out of [`visit_typed`] because the template walker reaches a call
+/// through its own traversal and has to run the same rules.
+pub(crate) fn validate_rune_call(
+    node: &JsNode,
+    context: &mut VisitorContext,
+) -> Result<(), AnalysisError> {
+    let JsNode::CallExpression { callee, arguments, start, end, .. } = node else {
         return Ok(());
     };
 
@@ -655,7 +706,7 @@ pub fn visit_typed(node: &JsNode, context: &mut VisitorContext) -> Result<(), An
     {
         for arg in args {
             if matches!(arg, JsNode::SpreadElement { .. }) {
-                return Err(errors::rune_invalid_spread(rune_name));
+                return Err(errors::rune_invalid_spread(rune_name).at(*start, *end));
             }
         }
     }
@@ -670,45 +721,48 @@ pub fn visit_typed(node: &JsNode, context: &mut VisitorContext) -> Result<(), An
                 return Err(errors::rune_invalid_arguments_length(
                     "$bindable",
                     "zero or one arguments",
-                ));
+                )
+                .at(*start, *end));
             }
             if !is_bindable_valid_placement(context) {
-                return Err(errors::bindable_invalid_location());
+                return Err(errors::bindable_invalid_location().at(*start, *end));
             }
             context.analysis.needs_context = true;
         }
         Some("$host") => {
             if arg_count > 0 {
-                return Err(errors::rune_invalid_arguments("$host"));
+                return Err(errors::rune_invalid_arguments("$host").at(*start, *end));
             } else if context.analysis.custom_element.is_none() {
-                return Err(errors::host_invalid_placement());
+                return Err(errors::host_invalid_placement().at(*start, *end));
             }
         }
         Some("$props") => {
             if context.has_props_rune {
-                return Err(errors::props_duplicate("$props"));
+                return Err(errors::props_duplicate("$props").at(*start, *end));
             }
             context.has_props_rune = true;
             if context.ast_type != super::AstType::Instance || !is_props_valid_placement(context) {
-                return Err(errors::props_invalid_placement());
+                return Err(errors::props_invalid_placement().at(*start, *end));
             }
             if arg_count > 0 {
-                return Err(errors::rune_invalid_arguments("$props"));
+                return Err(errors::rune_invalid_arguments("$props").at(*start, *end));
             }
         }
         Some("$props.id") => {
             if context.analysis.props_id.is_some() {
-                return Err(errors::props_duplicate("$props.id"));
+                return Err(errors::props_duplicate("$props.id").at(*start, *end));
             }
-            if !is_props_id_valid_placement(context) {
-                return Err(errors::props_id_invalid_placement());
+            if context.ast_type != super::AstType::Instance || !is_props_id_valid_placement(context)
+            {
+                return Err(errors::props_id_invalid_placement().at(*start, *end));
             }
             if arg_count > 0 {
-                return Err(errors::rune_invalid_arguments("$props.id"));
+                return Err(errors::rune_invalid_arguments("$props.id").at(*start, *end));
             }
             // Get parent VariableDeclarator to extract id name
             if let Some(parent) = get_parent(context, 1)
                 && let Some(id_name) = parent
+                    .as_value()
                     .get("id")
                     .and_then(|id| id.get("name"))
                     .and_then(|n| n.as_str())
@@ -718,7 +772,9 @@ pub fn visit_typed(node: &JsNode, context: &mut VisitorContext) -> Result<(), An
         }
         Some("$state") | Some("$state.raw") | Some("$derived") | Some("$derived.by") => {
             if !is_state_or_derived_valid_placement(context) {
-                return Err(errors::state_invalid_placement(rune.as_deref().unwrap()));
+                return Err(
+                    errors::state_invalid_placement(rune.as_deref().unwrap()).at(*start, *end)
+                );
             }
             let rune_name = rune.as_deref().unwrap();
             if rune_name == "$derived" || rune_name == "$derived.by" {
@@ -726,61 +782,65 @@ pub fn visit_typed(node: &JsNode, context: &mut VisitorContext) -> Result<(), An
                     return Err(errors::rune_invalid_arguments_length(
                         rune_name,
                         "exactly one argument",
-                    ));
+                    )
+                    .at(*start, *end));
                 }
             } else if arg_count > 1 {
                 return Err(errors::rune_invalid_arguments_length(
                     rune_name,
                     "zero or one arguments",
-                ));
+                )
+                .at(*start, *end));
             }
         }
         Some("$effect") | Some("$effect.pre") => {
             if !is_effect_valid_placement(context) {
-                return Err(errors::effect_invalid_placement());
+                return Err(errors::effect_invalid_placement().at(*start, *end));
             }
             if arg_count != 1 {
                 return Err(errors::rune_invalid_arguments_length(
                     rune.as_deref().unwrap(),
                     "exactly one argument",
-                ));
+                )
+                .at(*start, *end));
             }
             context.analysis.needs_context = true;
         }
         Some("$effect.tracking") if arg_count != 0 => {
-            return Err(errors::rune_invalid_arguments("$effect.tracking"));
+            return Err(errors::rune_invalid_arguments("$effect.tracking").at(*start, *end));
         }
         Some("$effect.root") if arg_count != 1 => {
             return Err(errors::rune_invalid_arguments_length(
                 "$effect.root",
                 "exactly one argument",
-            ));
+            )
+            .at(*start, *end));
         }
         Some("$effect.pending") => {}
         Some("$inspect") if arg_count < 1 => {
-            return Err(errors::rune_invalid_arguments_length(
-                "$inspect",
-                "one or more arguments",
-            ));
+            return Err(errors::rune_invalid_arguments_length("$inspect", "one or more arguments")
+                .at(*start, *end));
         }
         Some("$inspect().with") if arg_count != 1 => {
             return Err(errors::rune_invalid_arguments_length(
                 "$inspect().with",
                 "exactly one argument",
-            ));
+            )
+            .at(*start, *end));
         }
         Some("$inspect.trace") => {
             if arg_count > 1 {
                 return Err(errors::rune_invalid_arguments_length(
                     "$inspect.trace",
                     "zero or one arguments",
-                ));
+                )
+                .at(*start, *end));
             }
             if !is_inspect_trace_valid_placement(context) {
-                return Err(errors::inspect_trace_invalid_placement());
+                return Err(errors::inspect_trace_invalid_placement().at(*start, *end));
             }
             if is_inside_generator_function(context) {
-                return Err(errors::inspect_trace_generator());
+                return Err(errors::inspect_trace_generator().at(*start, *end));
             }
             if context.analysis.dev {
                 context.analysis.tracing = true;
@@ -790,26 +850,34 @@ pub fn visit_typed(node: &JsNode, context: &mut VisitorContext) -> Result<(), An
             return Err(errors::rune_invalid_arguments_length(
                 "$state.eager",
                 "exactly one argument",
-            ));
+            )
+            .at(*start, *end));
         }
         Some("$state.snapshot") if arg_count != 1 => {
             return Err(errors::rune_invalid_arguments_length(
                 "$state.snapshot",
                 "exactly one argument",
-            ));
+            )
+            .at(*start, *end));
         }
         _ => {}
     }
 
-    // Track expression metadata for non-rune calls
-    let is_pure_call = super::shared::utils::is_pure_node(callee_node, context);
-    if let Some(expression) = context.current_expression() {
-        let has_dependencies = !expression.dependencies.is_empty();
-        if !is_pure_call || has_dependencies {
-            expression.set_has_call(true);
-            expression.set_has_state(true);
-        }
-    }
+    Ok(())
+}
+
+/// Visit a call expression (typed JsNode path).
+pub fn visit_typed(node: &JsNode, context: &mut VisitorContext) -> Result<(), AnalysisError> {
+    let JsNode::CallExpression { callee, arguments, .. } = node else {
+        return Ok(());
+    };
+
+    validate_rune_call(node, context)?;
+
+    let arena = context.parse_arena;
+    let callee_node = arena.get_js_node(*callee);
+    let args = arena.get_js_children(*arguments);
+    let rune = super::shared::utils::get_rune_from_node(node, &context.analysis.root.scope, arena);
 
     // For $derived and $inspect, increment function_depth when visiting arguments
     let increment_depth = matches!(rune.as_deref(), Some("$derived") | Some("$inspect"));

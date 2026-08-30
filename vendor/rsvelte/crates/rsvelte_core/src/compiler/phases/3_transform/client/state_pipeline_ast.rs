@@ -42,9 +42,13 @@ use oxc_ast_visit::{Visit, walk};
 use oxc_parser::ParseOptions;
 use oxc_semantic::{Semantic, SemanticBuilder};
 use oxc_span::{GetSpan, SourceType};
-use oxc_syntax::operator::{AssignmentOperator, UpdateOperator};
-use oxc_syntax::symbol::SymbolId;
-use rustc_hash::FxHashSet;
+use oxc_syntax::operator::{
+    AssignmentOperator, BinaryOperator, LogicalOperator, UnaryOperator, UpdateOperator,
+};
+use oxc_syntax::symbol::{SymbolFlags, SymbolId};
+
+use crate::compiler::phases::phase3_transform::shared::js_scan::contains_identifier;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::ast_rewrite::{self, Edit};
 use super::expression_utils::{
@@ -69,31 +73,38 @@ pub fn transform_state_pipeline_ast(
     if state_vars.is_empty() {
         return None;
     }
-    // Pre-filter: anything in non_reactive_vars is excluded from reads.
-    let effective_read_names: Vec<String> = state_vars
-        .iter()
-        .filter(|v| !non_reactive_vars.iter().any(|n| n == *v))
-        .cloned()
-        .collect();
-    if !state_vars
-        .iter()
-        .any(|v| memchr::memmem::find(source.as_bytes(), v.as_bytes()).is_some())
-    {
+    crate::compiler::phases::phase3_transform::profile::record_sp_call();
+    if !state_vars.iter().any(|v| contains_identifier(source, v)) {
+        crate::compiler::phases::phase3_transform::profile::record_sp_bail(state_vars.len() as u64);
         return None;
     }
+    // Pre-filter: anything in non_reactive_vars is excluded from reads.
+    let effective_read_names: Vec<String> =
+        state_vars.iter().filter(|v| !non_reactive_vars.iter().any(|n| n == *v)).cloned().collect();
     if memchr::memchr(b'=', source.as_bytes()).is_none()
         && memchr::memmem::find(source.as_bytes(), b"++").is_none()
         && memchr::memmem::find(source.as_bytes(), b"--").is_none()
-        && !effective_read_names
-            .iter()
-            .any(|v| memchr::memmem::find(source.as_bytes(), v.as_bytes()).is_some())
+        && !effective_read_names.iter().any(|v| contains_identifier(source, v))
     {
         return None;
     }
 
-    ast_rewrite::fixed_point(source, |src| {
-        single_pass(
-            src,
+    let spliced = || {
+        ast_rewrite::fixed_point(source, |src| {
+            single_pass(
+                src,
+                state_vars,
+                raw_state_vars,
+                is_runes,
+                non_proxy_vars,
+                &effective_read_names,
+            )
+        })
+    };
+
+    ast_rewrite::dual_run::resolve("state_pipeline_ast:inplace", source, spliced, || {
+        transform_state_pipeline_in_place(
+            source,
             state_vars,
             raw_state_vars,
             is_runes,
@@ -114,13 +125,14 @@ fn single_pass(
     ast_rewrite::with_program(
         &STATE_PIPELINE_ALLOC,
         source,
-        SourceType::mjs(),
-        ParseOptions {
-            allow_return_outside_function: true,
-            ..ParseOptions::default()
-        },
+        SourceType::ts().with_module(true),
+        ParseOptions { allow_return_outside_function: true, ..ParseOptions::default() },
         |program| {
-            let semantic_ret = SemanticBuilder::new().with_build_nodes(true).build(program);
+            let semantic_ret = super::super::profile::semantic_build(
+                super::super::profile::SEM_STATE_PIPELINE,
+                program.source_text.len(),
+                || SemanticBuilder::new().with_build_nodes(true).build(program),
+            );
             let semantic = &semantic_ret.semantic;
             let state_var_symbols = find_state_var_symbols(semantic, state_vars);
 
@@ -136,6 +148,8 @@ fn single_pass(
                 read_replacements: Vec::new(),
                 assigns_replacements: Vec::new(),
                 skip_spans: FxHashSet::default(),
+                in_place: false,
+                sites: Sites::default(),
             };
             visitor.visit_program(program);
 
@@ -147,9 +161,7 @@ fn single_pass(
                 .read_replacements
                 .into_iter()
                 .filter(|(s, e, _)| {
-                    !assigns
-                        .iter()
-                        .any(|(as_s, as_e, _)| *s >= *as_s && *e <= *as_e)
+                    !assigns.iter().any(|(as_s, as_e, _)| *s >= *as_s && *e <= *as_e)
                 })
                 .collect();
 
@@ -181,6 +193,34 @@ struct PipelineVisitor<'a, 'sem> {
     /// $.update / $.update_pre / $.mutate, shorthand-property
     /// value position.
     skip_spans: FxHashSet<u32>,
+    /// Whether this walk feeds the in-place rewriter rather than the
+    /// splice pipeline. Gates both `sites` collection and the wider
+    /// rhs fold, so the splice path stays byte-for-byte unchanged.
+    in_place: bool,
+    sites: Sites,
+}
+
+/// The rewrite sites the in-place pass needs, keyed by `(start, end)`
+/// span. Operator, `prefix` and proxy-ness are re-read off the AST, so
+/// only the decision itself crosses from the walk to the rewriter.
+#[derive(Default)]
+struct Sites {
+    reads: FxHashSet<(u32, u32)>,
+    safe_reads: FxHashSet<(u32, u32)>,
+    shorthands: FxHashSet<(u32, u32)>,
+    safe_shorthands: FxHashSet<(u32, u32)>,
+    /// Assignment span -> (needs proxy, compound read needs `$.safe_get`).
+    assigns: FxHashMap<(u32, u32), (bool, bool)>,
+    updates: FxHashSet<(u32, u32)>,
+}
+
+impl Sites {
+    fn is_empty(&self) -> bool {
+        self.reads.is_empty()
+            && self.shorthands.is_empty()
+            && self.assigns.is_empty()
+            && self.updates.is_empty()
+    }
 }
 
 impl<'a, 'sem> PipelineVisitor<'a, 'sem> {
@@ -199,6 +239,27 @@ impl<'a, 'sem> PipelineVisitor<'a, 'sem> {
             &self.state_var_symbols,
             self.state_vars,
         )
+    }
+
+    /// Nested `var` rune declarations are function-scoped and may be read
+    /// before initialization. Root-scope module/component declarations keep
+    /// the ordinary getter used by upstream. Resolve the reference's own
+    /// symbol instead of reducing this decision to a name: a same-named
+    /// `let`/`const` in another scope must continue to use `$.get`.
+    fn reference_needs_safe_get(&self, ident: &IdentifierReference) -> bool {
+        let Some(reference_id) = ident.reference_id.get() else {
+            return false;
+        };
+        let scoping = self.semantic.scoping();
+        let Some(symbol_id) = scoping.get_reference(reference_id).symbol_id() else {
+            return false;
+        };
+        scoping.symbol_scope_id(symbol_id) != scoping.root_scope_id()
+            && scoping.symbol_flags(symbol_id).contains(SymbolFlags::FunctionScopedVariable)
+    }
+
+    fn getter_for_reference(&self, ident: &IdentifierReference) -> &'static str {
+        if self.reference_needs_safe_get(ident) { "$.safe_get" } else { "$.get" }
     }
 
     fn skip(&mut self, ident: &IdentifierReference) {
@@ -231,6 +292,41 @@ impl<'a, 'sem> PipelineVisitor<'a, 'sem> {
         }
         out
     }
+
+    /// The rhs text as the splice pipeline would see it on its *last*
+    /// fixed-point iteration: inner assignments and updates are already
+    /// rewritten there, and `expression_needs_proxy_with_scope` reads
+    /// that text. The in-place path runs once, so it folds them here.
+    fn rhs_text_with_inner_edits(&self, rhs_span: oxc_span::Span) -> String {
+        let rhs_start = rhs_span.start as usize;
+        let original = &self.source[rhs_start..rhs_span.end as usize];
+        let mut inner: Vec<&Edit> = self
+            .read_replacements
+            .iter()
+            .chain(self.assigns_replacements.iter())
+            .filter(|(s, e, _)| *s >= rhs_span.start && *e <= rhs_span.end)
+            .collect();
+        if inner.is_empty() {
+            return original.to_string();
+        }
+        // Outermost-only: AST spans nest rather than partially overlap,
+        // and an inner edit's text is already folded into the enclosing
+        // one (children are pushed first).
+        inner.sort_by_key(|(s, e, _)| (*s, std::cmp::Reverse(*e)));
+        let mut kept: Vec<&Edit> = Vec::new();
+        for edit in inner {
+            if kept.last().is_some_and(|last| edit.1 <= last.1) {
+                continue;
+            }
+            kept.push(edit);
+        }
+        kept.sort_by_key(|r| std::cmp::Reverse(r.0));
+        let mut out = original.to_string();
+        for (s, e, rewrite) in kept {
+            out.replace_range((*s as usize) - rhs_start..(*e as usize) - rhs_start, rewrite);
+        }
+        out
+    }
 }
 
 impl<'a, 'sem, 'ast> Visit<'ast> for PipelineVisitor<'a, 'sem> {
@@ -245,8 +341,18 @@ impl<'a, 'sem, 'ast> Visit<'ast> for PipelineVisitor<'a, 'sem> {
         if !self.is_state_var_ref(ident) {
             return;
         }
-        self.read_replacements
-            .push((ident.span.start, ident.span.end, format!("$.get({})", name)));
+        let getter = self.getter_for_reference(ident);
+        self.read_replacements.push((
+            ident.span.start,
+            ident.span.end,
+            format!("{}({})", getter, name),
+        ));
+        if self.in_place {
+            self.sites.reads.insert((ident.span.start, ident.span.end));
+            if getter == "$.safe_get" {
+                self.sites.safe_reads.insert((ident.span.start, ident.span.end));
+            }
+        }
     }
 
     fn visit_assignment_expression(&mut self, expr: &AssignmentExpression<'ast>) {
@@ -271,23 +377,47 @@ impl<'a, 'sem, 'ast> Visit<'ast> for PipelineVisitor<'a, 'sem> {
         if !self.is_state_var_ref(ident_ref) {
             return;
         }
+        let safe_get = self.reference_needs_safe_get(ident_ref);
 
         let rhs_span = expr.right.span();
-        let rhs_text = self.rhs_text_with_inner_reads(rhs_span);
+        let rhs_text = if self.in_place {
+            self.rhs_text_with_inner_edits(rhs_span)
+        } else {
+            self.rhs_text_with_inner_reads(rhs_span)
+        };
 
         match expr.operator {
             AssignmentOperator::Assign => {
                 let is_raw_state = self.raw_state_vars.iter().any(|s| s.as_str() == name);
+                // A bare-identifier RHS declared inside this statement resolves
+                // per-site (upstream should_proxy consults the scope at the
+                // assignment); the name-list fallback cannot distinguish two
+                // same-named inner bindings with different proxy-ness.
+                let site_decision = match expr.right.get_inner_expression() {
+                    Expression::Identifier(rhs_id) => {
+                        super::state_assigns_combined_ast::ident_rhs_needs_proxy(
+                            self.semantic,
+                            rhs_id,
+                        )
+                    }
+                    _ => None,
+                };
                 let needs_proxy = self.is_runes
                     && !is_raw_state
-                    && expression_needs_proxy_with_scope(rhs_text.trim(), self.non_proxy_vars);
+                    && site_decision.unwrap_or_else(|| {
+                        expression_needs_proxy_with_scope(rhs_text.trim(), self.non_proxy_vars)
+                    });
                 let rewrite = if needs_proxy {
                     format!("$.set({}, {}, true)", name, rhs_text)
                 } else {
                     format!("$.set({}, {})", name, rhs_text)
                 };
-                self.assigns_replacements
-                    .push((expr.span.start, expr.span.end, rewrite));
+                self.assigns_replacements.push((expr.span.start, expr.span.end, rewrite));
+                if self.in_place {
+                    self.sites
+                        .assigns
+                        .insert((expr.span.start, expr.span.end), (needs_proxy, safe_get));
+                }
             }
             op => {
                 let op_str: &str = match op {
@@ -309,11 +439,17 @@ impl<'a, 'sem, 'ast> Visit<'ast> for PipelineVisitor<'a, 'sem> {
                     rhs_trimmed.to_string()
                 };
                 let rewrite = format!(
-                    "$.set({}, $.get({}) {} {})",
-                    name, name, op_str, rhs_for_output
+                    "$.set({}, {}({}) {} {})",
+                    name,
+                    if safe_get { "$.safe_get" } else { "$.get" },
+                    name,
+                    op_str,
+                    rhs_for_output
                 );
-                self.assigns_replacements
-                    .push((expr.span.start, expr.span.end, rewrite));
+                self.assigns_replacements.push((expr.span.start, expr.span.end, rewrite));
+                if self.in_place {
+                    self.sites.assigns.insert((expr.span.start, expr.span.end), (false, safe_get));
+                }
             }
         }
     }
@@ -341,8 +477,10 @@ impl<'a, 'sem, 'ast> Visit<'ast> for PipelineVisitor<'a, 'sem> {
             (UpdateOperator::Increment, true) => format!("$.update_pre({})", name),
             (UpdateOperator::Decrement, true) => format!("$.update_pre({}, -1)", name),
         };
-        self.assigns_replacements
-            .push((expr.span.start, expr.span.end, rewrite));
+        self.assigns_replacements.push((expr.span.start, expr.span.end, rewrite));
+        if self.in_place {
+            self.sites.updates.insert((expr.span.start, expr.span.end));
+        }
     }
 
     fn visit_call_expression(&mut self, call: &CallExpression<'ast>) {
@@ -354,10 +492,8 @@ impl<'a, 'sem, 'ast> Visit<'ast> for PipelineVisitor<'a, 'sem> {
             && obj.name == "$"
         {
             let prop = member.property.name.as_str();
-            if matches!(
-                prop,
-                "set" | "update" | "update_pre" | "mutate" | "get" | "safe_get"
-            ) && let Some(Argument::Identifier(id)) = call.arguments.first()
+            if matches!(prop, "set" | "update" | "update_pre" | "mutate" | "get" | "safe_get")
+                && let Some(Argument::Identifier(id)) = call.arguments.first()
             {
                 self.skip(id);
             }
@@ -376,11 +512,18 @@ impl<'a, 'sem, 'ast> Visit<'ast> for PipelineVisitor<'a, 'sem> {
             && self.is_state_var_ref(value_ident)
         {
             let name = key.name.as_str();
+            let safe_get = self.reference_needs_safe_get(value_ident);
             self.read_replacements.push((
                 prop.span.start,
                 prop.span.end,
-                format!("{}: $.get({})", name, name),
+                format!("{}: {}({})", name, if safe_get { "$.safe_get" } else { "$.get" }, name),
             ));
+            if self.in_place {
+                self.sites.shorthands.insert((prop.span.start, prop.span.end));
+                if safe_get {
+                    self.sites.safe_shorthands.insert((prop.span.start, prop.span.end));
+                }
+            }
             self.skip(value_ident);
             walk::walk_object_property(self, prop);
             return;
@@ -409,7 +552,7 @@ mod tests {
             &[],
         )
         .unwrap();
-        assert_eq!(out, "let count; let total; $.set(total, $.get(count));");
+        assert_eq!(out, "let count;\nlet total;\n\n$.set(total, $.get(count));");
     }
 
     #[test]
@@ -423,10 +566,7 @@ mod tests {
             &[],
         )
         .unwrap();
-        assert_eq!(
-            out,
-            "let count; let total; $.set(total, $.get(total) + $.get(count));"
-        );
+        assert_eq!(out, "let count;\nlet total;\n\n$.set(total, $.get(total) + $.get(count));");
     }
 
     #[test]
@@ -440,7 +580,37 @@ mod tests {
             &[],
         )
         .unwrap();
-        assert_eq!(out, "let count; let r = $.get(count) + 1;");
+        assert_eq!(out, "let count;\nlet r = $.get(count) + 1;");
+    }
+
+    #[test]
+    fn var_reads_use_safe_get_per_resolved_binding() {
+        let out = transform_state_pipeline_ast(
+            "const value = $.derived(() => 1); function f() { var value = $.derived(() => 2); return value; } value;",
+            &ssv(&["value"]),
+            &[],
+            false,
+            &[],
+            &[],
+        )
+        .unwrap();
+        assert!(out.contains("return $.safe_get(value);"));
+        assert!(out.ends_with("$.get(value);"));
+    }
+
+    #[test]
+    fn root_var_reads_use_get() {
+        let out = transform_state_pipeline_ast(
+            "var value = $.derived(() => 1); value;",
+            &ssv(&["value"]),
+            &[],
+            false,
+            &[],
+            &[],
+        )
+        .unwrap();
+        assert!(out.ends_with("$.get(value);"));
+        assert!(!out.contains("$.safe_get(value)"));
     }
 
     #[test]
@@ -454,7 +624,7 @@ mod tests {
             &[],
         )
         .unwrap();
-        assert_eq!(out, "let count; $.update(count);");
+        assert_eq!(out, "let count;\n\n$.update(count);");
     }
 
     #[test]
@@ -468,7 +638,7 @@ mod tests {
             &[],
         )
         .unwrap();
-        assert_eq!(out, "let count; let o = { count: $.get(count) };");
+        assert_eq!(out, "let count;\nlet o = { count: $.get(count) };");
     }
 
     #[test]
@@ -499,7 +669,7 @@ mod tests {
             &ssv(&["count"]),
         )
         .unwrap();
-        assert_eq!(out, "let count; $.set(count, 5);");
+        assert_eq!(out, "let count;\n\n$.set(count, 5);");
     }
 
     #[test]
@@ -513,10 +683,7 @@ mod tests {
             &[],
         )
         .unwrap();
-        assert_eq!(
-            out,
-            "let outer; let inner; $.set(outer, ($.set(inner, 1)));"
-        );
+        assert_eq!(out, "let outer;\nlet inner;\n\n$.set(outer, $.set(inner, 1));");
     }
 
     #[test]
@@ -524,7 +691,21 @@ mod tests {
         let out =
             transform_state_pipeline_ast("let x; x = { a: 1 };", &ssv(&["x"]), &[], true, &[], &[])
                 .unwrap();
-        assert_eq!(out, "let x; $.set(x, { a: 1 }, true);");
+        assert_eq!(out, "let x;\n\n$.set(x, { a: 1 }, true);");
+    }
+
+    #[test]
+    fn typescript_parameter_rhs_is_proxied() {
+        let out = transform_state_pipeline_ast(
+            "let active_heading; function update(heading: Heading) { active_heading = heading; }",
+            &ssv(&["active_heading"]),
+            &[],
+            true,
+            &[],
+            &[],
+        )
+        .unwrap();
+        assert!(out.contains("$.set(active_heading, heading, true)"), "{out}");
     }
 
     #[test]
@@ -538,7 +719,7 @@ mod tests {
             &[],
         )
         .unwrap();
-        assert_eq!(out, "let x; $.set(x, { a: 1 });");
+        assert_eq!(out, "let x;\n\n$.set(x, { a: 1 });");
     }
 
     #[test]
@@ -594,7 +775,234 @@ mod tests {
         assert!(out.contains("$.update(count);"));
         // Array literal with multiple state-var reads
         assert!(out.contains("$.set(items, [$.get(count), $.get(total)]"));
-        // Shadow preserved
-        assert!(out.contains("function inner(count) { count = 99; }"));
+        // Shadow preserved — the assignment inside `inner` is left alone, whatever
+        // line the printer puts it on.
+        assert!(out.contains("count = 99;"));
+        assert!(!out.contains("$.set(count, 99)"));
+    }
+}
+
+// ── in-place port ──────────────────────────────────────────────────────
+
+thread_local! {
+    static STATE_PIPELINE_IN_PLACE_ALLOC: RefCell<Allocator> = RefCell::new(Allocator::default());
+}
+
+/// In-place equivalent of [`transform_state_pipeline_ast`].
+///
+/// The splice path needs a fixed point because a wrap emitted for an outer
+/// assignment hides the inner ones behind `innermost_only`; post-order
+/// mutation composes instead, so one walk suffices. Deciding a site still
+/// needs a [`Semantic`], which borrows the program immutably, hence the
+/// collect-then-rewrite split.
+fn transform_state_pipeline_in_place(
+    source: &str,
+    state_vars: &[String],
+    raw_state_vars: &[String],
+    is_runes: bool,
+    non_proxy_vars: &[String],
+    effective_read_names: &[String],
+) -> ast_rewrite::Rewrite {
+    ast_rewrite::with_program_mut(
+        &STATE_PIPELINE_IN_PLACE_ALLOC,
+        source,
+        SourceType::ts().with_module(true),
+        ParseOptions { allow_return_outside_function: true, ..ParseOptions::default() },
+        |allocator, program| {
+            let sites = {
+                let semantic_ret = super::super::profile::semantic_build(
+                    super::super::profile::SEM_STATE_PIPELINE_IN_PLACE,
+                    program.source_text.len(),
+                    || SemanticBuilder::new().with_build_nodes(true).build(program),
+                );
+                let semantic = &semantic_ret.semantic;
+                let state_var_symbols = find_state_var_symbols(semantic, state_vars);
+                let mut visitor = PipelineVisitor {
+                    source,
+                    semantic,
+                    state_vars,
+                    raw_state_vars,
+                    is_runes,
+                    non_proxy_vars,
+                    effective_read_names,
+                    state_var_symbols,
+                    read_replacements: Vec::new(),
+                    assigns_replacements: Vec::new(),
+                    skip_spans: FxHashSet::default(),
+                    in_place: true,
+                    sites: Sites::default(),
+                };
+                visitor.visit_program(program);
+                visitor.sites
+            };
+            if sites.is_empty() {
+                return false;
+            }
+            let mut rewriter = PipelineRewriter {
+                b: crate::compiler::phases::phase3_transform::builders::B::new(allocator),
+                sites,
+                changed: false,
+            };
+            oxc_ast_visit::VisitMut::visit_program(&mut rewriter, program);
+            rewriter.changed
+        },
+    )
+}
+
+enum CompoundOp {
+    Binary(BinaryOperator),
+    Logical(LogicalOperator),
+}
+
+/// The compound operators this pass rewrites — narrower than the shared
+/// helper, which also covers bitwise and shift forms the text path leaves
+/// alone. `None` covers plain `=` as well as anything unsupported; the
+/// site map decided eligibility already, so both are safe here.
+fn compound_op(op: AssignmentOperator) -> Option<CompoundOp> {
+    Some(match op {
+        AssignmentOperator::Addition => CompoundOp::Binary(BinaryOperator::Addition),
+        AssignmentOperator::Subtraction => CompoundOp::Binary(BinaryOperator::Subtraction),
+        AssignmentOperator::Multiplication => CompoundOp::Binary(BinaryOperator::Multiplication),
+        AssignmentOperator::Division => CompoundOp::Binary(BinaryOperator::Division),
+        AssignmentOperator::Remainder => CompoundOp::Binary(BinaryOperator::Remainder),
+        AssignmentOperator::Exponential => CompoundOp::Binary(BinaryOperator::Exponential),
+        AssignmentOperator::LogicalNullish => CompoundOp::Logical(LogicalOperator::Coalesce),
+        AssignmentOperator::LogicalAnd => CompoundOp::Logical(LogicalOperator::And),
+        AssignmentOperator::LogicalOr => CompoundOp::Logical(LogicalOperator::Or),
+        _ => return None,
+    })
+}
+
+struct PipelineRewriter<'a> {
+    b: crate::compiler::phases::phase3_transform::builders::B<'a>,
+    sites: Sites,
+    changed: bool,
+}
+
+impl<'a> PipelineRewriter<'a> {
+    fn state_read(&self, name: &str, safe: bool) -> Expression<'a> {
+        self.b.call(if safe { "$.safe_get" } else { "$.get" }, vec![self.b.id(name)])
+    }
+
+    fn state_read_with_source_identifier(
+        &self,
+        identifier: Expression<'a>,
+        safe: bool,
+    ) -> Expression<'a> {
+        // `SPAN` is a real location to rsvelte_esrap, whereas upstream's
+        // builder-created wrapper has `loc: null`. Unlocate the synthesized
+        // call first, then put the original located identifier back as its
+        // argument so only that identifier advances the comment cursor.
+        let mut call = self.b.call(if safe { "$.safe_get" } else { "$.get" }, vec![self.b.void0()]);
+        ast_rewrite::mark_synthesized_expression(&mut call);
+        let Expression::CallExpression(call_expression) = &mut call else {
+            unreachable!("B::call always creates a call expression")
+        };
+        call_expression.arguments[0] = Argument::from(identifier);
+        call
+    }
+
+    fn rewrite_read(&mut self, expr: &mut Expression<'a>) {
+        let Expression::Identifier(id) = &*expr else {
+            return;
+        };
+        if !self.sites.reads.contains(&(id.span.start, id.span.end)) {
+            return;
+        }
+        let span = (id.span.start, id.span.end);
+        let safe = self.sites.safe_reads.contains(&span);
+        let identifier = std::mem::replace(expr, self.b.void0());
+        *expr = self.state_read_with_source_identifier(identifier, safe);
+        self.changed = true;
+    }
+
+    fn rewrite_assignment(&mut self, expr: &mut Expression<'a>) {
+        let (needs_proxy, safe_get, name, operator) = {
+            let Expression::AssignmentExpression(assign) = &*expr else {
+                return;
+            };
+            let Some(&(needs_proxy, safe_get)) =
+                self.sites.assigns.get(&(assign.span.start, assign.span.end))
+            else {
+                return;
+            };
+            let AssignmentTarget::AssignmentTargetIdentifier(id) = &assign.left else {
+                return;
+            };
+            (needs_proxy, safe_get, id.name, assign.operator)
+        };
+
+        let taken = std::mem::replace(expr, self.b.void0());
+        let Expression::AssignmentExpression(assign) = taken else { unreachable!("checked above") };
+        let right = assign.unbox().right;
+        let value = match compound_op(operator) {
+            None => right,
+            Some(CompoundOp::Binary(op)) => {
+                self.b.binary(op, self.state_read(name.as_str(), safe_get), right)
+            }
+            Some(CompoundOp::Logical(op)) => {
+                self.b.logical(op, self.state_read(name.as_str(), safe_get), right)
+            }
+        };
+        let mut args = vec![self.b.id(name.as_str()), value];
+        if needs_proxy {
+            args.push(self.b.bool(true));
+        }
+        *expr = self.b.call("$.set", args);
+        self.changed = true;
+    }
+
+    fn rewrite_update(&mut self, expr: &mut Expression<'a>) {
+        let (name, prefix, decrement) = {
+            let Expression::UpdateExpression(update) = &*expr else {
+                return;
+            };
+            if !self.sites.updates.contains(&(update.span.start, update.span.end)) {
+                return;
+            }
+            let SimpleAssignmentTarget::AssignmentTargetIdentifier(id) = &update.argument else {
+                return;
+            };
+            (id.name, update.prefix, update.operator == UpdateOperator::Decrement)
+        };
+
+        let callee = if prefix { "$.update_pre" } else { "$.update" };
+        let mut args = vec![self.b.id(name.as_str())];
+        if decrement {
+            args.push(self.b.unary(UnaryOperator::UnaryNegation, self.b.number(1.0)));
+        }
+        *expr = self.b.call(callee, args);
+        self.changed = true;
+    }
+}
+
+impl<'a> oxc_ast_visit::VisitMut<'a> for PipelineRewriter<'a> {
+    fn visit_expression(&mut self, expr: &mut Expression<'a>) {
+        oxc_ast_visit::walk_mut::walk_expression(self, expr);
+
+        match &*expr {
+            Expression::Identifier(_) => self.rewrite_read(expr),
+            Expression::AssignmentExpression(_) => self.rewrite_assignment(expr),
+            Expression::UpdateExpression(_) => self.rewrite_update(expr),
+            _ => {}
+        }
+    }
+
+    fn visit_object_property(&mut self, prop: &mut ObjectProperty<'a>) {
+        oxc_ast_visit::walk_mut::walk_object_property(self, prop);
+
+        if !self.sites.shorthands.contains(&(prop.span.start, prop.span.end)) {
+            return;
+        }
+        let PropertyKey::StaticIdentifier(key) = &prop.key else {
+            return;
+        };
+        let name = key.name;
+        let safe = self.sites.safe_shorthands.contains(&(prop.span.start, prop.span.end));
+        // esrap re-derives shorthand from key/value identity, so the value
+        // replacement is what expands the property.
+        prop.shorthand = false;
+        prop.value = self.state_read(name.as_str(), safe);
+        self.changed = true;
     }
 }

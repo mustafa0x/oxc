@@ -4,14 +4,16 @@
 //!
 //! Corresponds to Svelte's `2-analyze/visitors/shared/fragment.js`.
 
-use rustc_hash::FxHashSet;
-
 use super::super::super::AnalysisError;
 use super::super::super::errors;
 use super::super::super::utils::{check_graph_for_cycles, extract_svelte_ignore_with_warnings};
 use super::super::super::warnings;
 use super::super::VisitorContext;
 use crate::ast::template::{ConstTag, Fragment, TemplateNode};
+
+/// Insertion-ordered identifier set: the JS original uses a `Set`, and the order
+/// decides which `{@const}` cycle a diagnostic reports.
+type IdentifierSet = indexmap::IndexSet<String, rustc_hash::FxBuildHasher>;
 
 /// Result of collecting preceding ignores.
 struct PrecedingIgnores {
@@ -41,9 +43,15 @@ fn compute_all_preceding_ignores(
         match node {
             TemplateNode::Comment(comment) => {
                 // Extract svelte-ignore codes and accumulate them
-                let extracted = extract_svelte_ignore_with_warnings(&comment.data, runes);
+                let extracted = extract_svelte_ignore_with_warnings(
+                    comment.start + 4, // `<!--`.len()
+                    &comment.data,
+                    runes,
+                );
                 pending_ignores.extend(extracted.ignores);
-                pending_warnings.extend(extracted.warnings);
+                // The official scan walks the preceding comment run backwards from the
+                // annotated node, so the comment nearest it reports first.
+                pending_warnings.splice(..0, extracted.warnings);
                 // Comments themselves get None
                 result.push(None);
             }
@@ -85,9 +93,20 @@ fn compute_all_preceding_ignores(
 }
 
 /// Analyze a fragment.
-pub fn analyze(fragment: &mut Fragment, context: &mut VisitorContext) -> Result<(), AnalysisError> {
+pub fn analyze<'a, 'b: 'a>(
+    fragment: &mut Fragment<'b>,
+    context: &mut VisitorContext<'a>,
+) -> Result<(), AnalysisError> {
     // Check for cyclical dependencies between ConstTag nodes
     check_const_tag_cycles(&fragment.nodes)?;
+
+    // Every container reaches its children through here, so this is the one
+    // place that can answer upstream's `parent.type !== 'Root'` without a list
+    // of container types to keep in step.
+    let saved_root = std::mem::replace(
+        &mut context.in_root_fragment,
+        std::mem::take(&mut context.next_fragment_is_root),
+    );
 
     let runes = context.analysis.runes;
 
@@ -102,31 +121,24 @@ pub fn analyze(fragment: &mut Fragment, context: &mut VisitorContext) -> Result<
     // but only emit legacy_code/unknown_code warnings for non-Comment/non-Text nodes.
     let mut ignore_info = compute_all_preceding_ignores(&fragment.nodes, runes);
 
-    // Emit warnings from svelte-ignore comment validation (legacy_code, unknown_code).
-    // These are emitted only once per comment because only the first
-    // non-Comment/non-Text node collects from preceding comments.
-    for entry in ignore_info.iter().flatten() {
-        let (preceding, is_text) = entry;
-        // Only emit legacy_code/unknown_code warnings for non-Text nodes
-        if !is_text {
-            for warning in &preceding.warnings {
-                context
-                    .analysis
-                    .warnings
-                    .push(warnings::AnalysisWarning::new(
-                        warning.code.clone(),
-                        warning.message.clone(),
-                    ));
-            }
-        }
-    }
-
     for (idx, node) in fragment.nodes.iter_mut().enumerate() {
         // Take ownership of ignore codes to avoid cloning
-        let ignore_codes = ignore_info[idx]
-            .take()
-            .map(|(p, _)| p.ignores)
-            .unwrap_or_default();
+        let ignore_codes = match ignore_info[idx].take() {
+            Some((preceding, is_text)) => {
+                // The official `_` visitor extracts (and so reports) svelte-ignore codes
+                // as it reaches the annotated node, which interleaves these warnings with
+                // that node's own in source order. Text nodes only consume the codes.
+                if !is_text {
+                    // Emitted before `push_ignore` below, so an enclosing `svelte-ignore`
+                    // suppresses these but the run's own codes cannot suppress themselves.
+                    for warning in preceding.warnings {
+                        context.emit_warning(warning);
+                    }
+                }
+                preceding.ignores
+            }
+            None => Vec::new(),
+        };
         let has_ignores = !ignore_codes.is_empty();
         if has_ignores {
             // Store ignored codes on element metadata for use during code generation
@@ -156,6 +168,7 @@ pub fn analyze(fragment: &mut Fragment, context: &mut VisitorContext) -> Result<
             context.pop_ignore();
         }
     }
+    context.in_root_fragment = saved_root;
     Ok(())
 }
 
@@ -168,7 +181,7 @@ pub fn analyze(fragment: &mut Fragment, context: &mut VisitorContext) -> Result<
 /// Corresponds to `sort_const_tags` in `3-transform/utils.js`.
 fn check_const_tag_cycles(nodes: &[TemplateNode]) -> Result<(), AnalysisError> {
     // Collect all ConstTag nodes with their bindings and dependencies
-    let mut const_tags: Vec<(&ConstTag, Vec<String>, FxHashSet<String>)> = Vec::new();
+    let mut const_tags: Vec<(&ConstTag, Vec<String>, IdentifierSet)> = Vec::new();
 
     for node in nodes {
         if let TemplateNode::ConstTag(tag) = node {
@@ -195,11 +208,11 @@ fn check_const_tag_cycles(nodes: &[TemplateNode]) -> Result<(), AnalysisError> {
                     let deps = if let Some(init) = declaration.get("init") {
                         extract_expression_identifiers(init)
                     } else {
-                        FxHashSet::default()
+                        IdentifierSet::default()
                     };
                     (bindings, deps)
                 } else {
-                    (Vec::new(), FxHashSet::default())
+                    (Vec::new(), IdentifierSet::default())
                 }
             } else if decl_type == Some("AssignmentExpression") {
                 // AssignmentExpression structure
@@ -211,11 +224,11 @@ fn check_const_tag_cycles(nodes: &[TemplateNode]) -> Result<(), AnalysisError> {
                 let deps = if let Some(right) = decl_json.get("right") {
                     extract_expression_identifiers(right)
                 } else {
-                    FxHashSet::default()
+                    IdentifierSet::default()
                 };
                 (bindings, deps)
             } else {
-                (Vec::new(), FxHashSet::default())
+                (Vec::new(), IdentifierSet::default())
             };
 
             if !bindings.is_empty() {
@@ -253,7 +266,14 @@ fn check_const_tag_cycles(nodes: &[TemplateNode]) -> Result<(), AnalysisError> {
     if let Some(cycle) = check_graph_for_cycles::<String>(&edges) {
         // Format the cycle as "a → b → a"
         let cycle_str = cycle.join(" → ");
-        return Err(errors::const_tag_cycle(&cycle_str));
+        let error = errors::const_tag_cycle(&cycle_str);
+        let tag =
+            cycle.first().and_then(|name| binding_to_tag.get(name)).map(|idx| const_tags[*idx].0);
+        let error = match tag {
+            Some(tag) => error.at(tag.start, tag.end),
+            None => error,
+        };
+        return Err(error);
     }
 
     Ok(())
@@ -304,8 +324,8 @@ fn extract_pattern_identifiers(pattern: &serde_json::Value) -> Vec<String> {
 }
 
 /// Extract all identifier references from an expression.
-fn extract_expression_identifiers(expression: &serde_json::Value) -> FxHashSet<String> {
-    let mut identifiers = FxHashSet::default();
+fn extract_expression_identifiers(expression: &serde_json::Value) -> IdentifierSet {
+    let mut identifiers = IdentifierSet::default();
     collect_expression_identifiers(expression, &mut identifiers);
     identifiers
 }
@@ -314,10 +334,7 @@ fn extract_expression_identifiers(expression: &serde_json::Value) -> FxHashSet<S
 /// Respects scoping boundaries: does not recurse into function bodies
 /// (ArrowFunctionExpression, FunctionExpression, FunctionDeclaration)
 /// because those create new scopes where local declarations shadow outer names.
-fn collect_expression_identifiers(
-    expression: &serde_json::Value,
-    identifiers: &mut FxHashSet<String>,
-) {
+fn collect_expression_identifiers(expression: &serde_json::Value, identifiers: &mut IdentifierSet) {
     if let Some(expr_type) = expression.get("type").and_then(|t| t.as_str()) {
         match expr_type {
             "Identifier" => {
@@ -331,10 +348,7 @@ fn collect_expression_identifiers(
                     collect_expression_identifiers(object, identifiers);
                 }
                 // If computed, also collect from property
-                if expression
-                    .get("computed")
-                    .and_then(|c| c.as_bool())
-                    .unwrap_or(false)
+                if expression.get("computed").and_then(|c| c.as_bool()).unwrap_or(false)
                     && let Some(property) = expression.get("property")
                 {
                     collect_expression_identifiers(property, identifiers);
@@ -352,10 +366,7 @@ fn collect_expression_identifiers(
             // not variable references).
             "Property" => {
                 // For computed keys like `[expr]`, collect from the key expression
-                if expression
-                    .get("computed")
-                    .and_then(|c| c.as_bool())
-                    .unwrap_or(false)
+                if expression.get("computed").and_then(|c| c.as_bool()).unwrap_or(false)
                     && let Some(key) = expression.get("key")
                 {
                     collect_expression_identifiers(key, identifiers);

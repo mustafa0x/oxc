@@ -9,16 +9,15 @@
 
 use crate::ast::arena::ParseArena;
 use crate::ast::template::TemplateNode;
+use crate::compiler::phases::phase1_parse::utils::is_reserved;
 use crate::compiler::phases::phase2_analyze::scope::{Binding, Scope, ScopeRoot};
 use crate::compiler::phases::phase2_analyze::types::ComponentAnalysis;
 use crate::compiler::phases::phase3_transform::client::transform_template::Template;
 use crate::compiler::phases::phase3_transform::js_ast::arena::JsArena;
 use crate::compiler::phases::phase3_transform::js_ast::nodes::*;
 use im::{HashMap as ImHashMap, HashSet as ImHashSet};
-use indexmap::IndexSet;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::cell::{Cell, RefCell};
-use std::fmt::Write as _;
 use std::rc::Rc;
 
 /// Component transformation context.
@@ -35,12 +34,18 @@ pub struct ComponentContext<'a> {
     /// Uses interior mutability (UnsafeCell) so allocation only needs `&self`.
     pub arena: JsArena,
 
+    /// Preserve source spans only when the caller will emit a source map.
+    pub enable_sourcemap: bool,
+
     /// The path of nodes being visited (for parent access)
-    pub path: Vec<&'a TemplateNode>,
+    pub path: Vec<&'a TemplateNode<'a>>,
 
     /// Visit a node and return the transformed expression/statement
-    pub visit:
-        fn(&mut Self, &TemplateNode, Option<&ComponentClientTransformState<'a>>) -> TransformResult,
+    pub visit: fn(
+        &mut Self,
+        &TemplateNode<'_>,
+        Option<&ComponentClientTransformState<'a>>,
+    ) -> TransformResult,
 }
 
 impl<'a> ComponentContext<'a> {
@@ -49,31 +54,54 @@ impl<'a> ComponentContext<'a> {
         state: ComponentClientTransformState<'a>,
         visit: fn(
             &mut Self,
-            &TemplateNode,
+            &TemplateNode<'_>,
             Option<&ComponentClientTransformState<'a>>,
         ) -> TransformResult,
     ) -> Self {
-        Self {
-            state,
-            arena: JsArena::new(),
-            path: Vec::new(),
-            visit,
-        }
-    }
-
-    /// Push a node onto the path stack.
-    pub fn push_path(&mut self, node: &'a TemplateNode) {
-        self.path.push(node);
-    }
-
-    /// Pop a node from the path stack.
-    pub fn pop_path(&mut self) -> Option<&'a TemplateNode> {
-        self.path.pop()
+        Self { state, arena: JsArena::new(), enable_sourcemap: false, path: Vec::new(), visit }
     }
 
     /// Get the current parent node.
-    pub fn current_parent(&self) -> Option<&'a TemplateNode> {
+    pub fn current_parent(&self) -> Option<&'a TemplateNode<'a>> {
         self.path.last().copied()
+    }
+
+    /// Index into `profile::TF_KINDS`. Kept next to `visit_node`'s match so the
+    /// two arms cannot drift apart silently. Gated with its only call site so
+    /// the default build does not run this match per visited node and then
+    /// discard the result.
+    #[cfg(feature = "measure-tf-split")]
+    #[inline]
+    fn tf_kind_index_of(node: &TemplateNode<'_>) -> usize {
+        match node {
+            TemplateNode::Component(_) => 0,
+            TemplateNode::SvelteComponent(_) => 1,
+            TemplateNode::SvelteSelf(_) => 2,
+            TemplateNode::SvelteElement(_) => 3,
+            TemplateNode::ExpressionTag(_) => 4,
+            TemplateNode::RegularElement(_) => 5,
+            TemplateNode::Text(_) => 6,
+            TemplateNode::IfBlock(_) => 7,
+            TemplateNode::EachBlock(_) => 8,
+            TemplateNode::AwaitBlock(_) => 9,
+            TemplateNode::KeyBlock(_) => 10,
+            TemplateNode::SnippetBlock(_) => 11,
+            TemplateNode::RenderTag(_) => 12,
+            TemplateNode::HtmlTag(_) => 13,
+            TemplateNode::ConstTag(_) => 14,
+            TemplateNode::DeclarationTag(_) => 15,
+            TemplateNode::DebugTag(_) => 16,
+            TemplateNode::SvelteBoundary(_) => 17,
+            TemplateNode::SvelteHead(_) => 18,
+            TemplateNode::SvelteBody(_) => 19,
+            TemplateNode::SvelteWindow(_) => 20,
+            TemplateNode::SvelteDocument(_) => 21,
+            TemplateNode::TitleElement(_) => 22,
+            TemplateNode::Comment(_) => 23,
+            TemplateNode::SvelteFragment(_) => 24,
+            TemplateNode::SlotElement(_) => 25,
+            _ => 26,
+        }
     }
 
     /// Visit a template node and transform it.
@@ -84,9 +112,13 @@ impl<'a> ComponentContext<'a> {
     /// the overridden state (e.g., with a different `node` anchor).
     pub fn visit_node(
         &mut self,
-        node: &TemplateNode,
+        node: &TemplateNode<'_>,
         _state_override: Option<&ComponentClientTransformState<'a>>,
     ) -> TransformResult {
+        #[cfg(feature = "measure-tf-split")]
+        let _tf = crate::compiler::phases::phase3_transform::profile::tf_guard(
+            Self::tf_kind_index_of(node),
+        );
         match node {
             TemplateNode::Component(comp) => self.visit_component(comp),
             TemplateNode::SvelteComponent(comp) => self.visit_svelte_component(comp),
@@ -129,7 +161,7 @@ impl<'a> ComponentContext<'a> {
         };
 
         let component_name = comp.name.to_string();
-        let stmt = build_component(ComponentNode::Component(comp.clone()), component_name, self);
+        let stmt = build_component(ComponentNode::Component(comp), component_name, self);
 
         TransformResult::Statement(stmt)
     }
@@ -144,11 +176,8 @@ impl<'a> ComponentContext<'a> {
         };
 
         // For svelte:component, we use '$$component' as the component name
-        let stmt = build_component(
-            ComponentNode::SvelteComponent(comp.clone()),
-            "$$component".to_string(),
-            self,
-        );
+        let stmt =
+            build_component(ComponentNode::SvelteComponent(comp), "$$component".to_string(), self);
 
         TransformResult::Statement(stmt)
     }
@@ -164,11 +193,7 @@ impl<'a> ComponentContext<'a> {
 
         // For svelte:self, we use the component's own name for self-reference
         let component_name = self.state.analysis.name.clone();
-        let stmt = build_component(
-            ComponentNode::SvelteSelf(self_node.clone()),
-            component_name,
-            self,
-        );
+        let stmt = build_component(ComponentNode::SvelteSelf(self_node), component_name, self);
 
         TransformResult::Statement(stmt)
     }
@@ -178,8 +203,7 @@ impl<'a> ComponentContext<'a> {
         elem: &crate::ast::template::SvelteDynamicElement,
     ) -> TransformResult {
         use crate::ast::template::{
-            AnimateDirective, Attribute, BindDirective, ClassDirective, LetDirective, OnDirective,
-            StyleDirective, TransitionDirective, UseDirective,
+            Attribute, ClassDirective, LetDirective, OnDirective, StyleDirective,
         };
         use crate::compiler::phases::phase3_transform::client::visitors::animate_directive::animate_directive;
         use crate::compiler::phases::phase3_transform::client::visitors::attach_tag::attach_tag;
@@ -196,16 +220,11 @@ impl<'a> ComponentContext<'a> {
 
         // Categorize attributes - pre-allocate based on attribute count
         let attr_count = elem.attributes.len();
-        let mut attributes: Vec<&Attribute> = Vec::with_capacity(attr_count);
-        let mut class_directives: Vec<&ClassDirective> = Vec::new();
+        let mut attributes: Vec<&Attribute<'_>> = Vec::with_capacity(attr_count);
+        let mut class_directives: Vec<&ClassDirective<'_>> = Vec::new();
         let mut style_directives: Vec<&StyleDirective> = Vec::new();
         let mut on_directives: Vec<OnDirective> = Vec::new();
-        let mut transition_directives: Vec<TransitionDirective> = Vec::new();
-        let mut use_directives: Vec<UseDirective> = Vec::new();
         let mut let_directives: Vec<LetDirective> = Vec::new();
-        let mut bind_directives: Vec<BindDirective> = Vec::new();
-        let mut animate_directives: Vec<AnimateDirective> = Vec::new();
-        let mut attach_tags: Vec<crate::ast::template::AttachTag> = Vec::new();
         let mut dynamic_namespace: Option<crate::ast::template::AttributeValue> = None;
 
         for attribute in &elem.attributes {
@@ -234,24 +253,10 @@ impl<'a> ComponentContext<'a> {
                 Attribute::OnDirective(dir) => {
                     on_directives.push(dir.clone());
                 }
-                Attribute::TransitionDirective(dir) => {
-                    transition_directives.push(dir.clone());
-                }
-                Attribute::UseDirective(dir) => {
-                    use_directives.push(dir.clone());
-                }
                 Attribute::LetDirective(dir) => {
                     let_directives.push(dir.clone());
                 }
-                Attribute::BindDirective(dir) => {
-                    bind_directives.push(dir.clone());
-                }
-                Attribute::AnimateDirective(dir) => {
-                    animate_directives.push(dir.clone());
-                }
-                Attribute::AttachTag(tag) => {
-                    attach_tags.push(tag.clone());
-                }
+                _ => {}
             }
         }
 
@@ -261,124 +266,74 @@ impl<'a> ComponentContext<'a> {
         let anchor_id_name = "$$anchor".to_string();
         let element_id = b::id(&element_id_name);
 
+        // Upstream's inner context carries `memoizer: new Memoizer()`, so a
+        // memoized `$0` an attribute produces is bound by THIS element's
+        // `$.template_effect` rather than by an enclosing one.
+        let child_memoizer = Memoizer::with_parent_conflicts(&self.state.memoizer);
+        let saved_memoizer = std::mem::replace(&mut self.state.memoizer, child_memoizer);
+
         // Store the current node and create inner state vectors
         let mut inner_init: Vec<JsStatement> = Vec::new();
         let mut inner_update: Vec<JsStatement> = Vec::new();
         let mut inner_after_update: Vec<JsStatement> = Vec::new();
 
-        // Check if there are use directives (affects how we handle on: directives)
-        let has_use = !use_directives.is_empty();
-
-        // Process OnDirectives
+        // Process OnDirectives.
+        // Unlike RegularElement, SvelteElement.js always emits events bare into
+        // after_update (no `$.effect` wrapping for `use:` directives).
         for on_directive in &on_directives {
             // Save current node and temporarily set to element_id.
             // `mem::replace` returns the old value as we install the new one,
             // so we don't pay an extra clone of the saved `self.state.node`.
             let saved_node = std::mem::replace(&mut self.state.node, element_id.clone());
+            // A non-function handler declares its `$.derived` through init, and
+            // upstream visits with the inner context — so it belongs inside the
+            // `$.element` callback, not beside it.
+            let saved_init_len = self.state.init.len();
 
             if let TransformResult::Expression(event_call) = self.visit_on_directive(on_directive) {
-                if has_use {
-                    // If there's a use: directive, wrap in $.effect
-                    inner_init.push(b::stmt(
-                        &self.arena,
-                        b::call(
-                            &self.arena,
-                            b::member_path(&self.arena, "$.effect"),
-                            vec![b::thunk(&self.arena, event_call)],
-                        ),
-                    ));
-                } else {
-                    inner_after_update.push(b::stmt(&self.arena, event_call));
-                }
+                inner_after_update.push(b::stmt(&self.arena, event_call));
             }
 
-            // Restore node
-            self.state.node = saved_node;
-        }
-
-        // Process TransitionDirectives
-        for trans_directive in &transition_directives {
-            // Save current state
-            let saved_init_len = self.state.init.len();
-            let saved_after_update_len = self.state.after_update.len();
-
-            // Temporarily set node to element_id (see OnDirectives loop for rationale)
-            let saved_node = std::mem::replace(&mut self.state.node, element_id.clone());
-
-            transition_directive(trans_directive, self);
-
-            // Collect statements added by transition_directive
             inner_init.extend(self.state.init.drain(saved_init_len..));
-            inner_after_update.extend(self.state.after_update.drain(saved_after_update_len..));
 
             // Restore node
             self.state.node = saved_node;
         }
 
-        // Process UseDirectives (actions)
-        for use_dir in &use_directives {
-            // Temporarily set node to element_id (see OnDirectives loop for rationale)
-            let saved_node = std::mem::replace(&mut self.state.node, element_id.clone());
-
-            let stmt = use_directive(use_dir, self);
-            inner_init.push(stmt);
-
-            // Restore node
-            self.state.node = saved_node;
-        }
-
-        // Process AnimateDirectives
-        for anim_directive in &animate_directives {
+        // The remaining directives all reach `context.visit(attribute, inner_state)`
+        // in one source-order pass upstream, so they must be emitted in that order
+        // and not grouped by kind.
+        for attribute in &elem.attributes {
             let saved_init_len = self.state.init.len();
             let saved_after_update_len = self.state.after_update.len();
-
             let saved_node = std::mem::replace(&mut self.state.node, element_id.clone());
 
-            animate_directive(anim_directive, self);
+            match attribute {
+                Attribute::TransitionDirective(dir) => transition_directive(dir, self),
+                Attribute::UseDirective(dir) => {
+                    let stmt = use_directive(dir, self);
+                    self.state.init.push(stmt);
+                }
+                Attribute::AnimateDirective(dir) => animate_directive(dir, self),
+                Attribute::BindDirective(dir) => {
+                    use crate::compiler::phases::phase3_transform::client::visitors::bind_directive::bind_directive;
 
-            // Collect statements added by animate_directive
+                    bind_directive(
+                        dir,
+                        self,
+                        crate::compiler::phases::phase3_transform::utils::ParentRef::SvelteElement(
+                            elem,
+                        ),
+                    );
+                }
+                Attribute::AttachTag(tag) => {
+                    attach_tag(tag, self);
+                }
+                _ => {}
+            }
+
             inner_init.extend(self.state.init.drain(saved_init_len..));
             inner_after_update.extend(self.state.after_update.drain(saved_after_update_len..));
-
-            self.state.node = saved_node;
-        }
-
-        // Process BindDirectives
-        // In the official compiler, these go through the else branch: context.visit(attribute, inner_context.state)
-        for bind_dir in &bind_directives {
-            use crate::compiler::phases::phase3_transform::client::visitors::bind_directive::bind_directive;
-
-            let saved_init_len = self.state.init.len();
-            let saved_after_update_len = self.state.after_update.len();
-
-            let saved_node = std::mem::replace(&mut self.state.node, element_id.clone());
-
-            // For svelte:element, the parent is the element itself
-            bind_directive(
-                bind_dir,
-                self,
-                crate::compiler::phases::phase3_transform::utils::ParentRef::SvelteElement(elem),
-            );
-
-            // Collect statements added by bind_directive
-            inner_init.extend(self.state.init.drain(saved_init_len..));
-            inner_after_update.extend(self.state.after_update.drain(saved_after_update_len..));
-
-            self.state.node = saved_node;
-        }
-
-        // Process AttachTags
-        // In the official compiler, these go through the else branch: context.visit(attribute, inner_context.state)
-        for attach in &attach_tags {
-            let saved_init_len = self.state.init.len();
-
-            let saved_node = std::mem::replace(&mut self.state.node, element_id.clone());
-
-            attach_tag(attach, self);
-
-            // Collect statements added by attach_tag
-            inner_init.extend(self.state.init.drain(saved_init_len..));
-
             self.state.node = saved_node;
         }
 
@@ -396,9 +351,8 @@ impl<'a> ComponentContext<'a> {
 
             // Determine which path to use for attributes, matching the official
             // SvelteElement.js (lines 76-94):
-            // 1. Single text class attribute (no directives) -> fast $.set_class
-            // 2. Single text class attribute + class directives -> build_set_class
-            // 3. Any other attributes/directives -> build_attribute_effect
+            // 1. Single text class attribute -> build_set_class
+            // 2. Any other attributes/directives -> build_attribute_effect
             let is_single_text_class = attributes.len() == 1
                 && style_directives.is_empty()
                 && matches!(&attributes[0], Attribute::Attribute(a)
@@ -409,47 +363,7 @@ impl<'a> ComponentContext<'a> {
                     }
                 );
 
-            if is_single_text_class && class_directives.is_empty() {
-                // Fast path: single static class attribute, no class directives
-                // Build $.set_class call directly
-                let css_hash = self.state.analysis.css.hash.clone();
-                let is_scoped = elem.metadata.scoped && !css_hash.is_empty();
-
-                if let Attribute::Attribute(attr) = &attributes[0] {
-                    // Extract the text value
-                    let mut text_value = String::new();
-                    if let crate::ast::template::AttributeValue::Sequence(parts) = &attr.value {
-                        for part in parts {
-                            if let crate::ast::template::AttributeValuePart::Text(t) = part {
-                                text_value.push_str(&t.data);
-                            }
-                        }
-                    }
-
-                    // Concatenate CSS hash if scoped
-                    let class_str = if is_scoped && !css_hash.is_empty() {
-                        if text_value.is_empty() {
-                            css_hash.clone()
-                        } else {
-                            format!("{} {}", text_value, css_hash)
-                        }
-                    } else {
-                        text_value
-                    };
-
-                    // $.set_class(element_id, is_html ? 1 : 0, class_value)
-                    let set_class_call = b::call(
-                        &self.arena,
-                        b::member_path(&self.arena, "$.set_class"),
-                        vec![
-                            b::id(&element_id_name),
-                            b::number(0.0), // is_html=false for svelte:element
-                            b::string(class_str),
-                        ],
-                    );
-                    self.state.init.push(b::stmt(&self.arena, set_class_call));
-                }
-            } else if is_single_text_class {
+            if is_single_text_class {
                 // Single text class attribute WITH class directives -> build_set_class
                 // This matches the official SvelteElement.js line 82:
                 //   build_set_class(node, element_id, attributes[0], class_directives, inner_context, false)
@@ -479,6 +393,7 @@ impl<'a> ComponentContext<'a> {
                     &dummy_element,
                     &element_id_name,
                     class_attr_value,
+                    matches!(&attributes[0], Attribute::Attribute(a) if a.metadata.needs_clsx),
                     &class_directives,
                     self,
                     false, // is_html=false for svelte:element
@@ -521,6 +436,7 @@ impl<'a> ComponentContext<'a> {
                     &dummy_element,
                     &element_id_name,
                     None, // No class attribute
+                    false,
                     &class_directives,
                     self,
                     false, // is_html=false for svelte:element
@@ -559,29 +475,63 @@ impl<'a> ComponentContext<'a> {
         let mut callback_body: Vec<JsStatement> = Vec::new();
         callback_body.extend(inner_init);
 
+        // Drained before the parent memoizer is restored: `inner_update` already
+        // references these parameters.
+        let memo_params = self.state.memoizer.get_params();
+        let memo_sync = self.state.memoizer.sync_values(&self.arena);
+        let memo_async = self.state.memoizer.async_values(&self.arena);
+        self.state.memoizer = saved_memoizer;
+
         // Add template_effect if there are update statements from attributes/directives
         if !inner_update.is_empty() {
-            // Use expression body form when there's exactly one expression statement
-            // (matches official compiler's `() => expr` vs `() => { stmts }`)
-            let callback = if inner_update.len() == 1 {
-                if let JsStatement::Expression(ref expr_stmt) = inner_update[0] {
-                    b::arrow(
+            // SvelteElement owns this template_effect instead of letting the
+            // surrounding Fragment visitor build it. Collect top-level-await
+            // blockers here for the same reason: a class/style directive may
+            // read a binding whose value is not available until $$promises[n]
+            // resolves.
+            let blockers = {
+                let mut names = Vec::new();
+                for statement in &inner_update {
+                    crate::compiler::phases::phase3_transform::client::visitors::fragment::collect_identifiers_from_statement(
+                        statement,
                         &self.arena,
-                        vec![],
-                        self.arena.get_expr(expr_stmt.expression).clone(),
-                    )
-                } else {
-                    b::arrow_block(vec![], inner_update)
+                        &mut names,
+                    );
                 }
-            } else {
-                b::arrow_block(vec![], inner_update)
+
+                let blocker_map = self.state.blocker_map.borrow();
+                let const_blocker_map = self.state.const_blocker_map.borrow();
+                let mut seen = rustc_hash::FxHashSet::default();
+                let mut expressions = Vec::new();
+
+                for name in names {
+                    if !seen.insert(name.clone()) {
+                        continue;
+                    }
+
+                    if let Some(blocker) = const_blocker_map.get(name.as_str()) {
+                        expressions.push(blocker.clone());
+                    } else if let Some(&index) = blocker_map.get(name.as_str()) {
+                        expressions.push(b::member_computed(
+                            &self.arena,
+                            b::id("$$promises"),
+                            b::number(index as f64),
+                        ));
+                    }
+                }
+
+                (!expressions.is_empty()).then(|| b::array(expressions))
             };
+
             callback_body.push(b::stmt(
                 &self.arena,
-                b::call(
+                crate::compiler::phases::phase3_transform::client::visitors::shared::utils::build_render_statement_with_memoizer(
                     &self.arena,
-                    b::member_path(&self.arena, "$.template_effect"),
-                    vec![callback],
+                    inner_update,
+                    memo_params,
+                    memo_sync,
+                    memo_async,
+                    blockers,
                 ),
             ));
         }
@@ -641,11 +591,7 @@ impl<'a> ComponentContext<'a> {
         let get_tag = if has_await {
             b::thunk(
                 &self.arena,
-                b::call(
-                    &self.arena,
-                    b::member_path(&self.arena, "$.get"),
-                    vec![b::id("$$tag")],
-                ),
+                b::call(&self.arena, b::member_path(&self.arena, "$.get"), vec![b::id("$$tag")]),
             )
         } else {
             b::thunk(&self.arena, tag_expr.clone())
@@ -657,11 +603,7 @@ impl<'a> ComponentContext<'a> {
         let is_svg_or_mathml = b::boolean(elem.metadata.svg || elem.metadata.mathml);
 
         // Clone get_tag before moving it - needed for dev-mode validate calls
-        let get_tag_for_validate = if self.state.dev {
-            Some(get_tag.clone())
-        } else {
-            None
-        };
+        let get_tag_for_validate = if self.state.dev { Some(get_tag.clone()) } else { None };
 
         let mut element_args = vec![self.state.node.clone(), get_tag, is_svg_or_mathml];
 
@@ -672,10 +614,7 @@ impl<'a> ComponentContext<'a> {
         if has_callback || has_dynamic_ns {
             if has_callback {
                 let callback = b::arrow_block(
-                    vec![
-                        b::id_pattern(&element_id_name),
-                        b::id_pattern(&anchor_id_name),
-                    ],
+                    vec![b::id_pattern(&element_id_name), b::id_pattern(&anchor_id_name)],
                     callback_body,
                 );
                 element_args.push(callback);
@@ -695,7 +634,7 @@ impl<'a> ComponentContext<'a> {
 
         // Dev mode: add location [line, column] as the last argument
         if self.state.dev {
-            use crate::compiler::phases::phase3_transform::client::visitors::attribute::locate_in_source;
+            use crate::compiler::phases::phase3_transform::utils::locate_in_source;
             let (line, col) = locate_in_source(&self.state.analysis.source, elem.start as usize);
             // Ensure we have enough arguments before the location
             // The function signature is: element(node, get_tag, is_svg_or_mathml, callback?, namespace?, location?)
@@ -715,11 +654,7 @@ impl<'a> ComponentContext<'a> {
 
         let element_call_stmt = b::stmt(
             &self.arena,
-            b::call(
-                &self.arena,
-                b::member_path(&self.arena, "$.element"),
-                element_args,
-            ),
+            b::call(&self.arena, b::member_path(&self.arena, "$.element"), element_args),
         );
 
         // Handle LetDirectives: the official Svelte compiler throws "Not implemented: LetDirective"
@@ -728,7 +663,7 @@ impl<'a> ComponentContext<'a> {
         // `context.visit(attribute)` without providing `let_directives` in state, so the
         // LetDirective.js visitor returns undefined and the raw AST node flows into esrap).
         // We match this behaviour by recording a pending error on the state; the root transform
-        // (transform_client_with_visitors) checks it after the fragment visit and returns
+        // (transform_client) checks it after the fragment visit and returns
         // Err(TransformError::CodeGen("Not implemented: LetDirective")).
         let mut statements = Vec::new();
         if !let_directives.is_empty() {
@@ -762,18 +697,11 @@ impl<'a> ComponentContext<'a> {
         // If the tag expression has await or blockers, wrap in $.async()
         if has_await || has_blockers {
             let metadata = ExpressionMetadata::from_template_metadata(&elem.metadata.expression);
-            let blockers_expr = if has_blockers {
-                metadata.blockers()
-            } else {
-                b::array(vec![])
-            };
+            let blockers_expr = if has_blockers { metadata.blockers() } else { b::array(vec![]) };
 
             let async_values = if has_await {
                 // Strip the top-level await since $.async handles the awaiting
-                b::array(vec![b::thunk(
-                    &self.arena,
-                    b::strip_await(&self.arena, tag_expr),
-                )])
+                b::array(vec![b::thunk(&self.arena, b::strip_await(&self.arena, tag_expr))])
             } else {
                 b::undefined(&self.arena)
             };
@@ -794,12 +722,7 @@ impl<'a> ComponentContext<'a> {
                 b::call(
                     &self.arena,
                     b::member_path(&self.arena, "$.async"),
-                    vec![
-                        self.state.node.clone(),
-                        blockers_expr,
-                        async_values,
-                        callback,
-                    ],
+                    vec![self.state.node.clone(), blockers_expr, async_values, callback],
                 ),
             ));
         } else if statements.len() == 1 {
@@ -807,9 +730,7 @@ impl<'a> ComponentContext<'a> {
         } else {
             // Wrap multiple statements in a block, matching the official compiler:
             // context.state.init.push(statements.length === 1 ? statements[0] : b.block(statements))
-            self.state
-                .init
-                .push(JsStatement::Block(JsBlockStatement { body: statements }));
+            self.state.init.push(JsStatement::Block(JsBlockStatement::with_body(statements)));
         }
 
         TransformResult::None
@@ -817,7 +738,7 @@ impl<'a> ComponentContext<'a> {
 
     fn visit_expression_tag(
         &mut self,
-        _expr: &crate::ast::template::ExpressionTag,
+        _expr: &crate::ast::template::ExpressionTag<'_>,
     ) -> TransformResult {
         // TODO: Implement {expression} transformation
         TransformResult::None
@@ -932,9 +853,7 @@ impl<'a> ComponentContext<'a> {
         // We'll only get here if comments are not filtered out, which they are
         // unless preserveComments is true. The lone-script synthetic comment
         // also arrives here. Corresponds to Comment.js in the official compiler.
-        self.state
-            .template
-            .push_comment(Some(comment.data.to_string()));
+        self.state.template.push_comment(Some(comment.data.to_string()));
         TransformResult::None
     }
 
@@ -1031,14 +950,13 @@ impl<'a> ComponentContext<'a> {
                     is_defined: false,
                     is_reactive: true,
                     replacement_id: None,
+                    store_source: None,
                 },
             );
             // Let directive bindings are template-kind (BindingKind::Let) in
             // the official compiler and require deep_read_state wrapping in
             // legacy reactivity sequences.
-            self.state
-                .transform_deep_read
-                .insert(binding_name.clone(), ());
+            self.state.transform_deep_read.insert(binding_name.clone(), ());
         }
 
         // Memoizer: track sync and async memoized expressions
@@ -1079,16 +997,10 @@ impl<'a> ComponentContext<'a> {
                             // The index is the position about to be pushed, matching the
                             // enumerate-based declaration numbering (was double-counted).
                             let idx = memo_entries.len();
-                            memo_entries.push(SlotMemoEntry {
-                                expression: value,
-                                is_async: has_await,
-                            });
+                            memo_entries
+                                .push(SlotMemoEntry { expression: value, is_async: has_await });
                             let param_id = b::id(format!("${idx}"));
-                            b::call(
-                                arena_ref,
-                                b::member_path(arena_ref, "$.get"),
-                                vec![param_id],
-                            )
+                            b::call(arena_ref, b::member_path(arena_ref, "$.get"), vec![param_id])
                         } else {
                             value
                         }
@@ -1121,11 +1033,7 @@ impl<'a> ComponentContext<'a> {
         } else {
             let mut args = vec![b::object(props)];
             args.extend(spreads);
-            b::call(
-                &self.arena,
-                b::member_path(&self.arena, "$.spread_props"),
-                args,
-            )
+            b::call(&self.arena, b::member_path(&self.arena, "$.spread_props"), args)
         };
 
         // Build fallback function
@@ -1152,9 +1060,7 @@ impl<'a> ComponentContext<'a> {
         // Restore original transforms after visiting children
         for (name, saved) in &saved_transforms {
             if let Some(original_transform) = saved {
-                self.state
-                    .transform
-                    .insert(name.clone(), original_transform.clone());
+                self.state.transform.insert(name.clone(), original_transform.clone());
             } else {
                 self.state.transform.remove(name);
             }
@@ -1165,13 +1071,7 @@ impl<'a> ComponentContext<'a> {
         let slot_call = b::call(
             &self.arena,
             b::member_path(&self.arena, "$.slot"),
-            vec![
-                self.state.node.clone(),
-                b::id("$$props"),
-                name,
-                props_expression,
-                fallback,
-            ],
+            vec![self.state.node.clone(), b::id("$$props"), name, props_expression, fallback],
         );
 
         // Check if we have any async memoized entries
@@ -1179,27 +1079,18 @@ impl<'a> ComponentContext<'a> {
 
         if has_async {
             // Build sync derived declarations
-            let sync_entries: Vec<(usize, &SlotMemoEntry)> = memo_entries
-                .iter()
-                .enumerate()
-                .filter(|(_, e)| !e.is_async)
-                .collect();
+            let sync_entries: Vec<(usize, &SlotMemoEntry)> =
+                memo_entries.iter().enumerate().filter(|(_, e)| !e.is_async).collect();
 
-            let async_entries: Vec<(usize, &SlotMemoEntry)> = memo_entries
-                .iter()
-                .enumerate()
-                .filter(|(_, e)| e.is_async)
-                .collect();
+            let async_entries: Vec<(usize, &SlotMemoEntry)> =
+                memo_entries.iter().enumerate().filter(|(_, e)| e.is_async).collect();
 
             // Build statements: derived declarations + slot call
             let mut statements: Vec<JsStatement> = Vec::new();
 
             // Add sync derived declarations: let $N = $.derived(() => expr)
-            let derived_fn = if self.state.analysis.runes {
-                "$.derived"
-            } else {
-                "$.derived_safe_equal"
-            };
+            let derived_fn =
+                if self.state.analysis.runes { "$.derived" } else { "$.derived_safe_equal" };
             for (idx, entry) in &sync_entries {
                 statements.push(b::let_decl(
                     &self.arena,
@@ -1249,11 +1140,8 @@ impl<'a> ComponentContext<'a> {
         } else if !memo_entries.is_empty() {
             // Non-async case but with memoized entries:
             // Wrap in a block scope with derived declarations
-            let derived_fn = if self.state.analysis.runes {
-                "$.derived"
-            } else {
-                "$.derived_safe_equal"
-            };
+            let derived_fn =
+                if self.state.analysis.runes { "$.derived" } else { "$.derived_safe_equal" };
             let mut statements: Vec<JsStatement> = Vec::new();
             for (idx, entry) in memo_entries.iter().enumerate() {
                 let deep_read_expr = if !self.state.analysis.runes {
@@ -1271,11 +1159,7 @@ impl<'a> ComponentContext<'a> {
                         vec![b::thunk(&self.arena, entry.expression.clone())],
                     )
                 };
-                statements.push(b::let_decl(
-                    &self.arena,
-                    format!("${idx}"),
-                    Some(deep_read_expr),
-                ));
+                statements.push(b::let_decl(&self.arena, format!("${idx}"), Some(deep_read_expr)));
             }
             statements.push(b::stmt(&self.arena, slot_call));
             // Wrap in block scope so $0, $1, etc. don't leak
@@ -1375,158 +1259,50 @@ impl<'a> ComponentContext<'a> {
                             is_defined: false,
                             is_reactive: true,
                             replacement_id: None,
+                            store_source: None,
                         },
                     );
                     // Let directive bindings are template-kind.
                     self.state.transform_deep_read.insert(name.clone(), ());
-                } else {
-                    // Destructured case: let:x={{y, z}} or let:x={[a, b]}
-                    // Generates: const derived_name = $.derived(() => { let {y, z} = $$slotProps.x; return {y, z}; })
-                    // And registers transforms: y -> $.get(derived_name).y, z -> $.get(derived_name).z
-                    if let Some(expr) = &let_dir.expression {
-                        {
-                            let expr_type = expr.node_type().unwrap_or("");
-                            // Extract binding names from the expression
-                            let mut binding_names: Vec<compact_str::CompactString> = Vec::new();
-                            let node = expr.as_node();
-                            match &*node {
-                                crate::ast::typed_expr::JsNode::ObjectExpression {
-                                    properties,
-                                    ..
-                                } => {
-                                    // Object destructuring: {y, z}
-                                    for prop in self.state.parse_arena.get_js_children(*properties)
-                                    {
-                                        if let Some(key_id) = prop.key() {
-                                            let key = self.state.parse_arena.get_js_node(key_id);
-                                            if let Some(name) = key.name() {
-                                                binding_names.push(name.into());
-                                            }
-                                        }
-                                    }
-                                }
-                                crate::ast::typed_expr::JsNode::ArrayExpression {
-                                    elements,
-                                    ..
-                                } => {
-                                    for elem in elements.iter().flatten() {
-                                        if let Some(name) = elem.name() {
-                                            binding_names.push(name.into());
-                                        }
-                                    }
-                                }
-                                _ => {}
-                            }
+                } else if let Some((derived_name, binding_names, const_stmt)) =
+                    crate::compiler::phases::phase3_transform::client::visitors::shared::component::build_destructured_let_directive(
+                        let_dir, self,
+                    )
+                {
+                    // Destructured case: the pattern, the names it binds and the
+                    // derived it reads through are the component path's, so a
+                    // rename / nesting / rest / default behaves the same here.
+                    let_names.push(derived_name.clone().into());
+                    saved_transforms.push((
+                        derived_name.clone(),
+                        self.state.transform.get(&derived_name).cloned(),
+                    ));
 
-                            if !binding_names.is_empty() {
-                                // Generate unique name for the derived variable
-                                let derived_name = self.state.memoizer.generate_id(prop_name);
-                                let_names.push(derived_name.clone().into());
-                                // Save existing transform for derived_name (if any) before it could be shadowed
-                                saved_transforms.push((
-                                    derived_name.clone(),
-                                    self.state.transform.get(&derived_name).cloned(),
-                                ));
-
-                                // Register transforms for each binding:
-                                // binding_name -> $.get(derived_name).binding_name
-                                for binding_name in &binding_names {
-                                    let derived_name_clone = derived_name.clone();
-                                    let_names.push(binding_name.clone());
-                                    // Save existing transform before overwriting
-                                    saved_transforms.push((
-                                        binding_name.to_string(),
-                                        self.state.transform.get(binding_name.as_str()).cloned(),
-                                    ));
-                                    self.state.transform.insert(
-                                        binding_name.to_string(),
-                                        IdentifierTransform {
-                                            read: Some(|arena, node| {
-                                                // The node is the identifier (e.g., `num`)
-                                                // We need to produce: $.get(derived_name).num
-                                                // But we can't capture derived_name in a fn pointer.
-                                                // Instead we use read_source which is checked
-                                                // in apply_transforms_to_expression.
-                                                b::call(
-                                                    arena,
-                                                    b::member_path(arena, "$.get"),
-                                                    vec![node],
-                                                )
-                                            }),
-                                            read_source: Some(derived_name_clone),
-                                            assign: None,
-                                            mutate: None,
-                                            update: None,
-                                            skip_proxy: false,
-                                            is_defined: false,
-                                            is_reactive: true,
-                                            replacement_id: None,
-                                        },
-                                    );
-                                    // Destructured let directive binding is template-kind.
-                                    self.state
-                                        .transform_deep_read
-                                        .insert(binding_name.to_string(), ());
-                                }
-
-                                // Build the destructuring pattern
-                                let destructuring_pat = if expr_type == "ObjectExpression" {
-                                    b::object_pattern(
-                                        binding_names
-                                            .iter()
-                                            .map(|n| JsObjectPatternProperty::Property {
-                                                key: JsPropertyKey::Identifier(n.clone()),
-                                                value: b::id_pattern(n.clone()),
-                                                computed: false,
-                                                shorthand: true,
-                                            })
-                                            .collect(),
-                                    )
-                                } else {
-                                    b::array_pattern(
-                                        binding_names
-                                            .iter()
-                                            .map(|n| Some(b::id_pattern(n.clone())))
-                                            .collect(),
-                                    )
-                                };
-
-                                // Build the return object: { a, b }
-                                let return_obj_expr = b::object(
-                                    binding_names
-                                        .iter()
-                                        .map(|n| b::prop(&self.arena, n.clone(), b::id(n.clone())))
-                                        .collect(),
-                                );
-
-                                // Generate: const derived_name = $.derived(() => {
-                                //   let { y, z } = $$slotProps.prop_name;
-                                //   return { y, z };
-                                // })
-                                // Note: destructured case always uses $.derived (not $.derived_safe_equal)
-                                let inner_let = b::var_decl_pattern(
-                                    &self.arena,
-                                    JsVariableKind::Let,
-                                    destructuring_pat,
-                                    Some(b::member(
-                                        &self.arena,
-                                        b::id("$$slotProps"),
-                                        prop_name.to_string(),
-                                    )),
-                                );
-                                let inner_return = b::return_value(&self.arena, return_obj_expr);
-                                let_stmts.push(b::const_decl(
-                                    &self.arena,
-                                    &derived_name,
-                                    b::call(
-                                        &self.arena,
-                                        b::member_path(&self.arena, "$.derived"),
-                                        vec![b::arrow_block(vec![], vec![inner_let, inner_return])],
-                                    ),
-                                ));
-                            }
-                        }
+                    for binding_name in &binding_names {
+                        let name = binding_name.to_string();
+                        let_names.push(binding_name.clone());
+                        saved_transforms.push((name.clone(), self.state.transform.get(&name).cloned()));
+                        self.state.transform.insert(
+                            name.clone(),
+                            IdentifierTransform {
+                                read: Some(|arena, node| {
+                                    b::call(arena, b::member_path(arena, "$.get"), vec![node])
+                                }),
+                                read_source: Some(derived_name.clone()),
+                                assign: None,
+                                mutate: None,
+                                update: None,
+                                skip_proxy: false,
+                                is_defined: false,
+                                is_reactive: true,
+                                replacement_id: None,
+                                store_source: None,
+                            },
+                        );
+                        self.state.transform_deep_read.insert(name, ());
                     }
+
+                    let_stmts.push(const_stmt);
                 }
             }
         }
@@ -1548,9 +1324,7 @@ impl<'a> ComponentContext<'a> {
         // Restore original transforms that were saved before let: directives
         for (name, saved) in &saved_transforms {
             if let Some(original_transform) = saved {
-                self.state
-                    .transform
-                    .insert(name.clone(), original_transform.clone());
+                self.state.transform.insert(name.clone(), original_transform.clone());
             } else {
                 self.state.transform.remove(name);
             }
@@ -1618,6 +1392,12 @@ impl<'a> ComponentContext<'a> {
                         crate::compiler::phases::phase3_transform::utils::ParentRef::None,
                     );
                 }
+                Attribute::TransitionDirective(transition) => {
+                    crate::compiler::phases::phase3_transform::client::visitors::transition_directive::transition_directive(transition, self);
+                }
+                Attribute::AnimateDirective(animate) => {
+                    crate::compiler::phases::phase3_transform::client::visitors::animate_directive::animate_directive(animate, self);
+                }
                 Attribute::AttachTag(attach) => {
                     // Handle {@attach ...} directives on special elements like
                     // `<svelte:body {@attach swipe} />`. Mirrors RegularElement.js behavior.
@@ -1640,11 +1420,10 @@ impl<'a> ComponentContext<'a> {
                             capture = true;
                         }
 
-                        // Extract and convert the handler expression
-                        let saved_in_event = self.state.in_event_attribute_handler;
-                        self.state.in_event_attribute_handler = true;
+                        // No exemption here: upstream's special case lists only
+                        // `RegularElement` and `SvelteElement`, so `<svelte:window>`
+                        // and friends never skip the `$.assign` wrap.
                         let handler = extract_event_handler(&event_attr.value, self);
-                        self.state.in_event_attribute_handler = saved_in_event;
 
                         // Build the $.event() call
                         // For special elements, events are never delegated and always go to init
@@ -1713,7 +1492,7 @@ fn extract_event_handler(
         build_event_handler, extract_expression_tag,
     };
     let expr_tag = extract_expression_tag(value);
-    build_event_handler(expr_tag, context)
+    build_event_handler(expr_tag, context, None)
 }
 
 /// Check if an event is passive.
@@ -1757,9 +1536,12 @@ pub struct TransformOptions {
     pub experimental_async: bool,
 
     /// Whether HMR (Hot Module Replacement) is enabled.
-    /// When true, components need fragment wrappers even in standalone mode
-    /// because $.hmr() uses block/branch effects that need stable anchor nodes.
     pub hmr: bool,
+
+    /// The component source. Upstream prints the whole client output against
+    /// one comment cursor over this text, so a template comment's landing spot
+    /// is decided by source line and column — see [`JsSourceAnchor`].
+    pub source: std::rc::Rc<str>,
 }
 
 impl Default for TransformOptions {
@@ -1771,6 +1553,7 @@ impl Default for TransformOptions {
             preserve_comments: false,
             experimental_async: false,
             hmr: false,
+            source: "".into(),
         }
     }
 }
@@ -1864,6 +1647,17 @@ pub struct ComponentClientTransformState<'a> {
     /// inside a sibling `{#if}`).
     pub transform_deep_read: ImHashMap<String, ()>,
 
+    /// Await then/catch bindings whose active read transform is `$.get(name)`.
+    /// Await fragments scope these alongside `transform`; text-based template
+    /// declaration lowering uses the set to apply the same scoped reads.
+    pub await_binding_names: ImHashMap<String, ()>,
+
+    /// Names a nested template construct (`{@const}`, a snippet parameter) binds
+    /// in the block being visited, shadowing an enclosing `{#each}`'s item or
+    /// index of the same name. The reactivity probe and the index-usage tracker
+    /// both key on the name alone, so the shadow has to be spelled out for them.
+    pub each_shadowing_names: ImHashMap<String, ()>,
+
     /// Delegated events (insertion-ordered to match official compiler's `Set<string>`)
     pub events: indexmap::IndexSet<String>,
 
@@ -1909,21 +1703,22 @@ pub struct ComponentClientTransformState<'a> {
     /// This is used to skip rest_prop → $$props transformation for direct property assignments.
     pub in_direct_assignment_lhs: bool,
 
-    /// Flag indicating if we're inside a bind directive expression.
-    /// Used to skip coercive assignment transforms ($.assign_nullish, etc.) for bind setters.
-    pub in_bind_directive: bool,
+    /// Name of the declarator whose `$state(...)` initializer is being converted.
+    /// `create_state_declarator` (`VariableDeclaration.js`) labels the proxy with
+    /// it, and the expression converter has no other way back to the pattern.
+    pub state_declarator_name: Option<String>,
 
-    /// Flag indicating if we're inside an event attribute handler (e.g., onclick={() => ...}).
-    /// Used to track the event handler context so that the expression converter can skip
-    /// coercive assignment transforms for the direct body of event handler arrow functions.
-    /// Reference: AssignmentExpression.js lines 189-209 in the official Svelte compiler.
-    pub in_event_attribute_handler: bool,
+    /// One-shot token mirroring upstream's `path.at(-1) !== 'ExpressionStatement'`
+    /// guard: set just before converting the direct expression child of an
+    /// `ExpressionStatement`, consumed (and cleared) by the assignment visitor so
+    /// nested assignments do not inherit it.
+    pub assignment_is_statement: bool,
 
-    /// Depth counter for tracking whether we're at the direct body level of an event
-    /// handler arrow function. Set to 1 when processing the body expression of an
-    /// event handler arrow, and 0 otherwise. Nested expressions reset this to 0.
-    /// When this is 1 AND in_event_attribute_handler is true, coercive assignment
-    /// transforms ($.assign) are skipped (matching Svelte's path-based check).
+    /// 1 while converting the direct assignment body of an arrow that is exempt
+    /// from the coercive assignment transform, 0 otherwise. Which arrows are
+    /// exempt is decided by identity (`ComponentAnalysis::event_attribute_arrows`),
+    /// never by "somewhere inside a handler" — every other arrow clears it, so an
+    /// outer exemption cannot leak into one nested below it.
     pub event_handler_arrow_body_level: u32,
 
     /// Flag indicating if the current EachBlock should be treated as "controlled".
@@ -2095,9 +1890,12 @@ pub struct ComponentClientTransformState<'a> {
     pub const_blocker_map: Rc<std::cell::RefCell<rustc_hash::FxHashMap<String, JsExpr>>>,
 
     /// Pending transform error set during template traversal (e.g. "Not implemented: LetDirective").
-    /// Checked after the root fragment visit; if Some, `transform_client_with_visitors` returns
+    /// Checked after the root fragment visit; if Some, `transform_client` returns
     /// `Err(TransformError::CodeGen(...))` so the corpus sees an error entry for the client target.
     pub pending_error: Option<String>,
+
+    /// `{@const}` awaits are lowered by the enclosing async template machinery.
+    pub suppress_pickled_await_instrumentation: Cell<bool>,
 }
 
 /// Context information for generating bindings inside each blocks.
@@ -2114,9 +1912,10 @@ pub struct EachBindingContext {
     /// Whether the item is reactive (wrapped in $.get())
     pub item_reactive: bool,
 
-    /// The collection expression string for invalidation
-    /// e.g., "items()" for props, "$.get(a)" for state
-    pub collection_expr: String,
+    /// The collection expression as an AST node (e.g. `items()` for props,
+    /// `$.get(a)` for state). Kept structured so that `collection[$$index]`
+    /// parenthesises a loose-binding collection such as `$.get(a) ?? []`.
+    pub collection_expr: JsExpr,
 
     /// If a $$array parameter was generated (scope shadowing case)
     pub collection_id: Option<String>,
@@ -2204,6 +2003,8 @@ impl<'a> ComponentClientTransformState<'a> {
             memoizer: Memoizer::with_scope_declarations(scope, scope_root),
             transform: ImHashMap::new(),
             transform_deep_read: ImHashMap::new(),
+            await_binding_names: ImHashMap::new(),
+            each_shadowing_names: ImHashMap::new(),
             events: indexmap::IndexSet::default(),
             metadata: ComponentMetadata::default(),
             in_constructor: false,
@@ -2217,8 +2018,8 @@ impl<'a> ComponentClientTransformState<'a> {
             module_level_snippets: Vec::new(),
             snippet_names: ImHashSet::new(),
             in_direct_assignment_lhs: false,
-            in_bind_directive: false,
-            in_event_attribute_handler: false,
+            state_declarator_name: None,
+            assignment_is_statement: false,
             event_handler_arrow_body_level: 0,
             is_controlled_each: false,
             is_controlled_html: false,
@@ -2248,6 +2049,7 @@ impl<'a> ComponentClientTransformState<'a> {
             const_blocker_map: Rc::new(std::cell::RefCell::new(rustc_hash::FxHashMap::default())),
             templates: Rc::new(std::cell::RefCell::new(rustc_hash::FxHashMap::default())),
             pending_error: None,
+            suppress_pickled_await_instrumentation: Cell::new(false),
         }
     }
 
@@ -2399,26 +2201,6 @@ impl<'a> ComponentClientTransformState<'a> {
         self.has_blockers_for_names(&name_refs)
     }
 
-    /// Get blocker expressions from the const_blocker_map for identifiers in a JS expression.
-    /// Returns const-tag-level blocker expressions (e.g., `promises_1[0]`).
-    pub fn get_const_blockers_for_expr(&self, expr: &JsExpr, arena: &JsArena) -> Vec<JsExpr> {
-        let names = collect_identifiers_from_expr(expr, arena);
-        let const_map = self.const_blocker_map.borrow();
-        let mut exprs: Vec<JsExpr> = Vec::new();
-        // Deduplicate by pointer identity from the map (same map value = same expression).
-        let mut seen_ptrs: Vec<*const JsExpr> = Vec::new();
-        for name in &names {
-            if let Some(blocker_expr) = const_map.get(name.as_str()) {
-                let ptr = blocker_expr as *const JsExpr;
-                if !seen_ptrs.contains(&ptr) {
-                    seen_ptrs.push(ptr);
-                    exprs.push(blocker_expr.clone());
-                }
-            }
-        }
-        exprs
-    }
-
     /// Get all blocker expressions (both instance-level and const-tag-level)
     /// for identifiers referenced in a JS expression.
     pub fn get_all_blockers_for_expr(&self, expr: &JsExpr, arena: &JsArena) -> Vec<JsExpr> {
@@ -2458,6 +2240,9 @@ fn collect_identifiers_recursive(
 ) {
     use crate::compiler::phases::phase3_transform::js_ast::nodes::*;
     match expr {
+        JsExpr::Spanned(inner, _, _) => {
+            collect_identifiers_recursive(arena.get_expr(*inner), arena, names);
+        }
         JsExpr::Identifier(name) if !names.contains(name) => {
             names.push(name.clone());
         }
@@ -2478,7 +2263,10 @@ fn collect_identifiers_recursive(
                 // This is needed for blocker detection of props destructured after await
                 if let JsExpr::Identifier(obj) = arena.get_expr(member.object) {
                     if obj == "$$props" {
-                        if let JsMemberProperty::Identifier(prop_name) = &member.property {
+                        if let JsMemberProperty::Identifier(prop_name)
+                        | JsMemberProperty::SpannedIdentifier { name: prop_name, .. } =
+                            &member.property
+                        {
                             if !names.contains(prop_name) {
                                 names.push(prop_name.clone());
                             }
@@ -2590,7 +2378,7 @@ pub struct IdentifierTransform {
     /// - identifier: The identifier being assigned to
     /// - value: The value being assigned
     /// - needs_proxy: Whether the value needs to be proxified
-    pub assign: Option<fn(&JsArena, JsExpr, JsExpr, bool) -> JsExpr>,
+    pub assign: Option<fn(&IdentifierTransform, &JsArena, JsExpr, JsExpr, bool) -> JsExpr>,
 
     /// How to handle mutations to the identifier
     ///
@@ -2598,7 +2386,7 @@ pub struct IdentifierTransform {
     /// - arena: The JS arena allocator
     /// - identifier: The identifier being mutated
     /// - mutation_expr: The mutation expression (e.g., `obj.prop = value`)
-    pub mutate: Option<fn(&JsArena, JsExpr, JsExpr) -> JsExpr>,
+    pub mutate: Option<fn(&IdentifierTransform, &JsArena, JsExpr, JsExpr) -> JsExpr>,
 
     /// How to handle update expressions (++ or --)
     ///
@@ -2607,7 +2395,7 @@ pub struct IdentifierTransform {
     /// - operator: The update operator (++ or --)
     /// - argument: The identifier being updated
     /// - prefix: Whether the operator is prefix (++x) or postfix (x++)
-    pub update: Option<fn(&JsArena, JsUpdateOp, JsExpr, bool) -> JsExpr>,
+    pub update: Option<fn(&IdentifierTransform, &JsArena, JsUpdateOp, JsExpr, bool) -> JsExpr>,
 
     /// Whether to skip proxy wrapping for this variable (e.g., $state.raw)
     /// When true, needs_proxy will always be false for assignments
@@ -2628,6 +2416,12 @@ pub struct IdentifierTransform {
     /// Used for legacy reactive imports where `numbers` becomes `$$_import_numbers()`.
     /// The read transform is then applied to the replacement identifier.
     pub replacement_id: Option<String>,
+
+    /// For a `$store` subscription, how the underlying store variable itself
+    /// reads — upstream's `get_store()`, i.e. `context.visit(b.id(name.slice(1)))`.
+    /// Resolved after every transform is registered, because the store variable's
+    /// own transform may be added later in the same pass.
+    pub store_source: Option<JsExpr>,
 }
 
 /// Component metadata.
@@ -2643,6 +2437,14 @@ pub struct ComponentMetadata {
     /// When true, infer_namespace should NOT re-evaluate from children,
     /// because the namespace is determined at runtime by $.element().
     pub svelte_element_child: bool,
+
+    /// Whether an ancestor element is a `<text>` element. Stands in for upstream
+    /// `clean_nodes`' `path.some((n) => n.type === 'RegularElement' && n.name ===
+    /// 'text')`, because this port never populates `context.path`.
+    pub in_text_element: bool,
+
+    /// Whether the current fragment is inside a bound editable element.
+    pub bound_contenteditable: bool,
 }
 
 impl Default for ComponentMetadata {
@@ -2651,68 +2453,9 @@ impl Default for ComponentMetadata {
             namespace: "html".to_string(),
             scoped: false,
             svelte_element_child: false,
+            in_text_element: false,
+            bound_contenteditable: false,
         }
-    }
-}
-
-/// Template builder.
-///
-/// Accumulates HTML template parts during traversal.
-#[derive(Debug, Default, Clone)]
-pub struct TemplateBuilder {
-    /// HTML parts being accumulated
-    parts: Vec<String>,
-
-    /// Element stack for tracking open elements
-    element_stack: Vec<String>,
-}
-
-impl TemplateBuilder {
-    /// Create a new template builder.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Push an opening element tag.
-    pub fn push_element(&mut self, tag: &str, _start: u32) {
-        self.parts.push(format!("<{}>", tag));
-        self.element_stack.push(tag.to_string());
-    }
-
-    /// Pop the last opened element and close it.
-    pub fn pop_element(&mut self) {
-        if let Some(tag) = self.element_stack.pop() {
-            self.parts.push(format!("</{}>", tag));
-        }
-    }
-
-    /// Push a comment placeholder.
-    pub fn push_comment(&mut self) {
-        self.parts.push("<!---->".to_string());
-    }
-
-    /// Set a property on the current element.
-    pub fn set_prop(&mut self, name: &str, value: &str) {
-        // This should be called before the element is closed
-        if !self.element_stack.is_empty()
-            // Insert before the last '>'
-            && let Some(last) = self.parts.last_mut()
-            && last.ends_with('>')
-        {
-            last.pop(); // Remove the '>'
-            let _ = write!(last, " {}=\"{}\"", name, value);
-            last.push('>');
-        }
-    }
-
-    /// Get the combined HTML template string.
-    pub fn get_html(&self) -> String {
-        self.parts.join("")
-    }
-
-    /// Push raw HTML content.
-    pub fn push_raw(&mut self, html: &str) {
-        self.parts.push(html.to_string());
     }
 }
 
@@ -2734,12 +2477,6 @@ pub struct MemoEntry {
 /// `svelte/packages/svelte/src/compiler/phases/3-transform/client/visitors/shared/utils.js`.
 #[derive(Debug, Default, Clone)]
 pub struct Memoizer {
-    /// Counter for generating unique memoization variable names
-    counter: usize,
-
-    /// Map from expression hash to memoized variable name
-    memos: FxHashMap<String, String>,
-
     /// Shared set of conflicting names to avoid collisions across all scopes.
     /// Uses Rc<RefCell<...>> so that parent and child memoizers share the SAME
     /// conflicts set, matching the official Svelte compiler's single shared
@@ -2760,8 +2497,6 @@ impl Memoizer {
     /// Create a new memoizer.
     pub fn new() -> Self {
         Self {
-            counter: 0,
-            memos: FxHashMap::default(),
             conflicts: Rc::new(RefCell::new(FxHashSet::default())),
             next_suffix: Rc::new(RefCell::new(FxHashMap::default())),
             sync: Vec::new(),
@@ -2786,13 +2521,10 @@ impl Memoizer {
         _scope: &crate::compiler::phases::phase2_analyze::scope::Scope,
         scope_root: &crate::compiler::phases::phase2_analyze::scope::ScopeRoot,
     ) -> Self {
-        // Share the conflicts set from ScopeRoot directly via Rc::clone
-        // (avoids cloning the entire FxHashSet). This mirrors scope.root.conflicts
-        // in the official Svelte compiler.
+        // Generated names belong to one transform. Keeping them out of the
+        // analysis seed makes repeated transforms deterministic.
         Self {
-            counter: 0,
-            memos: FxHashMap::default(),
-            conflicts: Rc::clone(&scope_root.conflicts),
+            conflicts: Rc::new(RefCell::new(scope_root.conflicts.clone())),
             sync: Vec::new(),
             async_entries: Vec::new(),
             next_suffix: Rc::new(RefCell::new(FxHashMap::default())),
@@ -2805,8 +2537,6 @@ impl Memoizer {
     /// a single shared `ScopeRoot.conflicts` set across all scopes.
     pub fn with_parent_conflicts(parent: &Memoizer) -> Self {
         Self {
-            counter: 0,
-            memos: FxHashMap::default(),
             conflicts: Rc::clone(&parent.conflicts),
             next_suffix: Rc::clone(&parent.next_suffix),
             sync: Vec::new(),
@@ -2852,20 +2582,14 @@ impl Memoizer {
 
         // Calculate the index for this memoized expression
         // Sync expressions come first, then async expressions
-        let idx = if has_await {
-            self.sync.len() + self.async_entries.len()
-        } else {
-            self.sync.len()
-        };
+        let idx =
+            if has_await { self.sync.len() + self.async_entries.len() } else { self.sync.len() };
 
         // Create the identifier with the correct name ($0, $1, etc.)
         let name = format!("${}", idx);
         let id = b::id(&name);
 
-        let entry = MemoEntry {
-            id: id.clone(),
-            expression,
-        };
+        let entry = MemoEntry { id: id.clone(), expression };
 
         if has_await {
             self.async_entries.push(entry);
@@ -2897,11 +2621,7 @@ impl Memoizer {
         self.sync
             .iter()
             .map(|memo| {
-                let derived_fn = if runes {
-                    "$.derived"
-                } else {
-                    "$.derived_safe_equal"
-                };
+                let derived_fn = if runes { "$.derived" } else { "$.derived_safe_equal" };
                 // Extract the identifier name from the JsExpr::Identifier
                 let name = match &memo.id {
                     JsExpr::Identifier(n) => n.clone(),
@@ -2918,11 +2638,6 @@ impl Memoizer {
                 )
             })
             .collect()
-    }
-
-    /// Check if there are any sync memoized expressions that need to be output.
-    pub fn has_deriveds(&self) -> bool {
-        !self.sync.is_empty()
     }
 
     /// Add an expression to be memoized for template effects.
@@ -2959,20 +2674,14 @@ impl Memoizer {
 
         // Calculate the index for this memoized expression
         // Sync expressions come first, then async expressions
-        let idx = if has_await {
-            self.sync.len() + self.async_entries.len()
-        } else {
-            self.sync.len()
-        };
+        let idx =
+            if has_await { self.sync.len() + self.async_entries.len() } else { self.sync.len() };
 
         // Create the parameter identifier immediately with the correct name
         let name = format!("${}", idx);
         let id = b::id(&name);
 
-        let entry = MemoEntry {
-            id: id.clone(),
-            expression,
-        };
+        let entry = MemoEntry { id: id.clone(), expression };
 
         if has_await {
             self.async_entries.push(entry);
@@ -2990,9 +2699,7 @@ impl Memoizer {
     pub fn get_params(&self) -> Vec<JsExpr> {
         use crate::compiler::phases::phase3_transform::js_ast::builders as b;
 
-        (0..self.sync.len() + self.async_entries.len())
-            .map(|i| b::id(format!("${}", i)))
-            .collect()
+        (0..self.sync.len() + self.async_entries.len()).map(|i| b::id(format!("${}", i))).collect()
     }
 
     /// Apply memoization - this is kept for compatibility but now just returns the params.
@@ -3017,11 +2724,8 @@ impl Memoizer {
         // access not-yet-initialized functions in template") needs the
         // wrapping `() => getX()` so the function is only read when the
         // deferred template effect actually runs.
-        let thunks: Vec<JsExpr> = self
-            .sync
-            .iter()
-            .map(|memo| b::arrow(arena, vec![], memo.expression.clone()))
-            .collect();
+        let thunks: Vec<JsExpr> =
+            self.sync.iter().map(|memo| b::arrow(arena, vec![], memo.expression.clone())).collect();
 
         Some(b::array(thunks))
     }
@@ -3068,23 +2772,12 @@ impl Memoizer {
         exprs
     }
 
-    /// Check if there are any async memoized expressions.
-    pub fn has_async(&self) -> bool {
-        !self.async_entries.is_empty()
-    }
-
     /// Get the async parameter identifiers for the $.async() arrow function.
     ///
     /// Returns the list of async parameter identifiers ($0, $1, etc.) that will
     /// be passed as parameters to the arrow function in $.async() calls.
     pub fn async_ids(&self) -> Vec<JsExpr> {
         self.async_entries.iter().map(|e| e.id.clone()).collect()
-    }
-
-    /// Clear all memoized expressions (but keep conflicts).
-    pub fn clear_memoized(&mut self) {
-        self.sync.clear();
-        self.async_entries.clear();
     }
 
     /// Generate a unique identifier with a given base name.
@@ -3119,7 +2812,9 @@ impl Memoizer {
         // success.
         {
             let mut conflicts = self.conflicts.borrow_mut();
-            if !conflicts.contains(sanitized) {
+            // `Scope.unique` rejects a reserved word here too, so `<var>` takes
+            // the suffix path and becomes `var_1` rather than `var var = …`.
+            if !conflicts.contains(sanitized) && !is_reserved(sanitized) {
                 conflicts.insert(sanitized.to_string());
                 return sanitized.to_string();
             }
@@ -3172,7 +2867,7 @@ impl Memoizer {
         // `insert` that tests and records the suffixed name in one hash.
         {
             let mut conflicts = self.conflicts.borrow_mut();
-            if !conflicts.contains(sanitized.as_str()) {
+            if !conflicts.contains(sanitized.as_str()) && !is_reserved(&sanitized) {
                 conflicts.insert(sanitized.clone());
                 return sanitized;
             }
@@ -3209,16 +2904,6 @@ impl Memoizer {
         name
     }
 
-    /// Reset the memoizer state.
-    pub fn reset(&mut self) {
-        self.counter = 0;
-        self.memos.clear();
-        self.conflicts.borrow_mut().clear();
-        self.next_suffix.borrow_mut().clear();
-        self.sync.clear();
-        self.async_entries.clear();
-    }
-
     /// Merge conflicts from another memoizer.
     /// With shared Rc<RefCell<...>> conflicts, this is a no-op.
     pub fn merge_conflicts(&mut self, _other: &Memoizer) {
@@ -3248,18 +2933,20 @@ fn is_valid_identifier(name: &str) -> bool {
 fn sanitize_identifier(name: &str) -> String {
     let mut result = String::with_capacity(name.len());
 
+    // Upstream is `name.replace(/(^[^a-zA-Z_$]|[^a-zA-Z0-9_$])/g, '_')` over a
+    // UTF-16 string, so an astral character is replaced by *two* underscores.
     for (i, c) in name.chars().enumerate() {
-        if c.is_ascii_alphabetic() || c == '_' || c == '$' {
-            result.push(c);
-        } else if c.is_ascii_digit() {
-            if i == 0 {
-                // Can't start with a digit, prefix with underscore
-                result.push('_');
-            }
+        let keep = if i == 0 {
+            c.is_ascii_alphabetic() || c == '_' || c == '$'
+        } else {
+            c.is_ascii_alphanumeric() || c == '_' || c == '$'
+        };
+        if keep {
             result.push(c);
         } else {
-            // Replace invalid characters (like '-') with underscore
-            result.push('_');
+            for _ in 0..c.len_utf16() {
+                result.push('_');
+            }
         }
     }
 
@@ -3279,7 +2966,6 @@ const FLAG_HAS_CALL: u8 = 1 << 1;
 const FLAG_HAS_AWAIT: u8 = 1 << 2;
 const FLAG_HAS_MEMBER_EXPRESSION: u8 = 1 << 3;
 const FLAG_HAS_ASSIGNMENT: u8 = 1 << 4;
-const FLAG_DYNAMIC: u8 = 1 << 5;
 
 /// Expression metadata for analysis.
 ///
@@ -3299,15 +2985,10 @@ pub struct ExpressionMetadata {
     /// need to be read for dependency tracking (matching the official Svelte
     /// compiler's `metadata.references`).
     /// Uses IndexSet to preserve insertion order (matching JavaScript Set behavior).
-    pub references: IndexSet<usize>,
+    pub references: crate::ast::template::BindingIndexSet,
 }
 
 impl ExpressionMetadata {
-    /// Create a new expression metadata.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     /// Create ExpressionMetadata from the template's ExpressionMetadata.
     /// This is a helper to convert from phase 2 metadata to phase 3 metadata.
     /// Uses direct flag byte copy (bits 0-4 are aligned between the two types).
@@ -3316,11 +2997,7 @@ impl ExpressionMetadata {
         // Copy bits 0-4 directly (STATE, CALL, AWAIT, MEMBER_EXPRESSION, ASSIGNMENT).
         // Bit 5 (DYNAMIC) is not present in the template metadata, so it stays 0.
         let flags = meta.raw_flags() & 0x1F; // mask to bits 0-4
-        Self {
-            flags,
-            blockers: Vec::new(),
-            references: meta.references.clone(),
-        }
+        Self { flags, blockers: Vec::new(), references: meta.references.clone() }
     }
 
     /// Whether the expression contains a call
@@ -3403,32 +3080,6 @@ impl ExpressionMetadata {
         }
     }
 
-    /// Whether the expression is dynamic (needs reactive tracking)
-    #[inline]
-    pub fn dynamic(&self) -> bool {
-        self.flags & FLAG_DYNAMIC != 0
-    }
-
-    /// Set whether the expression is dynamic
-    #[inline]
-    pub fn set_dynamic(&mut self, v: bool) {
-        if v {
-            self.flags |= FLAG_DYNAMIC;
-        } else {
-            self.flags &= !FLAG_DYNAMIC;
-        }
-    }
-
-    /// Check if the expression has any blocking dependencies.
-    pub fn has_blockers(&self) -> bool {
-        !self.blockers.is_empty()
-    }
-
-    /// Check if the expression is async (has await or blockers).
-    pub fn is_async(&self) -> bool {
-        self.has_await() || self.has_blockers()
-    }
-
     /// Get the blocking dependencies as a JS array expression.
     pub fn blockers(&self) -> JsExpr {
         use crate::compiler::phases::phase3_transform::js_ast::builders as b;
@@ -3491,17 +3142,6 @@ fn build_slot_async_thunk(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_template_builder() {
-        let mut builder = TemplateBuilder::new();
-        builder.push_element("div", 0);
-        builder.push_comment();
-        builder.pop_element();
-
-        let html = builder.get_html();
-        assert_eq!(html, "<div><!----></div>");
-    }
 
     #[test]
     fn test_memoizer_simple_expression() {

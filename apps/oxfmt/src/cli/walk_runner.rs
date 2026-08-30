@@ -20,8 +20,7 @@ use super::{
 #[cfg(feature = "napi")]
 use crate::core::JsConfigLoaderCb;
 use crate::core::{
-    ConfigResolver, ExternalPluginSupport, FormatStrategy, SourceFormatter,
-    resolve_editorconfig_path, utils,
+    ConfigResolver, FormatStrategy, SourceFormatter, resolve_editorconfig_path, utils,
 };
 
 pub struct WalkRunner {

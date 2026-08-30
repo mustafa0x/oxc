@@ -9,6 +9,8 @@
 pub mod arena;
 pub mod css;
 pub mod js;
+#[doc(hidden)]
+pub mod oxc_program;
 pub mod span;
 pub mod template;
 pub mod typed_expr;

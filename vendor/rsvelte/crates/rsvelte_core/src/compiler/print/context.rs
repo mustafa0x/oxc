@@ -5,12 +5,12 @@
 //!
 //! - Building the output string with proper formatting
 //! - Managing indentation levels
-//! - Tracking source map mappings
 //! - Measuring output length for formatting decisions
 //!
 //! Reference: esrap npm package Context API
 
 use oxc_allocator::Allocator;
+use std::collections::HashSet;
 
 /// Default indentation string (1 tab, as per Svelte's print output).
 const INDENT_STRING: &str = "\t";
@@ -39,9 +39,11 @@ pub struct Context<'a> {
     needs_newline: bool,
     /// Deferred margin flag (like esrap's needs_margin)
     needs_margin: bool,
-    /// Source map mappings (line, column) -> (original_line, original_column)
-    /// TODO: Implement proper source map support
-    mappings: Vec<(usize, usize, usize, usize)>,
+    /// Nesting depth of elements whose text content is emitted verbatim.
+    pub preserve_whitespace: usize,
+    verbatim_lines: HashSet<usize>,
+    css_comments: Vec<serde_json::Value>,
+    css_comment_index: usize,
 }
 
 impl<'a> Context<'a> {
@@ -60,7 +62,10 @@ impl<'a> Context<'a> {
             source: None,
             needs_newline: false,
             needs_margin: false,
-            mappings: Vec::new(),
+            preserve_whitespace: 0,
+            verbatim_lines: HashSet::new(),
+            css_comments: Vec::new(),
+            css_comment_index: 0,
         }
     }
 
@@ -75,7 +80,10 @@ impl<'a> Context<'a> {
             source,
             needs_newline: false,
             needs_margin: false,
-            mappings: Vec::new(),
+            preserve_whitespace: 0,
+            verbatim_lines: HashSet::new(),
+            css_comments: Vec::new(),
+            css_comment_index: 0,
         }
     }
 
@@ -113,6 +121,71 @@ impl<'a> Context<'a> {
         }
 
         self.buffer.push_str(text);
+    }
+
+    pub fn write_verbatim(&mut self, text: &str) {
+        let line = self.buffer.bytes().filter(|&byte| byte == b'\n').count();
+        for (offset, _) in text.match_indices('\n') {
+            let next = text[..offset].bytes().filter(|&byte| byte == b'\n').count() + 1;
+            self.verbatim_lines.insert(line + next);
+        }
+        self.write(text);
+        if text.contains('\n') {
+            self.multiline = true;
+            self.at_line_start = text.ends_with('\n');
+        }
+    }
+
+    pub fn set_css_comments(&mut self, comments: &[serde_json::Value]) {
+        self.css_comments = comments.to_vec();
+        self.css_comment_index = 0;
+    }
+
+    pub fn has_css_comment_before(&self, end: u64) -> bool {
+        self.css_comments
+            .get(self.css_comment_index)
+            .and_then(|comment| comment.get("start"))
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|start| start < end)
+    }
+
+    pub fn write_css_comments_before(&mut self, end: u64, inline: bool) -> bool {
+        let mut written = false;
+        while self.has_css_comment_before(end) {
+            if inline && written {
+                self.write(" ");
+            }
+            let value = self.css_comments[self.css_comment_index]
+                .get("value")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            self.write("/*");
+            self.write(&value);
+            self.write("*/");
+            self.css_comment_index += 1;
+            written = true;
+        }
+        written
+    }
+
+    pub fn write_next_css_comment(&mut self) {
+        let value = self.css_comments[self.css_comment_index]
+            .get("value")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        self.write("/*");
+        self.write(&value);
+        self.write("*/");
+        self.css_comment_index += 1;
+    }
+
+    pub fn clear_pending_whitespace(&mut self) {
+        if self.buffer.is_empty() {
+            self.needs_newline = false;
+            self.needs_margin = false;
+        }
     }
 
     /// Add a newline to the output.
@@ -199,6 +272,7 @@ impl<'a> Context<'a> {
             self.needs_margin = false;
         }
 
+        let base_line = self.buffer.bytes().filter(|&byte| byte == b'\n').count();
         // Add indentation for each line in the other context
         let indent = INDENT_STRING.repeat(self.indent_level);
         for (i, line) in other.buffer.split('\n').enumerate() {
@@ -206,11 +280,15 @@ impl<'a> Context<'a> {
                 self.buffer.push('\n');
             }
             // Add indentation at line start
-            if ((i == 0 && self.at_line_start) || i > 0) && !line.is_empty() {
+            if ((i == 0 && self.at_line_start) || i > 0)
+                && !line.is_empty()
+                && !other.verbatim_lines.contains(&i)
+            {
                 self.buffer.push_str(&indent);
             }
             self.buffer.push_str(line);
         }
+        self.verbatim_lines.extend(other.verbatim_lines.iter().map(|line| base_line + line));
         self.at_line_start = other.buffer.ends_with('\n');
         if other.multiline {
             self.multiline = true;
@@ -240,24 +318,11 @@ impl<'a> Context<'a> {
             source: self.source,
             needs_newline: false,
             needs_margin: false,
-            mappings: Vec::new(),
+            preserve_whitespace: self.preserve_whitespace,
+            verbatim_lines: HashSet::new(),
+            css_comments: Vec::new(),
+            css_comment_index: 0,
         }
-    }
-
-    /// Add a source map location mapping.
-    ///
-    /// This records a mapping from the generated code position to the original source position.
-    /// TODO: Implement proper source map generation.
-    ///
-    /// # Arguments
-    ///
-    /// * `line` - The line number in the original source (1-indexed)
-    /// * `column` - The column number in the original source (0-indexed)
-    pub fn location(&mut self, line: usize, column: usize) {
-        let current_line = self.buffer.lines().count();
-        let current_column = self.buffer.lines().last().map(|l| l.len()).unwrap_or(0);
-        self.mappings
-            .push((current_line, current_column, line, column));
     }
 
     /// Flush any deferred newlines to the buffer.
@@ -287,15 +352,6 @@ impl<'a> Context<'a> {
     /// Returns the complete output buffer as a string slice.
     pub fn as_str(&self) -> &str {
         &self.buffer
-    }
-
-    /// Get the source map as a JSON string.
-    ///
-    /// TODO: Implement proper source map generation using the sourcemap crate.
-    /// For now, returns None.
-    pub fn get_source_map(&self) -> Option<String> {
-        // TODO: Generate proper source map from self.mappings
-        None
     }
 }
 
@@ -423,9 +479,6 @@ mod tests {
         ctx.dedent();
         ctx.write("level0");
 
-        assert_eq!(
-            ctx.to_string(),
-            "level0\n\tlevel1\n\t\tlevel2\n\tlevel1\nlevel0"
-        );
+        assert_eq!(ctx.to_string(), "level0\n\tlevel1\n\t\tlevel2\n\tlevel1\nlevel0");
     }
 }

@@ -117,11 +117,7 @@ pub fn transition_directive(node: &TransitionDirective, context: &mut ComponentC
     // Build the transition call: $.transition(flags, node, () => name, (() => expr)?)
     let mut statement = b::stmt(
         &context.arena,
-        b::call(
-            &context.arena,
-            b::member_path(&context.arena, "$.transition"),
-            args,
-        ),
+        b::call(&context.arena, b::member_path(&context.arena, "$.transition"), args),
     );
 
     // Check if any referenced variables are blocked by async promises.
@@ -165,9 +161,7 @@ pub fn get_blockers_for_exprs(exprs: &[&JsExpr], context: &ComponentContext) -> 
         }
     }
     let name_refs: Vec<&str> = all_names.iter().map(|s| s.as_str()).collect();
-    context
-        .state
-        .get_blockers_for_names(&name_refs, &context.arena)
+    context.state.get_blockers_for_names(&name_refs, &context.arena)
 }
 
 /// Collect all identifier names from a JsExpr without crossing function boundaries.
@@ -188,6 +182,9 @@ fn collect_expr_identifiers_recursive(
 ) {
     use crate::compiler::phases::phase3_transform::js_ast::nodes::*;
     match expr {
+        JsExpr::Spanned(inner, _, _) => {
+            collect_expr_identifiers_recursive(arena.get_expr(*inner), arena, names);
+        }
         JsExpr::Identifier(name) if !names.contains(name) => {
             names.push(name.clone());
         }

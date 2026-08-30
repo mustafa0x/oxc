@@ -6,16 +6,20 @@
 //!
 //! Corresponds to the implementation in `svelte/packages/svelte/src/compiler/preprocess/`.
 
+mod combine_sourcemaps;
 pub mod decode_sourcemap;
+pub mod encode_sourcemap;
+mod parse_attached_sourcemap;
 pub mod replace_in_code;
 pub mod types;
 
-use crate::compiler::utils::{get_basename, get_locator};
+use crate::compiler::utils::{get_basename, get_locator, utf16_len};
+use combine_sourcemaps::combine_sourcemaps;
 use decode_sourcemap::decode_map;
 use lazy_static::lazy_static;
+use parse_attached_sourcemap::parse_attached_sourcemap;
 use regex::Regex;
 use replace_in_code::{replace_in_code, slice_source};
-use rustc_hash::FxHashMap;
 use types::*;
 
 lazy_static! {
@@ -60,10 +64,7 @@ impl PreprocessResult {
     /// Create a new PreprocessResult.
     fn new(source: String, filename: Option<String>) -> Self {
         let get_location = get_locator(&source);
-        let file_basename = filename
-            .as_ref()
-            .map(|f| get_basename(f))
-            .unwrap_or_default();
+        let file_basename = filename.as_ref().map(|f| get_basename(f)).unwrap_or_default();
 
         PreprocessResult {
             source: source.clone(),
@@ -104,12 +105,7 @@ impl PreprocessResult {
         unique_deps.sort();
         unique_deps.dedup();
 
-        Processed {
-            code: self.source,
-            dependencies: unique_deps,
-            map,
-            attributes: None,
-        }
+        Processed { code: self.source, dependencies: unique_deps, map, attributes: None }
     }
 
     /// Get a Source reference for this result.
@@ -148,7 +144,7 @@ fn processed_content_to_code(
 ///
 /// Corresponds to `processed_tag_to_code` in index.js.
 fn processed_tag_to_code(
-    processed: &Processed,
+    processed: &mut Processed,
     tag_name: &str,
     original_attributes: &str,
     generated_attributes: &str,
@@ -166,40 +162,20 @@ fn processed_tag_to_code(
 
     let tag_open_code = if original_tag_open != tag_open {
         // Generate a source map for the open tag
-        let mut mappings = vec![vec![
-            vec![0, 0, 0, 0],
-            vec![
-                format!("<{}", tag_name).len() as i64,
-                0,
-                0,
-                format!("<{}", tag_name).len() as i64,
-            ],
-        ]];
+        let name_column = utf16_len(&format!("<{}", tag_name)) as i64;
+        let mut mappings = vec![vec![vec![0, 0, 0, 0], vec![name_column, 0, 0, name_column]]];
 
         let line = tag_open.split('\n').count() - 1;
-        let column = if line == 0 {
-            tag_open.len()
-        } else {
-            tag_open.len() - tag_open.rfind('\n').unwrap() - 1
-        };
+        let column = last_line_utf16_len(&tag_open);
 
         while mappings.len() <= line {
-            mappings.push(vec![vec![0, 0, 0, format!("<{}", tag_name).len() as i64]]);
+            mappings.push(vec![vec![0, 0, 0, name_column]]);
         }
 
         let original_line = original_tag_open.split('\n').count() - 1;
-        let original_column = if original_line == 0 {
-            original_tag_open.len()
-        } else {
-            original_tag_open.len() - original_tag_open.rfind('\n').unwrap() - 1
-        };
+        let original_column = last_line_utf16_len(&original_tag_open);
 
-        mappings[line].push(vec![
-            column as i64,
-            0,
-            original_line as i64,
-            original_column as i64,
-        ]);
+        mappings[line].push(vec![column as i64, 0, original_line as i64, original_column as i64]);
 
         let mut map = SimpleDecodedMap {
             version: Some(3),
@@ -221,29 +197,28 @@ fn processed_tag_to_code(
     let tag_close_code =
         build_mapped_code(tag_close, original_tag_open.len() + source.source.len());
 
-    // TODO: parse_attached_sourcemap equivalent if needed
-    let content_code = processed_content_to_code(
-        processed,
-        get_location(original_tag_open.len()),
-        file_basename,
-    );
+    parse_attached_sourcemap(processed, tag_name);
+    let content_code =
+        processed_content_to_code(processed, get_location(original_tag_open.len()), file_basename);
 
     tag_open_code.concat(content_code).concat(tag_close_code)
+}
+
+/// UTF-16 length of the last line of `s` — the column a source-map segment at
+/// the end of `s` sits at.
+fn last_line_utf16_len(s: &str) -> usize {
+    utf16_len(&s[s.rfind('\n').map(|i| i + 1).unwrap_or(0)..])
 }
 
 /// Parse tag attributes from a string.
 ///
 /// Corresponds to `parse_tag_attributes` in index.js.
-fn parse_tag_attributes(str: &str) -> FxHashMap<String, AttributeValue> {
-    let mut attrs = FxHashMap::default();
+fn parse_tag_attributes(str: &str) -> AttributeMap {
+    let mut attrs = AttributeMap::default();
 
     for cap in ATTRIBUTE_PATTERN.captures_iter(str) {
         let name = cap.get(1).map(|m| m.as_str()).unwrap_or("");
-        let value = cap
-            .get(2)
-            .or_else(|| cap.get(3))
-            .or_else(|| cap.get(4))
-            .map(|m| m.as_str());
+        let value = cap.get(2).or_else(|| cap.get(3)).or_else(|| cap.get(4)).map(|m| m.as_str());
 
         if let Some(val) = value {
             if val.is_empty() {
@@ -262,7 +237,7 @@ fn parse_tag_attributes(str: &str) -> FxHashMap<String, AttributeValue> {
 /// Stringify tag attributes to a string.
 ///
 /// Corresponds to `stringify_tag_attributes` in index.js.
-fn stringify_tag_attributes(attributes: &Option<FxHashMap<String, AttributeValue>>) -> String {
+fn stringify_tag_attributes(attributes: &Option<AttributeMap>) -> String {
     if let Some(attrs) = attributes {
         let value = attrs
             .iter()
@@ -274,11 +249,7 @@ fn stringify_tag_attributes(attributes: &Option<FxHashMap<String, AttributeValue
             .collect::<Vec<_>>()
             .join(" ");
 
-        if value.is_empty() {
-            String::new()
-        } else {
-            format!(" {}", value)
-        }
+        if value.is_empty() { String::new() } else { format!(" {}", value) }
     } else {
         String::new()
     }
@@ -308,11 +279,7 @@ async fn process_tag(
 ) -> Result<SourceUpdate, PreprocessError> {
     let filename = source.filename.clone();
     let markup = source.source.clone();
-    let tag_regex = if tag_name == "style" {
-        &*REGEX_STYLE_TAGS
-    } else {
-        &*REGEX_SCRIPT_TAGS
-    };
+    let tag_regex = if tag_name == "style" { &*REGEX_STYLE_TAGS } else { &*REGEX_SCRIPT_TAGS };
 
     let dependencies = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let dependencies_for_closure = dependencies.clone();
@@ -349,22 +316,19 @@ async fn process_tag(
 
             let processed_opt = preprocessor(options).await?;
 
-            if let Some(processed) = processed_opt {
+            if let Some(mut processed) = processed_opt {
                 if !processed.dependencies.is_empty()
                     && let Ok(mut deps) = dependencies.lock()
                 {
                     deps.extend_from_slice(&processed.dependencies);
                 }
 
-                // Check if anything changed. An attribute-only change (same code,
-                // no map, but returned `attributes`) must still be treated as a
-                // real diff so the tag is re-emitted with the new attributes —
-                // otherwise the original tag with stale attributes is returned
-                // (H-139).
-                if processed.map.is_none()
-                    && processed.code == content
-                    && processed.attributes.is_none()
-                {
+                // Upstream discards the whole result here, `attributes`
+                // included, so an attribute-only change never takes effect.
+                // Re-emitting the tag for it replaces the attribute list
+                // wholesale and drops `module` / `lang`, which changes what the
+                // component compiles to.
+                if processed.map.is_none() && processed.code == content {
                     return Ok(MappedCode::from_source(&slice_source(
                         tag_with_content.to_string(),
                         tag_offset,
@@ -383,7 +347,7 @@ async fn process_tag(
                 };
 
                 Ok(processed_tag_to_code(
-                    &processed,
+                    &mut processed,
                     &tag_name,
                     attributes,
                     &final_attributes,
@@ -401,11 +365,8 @@ async fn process_tag(
 
     let mapped = replace_in_code(tag_regex, get_replacement, source).await?;
 
-    let collected_dependencies = if let Ok(deps) = dependencies.lock() {
-        deps.clone()
-    } else {
-        vec![]
-    };
+    let collected_dependencies =
+        if let Ok(deps) = dependencies.lock() { deps.clone() } else { vec![] };
 
     Ok(SourceUpdate {
         string: Some(mapped.string),
@@ -433,14 +394,12 @@ async fn process_markup(
     let processed_opt = process(options).await?;
 
     if let Some(processed) = processed_opt {
-        let map = if let Some(map_input) = processed.map {
-            match map_input {
-                SourceMapInput::Json(json) => serde_json::from_str(&json).ok(),
-                SourceMapInput::Decoded(decoded) => Some(decoded),
-            }
-        } else {
-            None
-        };
+        // Route through `decode_map` so a standard Source Map v3 document with a
+        // VLQ-encoded `mappings` string decodes here too, matching the
+        // script/style paths (`processed_content_to_code`). The previous inline
+        // `serde_json::from_str` only accepted the pre-decoded array form and
+        // silently dropped every VLQ string map.
+        let map = decode_map(&processed);
 
         Ok(SourceUpdate {
             string: Some(processed.code),
@@ -464,24 +423,24 @@ async fn process_markup(
 /// Corresponds to the default export `preprocess` function in index.js.
 pub async fn preprocess(
     source: String,
-    preprocessors: Vec<PreprocessorGroup>,
+    preprocessors: &[PreprocessorGroup],
     filename: Option<String>,
 ) -> Result<Processed, PreprocessError> {
     let mut result = PreprocessResult::new(source, filename);
 
     for preprocessor in preprocessors {
-        if let Some(markup) = preprocessor.markup {
-            let update = process_markup(&markup, &result.as_source()).await?;
+        if let Some(markup) = &preprocessor.markup {
+            let update = process_markup(markup, &result.as_source()).await?;
             result.update_source(update);
         }
 
-        if let Some(script) = preprocessor.script {
-            let update = process_tag("script", &script, &result.as_source()).await?;
+        if let Some(script) = &preprocessor.script {
+            let update = process_tag("script", script, &result.as_source()).await?;
             result.update_source(update);
         }
 
-        if let Some(style) = preprocessor.style {
-            let update = process_tag("style", &style, &result.as_source()).await?;
+        if let Some(style) = &preprocessor.style {
+            let update = process_tag("style", style, &result.as_source()).await?;
             result.update_source(update);
         }
     }
@@ -515,30 +474,6 @@ fn sourcemap_add_offset(map: &mut SimpleDecodedMap, offset: Location, source_ind
     }
 }
 
-/// Combine multiple source maps into one.
-///
-/// Corresponds to `combine_sourcemaps` in mapped_code.js.
-fn combine_sourcemaps(
-    filename: &str,
-    sourcemap_list: &[SimpleDecodedMap],
-) -> Option<SimpleDecodedMap> {
-    if sourcemap_list.is_empty() {
-        return None;
-    }
-
-    // For simplicity, we'll use a basic implementation that takes the first map
-    // A full implementation would use proper source map remapping
-    // TODO: Implement full remapping logic similar to @jridgewell/remapping
-    let mut combined = sourcemap_list[0].clone();
-
-    // Ensure sources contains the filename
-    if combined.sources.is_empty() {
-        combined.sources = vec![filename.to_string()];
-    }
-
-    Some(combined)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -547,31 +482,24 @@ mod tests {
     fn test_parse_tag_attributes() {
         let attrs = parse_tag_attributes(r#" lang="ts" defer"#);
         assert_eq!(attrs.len(), 2);
-        assert_eq!(
-            attrs.get("lang"),
-            Some(&AttributeValue::String("ts".to_string()))
-        );
+        assert_eq!(attrs.get("lang"), Some(&AttributeValue::String("ts".to_string())));
         assert_eq!(attrs.get("defer"), Some(&AttributeValue::Boolean(true)));
     }
 
     #[test]
     fn test_stringify_tag_attributes() {
-        let mut attrs = FxHashMap::default();
+        let mut attrs = AttributeMap::default();
         attrs.insert("lang".to_string(), AttributeValue::String("ts".to_string()));
         attrs.insert("defer".to_string(), AttributeValue::Boolean(true));
 
-        let stringified = stringify_tag_attributes(&Some(attrs));
-        assert!(stringified.contains("lang=\"ts\""));
-        assert!(stringified.contains("defer"));
+        // Upstream stringifies `Object.entries`, i.e. insertion order.
+        assert_eq!(stringify_tag_attributes(&Some(attrs)), " lang=\"ts\" defer");
     }
 
     #[test]
     fn test_stringify_tag_attributes_escapes_values() {
-        let mut attrs = FxHashMap::default();
-        attrs.insert(
-            "data-test".to_string(),
-            AttributeValue::String(r#"a&b"c<d>e"#.to_string()),
-        );
+        let mut attrs = AttributeMap::default();
+        attrs.insert("data-test".to_string(), AttributeValue::String(r#"a&b"c<d>e"#.to_string()));
 
         let stringified = stringify_tag_attributes(&Some(attrs));
         assert_eq!(stringified, " data-test=\"a&amp;b&quot;c&lt;d&gt;e\"");
@@ -582,5 +510,83 @@ mod tests {
         let result = PreprocessResult::new("test".to_string(), Some("test.svelte".to_string()));
         assert_eq!(result.source, "test");
         assert_eq!(result.file_basename, "test.svelte");
+    }
+
+    #[test]
+    fn test_combine_sourcemaps_traces_preprocessor_chain() {
+        let map = |mappings| SimpleDecodedMap {
+            version: Some(3),
+            file: Some("intermediate.js".to_string()),
+            sources: vec!["input.svelte".to_string()],
+            sources_content: None,
+            names: vec![],
+            mappings,
+            source_root: None,
+        };
+
+        // The last transform maps generated 0:5 to its input 1:5; the
+        // preceding transform maps that input position to original 4:7.
+        let combined = combine_sourcemaps(
+            "input.svelte",
+            &[map(vec![vec![vec![5, 0, 1, 5]]]), map(vec![vec![], vec![vec![3, 0, 4, 7]]])],
+        )
+        .unwrap();
+
+        // remapping keeps the root map's `file`; upstream only drops it when falsy.
+        assert_eq!(combined.file.as_deref(), Some("intermediate.js"));
+        assert_eq!(combined.sources, vec!["input.svelte"]);
+        assert_eq!(combined.mappings, vec![vec![vec![5, 0, 4, 7]]]);
+    }
+
+    #[test]
+    fn test_combine_sourcemaps_keeps_foreign_sources_as_leaves() {
+        let combined = combine_sourcemaps(
+            "input.svelte",
+            &[SimpleDecodedMap {
+                version: Some(3),
+                file: None,
+                sources: vec!["other.ts".to_string()],
+                sources_content: None,
+                names: vec![],
+                mappings: vec![vec![vec![0, 0, 2, 4]]],
+                source_root: None,
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(combined.sources, vec!["other.ts"]);
+        assert_eq!(combined.mappings, vec![vec![vec![0, 0, 2, 4]]]);
+    }
+
+    #[test]
+    fn test_process_markup_decodes_vlq_string_map() {
+        // A markup preprocessor returning a standard Source Map v3 document
+        // (VLQ-encoded `mappings` string) must have its map decoded, not
+        // silently dropped — matching the script/style paths.
+        let process: MarkupPreprocessorFn = Box::new(|_opts: MarkupPreprocessorOptions| {
+            Box::pin(async {
+                Ok(Some(Processed {
+                    code: "<p>hi</p>".to_string(),
+                    map: Some(SourceMapInput::Json(
+                        r#"{"version":3,"sources":["input.svelte"],"names":[],"mappings":"AAAA"}"#
+                            .to_string(),
+                    )),
+                    dependencies: vec![],
+                    attributes: None,
+                }))
+            })
+        });
+
+        let source = Source {
+            source: "<p>hi</p>".to_string(),
+            get_location: std::sync::Arc::new(|_| Location { line: 0, column: 0 }),
+            file_basename: "input.svelte".to_string(),
+            filename: Some("input.svelte".to_string()),
+        };
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let update = runtime.block_on(process_markup(&process, &source)).unwrap();
+        let map = update.map.expect("VLQ string markup map should decode");
+        assert_eq!(map.mappings, vec![vec![vec![0, 0, 0, 0]]]);
     }
 }

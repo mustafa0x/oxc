@@ -17,78 +17,812 @@
 //! output.
 //!
 //! **CRITICAL RULE:** return `None` on ANY variant not explicitly handled
-//! here — in particular `JsExpr::Raw`, `JsExpr::Spanned`, `JsStatement::Raw`,
-//! and `JsStatement::RawMapped`, which carry opaque source text the structural
-//! esrap printer cannot reconstruct.
+//! here.
 //!
-//! All spans use the dummy [`oxc_span::SPAN`]: esrap formats structurally, so
-//! spans do not affect output for comment-free programs (and these IR nodes
-//! carry no comments).
+//! The text-carrying variants are handled, not excluded, and each has its own
+//! route:
+//!
+//!   * `JsStatement::Raw` / `JsStatement::RawMapped` — source text that
+//!     `parse_raw_statements` re-parses into real oxc statements, with
+//!     `expand_stmt` flattening a multi-statement chunk inline at
+//!     statement-list sites. A whole module body emitted as one `Raw` converts.
+//!   * `JsExpr::Raw` — opaque expression text, re-parsed by
+//!     `parse_raw_expression`.
+//!   * `JsExpr::Spanned` — not raw text at all: a real inner expression carrying
+//!     the original-source byte span, converted normally and then stamped so
+//!     `print_with_map` maps it back to the user's source.
+//!
+//! Re-parsing **fails loudly when the text does not parse** (`chunk-parse`) and
+//! **can differ silently when it does**: `restore_legacy_pre_effect_deps`
+//! and `restore_single_target_destructure_sequences` exist precisely
+//! because a round-trip that parses can still print differently from the text it
+//! came from.
+//!
+//! # Comments and the unified coordinate space
+//!
+//! Synthesized nodes use the dummy [`oxc_span::SPAN`]: esrap formats
+//! structurally, so their spans do not affect output. Comments are the one
+//! exception — esrap places them *positionally*, and a program reassembled from
+//! independently-parsed `Raw` chunks has no shared coordinate space to place
+//! them in.
+//!
+//! `Synth` builds one. Each comment-bearing chunk is re-parsed from a
+//! `pad + chunk` buffer so its spans (and its comments') land in a private,
+//! monotonically increasing region of a unified buffer above `loc_base`;
+//! container nodes get the span of the region their children consumed. Spans
+//! below `loc_base` — synthesized nodes, and the original-source spans stamped
+//! by `Spanned`/`RawMapped` — read as "no location" to the printer, mirroring
+//! esrap's `if (node.loc)` guards.
 
 use super::arena::{ExprId, JsArena};
 use super::nodes::*;
-use crate::compiler::phases::phase3_transform::builders::AstBuilder;
-use oxc_allocator::{Box as ArenaBox, Vec as ArenaVec};
+use crate::ast::oxc_program::RetainedProgram;
+use oxc_allocator::{ArenaBox, ArenaVec, GetAllocator, ReplaceWith};
 use oxc_ast::ast::*;
-use oxc_span::{GetSpanMut, SPAN, Span};
+use oxc_ast::builder::AstBuilder;
+use oxc_ast_visit::{VisitMut, walk_mut};
+use oxc_span::{GetSpan, GetSpanMut, SPAN, Span};
 use oxc_syntax::number::{BigintBase, NumberBase};
 use oxc_syntax::operator::{
     AssignmentOperator, BinaryOperator, LogicalOperator, UnaryOperator, UpdateOperator,
 };
+use rsvelte_esrap::{BraceMapping, LocRange};
+use std::cell::RefCell;
+use std::collections::HashSet;
+
+/// A converted program plus the comment coordinate space it needs to be printed
+/// in (see the module docs). `comment_source` is `None` for the common
+/// comment-free program, which prints exactly as before.
+pub struct Converted<'a> {
+    pub program: oxc_ast::ast::Program<'a>,
+    pub comment_source: Option<String>,
+    pub loc_base: u32,
+    pub loc_map: Vec<LocRange>,
+    pub brace_mappings: Vec<BraceMapping>,
+}
+
+impl<'a> Converted<'a> {
+    /// Strip every coordinate, yielding a program that indexes **no** text.
+    ///
+    /// A consumer that wants the AST rather than the printed code cannot use
+    /// these spans: they index the `.svelte` input (or, for a comment-bearing
+    /// program, a synthetic buffer above `loc_base`), while the text it will
+    /// slice is the generated JavaScript. A span that points into another text
+    /// is worse than no span, so the ones that would lie are removed — and
+    /// comments go with them, because a comment's position is a coordinate too.
+    ///
+    /// The program is no longer printable by [`rsvelte_esrap`]'s comment-aware
+    /// entry points; print first, then call this on the same conversion.
+    pub fn into_coordinate_free_program(mut self) -> Program<'a> {
+        SpanEraser.visit_program(&mut self.program);
+        self.program.comments.clear();
+        self.program.span = SPAN;
+        self.program
+    }
+}
+
+/// Sets every span the walk reaches to [`SPAN`]. `visit_span` is called once per
+/// node by the generated walk, so this reaches all of them without naming any.
+struct SpanEraser;
+
+impl<'a> VisitMut<'a> for SpanEraser {
+    fn visit_span(&mut self, span: &mut Span) {
+        *span = SPAN;
+    }
+}
+
+/// A retained source program to clone into the final OXC allocator.
+pub struct AstIsland<'source> {
+    pub program: &'source RetainedProgram<'source>,
+    pub source_offset: u32,
+    /// The top-level statements to retain, in their original program order.
+    /// Instance imports are hoisted separately by the client transform.
+    pub statement_indices: Vec<usize>,
+}
+
+const UNMAPPED_SPAN: Span = Span::new(u32::MAX, u32::MAX);
+
+thread_local! {
+    static FALLBACK_REASON: std::cell::Cell<&'static str> =
+        const { std::cell::Cell::new(UNSUPPORTED) };
+}
+
+/// The default: some node kind this converter does not handle bubbled `None`.
+const UNSUPPORTED: &str = "unsupported";
+
+fn note_fallback(reason: &'static str) {
+    FALLBACK_REASON.with(|c| c.set(reason));
+}
+
+/// Why the last [`program_to_oxc`] returned `None`, for the fallback debug log.
+pub fn take_fallback_reason() -> &'static str {
+    FALLBACK_REASON.with(|c| c.replace(UNSUPPORTED))
+}
 
 /// Convert a whole [`JsProgram`] into an oxc [`oxc_ast::ast::Program`].
 ///
 /// Returns `None` if any node in the program is not handled by this converter
 /// (see the module docs). The returned program borrows `allocator`, so the
 /// allocator must outlive the program (and any `rsvelte_esrap::print` of it).
+///
+/// Runs as a probe pass followed, only when a chunk turned out to carry
+/// comments, by a second pass that knows where to put the comment coordinate
+/// space — it has to sit above every span the first pass produced.
 pub fn program_to_oxc<'a>(
     program: &JsProgram,
     arena: &JsArena,
     allocator: &'a oxc_allocator::Allocator,
-) -> Option<oxc_ast::ast::Program<'a>> {
-    let ab = AstBuilder::new(allocator);
-    let cx = Cx { ab, arena };
+) -> Option<Converted<'a>> {
+    program_to_oxc_with_islands(program, arena, allocator, &[])
+}
+
+/// Convert an IR program while inserting retained source ASTs directly.
+pub fn program_to_oxc_with_islands<'a, 'source>(
+    program: &JsProgram,
+    arena: &JsArena,
+    allocator: &'a oxc_allocator::Allocator,
+    islands: &[AstIsland<'source>],
+) -> Option<Converted<'a>> {
+    note_fallback(UNSUPPORTED);
+    let (probe, synth) = convert_once(program, arena, allocator, islands, None)?;
+    if !synth.saw_comments {
+        return Some(probe);
+    }
+    let loc_base = synth.max_span.saturating_add(2);
+    let (converted, synth) = convert_once(program, arena, allocator, islands, Some(loc_base))?;
+    // Every span the pass produced outside a chunk region must stay below
+    // `loc_base`, or the printer would mistake it for a real location.
+    if synth.max_span >= loc_base {
+        note_fallback("loc-base");
+        return None;
+    }
+    Some(converted)
+}
+
+fn convert_once<'a, 'source>(
+    program: &JsProgram,
+    arena: &JsArena,
+    allocator: &'a oxc_allocator::Allocator,
+    islands: &[AstIsland<'source>],
+    loc_base: Option<u32>,
+) -> Option<(Converted<'a>, Synth)> {
+    let cx = Cx {
+        ab: AstBuilder::new(allocator),
+        arena,
+        islands,
+        synth: RefCell::new(Synth::new(loc_base)),
+        identifier_span_scopes: RefCell::new(Vec::new()),
+        brace_mappings: RefCell::new(Vec::new()),
+        component_brace_span: program
+            .component_brace_span
+            .as_ref()
+            .map(|(name, start, end)| (name.as_str(), *start, *end)),
+    };
 
     // Collect, flattening multi-statement `Raw` blobs inline. A single None
     // (parse failure / unhandled node) bails the whole program.
-    let mut body: Vec<Statement<'a>> = Vec::with_capacity(program.body.len());
-    for s in &program.body {
-        body.extend(cx.expand_stmt(s)?);
-    }
+    let (body, span) = cx.consumed(|| {
+        let mut body: Vec<Statement<'a>> = Vec::with_capacity(program.body.len());
+        for s in &program.body {
+            body.extend(cx.expand_stmt(s)?);
+        }
+        Some(body)
+    })?;
 
+    let synth = cx.synth.into_inner();
+    let brace_mappings = cx.brace_mappings.into_inner();
+    let ab = AstBuilder::new(allocator);
     let body = ArenaVec::from_iter_in(body, &ab);
-    Some(Program::new(
-        SPAN,
+    let comments = ArenaVec::from_iter_in(synth.comments.iter().cloned(), &ab);
+    let program = Program::new(
+        span,
         oxc_span::SourceType::mjs(),
         "",
-        ArenaVec::new_in(&ab),
+        comments,
         None,
         ArenaVec::new_in(&ab),
         body,
         &ab,
-    ))
+    );
+    let converted = Converted {
+        program,
+        comment_source: synth.enabled.then(|| synth.source.clone()),
+        loc_base: synth.loc_base,
+        loc_map: synth.loc_map.clone(),
+        brace_mappings,
+    };
+    Some((converted, synth))
 }
+
+/// Moves a chunk's parsed spans into the chunk's region of the unified buffer.
+/// `visit_span` is the one hook every generated walker routes each node's span
+/// through, so overriding it covers the whole subtree.
+struct ShiftSpans(u32);
+
+impl<'a> VisitMut<'a> for ShiftSpans {
+    fn visit_span(&mut self, span: &mut Span) {
+        span.start += self.0;
+        span.end += self.0;
+    }
+}
+
+/// Restore the original locations of parser nodes that came from an unchanged
+/// slice of a TypeScript-stripped script.
+struct RestoreRawMappedSpans<'s> {
+    spans: &'s [RawMappedSpan],
+}
+
+impl RestoreRawMappedSpans<'_> {
+    fn source_offset(&self, offset: u32) -> Option<u32> {
+        // `spans` is emitted in increasing `code` order and is one entry per
+        // copied run of a whole script, so this has to be a search, not a scan.
+        let index = self.spans.partition_point(|span| span.code.start <= offset).checked_sub(1)?;
+        // Two runs may touch at an endpoint, and a scan would have stopped at
+        // the earlier one — its `end` is where the copied text really is.
+        let index =
+            if index > 0 && self.spans[index - 1].code.end >= offset { index - 1 } else { index };
+        let span = &self.spans[index];
+        (offset <= span.code.end).then(|| span.source.start + offset - span.code.start)
+    }
+}
+
+impl<'a> VisitMut<'a> for RestoreRawMappedSpans<'_> {
+    fn visit_span(&mut self, span: &mut Span) {
+        let Some(start) = self.source_offset(span.start) else {
+            return;
+        };
+        let Some(end) = self.source_offset(span.end) else {
+            return;
+        };
+        *span = Span::new(start, end);
+    }
+}
+
+fn restore_raw_mapped_spans(stmts: &mut [Statement<'_>], spans: &[RawMappedSpan]) {
+    if spans.is_empty() {
+        return;
+    }
+    let mut restorer = RestoreRawMappedSpans { spans };
+    for statement in stmts {
+        restorer.visit_statement(statement);
+    }
+}
+
+/// Preserve upstream's comment cursor when TypeScript erasure removed the node
+/// a leading comment was attached to immediately before an exported prop.
+///
+/// The prop lowering keeps the source identifier but rebuilds the declaration.
+/// Leaving the reparsed declaration located makes esrap flush the orphaned
+/// comment before `let`; upstream reaches the identifier first and therefore
+/// emits `let // comment` instead. Only the declaration wrapper is unlocated —
+/// its identifier and initializer retain their copied source spans.
+fn unlocate_prop_declarations_after_erased_comments(
+    stmts: &mut [Statement<'_>],
+    spans: &[RawMappedSpan],
+    code_base: u32,
+) {
+    for comment_end in spans
+        .iter()
+        .filter(|span| span.erased_comment_before_export_prop)
+        .map(|span| code_base + span.code.end)
+    {
+        if let Some(Statement::VariableDeclaration(declaration)) =
+            stmts.iter_mut().find(|statement| statement.span().start >= comment_end)
+        {
+            declaration.span = SPAN;
+        }
+    }
+}
+
+/// The client transform rebuilds effect calls but retains their callback from
+/// the source AST. Keep that split when a raw chunk is reparsed: the callback
+/// remains located for comment placement while the generated call does not.
+struct GeneratedEffectCallUnlocator<'a> {
+    effect_spans: &'a [(bool, u32, u32)],
+    effect_index: usize,
+}
+
+struct SpanUnlocator;
+
+impl<'a> VisitMut<'a> for SpanUnlocator {
+    fn visit_span(&mut self, span: &mut Span) {
+        *span = SPAN;
+    }
+}
+
+impl<'a> VisitMut<'a> for GeneratedEffectCallUnlocator<'_> {
+    fn visit_expression(&mut self, expr: &mut Expression<'a>) {
+        walk_mut::walk_expression(self, expr);
+        let Expression::CallExpression(call) = expr else {
+            return;
+        };
+        if is_dollar_call(&call.callee, "inspect") {
+            call.span = SPAN;
+            if let Some(Argument::ArrowFunctionExpression(first)) = call.arguments.first_mut() {
+                first.span = SPAN;
+                if let Some(Expression::ArrayExpression(array)) = first.get_expression_mut() {
+                    array.span = SPAN;
+                }
+            }
+            let mut unlocator = SpanUnlocator;
+            for arg in call.arguments.iter_mut().skip(1) {
+                unlocator.visit_argument(arg);
+            }
+        } else if is_dollar_call(&call.callee, "user_effect")
+            || is_dollar_call(&call.callee, "user_pre_effect")
+        {
+            let pre = is_dollar_call(&call.callee, "user_pre_effect");
+            let mut span = None;
+            if let Some((_, start, end)) = self
+                .effect_spans
+                .get(self.effect_index)
+                .filter(|span| span.0 == pre)
+                .or_else(|| self.effect_spans.iter().find(|span| span.0 == pre))
+            {
+                let mapped = Span::new(*start, *end);
+                span = Some(mapped);
+                *call.callee.span_mut() = mapped;
+                if let Expression::StaticMemberExpression(member) = &mut call.callee {
+                    member.property.span = mapped;
+                    if let Expression::Identifier(object) = &mut member.object {
+                        object.span = mapped;
+                    }
+                }
+            }
+            self.effect_index += 1;
+            call.span = span.unwrap_or(SPAN);
+        } else if is_dollar_call(&call.callee, "effect_root") {
+            call.span = SPAN;
+        }
+    }
+}
+
+fn erase_generated_effect_call_locs(
+    stmts: &mut [Statement<'_>],
+    effect_spans: &[(bool, u32, u32)],
+) {
+    let mut unlocator = GeneratedEffectCallUnlocator { effect_spans, effect_index: 0 };
+    for stmt in stmts {
+        unlocator.visit_statement(stmt);
+    }
+}
+
+/// Match the locations upstream assigns when it builds a legacy reactive
+/// effect: the call, callee, arrow shells, parameter lists and callback's outer
+/// block are generated, while expressions and statements copied into those
+/// shells retain their source locations.
+fn unlocate_legacy_pre_effect_wrapper(call: &mut CallExpression<'_>) {
+    call.span = SPAN;
+
+    let mut unlocator = SpanUnlocator;
+    unlocator.visit_expression(&mut call.callee);
+
+    for argument in &mut call.arguments {
+        let Argument::ArrowFunctionExpression(arrow) = argument else {
+            continue;
+        };
+        arrow.span = SPAN;
+        unlocator.visit_formal_parameters(&mut arrow.params);
+        if let Some(type_parameters) = &mut arrow.type_parameters {
+            unlocator.visit_ts_type_parameter_declaration(type_parameters);
+        }
+        if let Some(return_type) = &mut arrow.return_type {
+            unlocator.visit_ts_type_annotation(return_type);
+        }
+        if let ArrowFunctionBody::FunctionBody(body) = &mut arrow.body {
+            body.span = SPAN;
+        }
+    }
+}
+
+/// Rebuilds any `SINGLE_TARGET_DESTRUCTURE_SEQUENCE_MARKER(expr)` call — however
+/// deeply nested — into a one-element `SequenceExpression`. See the marker's doc
+/// comment and [`Cx::restore_single_target_destructure_sequences`].
+struct SingleTargetSequenceRebuilder<'a, 'x> {
+    ab: &'x AstBuilder<'a>,
+}
+
+impl<'a, 'x> VisitMut<'a> for SingleTargetSequenceRebuilder<'a, 'x> {
+    fn visit_expression(&mut self, expr: &mut Expression<'a>) {
+        oxc_ast_visit::walk_mut::walk_expression(self, expr);
+
+        let is_marker_call = matches!(
+            expr,
+            Expression::CallExpression(call)
+                if call.arguments.len() == 1
+                    && !call.arguments[0].is_spread()
+                    && matches!(
+                        &call.callee,
+                        Expression::Identifier(id)
+                            if id.name == SINGLE_TARGET_DESTRUCTURE_SEQUENCE_MARKER
+                    )
+        );
+        if !is_marker_call {
+            return;
+        }
+
+        expr.replace_with(|e| {
+            let Expression::CallExpression(mut call) = e else { unreachable!() };
+            let arg = call.arguments.pop().unwrap();
+            // `is_spread()` was checked above, so this conversion cannot fail.
+            let inner =
+                Expression::try_from(arg).unwrap_or_else(|()| unreachable!("checked above"));
+            Expression::SequenceExpression(SequenceExpression::boxed(
+                SPAN,
+                ArenaVec::from_value_in(inner, self.ab),
+                self.ab,
+            ))
+        });
+    }
+}
+
+/// The unified comment coordinate space for a reassembled program.
+struct Synth {
+    /// Whether this pass places comments (`false` for the probe pass).
+    enabled: bool,
+    /// The buffer comment spans index into. Starts as a `loc_base`-long pad so
+    /// the first chunk's region begins at `loc_base`; each comment-bearing chunk
+    /// is appended verbatim, followed by a newline.
+    source: String,
+    loc_base: u32,
+    comments: Vec<Comment>,
+    /// Original-source comment ranges already copied into an anchored region.
+    /// Overlapping [`JsSourceAnchor`] regions share the upstream comment
+    /// cursor, so the same source comment must only enter the synthetic buffer
+    /// once even when their `region_start`s differ.
+    source_comments: HashSet<(u32, u32)>,
+    /// Comment-space ranges resolving back to original-source offsets, for
+    /// source maps: one per chunk region, plus one per reserved anchor.
+    loc_map: Vec<LocRange>,
+    /// Region the chunk just parsed occupies, consumed by the caller that knows
+    /// the chunk's original-source offset.
+    pending_region: Option<(u32, u32)>,
+    /// Original-source offset of the last comment-bearing chunk, so an anchor
+    /// can tell whether it sits after those comments in the *source* (which is
+    /// the order upstream compares in) and not merely after them in the buffer.
+    last_region_source: Option<u32>,
+    last_region_ends_with_removed_inspect_comment: bool,
+    saw_comments: bool,
+    /// Source offset of the region a [`JsSourceAnchor`] most recently opened,
+    /// so the anchors sharing it reuse one copy of the slice.
+    open_source_region: Option<u32>,
+    open_source_base: u32,
+    /// Upper bound on every span produced outside a chunk region.
+    max_span: u32,
+}
+
+impl Synth {
+    fn new(loc_base: Option<u32>) -> Self {
+        let loc_base = loc_base.unwrap_or(0);
+        let mut source = String::new();
+        if loc_base > 0 {
+            // Pad ends with a newline so a comment on the chunk's first line
+            // sees an empty indentation prefix, as it would unpadded.
+            source.push_str(&" ".repeat(loc_base as usize - 1));
+            source.push('\n');
+        }
+        Self {
+            enabled: loc_base > 0,
+            source,
+            loc_base,
+            comments: Vec::new(),
+            source_comments: HashSet::new(),
+            loc_map: Vec::new(),
+            pending_region: None,
+            last_region_source: None,
+            last_region_ends_with_removed_inspect_comment: false,
+            saw_comments: false,
+            open_source_region: None,
+            open_source_base: 0,
+            max_span: 0,
+        }
+    }
+
+    /// The offset the next chunk region would start at.
+    fn cursor(&self) -> u32 {
+        self.source.len() as u32
+    }
+
+    fn note_span(&mut self, end: u32) {
+        self.max_span = self.max_span.max(end);
+    }
+}
+
+/// Marker callee wrapping a single-target destructuring-assignment collapse
+/// (`({ a } = obj)` → `a = obj.a`) so the "this must reprint as a
+/// `SequenceExpression`" decision survives the raw-text reparse. Upstream's
+/// `visit_assignment_expression` (`shared/assignments.js`) always lowers a
+/// destructuring assignment through `b.sequence(assignments)` — an ESTree
+/// `SequenceExpression` *unconditionally*, even for a single assignment — and
+/// esrap's `SequenceExpression` printer always self-parenthesizes, `(expr)`,
+/// regardless of element count. rsvelte's client transform generates this
+/// lowering as plain source text; a single-assignment collapse re-parses to a
+/// bare (non-sequence) expression, which every downstream printer correctly
+/// treats as redundantly parenthesized (matching upstream's behavior for any
+/// plain, user-written `(x = 1)`, where the parens really are dropped) and
+/// removes — silently losing upstream's parens for the destructuring case.
+/// Wrapping the single assignment in a call to this marker keeps the
+/// "force sequence" decision attached to the generated text itself;
+/// [`Cx::restore_single_target_destructure_sequences`] finds the marker call
+/// after reparse and rebuilds the real single-element `SequenceExpression`.
+pub(crate) const SINGLE_TARGET_DESTRUCTURE_SEQUENCE_MARKER: &str = "__rsvelte_seq1";
+
+/// Marker used by snippet-default lowering to carry an explicit source
+/// parenthesis through the compact client IR. The rsvelte printer deliberately
+/// drops oxc's `ParenthesizedExpression` nodes, so conversion rebuilds the
+/// equivalent one-element `SequenceExpression`; esrap always prints a sequence
+/// with parentheses, including when its only item is itself a sequence.
+pub(crate) const SNIPPET_DEFAULT_PAREN_MARKER: &str = "\0rsvelte_snippet_paren";
 
 /// Conversion context: holds the oxc [`AstBuilder`] and the IR arena used to
 /// resolve [`ExprId`] handles.
-struct Cx<'a, 'arena> {
+struct Cx<'a, 'arena, 'source> {
     ab: AstBuilder<'a>,
     arena: &'arena JsArena,
+    islands: &'arena [AstIsland<'source>],
+    synth: RefCell<Synth>,
+    /// Identifier locations inherited from the generated expression currently
+    /// being converted. A nested `Spanned` node stamps its own final location.
+    identifier_span_scopes: RefCell<Vec<(&'arena str, (u32, u32))>>,
+    brace_mappings: RefCell<Vec<BraceMapping>>,
+    /// [`JsProgram::component_brace_span`], matched by function name.
+    component_brace_span: Option<(&'arena str, u32, u32)>,
 }
 
-impl<'a, 'arena> Cx<'a, 'arena> {
+impl<'a, 'arena, 'source> Cx<'a, 'arena, 'source> {
     /// Allocate a string into the oxc arena and return it as an `&'a str`,
     /// which satisfies the `Into<Atom<'a>>` / `Into<Str<'a>>` bounds used by
     /// the builder helpers.
     #[inline]
     fn str(&self, s: &str) -> &'a str {
-        self.ab.allocator.alloc_str(s)
+        self.ab.allocator().alloc_str(s)
+    }
+
+    /// Resolve an out-of-band generated-identifier span.
+    ///
+    /// This is an original-source coordinate, so it must not raise
+    /// [`Synth::max_span`]: `loc_base` separates synthesized/comment-space
+    /// coordinates from source coordinates, and moving that boundary to one
+    /// source offset would make later source offsets look comment-bearing.
+    fn identifier_span(&self, name: &str) -> Span {
+        self.arena
+            .identifier_span(name)
+            .or_else(|| self.scoped_identifier_span(name))
+            .map_or(SPAN, |(start, end)| Span::new(start, end))
+    }
+
+    fn scoped_identifier_span(&self, name: &str) -> Option<(u32, u32)> {
+        self.identifier_span_scopes
+            .borrow()
+            .iter()
+            .rev()
+            .find_map(|(scope_name, span)| (*scope_name == name).then_some(*span))
     }
 
     /// Resolve an `ExprId` handle and convert the pointed-to expression.
     #[inline]
     fn expr_id(&self, id: ExprId) -> Option<Expression<'a>> {
-        self.expr(self.arena.get_expr(id))
+        if let Some((name, span)) = self.arena.expression_identifier_span(id) {
+            self.identifier_span_scopes.borrow_mut().push((name, span));
+            let expression = self.expr(self.arena.get_expr(id));
+            self.identifier_span_scopes.borrow_mut().pop();
+            expression
+        } else {
+            self.expr(self.arena.get_expr(id))
+        }
+    }
+
+    /// Convert a member object and restore a span that could not be represented
+    /// by an in-band `Spanned` wrapper without hiding its IR variant.
+    #[inline]
+    fn member_object(&self, id: ExprId) -> Option<Expression<'a>> {
+        let mut object = self.expr_id(id)?;
+        if let Some((start, end)) = self.arena.bare_expr_span(id) {
+            *object.span_mut() = Span::new(start, end);
+            self.note_span(end);
+        }
+        Some(object)
+    }
+
+    /// Run `f` and report the comment-buffer region it consumed, so a container
+    /// node can span the comments its children carry (esrap brackets a body's
+    /// leading/trailing comments by the body's own `loc`). [`SPAN`] when the
+    /// subtree consumed nothing, i.e. carries no comments.
+    fn consumed<T>(&self, f: impl FnOnce() -> Option<T>) -> Option<(T, Span)> {
+        let before = self.synth.borrow().cursor();
+        let value = f()?;
+        let after = self.synth.borrow().cursor();
+        let span = if after > before { Span::new(before, after) } else { SPAN };
+        Some((value, span))
+    }
+
+    /// Record a span the printer must NOT read as a chunk location.
+    #[inline]
+    fn note_span(&self, end: u32) {
+        self.synth.borrow_mut().note_span(end);
+    }
+
+    /// Attach the region the chunk just parsed occupies to its original-source
+    /// offset (for source maps). Returns the region, if any.
+    fn take_chunk_region(
+        &self,
+        source_offset: Option<u32>,
+        copied_spans: &[RawMappedSpan],
+    ) -> Option<(u32, u32)> {
+        let mut synth = self.synth.borrow_mut();
+        let region = synth.pending_region.take()?;
+        if copied_spans.is_empty() {
+            synth.loc_map.push(LocRange {
+                start: region.0,
+                end: region.1,
+                source: source_offset,
+                linear: false,
+            });
+        } else {
+            // The parser's chunk coordinates are retained in comment space, and
+            // one chunk-wide anchor loses every token after the first rewritten
+            // byte, so each copied run carries its own linear range. Anything
+            // between two runs is generated, and is deliberately unmapped rather
+            // than guessed at.
+            let len = region.1 - region.0;
+            let mut cursor = 0;
+            for span in copied_spans {
+                let start = span.code.start.max(cursor).min(len);
+                let end = span.code.end.min(len);
+                if end <= start {
+                    continue;
+                }
+                if start > cursor {
+                    synth.loc_map.push(LocRange {
+                        start: region.0 + cursor,
+                        end: region.0 + start,
+                        source: None,
+                        linear: false,
+                    });
+                }
+                synth.loc_map.push(LocRange {
+                    start: region.0 + start,
+                    end: region.0 + end,
+                    source: Some(span.source.start + (start - span.code.start)),
+                    linear: true,
+                });
+                cursor = end;
+            }
+            if cursor < len {
+                synth.loc_map.push(LocRange {
+                    start: region.0 + cursor,
+                    end: region.1,
+                    source: None,
+                    linear: false,
+                });
+            }
+        }
+        synth.last_region_source = source_offset;
+        Some(region)
+    }
+
+    /// The comment-space position of a generated node that upstream anchors to
+    /// `source_offset` (esrap's `if (node.loc)` flush point). Sits at the buffer
+    /// cursor — past the preceding chunk's region and its closing newline, so a
+    /// comment left dangling at that chunk's end is flushed here and followed by
+    /// a line break, exactly as upstream flushes it at the next located node.
+    /// [`SPAN`] (no location) unless the anchor really does follow the pending
+    /// comments in the source, which is the order upstream compares in.
+    fn comment_anchor(&self, source_offset: Option<u32>) -> Span {
+        let Some(anchor) = source_offset else {
+            return SPAN;
+        };
+        let mut synth = self.synth.borrow_mut();
+        if !synth.enabled || synth.last_region_source.is_none_or(|chunk| anchor <= chunk) {
+            return SPAN;
+        }
+        let at = synth.cursor();
+        // The cursor anchors the first generated node following this chunk.
+        // Reusing it would make later statements claim the same trailing comment.
+        synth.last_region_source = None;
+        // Keep a later independently parsed comment on a distinct line. Otherwise
+        // it starts at this anchor and is emitted as the preceding statement's
+        // trailing comment.
+        synth.source.push('\n');
+        Span::new(at, at)
+    }
+
+    /// Append `anchor`'s source slice to the comment buffer (once per region)
+    /// and return the buffer offset the anchored node claims. The slice is
+    /// verbatim, so the line and column distances esrap measures between a
+    /// comment and its anchor are the ones the `.svelte` source really has —
+    /// which is what upstream measures, its whole client output sharing one
+    /// cursor over that file. `None` on the probe pass, or when the region
+    /// carries nothing to place.
+    fn open_source_region_parts(
+        &self,
+        region_start: u32,
+        region: &str,
+        comments: &[(u32, u32, bool)],
+        at: u32,
+        at_end: u32,
+    ) -> Option<Span> {
+        if at < region_start || at_end < at {
+            return None;
+        }
+        let offset = at - region_start;
+        let offset_end = at_end - region_start;
+        if offset_end as usize > region.len() {
+            return None;
+        }
+        if !comments.is_empty() {
+            self.synth.borrow_mut().saw_comments = true;
+        }
+        let mut synth = self.synth.borrow_mut();
+        if !synth.enabled {
+            return None;
+        }
+        if synth.open_source_region != Some(region_start) {
+            let base = synth.cursor();
+            synth.source.push_str(region);
+            synth.source.push('\n');
+            for &(source_start, source_end, line) in comments {
+                if !synth.source_comments.insert((source_start, source_end)) {
+                    continue;
+                }
+                let start = base + (source_start - region_start);
+                let end = base + (source_end - region_start);
+                let kind = if line {
+                    CommentKind::Line
+                } else if region[(start - base) as usize..(end - base) as usize].contains('\n') {
+                    CommentKind::MultiLineBlock
+                } else {
+                    CommentKind::SingleLineBlock
+                };
+                let mut comment = Comment::new(start, end, kind);
+                comment.attached_to = end;
+                synth.comments.push(comment);
+            }
+            synth.open_source_region = Some(region_start);
+            synth.open_source_base = base;
+        }
+        Some(Span::new(synth.open_source_base + offset, synth.open_source_base + offset_end))
+    }
+
+    fn open_source_region(&self, anchor: &JsSourceAnchor) -> Option<Span> {
+        self.open_source_region_parts(
+            anchor.region_start,
+            &anchor.region,
+            &anchor.comments,
+            anchor.at,
+            anchor.at_end,
+        )
+    }
+
+    /// Append a retained island's own source to the comment buffer, so the
+    /// statements cloned out of it carry buffer locations instead of `.svelte`
+    /// offsets. Returns the shift to apply to their (already absolute) spans.
+    fn open_island_region(&self, island: &AstIsland<'_>) -> Option<u32> {
+        let mut synth = self.synth.borrow_mut();
+        if !synth.enabled {
+            return None;
+        }
+        let text = island.program.source();
+        let base = synth.cursor();
+        synth.source.push_str(text);
+        synth.source.push('\n');
+        synth.open_source_region = None;
+        base.checked_sub(island.source_offset)
+    }
+
+    fn trailing_comment_anchor(&self, source_offset: Option<u32>) -> Span {
+        let Some(anchor) = source_offset else {
+            return SPAN;
+        };
+        let synth = self.synth.borrow();
+        if !synth.enabled
+            || !synth.last_region_ends_with_removed_inspect_comment
+            || synth.last_region_source.is_none_or(|chunk| anchor <= chunk)
+        {
+            return SPAN;
+        }
+        let at = synth.cursor();
+        Span::new(at, at)
     }
 
     // -- statements ---------------------------------------------------------
@@ -98,7 +832,9 @@ impl<'a, 'arena> Cx<'a, 'arena> {
             JsStatement::Expression(e) => {
                 let expr = self.expr_id(e.expression)?;
                 Some(Statement::ExpressionStatement(ExpressionStatement::boxed(
-                    SPAN, expr, &self.ab,
+                    self.comment_anchor(e.comment_anchor),
+                    expr,
+                    &self.ab,
                 )))
             }
             JsStatement::Return(r) => {
@@ -106,40 +842,30 @@ impl<'a, 'arena> Cx<'a, 'arena> {
                     Some(id) => Some(self.expr_id(id)?),
                     None => None,
                 };
-                Some(Statement::ReturnStatement(ReturnStatement::boxed(
-                    SPAN, arg, &self.ab,
-                )))
+                Some(Statement::ReturnStatement(ReturnStatement::boxed(SPAN, arg, &self.ab)))
             }
             JsStatement::VariableDeclaration(decl) => self.variable_declaration(decl),
             JsStatement::Block(b) => {
-                let stmts = self.statements(&b.body)?;
-                Some(Statement::BlockStatement(BlockStatement::boxed(
-                    SPAN, stmts, &self.ab,
-                )))
+                let (stmts, span) = self.statements(&b.body)?;
+                Some(Statement::BlockStatement(BlockStatement::boxed(span, stmts, &self.ab)))
             }
-            JsStatement::Empty => Some(Statement::EmptyStatement(EmptyStatement::boxed(
-                SPAN, &self.ab,
-            ))),
-            JsStatement::Debugger => Some(Statement::DebuggerStatement(DebuggerStatement::boxed(
-                SPAN, &self.ab,
-            ))),
+            JsStatement::Empty => {
+                Some(Statement::EmptyStatement(EmptyStatement::boxed(SPAN, &self.ab)))
+            }
+            JsStatement::Debugger => {
+                Some(Statement::DebuggerStatement(DebuggerStatement::boxed(SPAN, &self.ab)))
+            }
             JsStatement::Throw(id) => {
                 let arg = self.expr_id(*id)?;
-                Some(Statement::ThrowStatement(ThrowStatement::boxed(
-                    SPAN, arg, &self.ab,
-                )))
+                Some(Statement::ThrowStatement(ThrowStatement::boxed(SPAN, arg, &self.ab)))
             }
             JsStatement::Break(label) => {
                 let label = self.label(label.as_deref());
-                Some(Statement::BreakStatement(BreakStatement::boxed(
-                    SPAN, label, &self.ab,
-                )))
+                Some(Statement::BreakStatement(BreakStatement::boxed(SPAN, label, &self.ab)))
             }
             JsStatement::Continue(label) => {
                 let label = self.label(label.as_deref());
-                Some(Statement::ContinueStatement(ContinueStatement::boxed(
-                    SPAN, label, &self.ab,
-                )))
+                Some(Statement::ContinueStatement(ContinueStatement::boxed(SPAN, label, &self.ab)))
             }
             JsStatement::If(if_stmt) => {
                 let test = self.expr_id(if_stmt.test)?;
@@ -160,14 +886,19 @@ impl<'a, 'arena> Cx<'a, 'arena> {
                 let decl = oxc_ast::ast::Declaration::FunctionDeclaration(func);
                 Some(Statement::from(decl))
             }
+            // Keep parsing the retained source on the primary path. Besides
+            // preserving comments and syntax the compact IR does not model,
+            // this leaves its source-map behaviour unchanged; the structured
+            // class is for the text fallback only.
+            JsStatement::ClassDeclaration { source, .. } => {
+                self.raw_single_statement(source, None, &[], false, &[])
+            }
             JsStatement::For(for_stmt) => self.for_statement(for_stmt),
             JsStatement::ForOf(for_of) => self.for_of_statement(for_of),
             JsStatement::While(w) => {
                 let test = self.expr_id(w.test)?;
                 let body = self.stmt(self.arena.get_stmt(w.body))?;
-                Some(Statement::WhileStatement(WhileStatement::boxed(
-                    SPAN, test, body, &self.ab,
-                )))
+                Some(Statement::WhileStatement(WhileStatement::boxed(SPAN, test, body, &self.ab)))
             }
             JsStatement::DoWhile(d) => {
                 let body = self.stmt(self.arena.get_stmt(d.body))?;
@@ -185,24 +916,50 @@ impl<'a, 'arena> Cx<'a, 'arena> {
                 )))
             }
             JsStatement::Try(t) => self.try_statement(t),
-            // `Raw`/`RawMapped` at a SINGLE-statement site (if / while / for
+            // Raw statements at a SINGLE-statement site (if / while / for
             // body): parse the text; a lone statement is returned directly, a
             // multi-statement blob is wrapped in a block. (Statement-LIST sites
             // use `expand_stmt` instead, which flattens inline.)
-            JsStatement::Raw(code) => self.raw_single_statement(code),
-            JsStatement::RawMapped { code, .. } => self.raw_single_statement(code),
+            JsStatement::Raw(code) => self.raw_single_statement(code, None, &[], false, &[]),
+            JsStatement::RawEffect(code) => self.raw_single_statement(code, None, &[], true, &[]),
+            JsStatement::RawMapped { code, source_offset, comment_anchor: _, copied_spans } => {
+                self.raw_single_statement(code, Some(*source_offset), copied_spans, false, &[])
+            }
+            JsStatement::RawMappedEffect {
+                code,
+                source_offset,
+                comment_anchor: _,
+                effect_spans,
+                copied_spans,
+            } => self.raw_single_statement(
+                code,
+                Some(*source_offset),
+                copied_spans,
+                true,
+                effect_spans,
+            ),
+            JsStatement::RetainedAst { .. } => None,
         }
     }
 
     /// Convert a `Raw` statement at a single-statement position: one parsed
     /// statement is returned as-is; several are wrapped in a `{ … }` block.
-    fn raw_single_statement(&self, code: &str) -> Option<Statement<'a>> {
-        let stmts = self.parse_raw_statements(code)?;
+    fn raw_single_statement(
+        &self,
+        code: &str,
+        source_offset: Option<u32>,
+        copied_spans: &[RawMappedSpan],
+        unlocate_effect_calls: bool,
+        effect_spans: &[(bool, u32, u32)],
+    ) -> Option<Statement<'a>> {
+        let stmts = self.parse_raw_statements(code, unlocate_effect_calls, effect_spans)?;
+        let region = self.take_chunk_region(source_offset, copied_spans);
         if stmts.len() == 1 {
             stmts.into_iter().next()
         } else {
+            let span = region.map_or(SPAN, |(a, b)| Span::new(a, b));
             Some(Statement::BlockStatement(BlockStatement::boxed(
-                SPAN,
+                span,
                 ArenaVec::from_iter_in(stmts, &self.ab),
                 &self.ab,
             )))
@@ -232,9 +989,7 @@ impl<'a, 'arena> Cx<'a, 'arena> {
             None => None,
         };
         let body = self.stmt(self.arena.get_stmt(for_stmt.body))?;
-        Some(Statement::ForStatement(ForStatement::boxed(
-            SPAN, init, test, update, body, &self.ab,
-        )))
+        Some(Statement::ForStatement(ForStatement::boxed(SPAN, init, test, update, body, &self.ab)))
     }
 
     /// Build a `for (left of right)` / `for await (left of right)` statement,
@@ -302,8 +1057,8 @@ impl<'a, 'arena> Cx<'a, 'arena> {
                 Some(id) => Some(self.expr_id(id)?),
                 None => None,
             };
-            let consequent = self.statements(&case.consequent)?;
-            cases.push(SwitchCase::new(SPAN, test, consequent, &self.ab));
+            let (consequent, span) = self.statements(&case.consequent)?;
+            cases.push(SwitchCase::new(span, test, consequent, &self.ab));
         }
         Some(Statement::SwitchStatement(SwitchStatement::boxed(
             SPAN,
@@ -316,8 +1071,8 @@ impl<'a, 'arena> Cx<'a, 'arena> {
     /// Build a `try { } catch (e) { } finally { }` statement. Bails on a
     /// destructuring catch parameter.
     fn try_statement(&self, t: &JsTryStatement) -> Option<Statement<'a>> {
-        let block_stmts = self.statements(&t.block.body)?;
-        let block = BlockStatement::boxed(SPAN, block_stmts, &self.ab);
+        let (block_stmts, block_span) = self.statements(&t.block.body)?;
+        let block = BlockStatement::boxed(block_span, block_stmts, &self.ab);
 
         let handler = match &t.handler {
             None => None,
@@ -326,20 +1081,20 @@ impl<'a, 'arena> Cx<'a, 'arena> {
                     None => None,
                     Some(pat) => {
                         let pattern = self.binding_pattern(pat)?;
-                        Some(CatchParameter::new(SPAN, pattern, oxc_ast::builder::NONE, &self.ab))
+                        Some(CatchParameter::new(SPAN, pattern, None, &self.ab))
                     }
                 };
-                let body_stmts = self.statements(&catch.body.body)?;
-                let body = BlockStatement::boxed(SPAN, body_stmts, &self.ab);
-                Some(CatchClause::new(SPAN, param, body, &self.ab))
+                let (body_stmts, body_span) = self.statements(&catch.body.body)?;
+                let body = BlockStatement::boxed(body_span, body_stmts, &self.ab);
+                Some(CatchClause::boxed(body_span, param, body, &self.ab))
             }
         };
 
         let finalizer = match &t.finalizer {
             None => None,
             Some(block) => {
-                let stmts = self.statements(&block.body)?;
-                Some(BlockStatement::boxed(SPAN, stmts, &self.ab))
+                let (stmts, span) = self.statements(&block.body)?;
+                Some(BlockStatement::boxed(span, stmts, &self.ab))
             }
         };
 
@@ -353,8 +1108,16 @@ impl<'a, 'arena> Cx<'a, 'arena> {
     /// `emit_export_named`), so we set `raw` to the exact `'source'` spelling to
     /// make esrap reproduce it byte-for-byte regardless of quote options.
     fn module_source(&self, source: &str) -> oxc_ast::ast::StringLiteral<'a> {
-        let raw = self.str(&format!("'{source}'"));
-        StringLiteral::new(SPAN, self.str(source), Some(raw.into()), &self.ab)
+        #[cfg(feature = "measure-module-source")]
+        crate::measure_module_source::record(source.len());
+        // The quoted spelling is built straight into the arena and the unquoted
+        // value is a subslice of it, so neither string is copied twice.
+        let raw = oxc_allocator::StringBuilder::from_strs_array_in(
+            ["'", source, "'"],
+            self.ab.allocator(),
+        )
+        .into_str();
+        StringLiteral::new(SPAN, &raw[1..raw.len() - 1], Some(raw.into()), &self.ab)
     }
 
     /// Build a `ModuleExportName::IdentifierName` from a plain name.
@@ -413,7 +1176,7 @@ impl<'a, 'arena> Cx<'a, 'arena> {
             specifiers,
             source,
             None,
-            oxc_ast::builder::NONE,
+            None,
             ImportOrExportKind::Value,
             &self.ab,
         );
@@ -424,10 +1187,11 @@ impl<'a, 'arena> Cx<'a, 'arena> {
         // The declaration form (`export const/let/var …`) and the specifier
         // form (`export { a, b as c }`) are mutually exclusive in the IR (only
         // a variable declaration is representable as the declaration form).
-        let (declaration, specifiers) = if let Some(decl) = &export.declaration {
+        let specifiers = if let Some(decl) = &export.declaration {
             let var_decl = self.variable_declaration_node(decl)?;
             let declaration = oxc_ast::ast::Declaration::VariableDeclaration(var_decl);
-            (Some(declaration), ArenaVec::new_in(&self.ab))
+            let decl = ModuleDeclaration::new_export_declaration(SPAN, declaration, &self.ab);
+            return Some(Statement::from(decl));
         } else {
             let mut specs = ArenaVec::with_capacity_in(export.specifiers.len(), &self.ab);
             for spec in &export.specifiers {
@@ -441,17 +1205,14 @@ impl<'a, 'arena> Cx<'a, 'arena> {
                     &self.ab,
                 ));
             }
-            (None, specs)
+            specs
         };
 
-        // The IR has no re-export source (`export { x } from 'y'`); always None.
+        // The IR has no re-export source (`export { x } from 'y'`).
         let decl = ModuleDeclaration::new_export_named_declaration(
             SPAN,
-            declaration,
             specifiers,
-            None,
             ImportOrExportKind::Value,
-            oxc_ast::builder::NONE,
             &self.ab,
         );
         Some(Statement::from(decl))
@@ -460,7 +1221,11 @@ impl<'a, 'arena> Cx<'a, 'arena> {
     fn export_default(&self, export: &JsExportDefault) -> Option<Statement<'a>> {
         let kind = match &export.declaration {
             JsExportDefaultDeclaration::Function(func) => {
-                let func = self.build_function(func, FunctionType::FunctionDeclaration)?;
+                let mut func = self.build_function(func, FunctionType::FunctionDeclaration)?;
+                func.span = UNMAPPED_SPAN;
+                if let Some(id) = &mut func.id {
+                    id.span = UNMAPPED_SPAN;
+                }
                 oxc_ast::ast::ExportDefaultDeclarationKind::FunctionDeclaration(func)
             }
             JsExportDefaultDeclaration::Expression(id) => {
@@ -468,7 +1233,7 @@ impl<'a, 'arena> Cx<'a, 'arena> {
                 oxc_ast::ast::ExportDefaultDeclarationKind::from(expr)
             }
         };
-        let decl = ModuleDeclaration::new_export_default_declaration(SPAN, kind, &self.ab);
+        let decl = ModuleDeclaration::new_export_default_declaration(UNMAPPED_SPAN, kind, &self.ab);
         Some(Statement::from(decl))
     }
 
@@ -481,13 +1246,11 @@ impl<'a, 'arena> Cx<'a, 'arena> {
         func: &JsFunctionDeclaration,
         func_type: FunctionType,
     ) -> Option<oxc_allocator::Box<'a, oxc_ast::ast::Function<'a>>> {
-        let id = func
-            .id
-            .as_ref()
-            .map(|name| BindingIdentifier::new(SPAN, self.str(name), &self.ab));
+        let id =
+            func.id.as_ref().map(|name| BindingIdentifier::new(SPAN, self.str(name), &self.ab));
         let params = self.formal_params(&func.params)?;
-        let stmts = self.statements(&func.body.body)?;
-        let body = FunctionBody::new(SPAN, ArenaVec::new_in(&self.ab), stmts, &self.ab);
+        let (stmts, span) = self.block_body(&func.body, func.id.as_deref())?;
+        let body = FunctionBody::new(span, ArenaVec::new_in(&self.ab), stmts, &self.ab);
         Some(Function::boxed(
             SPAN,
             func_type,
@@ -495,23 +1258,64 @@ impl<'a, 'arena> Cx<'a, 'arena> {
             func.is_generator,
             func.is_async,
             false,
-            oxc_ast::builder::NONE,
-            oxc_ast::builder::NONE,
-            params,
-            oxc_ast::builder::NONE,
-            Some(body),
+            None,
+            None,
+            ArenaBox::new_in(params, &self.ab),
+            None,
+            Some(ArenaBox::new_in(body, &self.ab)),
             &self.ab,
         ))
     }
 
+    /// [`Cx::statements`] for a block that knows where its braces came from.
+    /// The printer reads one span for two questions — where the braces map and
+    /// where the comment cursor resyncs — so the source span is only usable
+    /// when the body consumed no comment region: reviving the cursor at a
+    /// builder-made body is what upstream does not do.
+    ///
+    /// The brace end is deliberately *not* [`Cx::note_span`]d. `loc_base` is the
+    /// boundary between the two coordinate spaces, so a source offset raising it
+    /// puts that boundary in the middle of the source range: every offset after
+    /// the script (a template expression's, say) then reads as a comment-space
+    /// position, and the printer flushes a comment at it.
+    fn block_body(
+        &self,
+        block: &super::nodes::JsBlockStatement,
+        name: Option<&str>,
+    ) -> Option<(ArenaVec<'a, Statement<'a>>, Span)> {
+        let Some((start, end)) = self
+            .component_brace_span
+            .filter(|(component, _, _)| name == Some(*component))
+            .map(|(_, start, end)| (start, end))
+        else {
+            return self.statements(&block.body);
+        };
+        let (stmts, span) = self.statements(&block.body)?;
+        let span = if span.is_empty() {
+            Span::new(start, end)
+        } else {
+            self.brace_mappings.borrow_mut().push(BraceMapping {
+                body_start: span.start,
+                body_end: span.end,
+                source_start: start,
+                source_end: end,
+            });
+            span
+        };
+        Some((stmts, span))
+    }
+
     /// Convert a slice of IR statements into an arena `Vec`, bailing on any
-    /// unhandled statement.
-    fn statements(&self, body: &[JsStatement]) -> Option<ArenaVec<'a, Statement<'a>>> {
-        let mut v: Vec<Statement<'a>> = Vec::with_capacity(body.len());
-        for s in body {
-            v.extend(self.expand_stmt(s)?);
-        }
-        Some(ArenaVec::from_iter_in(v, &self.ab))
+    /// unhandled statement. The span is the comment-buffer region the statements
+    /// consumed, which their container must carry (see [`Cx::consumed`]).
+    fn statements(&self, body: &[JsStatement]) -> Option<(ArenaVec<'a, Statement<'a>>, Span)> {
+        self.consumed(|| {
+            let mut v: Vec<Statement<'a>> = Vec::with_capacity(body.len());
+            for s in body {
+                v.extend(self.expand_stmt(s)?);
+            }
+            Some(ArenaVec::from_iter_in(v, &self.ab))
+        })
     }
 
     /// Build an optional `LabelIdentifier` for `break`/`continue` labels.
@@ -539,6 +1343,9 @@ impl<'a, 'arena> Cx<'a, 'arena> {
         };
 
         let mut declarators = ArenaVec::with_capacity_in(decl.declarations.len(), &self.ab);
+        let declaration_span = self.trailing_comment_anchor(
+            decl.declarations.first().and_then(|declarator| declarator.comment_anchor),
+        );
         for d in &decl.declarations {
             // Identifier or destructuring binding pattern; `binding_pattern`
             // bails on anything it cannot faithfully reproduce.
@@ -547,24 +1354,12 @@ impl<'a, 'arena> Cx<'a, 'arena> {
                 Some(id) => Some(self.expr_id(id)?),
                 None => None,
             };
-            declarators.push(VariableDeclarator::new(
-                SPAN,
-                kind,
-                binding,
-                oxc_ast::builder::NONE,
-                init,
-                false,
-                &self.ab,
-            ));
+            let span =
+                if declaration_span == SPAN { self.comment_anchor(d.comment_anchor) } else { SPAN };
+            declarators.push(VariableDeclarator::new(span, binding, None, init, false, &self.ab));
         }
 
-        Some(VariableDeclaration::boxed(
-            SPAN,
-            kind,
-            declarators,
-            false,
-            &self.ab,
-        ))
+        Some(VariableDeclaration::boxed(declaration_span, kind, declarators, false, &self.ab))
     }
 
     // -- binding patterns ---------------------------------------------------
@@ -578,11 +1373,29 @@ impl<'a, 'arena> Cx<'a, 'arena> {
     /// structurally).
     fn binding_pattern(&self, pat: &JsPattern) -> Option<oxc_ast::ast::BindingPattern<'a>> {
         match pat {
-            JsPattern::Identifier(name) => Some(BindingPattern::new_binding_identifier(
-                SPAN,
-                self.str(name),
-                &self.ab,
-            )),
+            JsPattern::Identifier(name) => {
+                Some(BindingPattern::new_binding_identifier(SPAN, self.str(name), &self.ab))
+            }
+            JsPattern::SpannedIdentifier { name, start, end } => {
+                Some(BindingPattern::new_binding_identifier(
+                    Span::new(*start, *end),
+                    self.str(name),
+                    &self.ab,
+                ))
+            }
+            JsPattern::SourceAnchored(anchor) => {
+                let mut pattern = self.binding_pattern(&anchor.inner)?;
+                if let Some(span) = self.open_source_region_parts(
+                    anchor.region_start,
+                    &anchor.region,
+                    &anchor.comments,
+                    anchor.at,
+                    anchor.at_end,
+                ) {
+                    *pattern.span_mut() = span;
+                }
+                Some(pattern)
+            }
             JsPattern::Object(obj) => {
                 let mut props = ArenaVec::with_capacity_in(obj.properties.len(), &self.ab);
                 let mut rest: Option<oxc_allocator::Box<'a, oxc_ast::ast::BindingRestElement<'a>>> =
@@ -590,12 +1403,7 @@ impl<'a, 'arena> Cx<'a, 'arena> {
                 let last = obj.properties.len().saturating_sub(1);
                 for (i, member) in obj.properties.iter().enumerate() {
                     match member {
-                        JsObjectPatternProperty::Property {
-                            key,
-                            value,
-                            computed,
-                            shorthand,
-                        } => {
+                        JsObjectPatternProperty::Property { key, value, computed, shorthand } => {
                             let key = if *computed {
                                 // A computed key holds an arbitrary expression;
                                 // only `JsPropertyKey::Computed` is meaningful.
@@ -624,9 +1432,7 @@ impl<'a, 'arena> Cx<'a, 'arena> {
                         }
                     }
                 }
-                Some(BindingPattern::new_object_pattern(
-                    SPAN, props, rest, &self.ab,
-                ))
+                Some(BindingPattern::new_object_pattern(SPAN, props, rest, &self.ab))
             }
             JsPattern::Array(arr) => {
                 let mut elements = ArenaVec::with_capacity_in(arr.elements.len(), &self.ab);
@@ -647,16 +1453,12 @@ impl<'a, 'arena> Cx<'a, 'arena> {
                         Some(el) => elements.push(Some(self.binding_pattern(el)?)),
                     }
                 }
-                Some(BindingPattern::new_array_pattern(
-                    SPAN, elements, rest, &self.ab,
-                ))
+                Some(BindingPattern::new_array_pattern(SPAN, elements, rest, &self.ab))
             }
             JsPattern::Assignment(JsAssignmentPattern { left, right }) => {
                 let left = self.binding_pattern(left)?;
                 let right = self.expr_id(*right)?;
-                Some(BindingPattern::new_assignment_pattern(
-                    SPAN, left, right, &self.ab,
-                ))
+                Some(BindingPattern::new_assignment_pattern(SPAN, left, right, &self.ab))
             }
             // A bare `Rest` only ever appears nested inside an object / array
             // pattern (handled above) or as the last function parameter (handled
@@ -669,46 +1471,56 @@ impl<'a, 'arena> Cx<'a, 'arena> {
 
     fn expr(&self, expr: &JsExpr) -> Option<Expression<'a>> {
         match expr {
-            JsExpr::Identifier(name) => {
-                Some(Expression::new_identifier(SPAN, self.str(name), &self.ab))
-            }
+            JsExpr::Identifier(name) => Some(Expression::new_identifier(
+                self.identifier_span(name),
+                self.str(name),
+                &self.ab,
+            )),
             JsExpr::OpaqueIdentifier(name) => {
-                Some(Expression::new_identifier(SPAN, self.str(name), &self.ab))
+                let span = self.scoped_identifier_span(name).map_or(SPAN, |(start, end)| {
+                    self.note_span(end);
+                    Span::new(start, end)
+                });
+                Some(Expression::new_identifier(span, self.str(name), &self.ab))
             }
             JsExpr::Literal(lit) => self.literal(lit),
-            JsExpr::This => Some(Expression::ThisExpression(ThisExpression::boxed(
-                SPAN, &self.ab,
-            ))),
+            JsExpr::This => Some(Expression::ThisExpression(ThisExpression::boxed(SPAN, &self.ab))),
             JsExpr::Super => Some(Expression::Super(Super::boxed(SPAN, &self.ab))),
-            JsExpr::MetaProperty(meta, property) => {
-                let meta = IdentifierName::new(SPAN, self.str(meta), &self.ab);
-                let property = IdentifierName::new(SPAN, self.str(property), &self.ab);
-                Some(Expression::new_meta_property(
-                    SPAN, meta, property, &self.ab,
-                ))
+            JsExpr::MetaProperty(meta, _property) => {
+                // oxc 0.141 split `MetaProperty` into `ImportMeta` / `NewTarget`;
+                // the meta keyword (`import` vs `new`) selects the variant.
+                Some(if meta.as_str() == "new" {
+                    Expression::new_new_target(SPAN, &self.ab)
+                } else {
+                    Expression::new_import_meta(SPAN, &self.ab)
+                })
             }
             JsExpr::Member(m) => self.member(m),
+            JsExpr::Call(c)
+                if matches!(self.arena.get_expr(c.callee), JsExpr::OpaqueIdentifier(name)
+                    if name.as_str() == SNIPPET_DEFAULT_PAREN_MARKER)
+                    && c.arguments.len() == 1
+                    && !c.optional =>
+            {
+                let inner = self.expr(&c.arguments[0])?;
+                Some(Expression::SequenceExpression(SequenceExpression::boxed(
+                    SPAN,
+                    ArenaVec::from_value_in(inner, &self.ab),
+                    &self.ab,
+                )))
+            }
             JsExpr::Call(c) => {
                 let callee = self.expr_id(c.callee)?;
                 let args = self.arguments(&c.arguments)?;
                 Some(Expression::CallExpression(CallExpression::boxed(
-                    SPAN,
-                    callee,
-                    oxc_ast::builder::NONE,
-                    args,
-                    c.optional,
-                    &self.ab,
+                    SPAN, callee, None, args, c.optional, &self.ab,
                 )))
             }
             JsExpr::New(n) => {
                 let callee = self.expr_id(n.callee)?;
                 let args = self.arguments(&n.arguments)?;
                 Some(Expression::NewExpression(NewExpression::boxed(
-                    SPAN,
-                    callee,
-                    oxc_ast::builder::NONE,
-                    args,
-                    &self.ab,
+                    SPAN, callee, None, args, &self.ab,
                 )))
             }
             JsExpr::Binary(b) => {
@@ -746,9 +1558,9 @@ impl<'a, 'arena> Cx<'a, 'arena> {
                 let test = self.expr_id(c.test)?;
                 let consequent = self.expr_id(c.consequent)?;
                 let alternate = self.expr_id(c.alternate)?;
-                Some(Expression::ConditionalExpression(
-                    ConditionalExpression::boxed(SPAN, test, consequent, alternate, &self.ab),
-                ))
+                Some(Expression::ConditionalExpression(ConditionalExpression::boxed(
+                    SPAN, test, consequent, alternate, &self.ab,
+                )))
             }
             JsExpr::Sequence(s) => {
                 let mut exprs = ArenaVec::with_capacity_in(s.expressions.len(), &self.ab);
@@ -775,9 +1587,7 @@ impl<'a, 'arena> Cx<'a, 'arena> {
                     };
                     elements.push(element);
                 }
-                Some(Expression::ArrayExpression(ArrayExpression::boxed(
-                    SPAN, elements, &self.ab,
-                )))
+                Some(Expression::ArrayExpression(ArrayExpression::boxed(SPAN, elements, &self.ab)))
             }
             JsExpr::Object(o) => self.object(o),
             JsExpr::Spread(inner) => {
@@ -789,9 +1599,7 @@ impl<'a, 'arena> Cx<'a, 'arena> {
             }
             JsExpr::Await(id) => {
                 let arg = self.expr_id(*id)?;
-                Some(Expression::AwaitExpression(AwaitExpression::boxed(
-                    SPAN, arg, &self.ab,
-                )))
+                Some(Expression::AwaitExpression(AwaitExpression::boxed(SPAN, arg, &self.ab)))
             }
             JsExpr::Void(id) => {
                 let arg = self.expr_id(*id)?;
@@ -810,22 +1618,20 @@ impl<'a, 'arena> Cx<'a, 'arena> {
             JsExpr::TaggedTemplate(t) => {
                 let tag = self.expr_id(t.tag)?;
                 let quasi = self.template_literal(&t.quasi)?;
-                Some(Expression::TaggedTemplateExpression(
-                    TaggedTemplateExpression::boxed(SPAN, tag, oxc_ast::builder::NONE, quasi, &self.ab),
-                ))
+                Some(Expression::TaggedTemplateExpression(TaggedTemplateExpression::boxed(
+                    SPAN, tag, None, quasi, &self.ab,
+                )))
             }
             JsExpr::Assignment(a) => {
                 let left = self.assignment_target(self.arena.get_expr(a.left))?;
                 let right = self.expr_id(a.right)?;
-                Some(Expression::AssignmentExpression(
-                    AssignmentExpression::boxed(
-                        SPAN,
-                        assignment_op(a.operator),
-                        left,
-                        right,
-                        &self.ab,
-                    ),
-                ))
+                Some(Expression::AssignmentExpression(AssignmentExpression::boxed(
+                    SPAN,
+                    assignment_op(a.operator),
+                    left,
+                    right,
+                    &self.ab,
+                )))
             }
             JsExpr::Update(u) => {
                 let target = self.simple_assignment_target(self.arena.get_expr(u.argument))?;
@@ -861,12 +1667,16 @@ impl<'a, 'arena> Cx<'a, 'arena> {
                 )))
             }
             JsExpr::Class(class) => self.class(class),
-            // `Spanned` wraps a real inner expression with the original-source
-            // byte span (start, end). Convert the inner expression and stamp its
-            // span so esrap's `print_with_map` maps it back to the user source.
+            // `Spanned` normally wraps a real inner expression with the
+            // original-source byte span (start, end). The reserved callee
+            // range is printer metadata, not a source position, so it must not
+            // raise the boundary below which source spans live.
             JsExpr::Spanned(inner, start, end) => {
                 let mut e = self.expr_id(*inner)?;
                 *e.span_mut() = Span::new(*start, *end);
+                if *start < rsvelte_esrap::COMMENT_ARGUMENT_CALLEE_BASE {
+                    self.note_span(*end);
+                }
                 Some(e)
             }
             // `Raw` carries opaque JS expression text. Parse it into a real oxc
@@ -874,6 +1684,27 @@ impl<'a, 'arena> Cx<'a, 'arena> {
             // semantically what the official compiler emits, so the round-trip is
             // byte-identical after esrap normalization).
             JsExpr::Raw(code) => self.parse_raw_expression(code),
+            JsExpr::SourceAnchored(anchor) => {
+                let mut e = self.expr_id(anchor.inner)?;
+                if let Some(span) = self.open_source_region(anchor) {
+                    if anchor.preserve_inner_spans {
+                        let base = span.start - (anchor.at - anchor.region_start);
+                        let mut remap = SourceRegionRemap {
+                            source_start: anchor.region_start,
+                            source_end: anchor.region_start + anchor.region.len() as u32,
+                            base,
+                            remapped: false,
+                        };
+                        remap.visit_expression(&mut e);
+                        if !remap.remapped {
+                            *e.span_mut() = span;
+                        }
+                    } else {
+                        *e.span_mut() = span;
+                    }
+                }
+                Some(e)
+            }
         }
     }
 
@@ -882,24 +1713,20 @@ impl<'a, 'arena> Cx<'a, 'arena> {
     /// strips the synthetic parens. Returns `None` on a parse error.
     fn parse_raw_expression(&self, code: &str) -> Option<Expression<'a>> {
         let wrapped = format!("({})", code.trim());
-        let owned = self.ab.allocator.alloc_str(&wrapped);
-        let ret =
-            oxc_parser::Parser::new(self.ab.allocator, owned, oxc_span::SourceType::mjs()).parse();
-        // Bail on any comment-bearing chunk: re-printing a parsed AST drops the
-        // comments (esrap places them by source line, which a reassembled program
-        // has no unified coordinate for). Falling back to the verbatim string
-        // codegen for these preserves the comments exactly. (KNOWN GAP: AST-side
-        // comment preservation, see docs/phase3-server-ast-remaining-work.md.)
-        if !ret.diagnostics.is_empty() || !ret.program.comments.is_empty() {
-            return None;
-        }
-        for stmt in ret.program.body {
+        let mut stmts = self.parse_chunk(&wrapped)?;
+        self.restore_single_target_destructure_sequences(&mut stmts);
+        // The synthetic parens are part of the chunk text, so the region already
+        // covers them; no caller needs it for an expression.
+        self.take_chunk_region(None, &[]);
+        for stmt in stmts {
             if let Statement::ExpressionStatement(es) = stmt {
-                let mut e = es.unbox().expression;
-                while let Expression::ParenthesizedExpression(p) = e {
-                    e = p.unbox().expression;
-                }
-                return Some(e);
+                let e = es.unbox().expression;
+                // Strip exactly ONE layer — the wrapper added above. Any further
+                // `ParenthesizedExpression` belongs to the chunk text itself.
+                return Some(match e {
+                    Expression::ParenthesizedExpression(p) => p.unbox().expression,
+                    other => other,
+                });
             }
         }
         None
@@ -907,16 +1734,158 @@ impl<'a, 'arena> Cx<'a, 'arena> {
 
     /// Parse a raw JS statement source string into a vec of oxc [`Statement`]s
     /// (`Raw` may hold several statements). Returns `None` on a parse error.
-    fn parse_raw_statements(&self, code: &str) -> Option<Vec<Statement<'a>>> {
-        let owned = self.ab.allocator.alloc_str(code.trim());
-        let ret =
-            oxc_parser::Parser::new(self.ab.allocator, owned, oxc_span::SourceType::mjs()).parse();
-        // Bail on comments so the verbatim string codegen preserves them (see
-        // `parse_raw_expression`).
-        if !ret.diagnostics.is_empty() || !ret.program.comments.is_empty() {
+    fn parse_raw_statements(
+        &self,
+        code: &str,
+        unlocate_effect_calls: bool,
+        effect_spans: &[(bool, u32, u32)],
+    ) -> Option<Vec<Statement<'a>>> {
+        let mut stmts = self.parse_chunk(code.trim())?;
+        self.restore_legacy_pre_effect_deps(&mut stmts);
+        self.restore_single_target_destructure_sequences(&mut stmts);
+        if unlocate_effect_calls {
+            erase_generated_effect_call_locs(&mut stmts, effect_spans);
+        }
+        Some(stmts)
+    }
+
+    /// Upstream builds the `$.legacy_pre_effect` dependency thunk as
+    /// `b.thunk(b.sequence(deps))`, and esrap prints a `SequenceExpression` with
+    /// parentheses even for a single element — so a one-dependency thunk prints
+    /// as `() => (dep)`. Re-parsing that generated text yields a
+    /// `ParenthesizedExpression`, which the printer drops (as esrap must, since
+    /// acorn elides source parens); rebuild the sequence so the parens survive.
+    /// Re-parsing also gives locations to the generated call and arrow wrappers;
+    /// erase those while retaining the source-located statements in the effect
+    /// callback, matching the split upstream constructs directly.
+    fn restore_legacy_pre_effect_deps(&self, stmts: &mut [Statement<'a>]) {
+        for stmt in stmts {
+            let Statement::ExpressionStatement(es) = stmt else {
+                continue;
+            };
+            let Expression::CallExpression(call) = &mut es.expression else {
+                continue;
+            };
+            if !is_dollar_call(&call.callee, "legacy_pre_effect") {
+                continue;
+            }
+            if let Some(Argument::ArrowFunctionExpression(arrow)) = call.arguments.first_mut()
+                && let Some(body) = arrow.get_expression_mut()
+            {
+                // A multi-dependency thunk re-parses as `Paren(Sequence)`, which
+                // the printer already prints with the sequence's own parens.
+                let single = matches!(&*body, Expression::ParenthesizedExpression(p)
+                    if !matches!(p.expression, Expression::SequenceExpression(_)));
+                if single {
+                    // `SPAN` mirrors upstream, where this node is builder-made
+                    // and so carries no `loc` for comment placement.
+                    body.replace_with(|e| {
+                        let Expression::ParenthesizedExpression(p) = e else { unreachable!() };
+                        Expression::SequenceExpression(SequenceExpression::boxed(
+                            SPAN,
+                            ArenaVec::from_value_in(p.unbox().expression, &self.ab),
+                            &self.ab,
+                        ))
+                    });
+                }
+            }
+
+            unlocate_legacy_pre_effect_wrapper(call);
+            es.span = SPAN;
+        }
+    }
+
+    /// See [`SINGLE_TARGET_DESTRUCTURE_SEQUENCE_MARKER`]. Unlike
+    /// [`Cx::restore_legacy_pre_effect_deps`] (which only ever sits at the top
+    /// of its own dedicated chunk), a destructuring-assignment collapse can be
+    /// nested arbitrarily deep (inside a function body, a block, another
+    /// expression, …), so this walks the whole chunk rather than just its
+    /// top-level statements.
+    fn restore_single_target_destructure_sequences(&self, stmts: &mut [Statement<'a>]) {
+        let mut rebuilder = SingleTargetSequenceRebuilder { ab: &self.ab };
+        for stmt in stmts {
+            rebuilder.visit_statement(stmt);
+        }
+    }
+
+    /// Parse one opaque chunk of generated JS. A comment-free chunk parses in
+    /// place, exactly as before. A comment-bearing chunk is re-parsed from a
+    /// `pad + text` buffer so its spans land at the chunk's own region of the
+    /// unified comment buffer, and its comments are collected there.
+    fn parse_chunk(&self, text: &str) -> Option<Vec<Statement<'a>>> {
+        let (text, sealed_at) = strip_removed_inspect_markers(text);
+        let removed_inspect = !sealed_at.is_empty();
+        let owned = self.ab.allocator().alloc_str(&text);
+        let ret = oxc_parser::Parser::new(self.ab.allocator(), owned, oxc_span::SourceType::mjs())
+            .parse();
+        if !ret.diagnostics.is_empty() {
+            note_fallback("chunk-parse");
             return None;
         }
-        Some(ret.program.body.into_iter().collect())
+        if ret.program.comments.is_empty() {
+            // Chunk-local spans stay below `loc_base`, so they read as "no
+            // location"; record the bound the second pass has to clear.
+            self.note_span(text.len() as u32);
+            let mut stmts: Vec<Statement<'a>> = ret.program.body.into_iter().collect();
+            seal_removed_inspect_empties(&mut stmts, &text, &sealed_at, 0);
+            return Some(stmts);
+        }
+        self.synth.borrow_mut().saw_comments = true;
+        if !self.synth.borrow().enabled {
+            // Probe pass: the comments are dropped here, but the result is
+            // discarded — it only tells the driver a second pass is needed.
+            self.note_span(text.len() as u32);
+            let mut stmts: Vec<Statement<'a>> = ret.program.body.into_iter().collect();
+            seal_removed_inspect_empties(&mut stmts, &text, &sealed_at, 0);
+            return Some(stmts);
+        }
+
+        // `base` is at least `loc_base` (>= 2): this path only runs once
+        // placement is enabled, and `Synth::new` seeded `source` with the pad.
+        let base = self.synth.borrow().cursor();
+        // One byte of pad reproduces the lexical context the chunk has in the
+        // unified buffer — its region always starts right after a newline — and
+        // the spans are moved into that region below. Padding with `base` real
+        // spaces instead would make every chunk re-lex the whole buffer before
+        // it, which is quadratic in the generated code size.
+        let mut padded = String::with_capacity(1 + text.len());
+        padded.push('\n');
+        padded.push_str(&text);
+        let owned = self.ab.allocator().alloc_str(&padded);
+        let ret = oxc_parser::Parser::new(self.ab.allocator(), owned, oxc_span::SourceType::mjs())
+            .parse();
+        if !ret.diagnostics.is_empty() {
+            note_fallback("chunk-parse");
+            return None;
+        }
+        let shift = base - 1;
+        let mut stmts: Vec<Statement<'a>> = ret.program.body.into_iter().collect();
+        let mut shifter = ShiftSpans(shift);
+        for stmt in &mut stmts {
+            shifter.visit_statement(stmt);
+        }
+        // The padded re-parse put the chunk one byte in, so its spans sit at
+        // `shift + 1` relative to the stripped text.
+        seal_removed_inspect_empties(&mut stmts, &text, &sealed_at, shift + 1);
+        let mut synth = self.synth.borrow_mut();
+        synth.source.push_str(&text);
+        synth.source.push('\n');
+        synth.comments.extend(ret.program.comments.iter().map(|comment| {
+            let mut comment = *comment;
+            comment.span.start += shift;
+            comment.span.end += shift;
+            comment.attached_to += shift;
+            comment
+        }));
+        synth.pending_region = Some((base, base + text.len() as u32));
+        synth.last_region_ends_with_removed_inspect_comment = removed_inspect
+            && ret
+                .program
+                .comments
+                .last()
+                .is_some_and(|comment| text[comment.span.end as usize - 1..].trim().is_empty());
+        drop(synth);
+        Some(stmts)
     }
 
     /// Expand one IR statement into its oxc statements — a `Raw`/`RawMapped`
@@ -925,20 +1894,128 @@ impl<'a, 'arena> Cx<'a, 'arena> {
     /// block bodies) so a multi-statement `Raw` flattens inline.
     fn expand_stmt(&self, stmt: &JsStatement) -> Option<Vec<Statement<'a>>> {
         match stmt {
-            JsStatement::Raw(code) => self.parse_raw_statements(code),
-            JsStatement::RawMapped {
-                code,
-                source_offset,
-            } => {
-                let mut stmts = self.parse_raw_statements(code)?;
+            JsStatement::RetainedAst { index, .. } => {
+                let island = self.islands.get(*index)?;
+                if !island.program.program().comments.is_empty() {
+                    return None;
+                }
+                if island.statement_indices.is_empty()
+                    || island.statement_indices.windows(2).any(|indices| indices[0] >= indices[1])
+                    || island
+                        .statement_indices
+                        .iter()
+                        .any(|&index| index >= island.program.program().body.len())
+                {
+                    return None;
+                }
+                let program =
+                    island.program.clone_program_into_at(self.ab.allocator(), island.source_offset);
+                // Upstream keeps every retained node's `loc`, so a body it prints
+                // re-syncs the comment cursor; an island's spans index the
+                // `.svelte` source instead, which reads as "no location" and
+                // KILLS the cursor before anything later can flush.
+                let shift = self.open_island_region(island);
+                Some(
+                    program
+                        .body
+                        .into_iter()
+                        .enumerate()
+                        .filter_map(|(index, statement)| {
+                            island.statement_indices.binary_search(&index).ok().map(|_| statement)
+                        })
+                        .map(|mut statement| {
+                            if let Some(shift) = shift {
+                                ShiftSpans(shift).visit_statement(&mut statement);
+                            }
+                            statement
+                        })
+                        .collect(),
+                )
+            }
+            JsStatement::ClassDeclaration { source, .. } => {
+                let stmts = self.parse_raw_statements(source, false, &[])?;
+                self.take_chunk_region(None, &[]);
+                Some(stmts)
+            }
+            JsStatement::Raw(code) => {
+                let stmts = self.parse_raw_statements(code, false, &[])?;
+                self.take_chunk_region(None, &[]);
+                Some(stmts)
+            }
+            JsStatement::RawEffect(code) => {
+                let stmts = self.parse_raw_statements(code, true, &[])?;
+                self.take_chunk_region(None, &[]);
+                Some(stmts)
+            }
+            JsStatement::RawMapped { code, source_offset, comment_anchor, copied_spans } => {
+                let mut stmts = self.parse_raw_statements(code, false, &[])?;
+                let region = self.take_chunk_region(Some(*source_offset), copied_spans);
+                if let Some((region_start, _)) = region {
+                    unlocate_prop_declarations_after_erased_comments(
+                        &mut stmts,
+                        copied_spans,
+                        region_start,
+                    );
+                    // The chunk's own spans are its comment anchors; the source
+                    // offset is carried by the region's `loc_map` entry instead.
+                    return Some(stmts);
+                }
+                let comment_anchor = self.comment_anchor(comment_anchor.or(Some(*source_offset)));
                 // Stamp each statement with the original-source offset so esrap's
                 // `print_with_map` maps the (transformed) instance-script lines
                 // back to the user source — mirroring the text codegen's
                 // per-block `source_offset` line mapping.
+                restore_raw_mapped_spans(&mut stmts, copied_spans);
                 let sp = Span::new(*source_offset, *source_offset);
                 for s in &mut stmts {
-                    *s.span_mut() = sp;
+                    if s.span().is_empty() {
+                        *s.span_mut() = sp;
+                    }
                 }
+                if comment_anchor != SPAN
+                    && let Some(statement) = stmts.first_mut()
+                {
+                    *statement.span_mut() = comment_anchor;
+                }
+                unlocate_prop_declarations_after_erased_comments(&mut stmts, copied_spans, 0);
+                self.note_span(*source_offset);
+                Some(stmts)
+            }
+            JsStatement::RawMappedEffect {
+                code,
+                source_offset,
+                comment_anchor,
+                effect_spans,
+                copied_spans,
+            } => {
+                let mut stmts = self.parse_raw_statements(code, false, &[])?;
+                if effect_spans.is_empty() {
+                    let region = self.take_chunk_region(Some(*source_offset), copied_spans);
+                    if let Some((region_start, _)) = region {
+                        unlocate_prop_declarations_after_erased_comments(
+                            &mut stmts,
+                            copied_spans,
+                            region_start,
+                        );
+                        return Some(stmts);
+                    }
+                }
+                restore_raw_mapped_spans(&mut stmts, copied_spans);
+                erase_generated_effect_call_locs(&mut stmts, effect_spans);
+                let sp = Span::new(*source_offset, *source_offset);
+                for s in &mut stmts {
+                    if s.span().is_empty() {
+                        *s.span_mut() = sp;
+                    }
+                }
+                let comment_anchor = self.comment_anchor(comment_anchor.or(Some(*source_offset)));
+                if comment_anchor != SPAN
+                    && let Some(statement) = stmts.first_mut()
+                {
+                    *statement.span_mut() = comment_anchor;
+                }
+                unlocate_prop_declarations_after_erased_comments(&mut stmts, copied_spans, 0);
+                self.note_span(*source_offset);
                 Some(stmts)
             }
             other => Some(vec![self.stmt(other)?]),
@@ -960,10 +2037,8 @@ impl<'a, 'arena> Cx<'a, 'arena> {
             ClassType, MethodDefinitionKind, MethodDefinitionType, PropertyDefinitionType,
         };
 
-        let id = class
-            .id
-            .as_ref()
-            .map(|name| BindingIdentifier::new(SPAN, self.str(name), &self.ab));
+        let id =
+            class.id.as_ref().map(|name| BindingIdentifier::new(SPAN, self.str(name), &self.ab));
 
         let super_class = match class.super_class {
             Some(id) => Some(self.expr_id(id)?),
@@ -1011,7 +2086,7 @@ impl<'a, 'arena> Cx<'a, 'arena> {
                         PropertyDefinitionType::PropertyDefinition,
                         ArenaVec::new_in(&self.ab),
                         key,
-                        oxc_ast::builder::NONE,
+                        None,
                         value,
                         prop.computed,
                         prop.is_static,
@@ -1030,15 +2105,14 @@ impl<'a, 'arena> Cx<'a, 'arena> {
             }
         }
 
-        let body = ClassBody::new(SPAN, elements, &self.ab);
+        let body = ClassBody::boxed(SPAN, elements, &self.ab);
         Some(Expression::ClassExpression(Class::boxed(
             SPAN,
             ClassType::ClassExpression,
             ArenaVec::new_in(&self.ab),
             id,
-            oxc_ast::builder::NONE,
-            super_class,
-            oxc_ast::builder::NONE,
+            None,
+            super_class.map(|expression| ClassHeritage { expression, type_arguments: None }),
             ArenaVec::new_in(&self.ab),
             body,
             false,
@@ -1073,13 +2147,11 @@ impl<'a, 'arena> Cx<'a, 'arena> {
         &self,
         func: &JsFunctionExpression,
     ) -> Option<oxc_allocator::Box<'a, oxc_ast::ast::Function<'a>>> {
-        let id = func
-            .id
-            .as_ref()
-            .map(|name| BindingIdentifier::new(SPAN, self.str(name), &self.ab));
+        let id =
+            func.id.as_ref().map(|name| BindingIdentifier::new(SPAN, self.str(name), &self.ab));
         let params = self.formal_params(&func.params)?;
-        let stmts = self.statements(&func.body.body)?;
-        let body = FunctionBody::new(SPAN, ArenaVec::new_in(&self.ab), stmts, &self.ab);
+        let (stmts, span) = self.block_body(&func.body, func.id.as_deref())?;
+        let body = FunctionBody::new(span, ArenaVec::new_in(&self.ab), stmts, &self.ab);
         Some(Function::boxed(
             SPAN,
             FunctionType::FunctionExpression,
@@ -1087,30 +2159,23 @@ impl<'a, 'arena> Cx<'a, 'arena> {
             func.is_generator,
             func.is_async,
             false,
-            oxc_ast::builder::NONE,
-            oxc_ast::builder::NONE,
-            params,
-            oxc_ast::builder::NONE,
-            Some(body),
+            None,
+            None,
+            ArenaBox::new_in(params, &self.ab),
+            None,
+            Some(ArenaBox::new_in(body, &self.ab)),
             &self.ab,
         ))
     }
 
     fn literal(&self, lit: &JsLiteral) -> Option<Expression<'a>> {
         match lit {
-            JsLiteral::String(s) => Some(Expression::new_string_literal(
-                SPAN,
-                self.str(s),
-                None,
-                &self.ab,
-            )),
-            JsLiteral::Number(n) => Some(Expression::new_numeric_literal(
-                SPAN,
-                *n,
-                None,
-                NumberBase::Decimal,
-                &self.ab,
-            )),
+            JsLiteral::String(s) => {
+                Some(Expression::new_string_literal(SPAN, self.str(s), None, &self.ab))
+            }
+            JsLiteral::Number(n) => {
+                Some(Expression::new_numeric_literal(SPAN, *n, None, NumberBase::Decimal, &self.ab))
+            }
             JsLiteral::RawString { value, raw } => Some(Expression::new_string_literal(
                 SPAN,
                 self.str(value),
@@ -1149,21 +2214,13 @@ impl<'a, 'arena> Cx<'a, 'arena> {
                     flag_bits |= RegExpFlags::try_from(ch).ok()?;
                 }
                 let regex = RegExp {
-                    pattern: RegExpPattern {
-                        text: self.str(pattern).into(),
-                        pattern: None,
-                    },
+                    pattern: RegExpPattern { text: self.str(pattern).into(), pattern: None },
                     flags: flag_bits,
                 };
                 // esrap prints `raw` verbatim when present, so emit the exact
                 // `/pattern/flags` source spelling.
                 let raw = self.str(&format!("/{pattern}/{flags}"));
-                Some(Expression::new_reg_exp_literal(
-                    SPAN,
-                    regex,
-                    Some(raw.into()),
-                    &self.ab,
-                ))
+                Some(Expression::new_reg_exp_literal(SPAN, regex, Some(raw.into()), &self.ab))
             }
         }
     }
@@ -1175,12 +2232,19 @@ impl<'a, 'arena> Cx<'a, 'arena> {
     /// Build a [`MemberExpression`] node from the IR member expression. Shared
     /// by the `Member` expression arm and the assignment-target helper.
     fn member_expr(&self, m: &JsMemberExpression) -> Option<oxc_ast::ast::MemberExpression<'a>> {
-        let object = self.expr_id(m.object)?;
+        let object = self.member_object(m.object)?;
         let member = match &m.property {
             JsMemberProperty::Identifier(name) => {
                 let property = IdentifierName::new(SPAN, self.str(name), &self.ab);
                 MemberExpression::StaticMemberExpression(StaticMemberExpression::boxed(
                     SPAN, object, property, m.optional, &self.ab,
+                ))
+            }
+            JsMemberProperty::SpannedIdentifier { name, start, end } => {
+                let span = Span::new(*start, *end);
+                let property = IdentifierName::new(span, self.str(name), &self.ab);
+                MemberExpression::StaticMemberExpression(StaticMemberExpression::boxed(
+                    span, object, property, m.optional, &self.ab,
                 ))
             }
             JsMemberProperty::Expression(id) => {
@@ -1231,9 +2295,15 @@ impl<'a, 'arena> Cx<'a, 'arena> {
         expr: &JsExpr,
     ) -> Option<oxc_ast::ast::SimpleAssignmentTarget<'a>> {
         match expr {
+            JsExpr::Spanned(inner, start, end) => {
+                let mut target = self.simple_assignment_target(self.arena.get_expr(*inner))?;
+                *target.span_mut() = Span::new(*start, *end);
+                self.note_span(*end);
+                Some(target)
+            }
             JsExpr::Identifier(name) => {
                 Some(SimpleAssignmentTarget::new_assignment_target_identifier(
-                    SPAN,
+                    self.identifier_span(name),
                     self.str(name),
                     &self.ab,
                 ))
@@ -1262,6 +2332,12 @@ impl<'a, 'arena> Cx<'a, 'arena> {
     /// itself bails.
     fn assignment_target(&self, expr: &JsExpr) -> Option<oxc_ast::ast::AssignmentTarget<'a>> {
         match expr {
+            JsExpr::Spanned(inner, start, end) => {
+                let mut target = self.assignment_target(self.arena.get_expr(*inner))?;
+                *target.span_mut() = Span::new(*start, *end);
+                self.note_span(*end);
+                Some(target)
+            }
             JsExpr::Array(arr) => {
                 let mut elements = ArenaVec::with_capacity_in(arr.elements.len(), &self.ab);
                 let mut rest: Option<
@@ -1314,9 +2390,7 @@ impl<'a, 'arena> Cx<'a, 'arena> {
                     }
                 }
                 let object = ObjectAssignmentTarget::boxed(SPAN, props, rest, &self.ab);
-                Some(oxc_ast::ast::AssignmentTarget::ObjectAssignmentTarget(
-                    object,
-                ))
+                Some(oxc_ast::ast::AssignmentTarget::ObjectAssignmentTarget(object))
             }
             // Plain identifier / simple member: reuse the simple-target helper.
             _ => {
@@ -1338,11 +2412,9 @@ impl<'a, 'arena> Cx<'a, 'arena> {
         {
             let binding = self.assignment_target(self.arena.get_expr(a.left))?;
             let init = self.expr_id(a.right)?;
-            return Some(
-                AssignmentTargetMaybeDefault::new_assignment_target_with_default(
-                    SPAN, binding, init, &self.ab,
-                ),
-            );
+            return Some(AssignmentTargetMaybeDefault::new_assignment_target_with_default(
+                SPAN, binding, init, &self.ab,
+            ));
         }
         let target = self.assignment_target(expr)?;
         Some(oxc_ast::ast::AssignmentTargetMaybeDefault::from(target))
@@ -1371,7 +2443,8 @@ impl<'a, 'arena> Cx<'a, 'arena> {
                 }
                 _ => return None,
             };
-            let binding = IdentifierReference::new(SPAN, self.str(name), &self.ab);
+            let binding =
+                IdentifierReference::new(self.identifier_span(name), self.str(name), &self.ab);
             return Some(
                 oxc_ast::ast::AssignmentTargetProperty::AssignmentTargetPropertyIdentifier(
                     AssignmentTargetPropertyIdentifier::boxed(SPAN, binding, init, &self.ab),
@@ -1382,11 +2455,9 @@ impl<'a, 'arena> Cx<'a, 'arena> {
         // Explicit `key: value` (value may carry a default).
         let key = self.class_member_key(&p.key, p.computed)?;
         let binding = self.assignment_target_maybe_default(self.arena.get_expr(p.value))?;
-        Some(
-            oxc_ast::ast::AssignmentTargetProperty::AssignmentTargetPropertyProperty(
-                AssignmentTargetPropertyProperty::boxed(SPAN, key, binding, p.computed, &self.ab),
-            ),
-        )
+        Some(oxc_ast::ast::AssignmentTargetProperty::AssignmentTargetPropertyProperty(
+            AssignmentTargetPropertyProperty::boxed(SPAN, key, binding, p.computed, &self.ab),
+        ))
     }
 
     fn object(&self, o: &JsObjectExpression) -> Option<Expression<'a>> {
@@ -1405,9 +2476,7 @@ impl<'a, 'arena> Cx<'a, 'arena> {
                 }
             }
         }
-        Some(Expression::ObjectExpression(ObjectExpression::boxed(
-            SPAN, props, &self.ab,
-        )))
+        Some(Expression::ObjectExpression(ObjectExpression::boxed(SPAN, props, &self.ab)))
     }
 
     /// Build a boxed [`ObjectProperty`] from an IR [`JsProperty`].
@@ -1459,6 +2528,22 @@ impl<'a, 'arena> Cx<'a, 'arena> {
                     let expr = Expression::new_identifier(SPAN, self.str(name), &self.ab);
                     PropertyKey::from(expr)
                 }
+                JsPropertyKey::SpannedIdentifier { name, start, end } => {
+                    let expr = Expression::new_identifier(
+                        Span::new(*start, *end),
+                        self.str(name),
+                        &self.ab,
+                    );
+                    PropertyKey::from(expr)
+                }
+                JsPropertyKey::SpannedStringLiteral { value, start, end } => {
+                    PropertyKey::from(Expression::new_string_literal(
+                        Span::new(*start, *end),
+                        self.str(value),
+                        None,
+                        &self.ab,
+                    ))
+                }
                 JsPropertyKey::Literal(lit) => {
                     let expr = self.literal(lit)?;
                     PropertyKey::from(expr)
@@ -1484,11 +2569,24 @@ impl<'a, 'arena> Cx<'a, 'arena> {
 
     fn property_key(&self, key: &JsPropertyKey) -> Option<PropertyKey<'a>> {
         match key {
-            JsPropertyKey::Identifier(name) => Some(PropertyKey::new_static_identifier(
-                SPAN,
-                self.str(name),
-                &self.ab,
-            )),
+            JsPropertyKey::Identifier(name) => {
+                Some(PropertyKey::new_static_identifier(SPAN, self.str(name), &self.ab))
+            }
+            JsPropertyKey::SpannedIdentifier { name, start, end } => {
+                Some(PropertyKey::new_static_identifier(
+                    Span::new(*start, *end),
+                    self.str(name),
+                    &self.ab,
+                ))
+            }
+            JsPropertyKey::SpannedStringLiteral { value, start, end } => {
+                Some(PropertyKey::from(Expression::new_string_literal(
+                    Span::new(*start, *end),
+                    self.str(value),
+                    None,
+                    &self.ab,
+                )))
+            }
             JsPropertyKey::Literal(lit) => {
                 // A literal key is the literal expression in key position.
                 let expr = self.literal(lit)?;
@@ -1503,41 +2601,28 @@ impl<'a, 'arena> Cx<'a, 'arena> {
 
     fn arrow(&self, arrow: &JsArrowFunction) -> Option<Expression<'a>> {
         let params = self.formal_params(&arrow.params)?;
-        let (is_expr, body) = match &arrow.body {
-            JsArrowBody::Expression(id) => {
-                // Expression-bodied arrow: the function body is a single
-                // implicit-return expression statement.
-                let expr = self.expr_id(*id)?;
-                let stmt = Statement::ExpressionStatement(ExpressionStatement::boxed(
-                    SPAN, expr, &self.ab,
-                ));
-                let stmts = ArenaVec::from_value_in(stmt, &self.ab);
-                (
-                    true,
-                    FunctionBody::new(SPAN, ArenaVec::new_in(&self.ab), stmts, &self.ab),
-                )
-            }
+        let body = match &arrow.body {
+            JsArrowBody::Expression(id) => ArrowFunctionBody::from(self.expr_id(*id)?),
             JsArrowBody::Block(block) => {
-                let stmts = self.statements(&block.body)?;
-                (
-                    false,
-                    FunctionBody::new(SPAN, ArenaVec::new_in(&self.ab), stmts, &self.ab),
-                )
+                let (stmts, span) = self.statements(&block.body)?;
+                ArrowFunctionBody::FunctionBody(FunctionBody::boxed(
+                    span,
+                    ArenaVec::new_in(&self.ab),
+                    stmts,
+                    &self.ab,
+                ))
             }
         };
 
-        Some(Expression::ArrowFunctionExpression(
-            ArrowFunctionExpression::boxed(
-                SPAN,
-                is_expr,
-                arrow.is_async,
-                oxc_ast::builder::NONE,
-                params,
-                oxc_ast::builder::NONE,
-                body,
-                &self.ab,
-            ),
-        ))
+        Some(Expression::ArrowFunctionExpression(ArrowFunctionExpression::boxed(
+            SPAN,
+            arrow.is_async,
+            None,
+            ArenaBox::new_in(params, &self.ab),
+            None,
+            body,
+            &self.ab,
+        )))
     }
 
     /// Build an optional-chaining wrapper (`a?.b`, `a?.()`). The inner IR
@@ -1553,27 +2638,22 @@ impl<'a, 'arena> Cx<'a, 'arena> {
             JsExpr::Call(c) => {
                 let callee = self.expr_id(c.callee)?;
                 let args = self.arguments(&c.arguments)?;
-                let call =
-                    CallExpression::boxed(SPAN, callee, oxc_ast::builder::NONE, args, c.optional, &self.ab);
+                let call = CallExpression::boxed(SPAN, callee, None, args, c.optional, &self.ab);
                 ChainElement::CallExpression(call)
             }
             _ => return None,
         };
-        Some(Expression::ChainExpression(ChainExpression::boxed(
-            SPAN, element, &self.ab,
-        )))
+        Some(Expression::ChainExpression(ChainExpression::boxed(SPAN, element, &self.ab)))
     }
 
     /// Build a function expression. Reuses [`formal_params`] (which bails on
     /// destructuring params) and [`statements`] for the body.
     fn function(&self, func: &JsFunctionExpression) -> Option<Expression<'a>> {
-        let id = func
-            .id
-            .as_ref()
-            .map(|name| BindingIdentifier::new(SPAN, self.str(name), &self.ab));
+        let id =
+            func.id.as_ref().map(|name| BindingIdentifier::new(SPAN, self.str(name), &self.ab));
         let params = self.formal_params(&func.params)?;
-        let stmts = self.statements(&func.body.body)?;
-        let body = FunctionBody::new(SPAN, ArenaVec::new_in(&self.ab), stmts, &self.ab);
+        let (stmts, span) = self.block_body(&func.body, func.id.as_deref())?;
+        let body = FunctionBody::new(span, ArenaVec::new_in(&self.ab), stmts, &self.ab);
         Some(Expression::FunctionExpression(Function::boxed(
             SPAN,
             FunctionType::FunctionExpression,
@@ -1581,11 +2661,11 @@ impl<'a, 'arena> Cx<'a, 'arena> {
             func.is_generator,
             func.is_async,
             false,
-            oxc_ast::builder::NONE,
-            oxc_ast::builder::NONE,
-            params,
-            oxc_ast::builder::NONE,
-            Some(body),
+            None,
+            None,
+            ArenaBox::new_in(params, &self.ab),
+            None,
+            Some(ArenaBox::new_in(body, &self.ab)),
             &self.ab,
         )))
     }
@@ -1611,7 +2691,7 @@ impl<'a, 'arena> Cx<'a, 'arena> {
                     SPAN,
                     ArenaVec::new_in(&self.ab),
                     rest_el,
-                    oxc_ast::builder::NONE,
+                    None,
                     &self.ab,
                 ));
                 continue;
@@ -1621,8 +2701,8 @@ impl<'a, 'arena> Cx<'a, 'arena> {
                 SPAN,
                 ArenaVec::new_in(&self.ab),
                 pattern,
-                oxc_ast::builder::NONE,
-                oxc_ast::builder::NONE,
+                None,
+                None,
                 false,
                 None,
                 false,
@@ -1653,6 +2733,25 @@ impl<'a, 'arena> Cx<'a, 'arena> {
             out.push(argument);
         }
         Some(out)
+    }
+}
+
+struct SourceRegionRemap {
+    source_start: u32,
+    source_end: u32,
+    base: u32,
+    remapped: bool,
+}
+
+impl<'a> VisitMut<'a> for SourceRegionRemap {
+    fn visit_span(&mut self, span: &mut Span) {
+        if span.start >= self.source_start && span.end <= self.source_end && span.start < span.end {
+            *span = Span::new(
+                self.base + span.start - self.source_start,
+                self.base + span.end - self.source_start,
+            );
+            self.remapped = true;
+        }
     }
 }
 
@@ -1721,6 +2820,15 @@ fn update_op(op: JsUpdateOp) -> UpdateOperator {
     }
 }
 
+/// Whether `callee` is `$.<name>` — the runtime-namespace call shape the client
+/// codegen emits.
+fn is_dollar_call(callee: &Expression, name: &str) -> bool {
+    let Expression::StaticMemberExpression(m) = callee else {
+        return false;
+    };
+    matches!(&m.object, Expression::Identifier(id) if id.name == "$") && m.property.name == name
+}
+
 fn unary_op(op: JsUnaryOp) -> UnaryOperator {
     match op {
         JsUnaryOp::Minus => UnaryOperator::UnaryNegation,
@@ -1730,5 +2838,294 @@ fn unary_op(op: JsUnaryOp) -> UnaryOperator {
         JsUnaryOp::TypeOf => UnaryOperator::Typeof,
         JsUnaryOp::Void => UnaryOperator::Void,
         JsUnaryOp::Delete => UnaryOperator::Delete,
+    }
+}
+
+const REMOVED_INSPECT_MARKER: &str = "/* $$inspect_removed$$ */";
+
+/// Drop the marker the client's non-dev `$inspect` removal leaves behind, and
+/// report where each one stood in the STRIPPED text.
+fn strip_removed_inspect_markers(text: &str) -> (String, Vec<u32>) {
+    if !text.contains(REMOVED_INSPECT_MARKER) {
+        return (text.to_string(), Vec::new());
+    }
+    let mut stripped = String::with_capacity(text.len());
+    let mut at = Vec::new();
+    let mut rest = text;
+    while let Some(i) = rest.find(REMOVED_INSPECT_MARKER) {
+        stripped.push_str(&rest[..i]);
+        at.push(stripped.len() as u32);
+        rest = &rest[i + REMOVED_INSPECT_MARKER.len()..];
+    }
+    stripped.push_str(rest);
+    (stripped, at)
+}
+
+/// Seal the `;` run each stripped marker introduces with [`B::empty_kept`]'s
+/// sentinel span. Those semicolons stand in for upstream's `b.empty`, not for a
+/// source semicolon, so they have to outlive the printer's empty-statement
+/// filter — which is what lets a `;;` the USER wrote be dropped, as esrap's
+/// `body()` drops it.
+fn seal_removed_inspect_empties(stmts: &mut [Statement<'_>], text: &str, at: &[u32], shift: u32) {
+    if at.is_empty() {
+        return;
+    }
+    seal_in_list(stmts, text, at, shift);
+    let mut sealer = SealNestedEmpties { text, at, shift };
+    for stmt in stmts {
+        sealer.visit_statement(stmt);
+    }
+}
+
+/// A removed `$inspect(…)` can sit in any body, and `parse_chunk` only hands
+/// back the chunk's TOP-LEVEL statements.
+struct SealNestedEmpties<'t> {
+    text: &'t str,
+    at: &'t [u32],
+    shift: u32,
+}
+
+impl<'a> VisitMut<'a> for SealNestedEmpties<'_> {
+    fn visit_statements(&mut self, stmts: &mut oxc_allocator::Vec<'a, Statement<'a>>) {
+        seal_in_list(stmts, self.text, self.at, self.shift);
+        oxc_ast_visit::walk_mut::walk_statements(self, stmts);
+    }
+}
+
+fn seal_in_list(stmts: &mut [Statement<'_>], text: &str, at: &[u32], shift: u32) {
+    for &marker in at {
+        let mut sealed = 0;
+        for stmt in stmts.iter_mut() {
+            let Statement::EmptyStatement(empty) = stmt else {
+                if sealed > 0 {
+                    break;
+                }
+                continue;
+            };
+            let start = empty.span.start.saturating_sub(shift);
+            if start < marker {
+                continue;
+            }
+            // Only the run the marker introduces: the earlier text pipeline may
+            // have re-indented it, but nothing else can stand in between.
+            if sealed == 0
+                && !text
+                    .get(marker as usize..start as usize)
+                    .is_some_and(|gap| gap.trim().is_empty())
+            {
+                break;
+            }
+            empty.span.end = u32::MAX;
+            sealed += 1;
+            // Upstream's residue is the expression's `;` plus the statement's.
+            if sealed == 2 {
+                break;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AstIsland, program_to_oxc, program_to_oxc_with_islands};
+    use crate::ast::oxc_program::RetainedProgram;
+    use crate::compiler::phases::phase3_transform::js_ast::{
+        JsArena, JsAssignmentOp, JsExpr, JsMemberExpression, JsMemberProperty, JsProgram,
+        JsStatement, JsUpdateOp, builders as b,
+    };
+    use oxc_allocator::Allocator;
+    use oxc_ast::ast::{Expression, Statement};
+    use oxc_span::{GetSpan, Span};
+
+    #[test]
+    fn generated_identifier_uses_keep_the_registered_span() {
+        let arena = JsArena::new();
+        arena.note_identifier_span("div", 7, 10);
+        let program = JsProgram::with_body(vec![b::stmt(&arena, b::id("div"))]);
+        let allocator = Allocator::default();
+        let converted =
+            program_to_oxc(&program, &arena, &allocator).expect("identifier is supported");
+
+        let oxc_ast::ast::Statement::ExpressionStatement(statement) = &converted.program.body[0]
+        else {
+            panic!("expected expression statement");
+        };
+        assert_eq!(statement.expression.span().start, 7);
+        assert_eq!(statement.expression.span().end, 10);
+    }
+
+    #[test]
+    fn generated_identifier_source_span_does_not_raise_comment_boundary() {
+        let arena = JsArena::new();
+        arena.note_identifier_span("div", 1_000, 1_003);
+        let program = JsProgram::with_body(vec![
+            JsStatement::Raw("/* comment */ value;".into()),
+            b::stmt(&arena, b::id("div")),
+        ]);
+        let allocator = Allocator::default();
+        let converted =
+            program_to_oxc(&program, &arena, &allocator).expect("commented chunk is supported");
+
+        assert!(converted.comment_source.is_some());
+        assert!(converted.loc_base < 1_000);
+        let oxc_ast::ast::Statement::ExpressionStatement(statement) = &converted.program.body[1]
+        else {
+            panic!("expected expression statement");
+        };
+        assert_eq!(statement.expression.span(), oxc_span::Span::new(1_000, 1_003));
+    }
+
+    #[test]
+    fn spanned_identifiers_convert_as_assignment_and_update_targets() {
+        let arena = JsArena::new();
+        let assignment = b::assignment(
+            &arena,
+            JsAssignmentOp::Assign,
+            JsExpr::Spanned(arena.alloc_expr(b::id("assigned")), 7, 15),
+            b::number(1.0),
+        );
+        let update = b::update(
+            &arena,
+            JsUpdateOp::Increment,
+            JsExpr::Spanned(arena.alloc_expr(b::id("updated")), 20, 27),
+            false,
+        );
+        let program =
+            JsProgram::with_body(vec![b::stmt(&arena, assignment), b::stmt(&arena, update)]);
+        let allocator = Allocator::default();
+        let converted = program_to_oxc(&program, &arena, &allocator)
+            .expect("spanned assignment targets are supported");
+
+        let Statement::ExpressionStatement(assignment) = &converted.program.body[0] else {
+            panic!("expected assignment expression statement");
+        };
+        let Expression::AssignmentExpression(assignment) = &assignment.expression else {
+            panic!("expected assignment expression");
+        };
+        assert_eq!(assignment.left.span(), Span::new(7, 15));
+
+        let Statement::ExpressionStatement(update) = &converted.program.body[1] else {
+            panic!("expected update expression statement");
+        };
+        let Expression::UpdateExpression(update) = &update.expression else {
+            panic!("expected update expression");
+        };
+        assert_eq!(update.argument.span(), Span::new(20, 27));
+    }
+
+    #[test]
+    fn expression_identifier_spans_are_scoped_and_keep_explicit_children() {
+        let arena = JsArena::new();
+        let explicit = crate::compiler::phases::phase3_transform::js_ast::JsExpr::Spanned(
+            arena.alloc_expr(b::id("foo")),
+            1,
+            4,
+        );
+        let call = b::call(
+            &arena,
+            b::id("consume"),
+            vec![
+                b::id("foo"),
+                explicit,
+                crate::compiler::phases::phase3_transform::js_ast::JsExpr::OpaqueIdentifier(
+                    "foo".into(),
+                ),
+            ],
+        );
+        let call_id = arena.alloc_expr(call);
+        arena.note_expression_identifier_span(call_id, "foo", 8, 11);
+        let program = JsProgram::with_body(vec![b::stmt(
+            &arena,
+            crate::compiler::phases::phase3_transform::js_ast::JsExpr::Spanned(call_id, 0, 0),
+        )]);
+        let allocator = Allocator::default();
+        let converted = program_to_oxc(&program, &arena, &allocator).expect("call is supported");
+
+        let oxc_ast::ast::Statement::ExpressionStatement(statement) = &converted.program.body[0]
+        else {
+            panic!("expected expression statement");
+        };
+        let oxc_ast::ast::Expression::CallExpression(call) = &statement.expression else {
+            panic!("expected call expression");
+        };
+        assert_eq!(call.arguments[0].span(), Span::new(8, 11));
+        assert_eq!(call.arguments[1].span(), Span::new(1, 4));
+        assert_eq!(call.arguments[2].span(), Span::new(8, 11));
+    }
+    #[test]
+    fn retained_island_keeps_absolute_source_spans() {
+        let retained = RetainedProgram::parse("import dep from 'dep'; let value = 1;", false);
+        let program = JsProgram::with_body(vec![JsStatement::RetainedAst {
+            index: 0,
+            fallback: "let value = 1;".into(),
+            source_offset: 12,
+            has_effect_rune: false,
+        }]);
+        let arena = JsArena::new();
+        let allocator = Allocator::default();
+        let converted = program_to_oxc_with_islands(
+            &program,
+            &arena,
+            &allocator,
+            &[AstIsland { program: &retained, source_offset: 12, statement_indices: vec![1] }],
+        )
+        .expect("retained AST is supported");
+
+        assert_eq!(converted.program.body.len(), 1, "instance import is hoisted");
+        assert_eq!(converted.program.body[0].span().start, 35);
+        assert_eq!(converted.program.body[0].span().end, 49);
+    }
+
+    #[test]
+    fn generated_component_wrapper_is_unmapped() {
+        let arena = JsArena::new();
+        let program = JsProgram::with_body(vec![b::export_default_function(
+            "Input",
+            vec![],
+            vec![JsStatement::RawMapped {
+                code: "let value = 1;".into(),
+                source_offset: 0,
+                comment_anchor: None,
+                copied_spans: Vec::new(),
+            }],
+        )]);
+        let allocator = Allocator::default();
+        let converted =
+            program_to_oxc(&program, &arena, &allocator).expect("mapped raw chunk is supported");
+        let printed = rsvelte_esrap::print_with_map(
+            &converted.program,
+            "let value = 1;",
+            &rsvelte_esrap::PrintOptions::default(),
+        );
+        assert!(printed.code.starts_with("export default function Input() {"));
+        assert!(printed.mappings.iter().all(|mapping| mapping.gen_line != 0));
+    }
+
+    #[test]
+    fn member_object_keeps_out_of_band_identifier_span() {
+        let arena = JsArena::new();
+        let object = arena.alloc_expr(JsExpr::Identifier("Math".into()));
+        arena.set_bare_expr_span(object, 7, 11);
+        let member = JsExpr::Member(JsMemberExpression {
+            object,
+            property: JsMemberProperty::Identifier("random".into()),
+            computed: false,
+            optional: false,
+        });
+        let program = JsProgram::with_body(vec![b::stmt(&arena, member)]);
+        let allocator = Allocator::default();
+        let converted = program_to_oxc(&program, &arena, &allocator).expect("member is supported");
+
+        let Statement::ExpressionStatement(statement) = &converted.program.body[0] else {
+            panic!("expected expression statement");
+        };
+        let Expression::StaticMemberExpression(member) = &statement.expression else {
+            panic!("expected static member");
+        };
+        let Expression::Identifier(object) = &member.object else {
+            panic!("expected bare identifier object");
+        };
+        assert_eq!(object.span.start, 7);
+        assert_eq!(object.span.end, 11);
     }
 }

@@ -10,7 +10,7 @@ mod rsvelte_backend {
 
     use oxc_span::Span;
     use svelte_compiler_rust::{
-        CompileOptions, GenerateMode, ParseOptions,
+        Allocator, CompileOptions, GenerateMode, ParseOptions,
         ast::{
             Fragment, Root, Script, ScriptContext, TemplateNode, arena::SerializeArenaGuard,
             typed_expr::JsNode,
@@ -166,7 +166,8 @@ mod rsvelte_backend {
     ///
     /// Returns the normalized rsvelte parse error when the source is invalid.
     pub fn parse_svelte(source: &str) -> Result<SvelteParseResult, SvelteParseError> {
-        let mut root = parse(source, ParseOptions::default())
+        let allocator = Allocator::default();
+        let mut root = parse(source, &allocator, ParseOptions::default())
             .map_err(|error| convert_parse_error(source, &error))?;
         // SAFETY: `root.arena` lives until the guard is dropped at the end of this function.
         let _arena_guard = unsafe { SerializeArenaGuard::new(&raw const root.arena) };
@@ -209,7 +210,8 @@ mod rsvelte_backend {
     ///
     /// Returns the normalized rsvelte parse error when the source is invalid.
     pub fn parse_svelte_syntax(source: &str) -> Result<SvelteParseResult, SvelteParseError> {
-        let root = parse(source, ParseOptions::default())
+        let allocator = Allocator::default();
+        let root = parse(source, &allocator, ParseOptions::default())
             .map_err(|error| convert_parse_error(source, &error))?;
         // SAFETY: `root.arena` lives until the guard is dropped at the end of this function.
         let _arena_guard = unsafe { SerializeArenaGuard::new(&raw const root.arena) };
@@ -228,7 +230,8 @@ mod rsvelte_backend {
     pub fn parse_svelte_for_lint(
         source: &str,
     ) -> Result<(SvelteParseResult, Option<SvelteSemanticSummary>), SvelteParseError> {
-        let mut root = parse(source, ParseOptions::default())
+        let allocator = Allocator::default();
+        let mut root = parse(source, &allocator, ParseOptions::default())
             .map_err(|error| convert_parse_error(source, &error))?;
         // SAFETY: `root.arena` lives until the guard is dropped at the end of this function.
         let _arena_guard = unsafe { SerializeArenaGuard::new(&raw const root.arena) };
@@ -599,8 +602,10 @@ mod rsvelte_backend {
             style_formatter: svelte_options
                 .style_options
                 .map(rsvelte_formatter::native_style_formatter),
-            single_attribute_per_line: svelte_options.single_attribute_per_line,
-            allow_shorthand: svelte_options.allow_shorthand,
+            attributes: rsvelte_formatter::AttributeFormatOptions {
+                single_attribute_per_line: svelte_options.single_attribute_per_line,
+                allow_shorthand: svelte_options.allow_shorthand,
+            },
             indent_script_and_style: svelte_options.indent_script_and_style,
             sort_order,
             bracket_same_line: svelte_options.bracket_same_line,
@@ -652,7 +657,7 @@ mod rsvelte_backend {
             AnalysisError::Scope(message) => ("scope_error", message.as_str()),
             AnalysisError::Validation(message) => ("validation_error", message.as_str()),
             AnalysisError::Css(message) => ("css_error", message.as_str()),
-            AnalysisError::ValidationWithCode { code, message } => {
+            AnalysisError::ValidationWithCode { code, message, .. } => {
                 (code.as_str(), message.as_str())
             }
         };

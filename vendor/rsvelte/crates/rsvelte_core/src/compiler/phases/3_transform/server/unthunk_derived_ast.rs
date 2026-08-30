@@ -40,18 +40,12 @@ pub(crate) fn unthunk_bare_derived_arg_ast(
         &UNTHUNK_ALLOC,
         script,
         SourceType::mjs(),
-        ParseOptions {
-            allow_return_outside_function: true,
-            ..ParseOptions::default()
-        },
+        ParseOptions { allow_return_outside_function: true, ..ParseOptions::default() },
         // The replacement (arrow span → bare name) never contains another edit's
         // span, so no innermost-only deferral is needed.
         false,
         |program| {
-            let mut collector = UnthunkCollector {
-                derived_names,
-                edits: Vec::new(),
-            };
+            let mut collector = UnthunkCollector { derived_names, edits: Vec::new() };
             collector.visit_program(program);
             collector.edits
         },
@@ -71,14 +65,10 @@ impl<'a> UnthunkCollector<'a> {
         let Expression::ArrowFunctionExpression(arrow) = expr else {
             return None;
         };
-        if !arrow.expression || !arrow.params.items.is_empty() || arrow.params.rest.is_some() {
+        if !arrow.params.items.is_empty() || arrow.params.rest.is_some() {
             return None;
         }
-        // An expression-bodied arrow stores its value as the single statement.
-        let [Statement::ExpressionStatement(stmt)] = arrow.body.statements.as_slice() else {
-            return None;
-        };
-        let Expression::CallExpression(call) = &stmt.expression else {
+        let Some(Expression::CallExpression(call)) = arrow.body.as_expression() else {
             return None;
         };
         if call.optional || !call.arguments.is_empty() {
@@ -87,9 +77,7 @@ impl<'a> UnthunkCollector<'a> {
         let Expression::Identifier(callee) = &call.callee else {
             return None;
         };
-        self.derived_names
-            .contains(callee.name.as_str())
-            .then_some(callee.name.as_str())
+        self.derived_names.contains(callee.name.as_str()).then_some(callee.name.as_str())
     }
 }
 

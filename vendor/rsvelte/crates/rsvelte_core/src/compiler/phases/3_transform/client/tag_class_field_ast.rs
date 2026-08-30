@@ -28,6 +28,8 @@ use oxc_ast::ast::*;
 use oxc_parser::ParseOptions;
 use oxc_span::{GetSpan, SourceType, Span};
 
+use crate::compiler::phases::phase3_transform::shared::js_scan;
+
 use super::ast_rewrite::{self, Edit};
 
 thread_local! {
@@ -38,116 +40,182 @@ thread_local! {
 /// Returns `None` if there's nothing to wrap (no class, no
 /// tag-eligible callee, parse failure, or every match already
 /// tagged).
-pub fn wrap_state_derived_with_tag_class_fields_ast(source: &str) -> Option<String> {
+/// Test-only entry point: with no original to consult, the label falls back to the
+/// accessor-pair heuristic alone, which is what the cases below pin down.
+#[cfg(test)]
+fn wrap_state_derived_with_tag_class_fields_ast(source: &str) -> Option<String> {
+    wrap_state_derived_with_tag_class_fields_ast_from(source, "")
+}
+
+/// `original` is the script as the user wrote it, before the class lowering. The
+/// generated accessor pair over a public field is byte-identical to a hand-written
+/// one over a private field, so only the original says which name the label takes.
+pub fn wrap_state_derived_with_tag_class_fields_ast_from(
+    source: &str,
+    original: &str,
+) -> Option<String> {
     if memchr::memmem::find(source.as_bytes(), b"$.state").is_none()
         && memchr::memmem::find(source.as_bytes(), b"$.derived").is_none()
         && memchr::memmem::find(source.as_bytes(), b"$.proxy").is_none()
     {
         return None;
     }
-    memchr::memmem::find(source.as_bytes(), b"class ")?;
+    // A prefilter for the AST rewrite below: `class\tK` is a class too, so the
+    // needle is the keyword, never the keyword plus one ASCII space (#3470).
+    if !js_scan::contains_identifier(source, "class") {
+        return None;
+    }
 
     ast_rewrite::rewrite_once(
         &CLASS_TAG_ALLOC,
         source,
         SourceType::mjs(),
-        ParseOptions {
-            allow_return_outside_function: true,
-            ..ParseOptions::default()
-        },
+        ParseOptions { allow_return_outside_function: true, ..ParseOptions::default() },
         false,
         |program| {
+            let ctx =
+                ClassTagCtx { source, declared_private: collect_declared_private_fields(original) };
             let mut replacements: Vec<Edit> = Vec::new();
             for stmt in &program.body {
-                walk_statement_for_classes(stmt, source, &mut replacements);
+                walk_statement_for_classes(stmt, &ctx, &mut replacements);
             }
             replacements
         },
     )
 }
 
+struct ClassTagCtx<'s> {
+    source: &'s str,
+    /// `(class name, field name without the `#`)` for every private field the
+    /// user wrote themselves.
+    declared_private: rustc_hash::FxHashSet<(String, String)>,
+}
+
+/// Parse the pre-lowering script and record which `#field`s it declared. Best
+/// effort: an unparseable original just leaves the accessor heuristic alone.
+fn collect_declared_private_fields(original: &str) -> rustc_hash::FxHashSet<(String, String)> {
+    let mut out = rustc_hash::FxHashSet::default();
+    if memchr::memmem::find(original.as_bytes(), b"#").is_none() {
+        return out;
+    }
+    let allocator = Allocator::default();
+    for source_type in [SourceType::mjs(), SourceType::mjs().with_typescript(true)] {
+        let ret = oxc_parser::Parser::new(&allocator, original, source_type)
+            .with_options(ParseOptions {
+                allow_return_outside_function: true,
+                ..ParseOptions::default()
+            })
+            .parse();
+        if !ret.diagnostics.is_empty() {
+            continue;
+        }
+        let mut collector = PrivateFieldCollector { out: &mut out };
+        oxc_ast_visit::Visit::visit_program(&mut collector, &ret.program);
+        break;
+    }
+    out
+}
+
+struct PrivateFieldCollector<'o> {
+    out: &'o mut rustc_hash::FxHashSet<(String, String)>,
+}
+
+impl<'a> oxc_ast_visit::Visit<'a> for PrivateFieldCollector<'_> {
+    fn visit_class(&mut self, class: &Class<'a>) {
+        let class_name = class.id.as_ref().map(|i| i.name.as_str()).unwrap_or("[class]");
+        for el in &class.body.body {
+            if let ClassElement::PropertyDefinition(prop) = el
+                && let PropertyKey::PrivateIdentifier(id) = &prop.key
+            {
+                self.out.insert((class_name.to_string(), id.name.to_string()));
+            }
+        }
+        oxc_ast_visit::walk::walk_class(self, class);
+    }
+}
+
 fn walk_statement_for_classes<'a>(
     stmt: &Statement<'a>,
-    source: &str,
+    ctx: &ClassTagCtx<'_>,
     replacements: &mut Vec<(u32, u32, String)>,
 ) {
     match stmt {
         Statement::ClassDeclaration(class) => {
-            handle_class(class, source, replacements);
+            handle_class(class, ctx, replacements);
         }
-        Statement::ExportNamedDeclaration(e) => {
-            if let Some(Declaration::ClassDeclaration(class)) = &e.declaration {
-                handle_class(class, source, replacements);
-            } else if let Some(Declaration::VariableDeclaration(vd)) = &e.declaration {
+        Statement::ExportDeclaration(e) => {
+            if let Declaration::ClassDeclaration(class) = &e.declaration {
+                handle_class(class, ctx, replacements);
+            } else if let Declaration::VariableDeclaration(vd) = &e.declaration {
                 for decl in &vd.declarations {
                     if let Some(init) = &decl.init {
-                        walk_expression_for_classes(init, source, replacements);
+                        walk_expression_for_classes(init, ctx, replacements);
                     }
                 }
             }
         }
         Statement::ExportDefaultDeclaration(e) => {
             if let ExportDefaultDeclarationKind::ClassDeclaration(class) = &e.declaration {
-                handle_class(class, source, replacements);
+                handle_class(class, ctx, replacements);
             } else if let Some(expr) = e.declaration.as_expression() {
-                walk_expression_for_classes(expr, source, replacements);
+                walk_expression_for_classes(expr, ctx, replacements);
             }
         }
         Statement::BlockStatement(b) => {
             for s in &b.body {
-                walk_statement_for_classes(s, source, replacements);
+                walk_statement_for_classes(s, ctx, replacements);
             }
         }
         Statement::FunctionDeclaration(f) => {
             if let Some(body) = &f.body {
                 for s in &body.statements {
-                    walk_statement_for_classes(s, source, replacements);
+                    walk_statement_for_classes(s, ctx, replacements);
                 }
             }
         }
         Statement::IfStatement(s) => {
-            walk_statement_for_classes(&s.consequent, source, replacements);
+            walk_statement_for_classes(&s.consequent, ctx, replacements);
             if let Some(alt) = &s.alternate {
-                walk_statement_for_classes(alt, source, replacements);
+                walk_statement_for_classes(alt, ctx, replacements);
             }
         }
         Statement::ForStatement(s) => {
-            walk_statement_for_classes(&s.body, source, replacements);
+            walk_statement_for_classes(&s.body, ctx, replacements);
         }
         Statement::ForInStatement(s) => {
-            walk_statement_for_classes(&s.body, source, replacements);
+            walk_statement_for_classes(&s.body, ctx, replacements);
         }
         Statement::ForOfStatement(s) => {
-            walk_statement_for_classes(&s.body, source, replacements);
+            walk_statement_for_classes(&s.body, ctx, replacements);
         }
         Statement::WhileStatement(s) => {
-            walk_statement_for_classes(&s.body, source, replacements);
+            walk_statement_for_classes(&s.body, ctx, replacements);
         }
         Statement::DoWhileStatement(s) => {
-            walk_statement_for_classes(&s.body, source, replacements);
+            walk_statement_for_classes(&s.body, ctx, replacements);
         }
         Statement::TryStatement(s) => {
             for stmt in &s.block.body {
-                walk_statement_for_classes(stmt, source, replacements);
+                walk_statement_for_classes(stmt, ctx, replacements);
             }
             if let Some(handler) = &s.handler {
                 for stmt in &handler.body.body {
-                    walk_statement_for_classes(stmt, source, replacements);
+                    walk_statement_for_classes(stmt, ctx, replacements);
                 }
             }
             if let Some(finalizer) = &s.finalizer {
                 for stmt in &finalizer.body {
-                    walk_statement_for_classes(stmt, source, replacements);
+                    walk_statement_for_classes(stmt, ctx, replacements);
                 }
             }
         }
         Statement::ExpressionStatement(es) => {
-            walk_expression_for_classes(&es.expression, source, replacements);
+            walk_expression_for_classes(&es.expression, ctx, replacements);
         }
         Statement::VariableDeclaration(vd) => {
             for decl in &vd.declarations {
                 if let Some(init) = &decl.init {
-                    walk_expression_for_classes(init, source, replacements);
+                    walk_expression_for_classes(init, ctx, replacements);
                 }
             }
         }
@@ -157,36 +225,48 @@ fn walk_statement_for_classes<'a>(
 
 fn walk_expression_for_classes<'a>(
     expr: &Expression<'a>,
-    source: &str,
+    ctx: &ClassTagCtx<'_>,
     replacements: &mut Vec<(u32, u32, String)>,
 ) {
     match expr {
         Expression::ClassExpression(class) => {
-            handle_class(class, source, replacements);
+            handle_class(class, ctx, replacements);
         }
         Expression::ParenthesizedExpression(p) => {
-            walk_expression_for_classes(&p.expression, source, replacements);
+            walk_expression_for_classes(&p.expression, ctx, replacements);
         }
         Expression::AssignmentExpression(a) => {
-            walk_expression_for_classes(&a.right, source, replacements);
+            walk_expression_for_classes(&a.right, ctx, replacements);
         }
         Expression::SequenceExpression(s) => {
             for e in &s.expressions {
-                walk_expression_for_classes(e, source, replacements);
+                walk_expression_for_classes(e, ctx, replacements);
             }
         }
         _ => {}
     }
 }
 
-fn handle_class<'a>(class: &Class<'a>, source: &str, replacements: &mut Vec<(u32, u32, String)>) {
-    let class_name = class
-        .id
-        .as_ref()
-        .map(|i| i.name.as_str())
-        .unwrap_or("Unknown");
+fn handle_class<'a>(
+    class: &Class<'a>,
+    ctx: &ClassTagCtx<'_>,
+    replacements: &mut Vec<(u32, u32, String)>,
+) {
+    // An `extends` expression may itself be an inline class. Those classes do
+    // not appear in the surrounding statement/expression walk, so recurse from
+    // the owning class before handling its own fields (#3072 mutation corpus).
+    if let Some(heritage) = &class.heritage {
+        walk_expression_for_classes(&heritage.expression, ctx, replacements);
+    }
 
-    let originally_public = compute_originally_public(class, source);
+    let source = ctx.source;
+    // Upstream's fallback for a class with no id (`ClassBody.js:82`).
+    let class_name = class.id.as_ref().map(|i| i.name.as_str()).unwrap_or("[class]");
+
+    let mut originally_public = compute_originally_public(class, source);
+    originally_public.retain(|(backing, _)| {
+        !ctx.declared_private.contains(&(class_name.to_string(), backing.clone()))
+    });
 
     for el in &class.body.body {
         match el {
@@ -217,10 +297,15 @@ fn handle_class<'a>(class: &Class<'a>, source: &str, replacements: &mut Vec<(u32
     }
 }
 
-/// Compute the set of private field base-names (without `#`) that
-/// look like compiler-converted public fields: i.e. a `set name(v)`
-/// method exists whose body calls `$.set(this.#name, ...)`.
-fn compute_originally_public<'a>(class: &Class<'a>, source: &str) -> Vec<String> {
+/// Map each private backing field to the public name it was lowered from.
+///
+/// The label upstream prints is `get_name(definition.key)` on the **original**
+/// key (`phases/nodes.js:157`), which this pass no longer has: a public
+/// `count = $state()` is already `#_count` plus an accessor pair. The pair is
+/// therefore matched back — the generated setter body is exactly
+/// `$.set(this.#backing, value[, true])` — and its key supplies the name,
+/// including the `String(value)` spelling of a literal key.
+fn compute_originally_public<'a>(class: &Class<'a>, source: &str) -> Vec<(String, String)> {
     let mut result = Vec::new();
     for el in &class.body.body {
         let ClassElement::MethodDefinition(method) = el else {
@@ -229,26 +314,53 @@ fn compute_originally_public<'a>(class: &Class<'a>, source: &str) -> Vec<String>
         if method.kind != MethodDefinitionKind::Set {
             continue;
         }
-        let PropertyKey::StaticIdentifier(setter_name) = &method.key else {
+        let Some(public_name) = property_key_name(&method.key) else {
             continue;
         };
-        let base_name = setter_name.name.as_str();
         let Some(body) = &method.value.body else {
             continue;
         };
         let body_text = &source[body.span.start as usize..body.span.end as usize];
-        let needle = format!("$.set(this.#{}", base_name);
-        if body_text.contains(&needle) {
-            result.push(base_name.to_string());
+        if let Some(backing) = generated_setter_backing(body_text) {
+            result.push((backing, public_name));
         }
     }
     result
 }
 
+/// `get_name(node)` from `phases/nodes.js`: a literal key prints as
+/// `String(value)`, an identifier as its name.
+fn property_key_name<'a>(key: &PropertyKey<'a>) -> Option<String> {
+    match key {
+        PropertyKey::StaticIdentifier(id) => Some(id.name.to_string()),
+        PropertyKey::PrivateIdentifier(id) => Some(format!("#{}", id.name)),
+        PropertyKey::NumericLiteral(lit) => Some(lit.raw.as_ref()?.to_string()),
+        PropertyKey::StringLiteral(lit) => Some(lit.value.to_string()),
+        _ => None,
+    }
+}
+
+/// The backing field of a *generated* accessor: the body has to be exactly the
+/// `$.set(this.#backing, value[, true])` statement `emit_class_field` writes, so
+/// a hand-written setter over a genuinely private field keeps its `#` label.
+fn generated_setter_backing(body_text: &str) -> Option<String> {
+    let compact: String = body_text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let inner = compact.strip_prefix("{ $.set(this.#")?.strip_suffix("}")?.trim_end();
+    let inner = inner.strip_suffix(';')?;
+    let (backing, rest) = inner.split_once(',')?;
+    if !matches!(rest.trim_end_matches(')').trim(), "value" | "value, true") {
+        return None;
+    }
+    if backing.is_empty() || !backing.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '$') {
+        return None;
+    }
+    Some(backing.to_string())
+}
+
 fn handle_property_definition<'a>(
     prop: &PropertyDefinition<'a>,
     class_name: &str,
-    originally_public: &[String],
+    originally_public: &[(String, String)],
     source: &str,
     replacements: &mut Vec<(u32, u32, String)>,
 ) {
@@ -263,21 +375,100 @@ fn handle_property_definition<'a>(
     };
 
     let field_name = pid.name.as_str();
-    let label = if originally_public.iter().any(|s| s.as_str() == field_name) {
-        format!("{}.{}", class_name, field_name)
-    } else {
-        format!("{}.#{}", class_name, field_name)
+    let label = match originally_public.iter().find(|(backing, _)| backing == field_name) {
+        Some((_, public_name)) => format!("{}.{}", class_name, public_name),
+        None => format!("{}.#{}", class_name, field_name),
     };
 
+    replacements.push(tag_edit(
+        source,
+        prop.span().start,
+        prop.key.span().end,
+        init_span,
+        tag_fn,
+        &label,
+    ));
+}
+
+/// The `$.tag(...)` wrap for one value. A comment between the `=` and the value
+/// moves inside the call, and the call is reflowed only when that region spans a
+/// line: esrap keeps a one-line comment inline, but a `//` comment placed inline
+/// would swallow the rest of the call.
+fn tag_edit(
+    source: &str,
+    stmt_start: u32,
+    lhs_end: u32,
+    init_span: Span,
+    tag_fn: &str,
+    label: &str,
+) -> Edit {
     let init_text = &source[init_span.start as usize..init_span.end as usize];
-    let rewrite = format!("{}({}, '{}')", tag_fn, init_text, label);
-    replacements.push((init_span.start, init_span.end, rewrite));
+    let flat = (init_span.start, init_span.end, format!("{}({}, '{}')", tag_fn, init_text, label));
+    let Some(eq) = assignment_eq_offset(source, lhs_end, init_span.start) else {
+        return flat;
+    };
+    let separator = &source[eq as usize + 1..init_span.start as usize];
+    let comment = separator.trim();
+    if comment.is_empty() {
+        return flat;
+    }
+    if !separator.contains('\n') {
+        return (eq + 1, init_span.end, format!(" {tag_fn}({comment} {init_text}, '{label}')"));
+    }
+
+    let indent = line_indent(source, stmt_start);
+    let arg_indent = format!("{}\t", indent);
+    let comment =
+        comment.lines().map(str::trim).collect::<Vec<_>>().join(&format!("\n{}", arg_indent));
+    // The value moves one level deeper, so its own continuation lines follow.
+    let init_text = init_text.replace('\n', "\n\t");
+    (
+        eq + 1,
+        init_span.end,
+        format!(
+            " {tag_fn}(\n{arg_indent}{comment}\n{arg_indent}{init_text},\n{arg_indent}'{label}'\n{indent})"
+        ),
+    )
+}
+
+/// Offset of the `=` separating a field / assignment target from its value,
+/// skipping comments so an `=` inside one is not mistaken for it.
+fn assignment_eq_offset(source: &str, from: u32, to: u32) -> Option<u32> {
+    let bytes = source.as_bytes();
+    let end = to as usize;
+    let mut i = from as usize;
+    while i < end {
+        match bytes[i] {
+            b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                while i < end && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                while i < end && !(bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/')) {
+                    i += 1;
+                }
+                i += 2;
+            }
+            b'=' => return Some(i as u32),
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+fn line_indent(source: &str, pos: u32) -> &str {
+    let line_start = source[..pos as usize].rfind('\n').map_or(0, |i| i + 1);
+    let line = &source[line_start..];
+    let width = line.len() - line.trim_start_matches([' ', '\t']).len();
+    &line[..width]
 }
 
 fn walk_method_stmt_for_this_assigns<'a>(
     stmt: &Statement<'a>,
     class_name: &str,
-    originally_public: &[String],
+    originally_public: &[(String, String)],
     source: &str,
     replacements: &mut Vec<(u32, u32, String)>,
 ) {
@@ -405,7 +596,7 @@ fn walk_method_stmt_for_this_assigns<'a>(
 fn walk_method_expr_for_this_assigns<'a>(
     expr: &Expression<'a>,
     class_name: &str,
-    originally_public: &[String],
+    originally_public: &[(String, String)],
     source: &str,
     replacements: &mut Vec<(u32, u32, String)>,
 ) {
@@ -442,7 +633,7 @@ fn walk_method_expr_for_this_assigns<'a>(
 fn handle_this_assignment<'a>(
     a: &AssignmentExpression<'a>,
     class_name: &str,
-    originally_public: &[String],
+    originally_public: &[(String, String)],
     source: &str,
     replacements: &mut Vec<(u32, u32, String)>,
 ) {
@@ -470,19 +661,24 @@ fn handle_this_assignment<'a>(
         return;
     };
 
-    let label = if let Some(base_name) = field_name.strip_prefix('#') {
-        if originally_public.iter().any(|s| s.as_str() == base_name) {
-            format!("{}.{}", class_name, base_name)
-        } else {
-            format!("{}.{}", class_name, field_name)
-        }
-    } else {
-        format!("{}.{}", class_name, field_name)
+    let label = match field_name.strip_prefix('#').and_then(|backing| {
+        originally_public
+            .iter()
+            .find(|(name, _)| name == backing)
+            .map(|(_, public_name)| public_name)
+    }) {
+        Some(public_name) => format!("{}.{}", class_name, public_name),
+        None => format!("{}.{}", class_name, field_name),
     };
 
-    let init_text = &source[init_span.start as usize..init_span.end as usize];
-    let rewrite = format!("{}({}, '{}')", tag_fn, init_text, label);
-    replacements.push((init_span.start, init_span.end, rewrite));
+    replacements.push(tag_edit(
+        source,
+        a.span().start,
+        a.left.span().end,
+        init_span,
+        tag_fn,
+        &label,
+    ));
 }
 
 fn is_this(expr: &Expression) -> bool {
@@ -521,10 +717,32 @@ mod tests {
     fn wraps_private_state_field() {
         let src = "class Counter { #count = $.state(0); }";
         let out = wrap_state_derived_with_tag_class_fields_ast(src).unwrap();
-        assert_eq!(
-            out,
-            "class Counter { #count = $.tag($.state(0), 'Counter.#count'); }"
+        assert_eq!(out, "class Counter { #count = $.tag($.state(0), 'Counter.#count'); }");
+    }
+
+    #[test]
+    fn reflows_a_field_whose_value_carries_a_comment() {
+        let src = "class C {\n\t#n = // c\n\t$.state(0);\n}";
+        let out = wrap_state_derived_with_tag_class_fields_ast(src).unwrap();
+        assert_eq!(out, "class C {\n\t#n = $.tag(\n\t\t// c\n\t\t$.state(0),\n\t\t'C.#n'\n\t);\n}");
+    }
+
+    #[test]
+    fn reflows_a_this_assignment_whose_value_carries_a_comment() {
+        let src =
+            "class C {\n\t#n;\n\tconstructor() {\n\t\tthis.#n = // c\n\t\t$.state(0);\n\t}\n}";
+        let out = wrap_state_derived_with_tag_class_fields_ast(src).unwrap();
+        assert!(
+            out.contains("this.#n = $.tag(\n\t\t\t// c\n\t\t\t$.state(0),\n\t\t\t'C.#n'\n\t\t);"),
+            "got: {out}"
         );
+    }
+
+    #[test]
+    fn keeps_a_field_on_one_line_without_a_comment() {
+        let src = "class C {\n\t#n = $.state(0);\n}";
+        let out = wrap_state_derived_with_tag_class_fields_ast(src).unwrap();
+        assert_eq!(out, "class C {\n\t#n = $.tag($.state(0), 'C.#n');\n}");
     }
 
     #[test]
@@ -543,12 +761,49 @@ mod tests {
 
     #[test]
     fn label_drops_hash_when_originally_public() {
-        // Compiler-converted public field: paired setter calls
-        // `$.set(this.#count, ...)`.
-        let src = "class C { #count = $.state(0); get count() { return $.get(this.#count); } set count(v) { $.set(this.#count, v, true); } }";
+        // Compiler-converted public field: the generated setter body is exactly
+        // `$.set(this.#count, value, true)`.
+        let src = "class C { #count = $.state(0); get count() { return $.get(this.#count); } set count(value) { $.set(this.#count, value, true); } }";
         let out = wrap_state_derived_with_tag_class_fields_ast(src).unwrap();
         assert!(out.contains("$.tag($.state(0), 'C.count')"));
         assert!(!out.contains("'C.#count'"));
+    }
+
+    #[test]
+    fn label_keeps_hash_for_a_hand_written_accessor_over_a_private_field() {
+        // `set count(val) { this.#count = val }` lowers to a setter whose body
+        // is NOT the generated one, so `#count` was written as private.
+        let src = "class C { #count = $.state(0); get count() { return $.get(this.#count); } set count(val) { $.set(this.#count, val, true); } }";
+        let out = wrap_state_derived_with_tag_class_fields_ast(src).unwrap();
+        assert!(out.contains("$.tag($.state(0), 'C.#count')"), "got: {out}");
+    }
+
+    #[test]
+    fn the_original_settles_a_hand_written_accessor_the_heuristic_cannot() {
+        // Both spellings lower to the same text; only the original says which is which.
+        let generated = "class C { #count = $.state(0); get count() { return $.get(this.#count); } set count(value) { $.set(this.#count, value, true); } }";
+        let from_public = wrap_state_derived_with_tag_class_fields_ast_from(
+            generated,
+            "class C { count = $state(0); }",
+        )
+        .unwrap();
+        assert!(from_public.contains("'C.count'"), "got: {from_public}");
+
+        let from_private = wrap_state_derived_with_tag_class_fields_ast_from(
+            generated,
+            "class C { #count = $state(0); get count() { return this.#count; } set count(value) { this.#count = value; } }",
+        )
+        .unwrap();
+        assert!(from_private.contains("'C.#count'"), "got: {from_private}");
+    }
+
+    #[test]
+    fn an_unparseable_original_leaves_the_heuristic_alone() {
+        let generated = "class C { #count = $.state(0); get count() { return $.get(this.#count); } set count(value) { $.set(this.#count, value, true); } }";
+        let out =
+            wrap_state_derived_with_tag_class_fields_ast_from(generated, "class C { #count =")
+                .unwrap();
+        assert!(out.contains("'C.count'"), "got: {out}");
     }
 
     #[test]
@@ -568,7 +823,7 @@ mod tests {
     #[test]
     fn this_private_assign_drops_hash_when_originally_public() {
         // Constructor assignment + paired getter/setter.
-        let src = "class C { constructor() { this.#count = $.state(0); } get count() { return $.get(this.#count); } set count(v) { $.set(this.#count, v, true); } }";
+        let src = "class C { constructor() { this.#count = $.state(0); } get count() { return $.get(this.#count); } set count(value) { $.set(this.#count, value, true); } }";
         let out = wrap_state_derived_with_tag_class_fields_ast(src).unwrap();
         assert!(out.contains("this.#count = $.tag($.state(0), 'C.count')"));
     }
@@ -592,11 +847,19 @@ mod tests {
     }
 
     #[test]
-    fn anonymous_class_uses_unknown() {
-        // Class expression with no id — label uses "Unknown".
+    fn anonymous_class_uses_the_upstream_placeholder() {
         let src = "let C = class { #x = $.state(0); };";
         let out = wrap_state_derived_with_tag_class_fields_ast(src).unwrap();
-        assert!(out.contains("'Unknown.#x'"));
+        assert!(out.contains("'[class].#x'"), "got: {out}");
+    }
+
+    #[test]
+    fn walks_commented_inline_classes_in_extends_chains() {
+        let src = "class Outer extends (class extends class {\n\t/* deep */\n\t#deep = $.state(1);\n} {\n\t// mid\n\t#mid = $.state(2);\n}) {\n\t#own = $.state(3);\n}";
+        let out = wrap_state_derived_with_tag_class_fields_ast(src).unwrap();
+        assert!(out.contains("#deep = $.tag($.state(1), '[class].#deep')"), "got: {out}");
+        assert!(out.contains("#mid = $.tag($.state(2), '[class].#mid')"), "got: {out}");
+        assert!(out.contains("#own = $.tag($.state(3), 'Outer.#own')"), "got: {out}");
     }
 
     #[test]

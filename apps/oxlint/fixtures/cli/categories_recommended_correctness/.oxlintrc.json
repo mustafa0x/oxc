@@ -1,6 +1,0 @@
-{
-  "plugins": ["react"],
-  "categories": {
-    "correctness": "recommended"
-  }
-}

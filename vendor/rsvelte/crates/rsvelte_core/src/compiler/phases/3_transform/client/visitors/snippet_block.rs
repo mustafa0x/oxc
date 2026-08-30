@@ -46,6 +46,7 @@
 
 use crate::ast::js::Expression;
 use crate::ast::template::{Fragment, SnippetBlock};
+use crate::compiler::phases::phase3_transform::client::source_anchor::CommentRegion;
 use crate::compiler::phases::phase3_transform::client::types::ComponentContext;
 use crate::compiler::phases::phase3_transform::js_ast::builders as b;
 use crate::compiler::phases::phase3_transform::js_ast::nodes::*;
@@ -114,8 +115,20 @@ pub fn snippet_block(node: &SnippetBlock, context: &mut ComponentContext) {
     }
 
     // Process each parameter
+    let mut parameter_region_start = node.expression.end().unwrap_or(node.start + 9);
     for (i, param) in node.parameters.iter().enumerate() {
-        if let Some(arg_info) = process_parameter(param, i, context) {
+        if let Some(mut arg_info) = process_parameter(param, i, context) {
+            if let (Some(start), Some(end)) = (param.start(), param.end()) {
+                if let Some(region) = CommentRegion::lexical_between(
+                    &context.state,
+                    parameter_region_start,
+                    end,
+                    parameter_region_start,
+                ) {
+                    arg_info.pattern = region.anchor_pattern(arg_info.pattern, start, end);
+                }
+                parameter_region_start = end;
+            }
             args.push(arg_info.pattern);
             declarations.extend(arg_info.declarations);
         }
@@ -144,8 +157,10 @@ pub fn snippet_block(node: &SnippetBlock, context: &mut ComponentContext) {
     // is also a prop). References to `options` inside the snippet body should
     // refer to the parameter, not the prop.
     let saved_shadowed = context.state.shadowed_prop_names.clone();
+    let saved_each_shadowing = context.state.each_shadowing_names.clone();
     for param in &node.parameters {
         for name in extract_param_names(param) {
+            context.state.each_shadowing_names.insert(name.clone(), ());
             context.state.shadowed_prop_names.insert(name);
         }
     }
@@ -159,6 +174,7 @@ pub fn snippet_block(node: &SnippetBlock, context: &mut ComponentContext) {
     context.state.transform_deep_read = saved_transform_deep_read;
     *context.state.blocker_map.borrow_mut() = saved_blocker_map;
     context.state.shadowed_prop_names = saved_shadowed;
+    context.state.each_shadowing_names = saved_each_shadowing;
 
     // Build the full body with declarations and visited body
     let mut full_body = Vec::new();
@@ -295,24 +311,16 @@ fn process_parameter(
             // Create assignment pattern: param = $.noop
             let pattern = JsPattern::Assignment(JsAssignmentPattern {
                 left: Box::new(b::id_pattern(name)),
-                right: context
-                    .arena
-                    .alloc_expr(b::member_path(&context.arena, "$.noop")),
+                right: context.arena.alloc_expr(b::member_path(&context.arena, "$.noop")),
             });
 
             // Set up transform for reading this parameter
             // In JS: transform[argument.name] = { read: b.call };
             // This means the parameter should be called like a function: param()
-            context
-                .state
-                .transform
-                .insert(name.to_string(), create_call_transform());
+            context.state.transform.insert(name.to_string(), create_call_transform());
             context.state.transform_deep_read.remove(name);
 
-            return Some(ParameterInfo {
-                pattern,
-                declarations: vec![],
-            });
+            return Some(ParameterInfo { pattern, declarations: vec![] });
         }
 
         if param_type == "AssignmentPattern" {
@@ -338,10 +346,7 @@ fn process_parameter(
         // A full implementation would use extract_paths like the JS version
         let declarations = process_destructured_pattern(obj, &arg_alias, context);
 
-        Some(ParameterInfo {
-            pattern,
-            declarations,
-        })
+        Some(ParameterInfo { pattern, declarations })
     } else {
         None
     }
@@ -354,16 +359,19 @@ fn process_destructured_pattern(
     arg_alias: &str,
     context: &mut ComponentContext,
 ) -> Vec<JsStatement> {
-    let mut declarations = Vec::new();
+    let mut inserts = Vec::new();
+    let mut paths = Vec::new();
     let base = b::optional_call(&context.arena, b::id(arg_alias), vec![]);
     extract_snippet_paths(
         &serde_json::Value::Object(obj.clone()),
         base,
         false,
-        &mut declarations,
+        &mut inserts,
+        &mut paths,
         context,
     );
-    declarations
+    inserts.extend(paths);
+    inserts
 }
 
 /// Emit a leaf binding `let name = needs_derived ? $.derived_safe_equal(() => access)
@@ -392,21 +400,14 @@ fn emit_snippet_path(
     };
     declarations.push(decl);
 
-    let transform = if needs_derived {
-        create_get_value_transform()
-    } else {
-        create_call_transform()
-    };
+    let transform =
+        if needs_derived { create_get_value_transform() } else { create_call_transform() };
     context.state.transform.insert(name.to_string(), transform);
     context.state.transform_deep_read.remove(name);
 
     if context.state.dev {
         let read_call = if needs_derived {
-            b::call(
-                &context.arena,
-                b::member_path(&context.arena, "$.get"),
-                vec![b::id(name)],
-            )
+            b::call(&context.arena, b::member_path(&context.arena, "$.get"), vec![b::id(name)])
         } else {
             b::call(&context.arena, b::id(name), vec![])
         };
@@ -418,8 +419,10 @@ fn emit_snippet_path(
 ///
 /// Walks a destructuring `pattern` (JSON), threading the access expression
 /// `base` (the AST that reads the current sub-value). Array patterns push an
-/// intermediate `var $$array = $.derived(() => $.to_array(base, len?))` and read
-/// elements as `$.get($$array)[i]`; object rest emits
+/// intermediate `var $$array = $.derived(() => $.to_array(base, len?))` into
+/// `inserts` and read elements as `$.get($$array)[i]`; leaf declarations go into
+/// `paths`. Upstream returns those collections separately and the caller emits
+/// every insert before every path. Object rest emits
 /// `$.exclude_from_object(base, [keys])`; defaults wrap the access in
 /// `$.fallback(...)`; the whole path collapses to `$.derived_safe_equal(...)`
 /// when any default is involved. (issue #446, H-100..H-103)
@@ -427,7 +430,8 @@ fn extract_snippet_paths(
     pattern: &serde_json::Value,
     base: JsExpr,
     has_default: bool,
-    declarations: &mut Vec<JsStatement>,
+    inserts: &mut Vec<JsStatement>,
+    paths: &mut Vec<JsStatement>,
     context: &mut ComponentContext,
 ) {
     let obj = match pattern.as_object() {
@@ -437,7 +441,7 @@ fn extract_snippet_paths(
     match obj.get("type").and_then(|t| t.as_str()) {
         Some("Identifier") => {
             if let Some(name) = obj.get("name").and_then(|n| n.as_str()) {
-                emit_snippet_path(name, base, has_default, declarations, context);
+                emit_snippet_path(name, base, has_default, paths, context);
             }
         }
         Some("ObjectPattern") => {
@@ -469,7 +473,8 @@ fn extract_snippet_paths(
                                 arg,
                                 rest_expr,
                                 has_default,
-                                declarations,
+                                inserts,
+                                paths,
                                 context,
                             );
                         }
@@ -482,7 +487,8 @@ fn extract_snippet_paths(
                                 value,
                                 access,
                                 has_default,
-                                declarations,
+                                inserts,
+                                paths,
                                 context,
                             );
                         }
@@ -514,7 +520,7 @@ fn extract_snippet_paths(
                 b::member_path(&context.arena, "$.to_array"),
                 to_array_args,
             );
-            declarations.push(b::var_decl(
+            inserts.push(b::var_decl(
                 &context.arena,
                 &array_name,
                 Some(b::call(
@@ -523,10 +529,7 @@ fn extract_snippet_paths(
                     vec![b::thunk(&context.arena, to_array_call)],
                 )),
             ));
-            context
-                .state
-                .transform
-                .insert(array_name.clone(), create_get_value_transform());
+            context.state.transform.insert(array_name.clone(), create_get_value_transform());
 
             for (i, elem) in elements.iter().enumerate() {
                 if elem.is_null() {
@@ -552,13 +555,20 @@ fn extract_snippet_paths(
                         vec![b::number(i as f64)],
                     );
                     if let Some(arg) = elem_obj.get("argument") {
-                        extract_snippet_paths(arg, slice_expr, has_default, declarations, context);
+                        extract_snippet_paths(
+                            arg,
+                            slice_expr,
+                            has_default,
+                            inserts,
+                            paths,
+                            context,
+                        );
                     }
                 } else {
                     // `$.get($$array)[i]`
                     let access =
                         b::member_computed(&context.arena, array_get(), b::number(i as f64));
-                    extract_snippet_paths(elem, access, has_default, declarations, context);
+                    extract_snippet_paths(elem, access, has_default, inserts, paths, context);
                 }
             }
         }
@@ -572,7 +582,7 @@ fn extract_snippet_paths(
                     b::member_path(&context.arena, "$.fallback"),
                     fallback_args,
                 );
-                extract_snippet_paths(left, fallback_call, true, declarations, context);
+                extract_snippet_paths(left, fallback_call, true, inserts, paths, context);
             }
         }
         _ => {}
@@ -586,15 +596,9 @@ fn object_pattern_property_access(
     base: JsExpr,
     context: &mut ComponentContext,
 ) -> JsExpr {
-    let computed = prop
-        .get("computed")
-        .and_then(|c| c.as_bool())
-        .unwrap_or(false);
+    let computed = prop.get("computed").and_then(|c| c.as_bool()).unwrap_or(false);
     let key = prop.get("key").and_then(|k| k.as_object());
-    let key_type = key
-        .and_then(|k| k.get("type"))
-        .and_then(|t| t.as_str())
-        .unwrap_or("");
+    let key_type = key.and_then(|k| k.get("type")).and_then(|t| t.as_str()).unwrap_or("");
     if !computed
         && key_type == "Identifier"
         && let Some(name) = key.and_then(|k| k.get("name")).and_then(|n| n.as_str())
@@ -615,10 +619,7 @@ fn object_pattern_key_literal(
     prop: &serde_json::Map<String, serde_json::Value>,
     context: &mut ComponentContext,
 ) -> Option<JsExpr> {
-    let computed = prop
-        .get("computed")
-        .and_then(|c| c.as_bool())
-        .unwrap_or(false);
+    let computed = prop.get("computed").and_then(|c| c.as_bool()).unwrap_or(false);
     let key = prop.get("key").and_then(|k| k.as_object())?;
     let key_type = key.get("type").and_then(|t| t.as_str()).unwrap_or("");
     if key_type == "Identifier" && !computed {
@@ -677,11 +678,8 @@ fn process_assignment_pattern(
         let mut all_args = vec![arg_call];
         all_args.extend(fallback_args);
 
-        let fallback_call = b::call(
-            &context.arena,
-            b::member_path(&context.arena, "$.fallback"),
-            all_args,
-        );
+        let fallback_call =
+            b::call(&context.arena, b::member_path(&context.arena, "$.fallback"), all_args);
 
         // Wrap in $.derived_safe_equal(() => $.fallback(...))
         let derived_call = b::call(
@@ -693,18 +691,20 @@ fn process_assignment_pattern(
         let decl = b::let_decl(&context.arena, name, Some(derived_call));
 
         // Set up transform: reads as $.get(name)
-        context
-            .state
-            .transform
-            .insert(name.to_string(), create_get_value_transform());
+        context.state.transform.insert(name.to_string(), create_get_value_transform());
         context.state.transform_deep_read.remove(name);
 
         let pattern = b::id_pattern(&arg_alias);
 
-        return Some(ParameterInfo {
-            pattern,
-            declarations: vec![decl],
-        });
+        let mut declarations = vec![decl];
+        // eager read so `Cannot access x before initialization` still throws in dev
+        if context.state.dev {
+            let read_call =
+                b::call(&context.arena, b::member_path(&context.arena, "$.get"), vec![b::id(name)]);
+            declarations.push(b::stmt(&context.arena, read_call));
+        }
+
+        return Some(ParameterInfo { pattern, declarations });
     }
 
     // Destructured pattern with a whole-parameter default (e.g.
@@ -717,25 +717,22 @@ fn process_assignment_pattern(
     let arg_call = b::optional_call(&context.arena, b::id(&arg_alias), vec![]);
     let mut fallback_args = vec![arg_call];
     fallback_args.extend(build_fallback_args(right, context));
-    let fallback_call = b::call(
-        &context.arena,
-        b::member_path(&context.arena, "$.fallback"),
-        fallback_args,
-    );
+    let fallback_call =
+        b::call(&context.arena, b::member_path(&context.arena, "$.fallback"), fallback_args);
 
-    let mut declarations = Vec::new();
+    let mut inserts = Vec::new();
+    let mut paths = Vec::new();
     extract_snippet_paths(
         &serde_json::Value::Object(left.clone()),
         fallback_call,
         true,
-        &mut declarations,
+        &mut inserts,
+        &mut paths,
         context,
     );
+    inserts.extend(paths);
 
-    Some(ParameterInfo {
-        pattern,
-        declarations,
-    })
+    Some(ParameterInfo { pattern, declarations: inserts })
 }
 
 /// Build the arguments for $.fallback() call.
@@ -765,10 +762,7 @@ fn build_fallback_args(
         // just pass `func` instead of `() => func()`. This matches Svelte's `unthunk` in builders.js.
         if let Some(obj) = default_value.as_object()
             && obj.get("type").and_then(|t| t.as_str()) == Some("CallExpression")
-            && obj
-                .get("arguments")
-                .and_then(|a| a.as_array())
-                .is_some_and(|a| a.is_empty())
+            && obj.get("arguments").and_then(|a| a.as_array()).is_some_and(|a| a.is_empty())
             && let Some(callee) = obj.get("callee").and_then(|c| c.as_object())
             && callee.get("type").and_then(|t| t.as_str()) == Some("Identifier")
         {
@@ -784,12 +778,119 @@ fn build_fallback_args(
             let default_expr =
                 convert_expression(&Expression::from_json(default_value.clone()), context);
             let default_expr = apply_transforms_to_expression(&default_expr, context);
-            vec![
-                b::thunk(&context.arena, default_expr),
-                JsExpr::Literal(JsLiteral::Boolean(true)),
-            ]
+            let default_expr = preserve_default_parentheses(default_value, default_expr, context);
+            vec![b::thunk(&context.arena, default_expr), JsExpr::Literal(JsLiteral::Boolean(true))]
         }
     }
+}
+
+/// Reproduce the parentheses that esrap adds when upstream rebuilds a snippet
+/// default as a generated thunk. The compact client IR loses the distinction at
+/// these two expression shapes, so carry this snippet-local formatting decision
+/// as a marker call; `to_oxc` restores the real wrapper.
+fn preserve_default_parentheses(
+    value: &serde_json::Value,
+    expr: JsExpr,
+    context: &ComponentContext,
+) -> JsExpr {
+    preserve_default_parentheses_tree(value, expr, context, true)
+}
+
+fn preserve_default_parentheses_tree(
+    value: &serde_json::Value,
+    expr: JsExpr,
+    context: &ComponentContext,
+    root: bool,
+) -> JsExpr {
+    let expr = match expr {
+        JsExpr::Spanned(inner, start, end) => {
+            let inner = context.arena.get_expr(inner).clone();
+            let inner = preserve_default_parentheses_tree(value, inner, context, root);
+            JsExpr::Spanned(context.arena.alloc_expr(inner), start, end)
+        }
+        other => preserve_default_parentheses_inner(value, other, context),
+    };
+
+    if root && value.get("type").and_then(serde_json::Value::as_str) == Some("SequenceExpression") {
+        parenthesize_snippet_default(expr, context)
+    } else {
+        expr
+    }
+}
+
+fn preserve_default_parentheses_inner(
+    value: &serde_json::Value,
+    expr: JsExpr,
+    context: &ComponentContext,
+) -> JsExpr {
+    match (value.get("type").and_then(serde_json::Value::as_str), expr) {
+        (Some("ConditionalExpression"), JsExpr::Conditional(mut conditional)) => {
+            for (key, slot) in [
+                ("test", &mut conditional.test),
+                ("consequent", &mut conditional.consequent),
+                ("alternate", &mut conditional.alternate),
+            ] {
+                if let Some(child) = value.get(key) {
+                    let current = context.arena.get_expr(*slot).clone();
+                    let mut child_expr =
+                        preserve_default_parentheses_tree(child, current, context, false);
+                    // esrap parenthesises a conditional used as another
+                    // conditional's consequent even though the grammar's
+                    // right-associativity makes the grouping optional.
+                    if key == "consequent"
+                        && child.get("type").and_then(serde_json::Value::as_str)
+                            == Some("ConditionalExpression")
+                        && source_parenthesizes(child, &context.state.analysis.source)
+                    {
+                        child_expr = parenthesize_snippet_default(child_expr, context);
+                    }
+                    *slot = context.arena.alloc_expr(child_expr);
+                }
+            }
+            JsExpr::Conditional(conditional)
+        }
+        (Some("SequenceExpression"), JsExpr::Sequence(mut sequence)) => {
+            if let Some(children) = value.get("expressions").and_then(serde_json::Value::as_array) {
+                for (child, current) in children.iter().zip(sequence.expressions.iter_mut()) {
+                    *current =
+                        preserve_default_parentheses_tree(child, current.clone(), context, false);
+                }
+            }
+            JsExpr::Sequence(sequence)
+        }
+        (_, other) => other,
+    }
+}
+
+fn parenthesize_snippet_default(expr: JsExpr, context: &ComponentContext) -> JsExpr {
+    use crate::compiler::phases::phase3_transform::js_ast::to_oxc::SNIPPET_DEFAULT_PAREN_MARKER;
+
+    b::call(
+        &context.arena,
+        JsExpr::OpaqueIdentifier(SNIPPET_DEFAULT_PAREN_MARKER.into()),
+        vec![expr],
+    )
+}
+
+fn source_parenthesizes(value: &serde_json::Value, source: &str) -> bool {
+    let Some(start) = value.get("start").and_then(serde_json::Value::as_u64) else {
+        return false;
+    };
+    let Some(end) = value.get("end").and_then(serde_json::Value::as_u64) else {
+        return false;
+    };
+    let (mut before, mut after) = (start as usize, end as usize);
+    let bytes = source.as_bytes();
+    if before > bytes.len() || after > bytes.len() {
+        return false;
+    }
+    while before > 0 && bytes[before - 1].is_ascii_whitespace() {
+        before -= 1;
+    }
+    while after < bytes.len() && bytes[after].is_ascii_whitespace() {
+        after += 1;
+    }
+    before > 0 && after < bytes.len() && bytes[before - 1] == b'(' && bytes[after] == b')'
 }
 
 /// Check if a JSON AST expression is "simple" (doesn't need thunking).
@@ -808,35 +909,19 @@ fn is_simple_expression_json(value: &serde_json::Value) -> bool {
     match expr_type {
         "Literal" | "Identifier" | "ArrowFunctionExpression" | "FunctionExpression" => true,
         "ConditionalExpression" => {
-            let test_simple = obj
-                .get("test")
-                .map(is_simple_expression_json)
-                .unwrap_or(true);
-            let consequent_simple = obj
-                .get("consequent")
-                .map(is_simple_expression_json)
-                .unwrap_or(true);
-            let alternate_simple = obj
-                .get("alternate")
-                .map(is_simple_expression_json)
-                .unwrap_or(true);
+            let test_simple = obj.get("test").map(is_simple_expression_json).unwrap_or(true);
+            let consequent_simple =
+                obj.get("consequent").map(is_simple_expression_json).unwrap_or(true);
+            let alternate_simple =
+                obj.get("alternate").map(is_simple_expression_json).unwrap_or(true);
             test_simple && consequent_simple && alternate_simple
         }
         "BinaryExpression" | "LogicalExpression" => {
-            let left_simple = obj
-                .get("left")
-                .map(is_simple_expression_json)
-                .unwrap_or(true);
-            let right_simple = obj
-                .get("right")
-                .map(is_simple_expression_json)
-                .unwrap_or(true);
+            let left_simple = obj.get("left").map(is_simple_expression_json).unwrap_or(true);
+            let right_simple = obj.get("right").map(is_simple_expression_json).unwrap_or(true);
             left_simple && right_simple
         }
-        "UnaryExpression" => obj
-            .get("argument")
-            .map(is_simple_expression_json)
-            .unwrap_or(true),
+        "UnaryExpression" => obj.get("argument").map(is_simple_expression_json).unwrap_or(true),
         // Generic "Expression" fallback from parser (position-only placeholder)
         "Expression" => true,
         _ => false,
@@ -847,7 +932,7 @@ fn is_simple_expression_json(value: &serde_json::Value) -> bool {
 fn create_call_transform()
 -> crate::compiler::phases::phase3_transform::client::types::IdentifierTransform {
     crate::compiler::phases::phase3_transform::client::types::IdentifierTransform {
-        read: Some(|arena, expr| b::call(arena, expr, vec![])),
+        read: Some(b::getter_call),
         read_source: None,
         assign: None,
         mutate: None,
@@ -857,6 +942,7 @@ fn create_call_transform()
         // Snippet parameters need reactive tracking when used in templates
         is_reactive: true,
         replacement_id: None,
+        store_source: None,
     }
 }
 
@@ -874,6 +960,7 @@ fn create_get_value_transform()
         // Derived values need reactive tracking
         is_reactive: true,
         replacement_id: None,
+        store_source: None,
     }
 }
 
@@ -1035,10 +1122,10 @@ mod tests {
   {a}{b}{c}
 {/snippet}
 {@render one(0)}"#;
-        let result = parse(input, ParseOptions::default()).unwrap();
-        let json = with_serialize_arena(&result.arena, || {
-            serde_json::to_string_pretty(&result).unwrap()
-        });
+        let result =
+            parse(input, &oxc_allocator::Allocator::default(), ParseOptions::default()).unwrap();
+        let json =
+            with_serialize_arena(&result.arena, || serde_json::to_string_pretty(&result).unwrap());
         assert!(
             json.contains("AssignmentPattern"),
             "Parser should produce AssignmentPattern for default params"

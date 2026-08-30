@@ -39,6 +39,7 @@
 //! ```
 
 pub mod constants;
+pub(crate) mod identifier_escapes;
 pub mod legacy;
 pub mod phases;
 pub mod preprocess;
@@ -50,7 +51,7 @@ use std::sync::Arc;
 
 use crate::ast::arena::SerializeArenaGuard;
 
-#[cfg(feature = "native")]
+#[cfg(feature = "parallel")]
 use rayon::prelude::*;
 
 // Re-export phase types
@@ -105,6 +106,26 @@ pub enum ComponentApi {
     #[default]
     #[serde(rename = "5")]
     V5,
+}
+
+/// Svelte-4 options that upstream still accepts solely in order to diagnose
+/// them. Only presence is recorded — the values never reach codegen — because
+/// that is the whole signal upstream's `validate-options.js` acts on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LegacyOptions {
+    /// `generate: 'dom' | 'ssr'` — the pre-Svelte-5 spellings of
+    /// `'client'` / `'server'`, still honoured but renamed.
+    pub generate_dom_ssr: bool,
+    /// `accessors` — deprecated in Svelte 5. Presence matters even for `false`.
+    pub accessors: bool,
+    /// `immutable` — deprecated in Svelte 5. Presence matters even for `false`.
+    pub immutable: bool,
+    /// `loopGuardTimeout` — removed in Svelte 5.
+    pub loop_guard_timeout: bool,
+    /// `enableSourcemap` — removed in Svelte 5.
+    pub enable_sourcemap: bool,
+    /// `hydratable` — removed in Svelte 5.
+    pub hydratable: bool,
 }
 
 /// Compatibility options for backward compatibility.
@@ -171,11 +192,17 @@ pub struct CssHashInput {
     pub filename: String,
     /// CSS code.
     pub css: String,
-    /// Hash function.
+    /// Raw digest function (no `svelte-` prefix), matching the `hash` argument
+    /// upstream hands to a user `cssHash` callback.
     pub hash: Arc<dyn Fn(&str) -> String + Send + Sync>,
 }
 
 /// Warning filter function type.
+///
+/// Prepared components invoke this callback independently for each emitted
+/// target. Callbacks used with cached or repeated output must therefore be
+/// referentially transparent. The stable `rsvelte` facade avoids this concern
+/// by returning all diagnostics for the embedder to filter after compilation.
 pub type WarningFilterFn = Arc<dyn Fn(&Warning) -> bool + Send + Sync>;
 
 /// Experimental options.
@@ -198,6 +225,10 @@ pub struct CompileOptions {
     /// Root directory for relative path resolution.
     pub root_dir: Option<String>,
     /// Warning filter function.
+    ///
+    /// Stateful filters make repeated prepared-component emissions
+    /// non-deterministic and must not participate in persistent caches without
+    /// a caller-owned stable identity.
     pub warning_filter: Option<WarningFilterFn>,
     /// Experimental options.
     pub experimental: ExperimentalOptions,
@@ -247,6 +278,15 @@ pub struct CompileOptions {
     /// When false, sourcemap computation is skipped for better performance.
     /// Defaults to true for backward compatibility.
     pub enable_sourcemap: bool,
+    /// Set by [`compile_module`], which reuses the component analysis. Upstream
+    /// knows it is analysing a module from the `analyze_module` entry point;
+    /// without this the only signal is a `.svelte.(js|ts)` filename, which the
+    /// caller need not supply. Not part of the upstream option set — leave it
+    /// `false`.
+    #[doc(hidden)]
+    pub is_module_source: bool,
+    /// Svelte-4 options that only produce a diagnostic.
+    pub legacy_options: LegacyOptions,
 }
 
 impl Default for CompileOptions {
@@ -281,7 +321,25 @@ impl Default for CompileOptions {
             hmr: false,
             modern_ast: false,
             enable_sourcemap: true,
+            is_module_source: false,
+            legacy_options: LegacyOptions::default(),
         }
+    }
+}
+
+/// The filename upstream's `validate-options.js` substitutes when the option is
+/// absent (`filename: string('(unknown)')`). It is not a placeholder for "we do
+/// not know": every consumer downstream reads the *defaulted* value, so the
+/// component name comes out `_unknown_` and the dev `[$.FILENAME]` assignment is
+/// still emitted.
+pub const UNKNOWN_FILENAME: &str = "(unknown)";
+
+impl CompileOptions {
+    /// The `filename` every consumer sees — the supplied one, or upstream's
+    /// [`UNKNOWN_FILENAME`] default.
+    #[must_use]
+    pub fn filename_or_unknown(&self) -> &str {
+        self.filename.as_deref().unwrap_or(UNKNOWN_FILENAME)
     }
 }
 
@@ -292,10 +350,7 @@ impl std::fmt::Debug for CompileOptions {
             .field("generate", &self.generate)
             .field("filename", &self.filename)
             .field("root_dir", &self.root_dir)
-            .field(
-                "warning_filter",
-                &self.warning_filter.as_ref().map(|_| "<function>"),
-            )
+            .field("warning_filter", &self.warning_filter.as_ref().map(|_| "<function>"))
             .field("experimental", &self.experimental)
             .field("name", &self.name)
             .field("custom_element", &self.custom_element)
@@ -402,62 +457,49 @@ pub struct Position {
     pub character: usize,
 }
 
-/// Convert a byte offset in source to a `Position` with line, column, and character.
+/// Resolve a warning/error byte `offset` to a [`Position`] (1-indexed line;
+/// 0-indexed UTF-16 column; UTF-16 character offset — matching JavaScript's
+/// string indexing) using a precomputed [`legacy::Utf8ToUtf16`] table.
 ///
-/// - `line` is 1-indexed
-/// - `column` is 0-indexed (in UTF-16 code units for compatibility with JavaScript)
-/// - `character` is the UTF-16 code unit offset (matching JavaScript's string indexing)
-fn byte_offset_to_position(source: &str, offset: usize) -> Position {
-    let offset = offset.min(source.len());
-    let before = &source[..offset];
-    let line = before.bytes().filter(|&b| b == b'\n').count() + 1;
-
-    // Calculate UTF-16 code unit offset for the `character` field.
-    // In JavaScript, string indices are UTF-16 code units, so characters
-    // outside the BMP (like emoji) count as 2 units (surrogate pair).
-    let character = before.chars().map(|c| c.len_utf16()).sum::<usize>();
-
-    // Calculate column in UTF-16 code units from last newline
-    let column = match before.rfind('\n') {
-        Some(last_newline) => before[last_newline + 1..]
-            .chars()
-            .map(|c| c.len_utf16())
-            .sum::<usize>(),
-        None => character,
-    };
-
-    Position {
-        line,
-        column,
-        character,
-    }
+/// Callers build one `table` per compile and reuse it across every warning, so
+/// the whole warning list shares a single source scan instead of rescanning
+/// from the start for each offset. An out-of-range or mid-codepoint `offset`
+/// resolves to the nearest char boundary at or below it (the table maps every
+/// byte of a multi-byte char to that char's start), so slicing never panics.
+fn warning_position(table: &legacy::Utf8ToUtf16, offset: u32) -> Position {
+    let (line, column, character) = table.position(offset as usize);
+    Position { line, column, character }
 }
 
 /// Generate a source code frame snippet for a warning/error.
 /// Shows 2 lines of context before and after, with a caret pointing to the column.
 /// Matches the official Svelte compiler's `locate_with_frame` output.
-fn generate_frame(source: &str, start_pos: &Position, end_pos: Option<&Position>) -> String {
+fn generate_frame(
+    source: &str,
+    table: &legacy::Utf8ToUtf16,
+    start_pos: &Position,
+    end_pos: Option<&Position>,
+) -> String {
     // Match the official compiler's get_code_frame behavior:
     // - Uses start.line - 1 (0-indexed) for the target line
     // - Uses end.column for the caret position
     // - Converts tabs to 2 spaces
-    // Use split('\n') to match JS behavior (includes trailing empty string after final newline)
-    let lines: Vec<&str> = source.split('\n').collect();
+    // A frame quotes five lines, so it reads them out of the line index the
+    // position conversion already built rather than splitting the whole source
+    // once per warning.
     let line_idx = start_pos.line.saturating_sub(1);
     let frame_start = line_idx.saturating_sub(2);
     // Match JS: Math.min(line + 3, lines.length) — exclusive upper bound
-    let frame_end = (line_idx + 3).min(lines.len());
+    let frame_end = (line_idx + 3).min(table.line_count());
 
     // Determine the column for the caret (official compiler uses end.column)
     let caret_column = end_pos.map_or(start_pos.column, |ep| ep.column);
 
     let digits = format!("{}", frame_end + 1).len();
 
-    lines[frame_start..frame_end]
-        .iter()
-        .enumerate()
-        .map(|(i, &line)| {
-            let actual_line = frame_start + i;
+    (frame_start..frame_end)
+        .map(|actual_line| {
+            let line = table.line_text(source, actual_line);
             let line_num = actual_line + 1;
             let line_content = tabs_to_spaces(line);
             if actual_line == line_idx {
@@ -465,13 +507,7 @@ fn generate_frame(source: &str, start_pos: &Position, end_pos: Option<&Position>
                     "{}^",
                     " ".repeat(digits + 2 + tabs_to_spaces_column(line, caret_column))
                 );
-                format!(
-                    "{:>width$}: {}\n{}",
-                    line_num,
-                    line_content,
-                    indicator,
-                    width = digits
-                )
+                format!("{:>width$}: {}\n{}", line_num, line_content, indicator, width = digits)
             } else {
                 format!("{:>width$}: {}", line_num, line_content, width = digits)
             }
@@ -494,13 +530,136 @@ fn tabs_to_spaces(s: &str) -> String {
 /// tabs-to-spaces conversion. Only leading tabs are converted.
 fn tabs_to_spaces_column(line: &str, column: usize) -> usize {
     let leading_tabs = line.bytes().take_while(|&b| b == b'\t').count();
-    if column <= leading_tabs {
-        // Column is within the leading tabs region: each tab becomes 2 spaces
-        column * 2
-    } else {
-        // Column is past the leading tabs: add the extra space per tab
-        leading_tabs + column
+    // Official measures `tabs_to_spaces(line.slice(0, column)).length`, so the
+    // caret saturates at the line's own length — the caret column comes from
+    // `end`, which can sit past the end of the quoted `start` line.
+    let taken = column.min(line.chars().map(char::len_utf16).sum());
+    taken + leading_tabs.min(taken)
+}
+
+/// Drop a leading byte order mark, which would otherwise be template content.
+/// Upstream `compiler/index.js` does this at every public entry point, so every
+/// position downstream is relative to the trimmed source.
+pub fn remove_bom(source: &str) -> &str {
+    source.strip_prefix('\u{feff}').unwrap_or(source)
+}
+
+/// Parse phase shared by [`compile`] and [`compile_both`]: the fixed component
+/// parse options plus [`phase1_parse::parse`](phases::phase1_parse::parse).
+///
+/// Returned to the caller so the `Root` is pinned on the caller's stack before
+/// the arena guard is installed — the guard holds a raw pointer to `ast.arena`,
+/// so the `Root` must not move after the guard is created.
+pub(crate) fn parse_component(
+    source: &str,
+    modern_ast: bool,
+) -> Result<crate::ast::Root<'_>, CompileError> {
+    let parse_options = crate::ParseOptions {
+        modern: true,
+        loose: false,
+        // The default legacy result rebuilds ESTree locations only when it is
+        // converted at the JSON boundary. `modernAst`, however, exposes this
+        // tree directly, so its locations still have to be retained here.
+        skip_expression_loc: !modern_ast,
+        defer_script_parse: true,
+        force_typescript: false,
+        lenient_script: false,
+        skip_non_css_lang_style: false,
+        capture_comments: modern_ast,
+        reparse_leading_slash_expression: false,
+    };
+    // M5-A: caller-owned arena, unused for now (Root borrows only `source`).
+    let alloc = oxc_allocator::Allocator::default();
+    Ok(phases::phase1_parse::parse(source, &alloc, parse_options)?)
+}
+
+/// Front-half shared by [`compile`] and [`compile_both`], run under the caller's
+/// arena guard: resolve lazy expressions, finish deferred script parsing, strip
+/// TypeScript, merge `<svelte:options>` into `options`, and analyze.
+///
+/// Returns the merged options, analysis, runes mode, and compile-only script programs.
+/// The caller must install the AST's serialize-arena guard for this call.
+pub(crate) fn prepare_and_analyze<'source>(
+    ast: &mut crate::ast::Root<'source>,
+    source: &'source str,
+    mut options: CompileOptions,
+) -> Result<
+    (CompileOptions, ComponentAnalysis, bool, crate::ast::oxc_program::RetainedScripts<'source>),
+    CompileError,
+> {
+    let line_offsets = phases::phase1_parse::compute_line_offsets(source, ast.skip_expression_loc);
+
+    // Resolve lazy expressions (deferred template expressions). If any
+    // expression has a parse error, return it immediately.
+    if let Some(parse_err) =
+        phases::phase1_parse::resolve_lazy::resolve_lazy_expressions_with_line_offsets(
+            ast,
+            source,
+            &line_offsets,
+        )
+    {
+        return Err(parse_err.into());
     }
+
+    // Ensure deferred script parsing is completed before TypeScript removal.
+    // When defer_script_parse is enabled, script content is stored as raw text;
+    // parse it first so remove_typescript_nodes can inspect the AST.
+    let mut retained_scripts = crate::ast::oxc_program::RetainedScripts::default();
+    {
+        if let Some(ref mut instance) = ast.instance {
+            let (parse_error, retained) =
+                phases::phase1_parse::read::script::ensure_script_parsed_retained(
+                    &ast.arena,
+                    instance,
+                    &line_offsets,
+                );
+            if let Some(parse_error) = parse_error {
+                return Err(parse_error.into());
+            }
+            retained_scripts.instance = retained;
+        }
+        if let Some(ref mut module) = ast.module {
+            let (parse_error, retained) =
+                phases::phase1_parse::read::script::ensure_script_parsed_retained(
+                    &ast.arena,
+                    module,
+                    &line_offsets,
+                );
+            if let Some(parse_error) = parse_error {
+                return Err(parse_error.into());
+            }
+            retained_scripts.module = retained;
+        }
+    }
+
+    phases::phase1_parse::merge_deferred_comments(ast);
+
+    // Remove TypeScript nodes from script content if TypeScript is detected.
+    remove_typescript_from_ast(ast, &retained_scripts)?;
+
+    // Merge parsed <svelte:options> into compile options.
+    // Reference: svelte/packages/svelte/src/compiler/index.js
+    //   const combined_options = { ...validated, ...parsed_options, customElementOptions };
+    if let Some(ref parsed_options) = ast.options {
+        if let Some(pw) = parsed_options.preserve_whitespace {
+            options.preserve_whitespace = pw;
+        }
+        // Handle <svelte:options css="injected" /> — override compile options
+        if parsed_options.css == Some(crate::ast::template::CssOption::Injected) {
+            options.css = CssMode::Injected;
+        }
+    }
+
+    // Phase 2: Analyze
+    let analysis = phases::phase2_analyze::analyze_prepared_component_with_retained(
+        ast,
+        source,
+        &options,
+        Some(&retained_scripts),
+    )?;
+    // Determine if runes mode was used
+    let runes_mode = options.runes.unwrap_or(analysis.runes);
+    Ok((options, analysis, runes_mode, retained_scripts))
 }
 
 /// Compile a Svelte component.
@@ -521,100 +680,64 @@ fn tabs_to_spaces_column(line: &str, column: usize) -> usize {
 ///
 /// Returns a `CompileResult` containing the generated JavaScript and CSS.
 pub fn compile(source: &str, options: CompileOptions) -> Result<CompileResult, CompileError> {
-    // Phase 1: Parse
-    let parse_options = crate::ParseOptions {
-        modern: true,
-        loose: false,
-        skip_expression_loc: true,
-        defer_script_parse: true,
-        force_typescript: false,
-        lenient_script: false,
-        skip_non_css_lang_style: false,
-        capture_comments: false,
-    };
-    let mut ast = phases::phase1_parse::parse(source, parse_options)?;
+    let generate = options.generate;
+    let normalized = identifier_escapes::normalize_component_source(source, options.modern_ast);
+    let source = normalized.as_deref().unwrap_or(source);
+    crate::toolchain::PreparedComponent::new(source, options)?.compile_mode(generate)
+}
 
-    // Install the thread-local serialize arena via an RAII guard for the
-    // entire resolve_lazy → strip_ts → analyze → transform pipeline.
-    // The guard restores whatever pointer was set on entry when dropped
-    // (including on `?` early-return and panic unwind), so concurrent
-    // `compile()` calls reusing the same thread can't observe each
-    // other's arenas — and nested `JsNode::to_value` fallbacks to
-    // `DESER_ARENA` can't wipe the outer scope.
-    //
-    // SAFETY: `ast.arena` lives until the end of this function, which
-    // outlives `_arena_guard`.
-    let _arena_guard = unsafe { SerializeArenaGuard::new(&ast.arena as *const _) };
+/// Compile without materializing the public AST for bindings whose wire format
+/// does not expose it.
+#[doc(hidden)]
+pub fn compile_without_ast(
+    source: &str,
+    options: CompileOptions,
+) -> Result<CompileResult, CompileError> {
+    let generate = options.generate;
+    let normalized = identifier_escapes::normalize_component_source(source, options.modern_ast);
+    let source = normalized.as_deref().unwrap_or(source);
+    crate::toolchain::PreparedComponent::new(source, options)?
+        .compile_mode_without_ast(generate, true)
+}
 
-    // Resolve lazy expressions (deferred template expressions)
-    // If any expression has a parse error, return it immediately
-    if let Some(parse_err) =
-        phases::phase1_parse::resolve_lazy::resolve_lazy_expressions(&mut ast, source)
-    {
-        return Err(parse_err.into());
-    }
+/// Compile a client component while exposing its generated JS program to an
+/// in-process consumer. The callback must not retain either borrow.
+pub fn compile_client_with_program_sink(
+    source: &str,
+    options: CompileOptions,
+    sink: &mut dyn FnMut(
+        &phases::phase3_transform::JsProgram,
+        &phases::phase3_transform::js_ast::arena::JsArena,
+    ),
+) -> Result<CompileResult, CompileError> {
+    let normalized = identifier_escapes::normalize_component_source(source, options.modern_ast);
+    let source = normalized.as_deref().unwrap_or(source);
+    crate::toolchain::PreparedComponent::new(source, options)?
+        .compile_client_with_program_sink(sink)
+}
 
-    // Ensure deferred script parsing is completed before TypeScript removal.
-    // When defer_script_parse is enabled, script content is stored as raw text.
-    // We need to parse it first so remove_typescript_nodes can inspect the AST.
-    {
-        let line_offsets = phases::phase1_parse::compute_line_offsets(source, false);
-        if let Some(ref mut instance) = ast.instance
-            && let Some(parse_err) = phases::phase1_parse::read::script::ensure_script_parsed(
-                &ast.arena,
-                instance,
-                source,
-                &line_offsets,
-            )
-        {
-            return Err(parse_err.into());
-        }
-        if let Some(ref mut module) = ast.module
-            && let Some(parse_err) = phases::phase1_parse::read::script::ensure_script_parsed(
-                &ast.arena,
-                module,
-                source,
-                &line_offsets,
-            )
-        {
-            return Err(parse_err.into());
-        }
-    }
+#[doc(hidden)]
+pub fn compile_with_external_sourcemap_content(
+    source: &str,
+    options: CompileOptions,
+) -> Result<CompileResult, CompileError> {
+    let generate = options.generate;
+    let normalized = identifier_escapes::normalize_component_source(source, options.modern_ast);
+    let source = normalized.as_deref().unwrap_or(source);
+    crate::toolchain::PreparedComponent::new(source, options)?
+        .compile_mode_with_sourcemap_content(generate, false)
+}
 
-    // Remove TypeScript nodes from script content if TypeScript is detected.
-    remove_typescript_from_ast(&mut ast)?;
-
-    // Merge parsed <svelte:options> into compile options
-    // Reference: svelte/packages/svelte/src/compiler/index.js
-    //   const combined_options = { ...validated, ...parsed_options, customElementOptions };
-    let mut options = options;
-    if let Some(ref parsed_options) = ast.options {
-        if let Some(pw) = parsed_options.preserve_whitespace {
-            options.preserve_whitespace = pw;
-        }
-        // Handle <svelte:options css="injected" /> — override compile options
-        if parsed_options.css == Some(crate::ast::template::CssOption::Injected) {
-            options.css = CssMode::Injected;
-        }
-    }
-
-    // Phase 2: Analyze
-    let analysis = phases::phase2_analyze::analyze_component(&mut ast, source, &options)?;
-
-    // Determine if runes mode was used
-    let runes_mode = options.runes.unwrap_or(analysis.runes);
-
-    // Phase 3: Transform (pass AST to avoid re-parsing)
-    let transform_result =
-        phases::phase3_transform::transform_component(&analysis, &ast, source, &options)?;
-
-    Ok(finalize_compile_result(
-        transform_result,
-        &analysis,
-        source,
-        &options,
-        runes_mode,
-    ))
+#[doc(hidden)]
+pub fn compile_without_ast_with_external_sourcemap_content(
+    source: &str,
+    options: CompileOptions,
+) -> Result<CompileResult, CompileError> {
+    let generate = options.generate;
+    let normalized = identifier_escapes::normalize_component_source(source, options.modern_ast);
+    let source = normalized.as_deref().unwrap_or(source);
+    crate::toolchain::PreparedComponent::new(source, options)?
+        .compile_mode_without_ast(generate, false)
 }
 
 /// Compile a single component to **both** client (CSR) and server (SSR) output in
@@ -634,120 +757,90 @@ pub fn compile_both(
     source: &str,
     options: CompileOptions,
 ) -> Result<(CompileResult, CompileResult), CompileError> {
-    // Phase 1: Parse (identical to `compile`).
-    let parse_options = crate::ParseOptions {
-        modern: true,
-        loose: false,
-        skip_expression_loc: true,
-        defer_script_parse: true,
-        force_typescript: false,
-        lenient_script: false,
-        skip_non_css_lang_style: false,
-        capture_comments: false,
-    };
-    let mut ast = phases::phase1_parse::parse(source, parse_options)?;
+    let normalized = identifier_escapes::normalize_component_source(source, options.modern_ast);
+    let source = normalized.as_deref().unwrap_or(source);
+    crate::toolchain::PreparedComponent::new(source, options)?.compile_both()
+}
 
-    // SAFETY: `ast.arena` lives until the end of this function (see `compile`).
-    let _arena_guard = unsafe { SerializeArenaGuard::new(&ast.arena as *const _) };
-
-    if let Some(parse_err) =
-        phases::phase1_parse::resolve_lazy::resolve_lazy_expressions(&mut ast, source)
-    {
-        return Err(parse_err.into());
+/// Option diagnostics carry no source position — upstream raises them from
+/// `validate-options.js`, which has no node to point at.
+fn legacy_option_warning(
+    warning: phases::phase2_analyze::warnings::AnalysisWarning,
+) -> phases::phase3_transform::TransformWarning {
+    phases::phase3_transform::TransformWarning {
+        code: warning.code,
+        message: warning.message,
+        start: None,
+        end: None,
     }
-
-    {
-        let line_offsets = phases::phase1_parse::compute_line_offsets(source, false);
-        if let Some(ref mut instance) = ast.instance
-            && let Some(parse_err) = phases::phase1_parse::read::script::ensure_script_parsed(
-                &ast.arena,
-                instance,
-                source,
-                &line_offsets,
-            )
-        {
-            return Err(parse_err.into());
-        }
-        if let Some(ref mut module) = ast.module
-            && let Some(parse_err) = phases::phase1_parse::read::script::ensure_script_parsed(
-                &ast.arena,
-                module,
-                source,
-                &line_offsets,
-            )
-        {
-            return Err(parse_err.into());
-        }
-    }
-
-    remove_typescript_from_ast(&mut ast)?;
-
-    let mut options = options;
-    if let Some(ref parsed_options) = ast.options {
-        if let Some(pw) = parsed_options.preserve_whitespace {
-            options.preserve_whitespace = pw;
-        }
-        if parsed_options.css == Some(crate::ast::template::CssOption::Injected) {
-            options.css = CssMode::Injected;
-        }
-    }
-
-    // Phase 2: Analyze — ONCE, shared by both transforms (mode-independent).
-    let analysis = phases::phase2_analyze::analyze_component(&mut ast, source, &options)?;
-    let runes_mode = options.runes.unwrap_or(analysis.runes);
-
-    // Phase 3: Transform twice over the shared (ast, analysis).
-    let mut client_options = options.clone();
-    client_options.generate = GenerateMode::Client;
-    let client_tr =
-        phases::phase3_transform::transform_component(&analysis, &ast, source, &client_options)?;
-    let client = finalize_compile_result(client_tr, &analysis, source, &client_options, runes_mode);
-
-    let mut server_options = options;
-    server_options.generate = GenerateMode::Server;
-    let server_tr =
-        phases::phase3_transform::transform_component(&analysis, &ast, source, &server_options)?;
-    let server = finalize_compile_result(server_tr, &analysis, source, &server_options, runes_mode);
-
-    Ok((client, server))
 }
 
 /// Build a [`CompileResult`] from a finished transform — accessors-deprecation
 /// warning, source-position resolution, frame generation, and warning filtering.
 /// Shared by [`compile`] and [`compile_both`] so the two paths are identical.
-fn finalize_compile_result(
+pub(crate) fn finalize_compile_result(
     mut transform_result: TransformResult,
     analysis: &ComponentAnalysis,
     source: &str,
     options: &CompileOptions,
     runes_mode: bool,
 ) -> CompileResult {
-    // Emit options_deprecated_accessors warning when accessors option is used in runes mode.
-    // Reference: svelte/packages/svelte/src/compiler/validate-options.js line 52
-    if options.accessors && runes_mode {
-        transform_result.warnings.insert(
-            0,
-            phases::phase3_transform::TransformWarning {
-                code: "options_deprecated_accessors".to_string(),
-                message: "The `accessors` option has been deprecated. It will have no effect in runes mode\nhttps://svelte.dev/e/options_deprecated_accessors".to_string(),
-                start: None,
-                end: None,
-            },
-        );
+    // Option diagnostics come from upstream's `validate-options.js`, which runs
+    // before parsing, so they lead the list — and in the declaration order of
+    // the validator's key table, since that is the order it walks them in.
+    let mut option_warnings: Vec<phases::phase3_transform::TransformWarning> = Vec::new();
+    if options.legacy_options.generate_dom_ssr {
+        option_warnings.push(legacy_option_warning(
+            phases::phase2_analyze::warnings::options_renamed_ssr_dom(),
+        ));
+    }
+    // Presence, not value: entry points that can distinguish a supplied
+    // `accessors` option record it in `legacy_options` and own warn-once
+    // semantics. The behavioural `options.accessors` field alone does not
+    // imply that this diagnostic should be emitted.
+    if options.legacy_options.accessors {
+        option_warnings.push(phases::phase3_transform::TransformWarning {
+            code: "options_deprecated_accessors".to_string(),
+            message: "The `accessors` option has been deprecated. It will have no effect in runes mode\nhttps://svelte.dev/e/options_deprecated_accessors".to_string(),
+            start: None,
+            end: None,
+        });
+    }
+    if options.legacy_options.immutable {
+        option_warnings.push(legacy_option_warning(
+            phases::phase2_analyze::warnings::options_deprecated_immutable(),
+        ));
+    }
+    if options.legacy_options.loop_guard_timeout {
+        option_warnings.push(legacy_option_warning(
+            phases::phase2_analyze::warnings::options_removed_loop_guard_timeout(),
+        ));
+    }
+    if options.legacy_options.enable_sourcemap {
+        option_warnings.push(legacy_option_warning(
+            phases::phase2_analyze::warnings::options_removed_enable_sourcemap(),
+        ));
+    }
+    if options.legacy_options.hydratable {
+        option_warnings.push(legacy_option_warning(
+            phases::phase2_analyze::warnings::options_removed_hydratable(),
+        ));
+    }
+    if !option_warnings.is_empty() {
+        transform_result.warnings.splice(0..0, option_warnings);
     }
 
     // Convert to CompileResult
     CompileResult {
-        js: CompileOutput {
-            code: transform_result.js,
-            map: transform_result.js_map,
-        },
+        js: CompileOutput { code: transform_result.js, map: transform_result.js_map },
         css: transform_result.css.map(|c| CssOutput {
             code: c.code,
             map: c.map,
             has_global: analysis.css.has_global,
         }),
-        warnings: {
+        warnings: if transform_result.warnings.is_empty() {
+            Vec::new()
+        } else {
             // Pre-compute warning filename once (shared across all warnings)
             let warning_filename = options.filename.as_ref().map(|f| {
                 // Only allocate if backslashes are present
@@ -772,19 +865,18 @@ fn finalize_compile_result(
                 }
                 f_normalized.to_string()
             });
+            // Build the byte→UTF-16 position table once and share it across every
+            // warning, instead of rescanning the source for each offset.
+            let pos_table = legacy::Utf8ToUtf16::new(source);
             transform_result
                 .warnings
                 .into_iter()
                 .map(|w| {
-                    let start_pos = w
-                        .start
-                        .map(|offset| byte_offset_to_position(source, offset as usize));
-                    let end_pos = w
-                        .end
-                        .map(|offset| byte_offset_to_position(source, offset as usize));
+                    let start_pos = w.start.map(|offset| warning_position(&pos_table, offset));
+                    let end_pos = w.end.map(|offset| warning_position(&pos_table, offset));
                     let frame = start_pos
                         .as_ref()
-                        .map(|sp| generate_frame(source, sp, end_pos.as_ref()));
+                        .map(|sp| generate_frame(source, &pos_table, sp, end_pos.as_ref()));
                     let url_suffix = format!("\nhttps://svelte.dev/e/{}", w.code);
                     let message_with_url = if w.message.contains(&url_suffix) {
                         w.message
@@ -802,16 +894,11 @@ fn finalize_compile_result(
                 })
                 // Apply the public `warning_filter` (keep the warning when the
                 // filter returns true, or when no filter is set) — H-083.
-                .filter(|w| {
-                    options
-                        .warning_filter
-                        .as_ref()
-                        .is_none_or(|filter| filter(w))
-                })
+                .filter(|w| options.warning_filter.as_ref().is_none_or(|filter| filter(w)))
                 .collect()
         },
         metadata: CompileMetadata { runes: runes_mode },
-        ast: None, // TODO: Return AST if options.modern_ast is true
+        ast: None,
     }
 }
 
@@ -833,6 +920,10 @@ pub struct ModuleCompileOptions {
     pub warning_filter: Option<WarningFilterFn>,
     /// Experimental options.
     pub experimental: ExperimentalOptions,
+    /// Svelte-4 options that only produce a diagnostic. Upstream's
+    /// `validate_module_options` stubs out every component-only key, so only
+    /// the shared `generate` alias is reported for a module.
+    pub legacy_options: LegacyOptions,
 }
 
 impl Default for ModuleCompileOptions {
@@ -844,6 +935,7 @@ impl Default for ModuleCompileOptions {
             root_dir: None,
             warning_filter: None,
             experimental: ExperimentalOptions::default(),
+            legacy_options: LegacyOptions::default(),
         }
     }
 }
@@ -880,6 +972,11 @@ pub fn compile_module(
     source: &str,
     options: ModuleCompileOptions,
 ) -> Result<CompileResult, CompileError> {
+    // A rune name spelled with a unicode escape is the same identifier to the
+    // parser and a different one to every text scan below.
+    let normalized = identifier_escapes::normalize_module_source(source);
+    let source = normalized.as_deref().unwrap_or(source);
+    let source = remove_bom(source);
     // Parse JS source into an AST using the same infrastructure as component scripts.
     // Upstream `compileModule` → `analyze_module` always parses with
     // `typescript: false` (2-analyze/index.js `parse(source, comments, false,
@@ -903,13 +1000,16 @@ pub fn compile_module(
         let (program, parse_error) =
             phases::phase1_parse::read::expression::parse_program_with_error(
                 &arena,
-                source,
-                0, // offset = 0 (source is the entire file)
-                &[],
-                false,        // upstream analyze_module always parses plain JS
-                &[],          // no leading comments
-                0,            // script_tag_start
-                source.len(), // script_tag_end
+                phases::phase1_parse::read::expression::ProgramParseParams {
+                    content: source,
+                    offset: 0, // source is the entire file
+                    line_offsets: &[],
+                    is_typescript: false, // upstream analyze_module always parses plain JS
+                    is_script: false,
+                    leading_comments: &[],
+                    script_tag_start: 0,
+                    script_tag_end: source.len(),
+                },
             );
 
         // Mirror upstream acorn's throw-on-error behaviour (js_parse_error).
@@ -931,13 +1031,14 @@ pub fn compile_module(
         fragment: crate::ast::template::Fragment {
             node_type: crate::ast::template::FragmentType::Fragment,
             nodes: Vec::new(),
-            metadata: crate::ast::template::FragmentMetadata {
-                transparent: false,
-                dynamic: false,
-            },
+            metadata: crate::ast::template::FragmentMetadata { transparent: false, dynamic: false },
         },
         options: None,
         comments: Vec::new(),
+        // This module's program is already parsed, so the flag only decides
+        // whether analysis rebuilds a line table it would not use; keep the
+        // pre-existing behaviour for the `.svelte.js` path.
+        skip_expression_loc: false,
         instance: None,
         module: Some(Box::new(crate::ast::template::Script {
             node_type: crate::ast::template::ScriptType::Script,
@@ -946,7 +1047,7 @@ pub fn compile_module(
             context: crate::ast::template::ScriptContext::Module,
             content: program,
             attributes: Vec::new(),
-            raw_content: String::new(),
+            raw_content: "",
             content_offset: 0,
             is_typescript: false,
         })),
@@ -965,6 +1066,7 @@ pub fn compile_module(
         warning_filter: options.warning_filter.clone(),
         experimental: options.experimental.clone(),
         runes: Some(true), // Modules are always in runes mode
+        is_module_source: true,
         ..Default::default()
     };
 
@@ -979,7 +1081,15 @@ pub fn compile_module(
     let _arena_guard = unsafe { SerializeArenaGuard::new(&ast.arena as *const _) };
 
     // Phase 2: Analyze (reuses component analysis infrastructure)
-    let analysis = phases::phase2_analyze::analyze_component(&mut ast, source, &compile_options)?;
+    let mut analysis =
+        phases::phase2_analyze::analyze_prepared_component(&mut ast, source, &compile_options)?;
+
+    // `validate_module_options` shares `common_options` with the component
+    // validator, so the renamed `generate` spelling is diagnosed here too — and
+    // ahead of everything the analysis found, since validation runs first.
+    if options.legacy_options.generate_dom_ssr {
+        analysis.warnings.insert(0, phases::phase2_analyze::warnings::options_renamed_ssr_dom());
+    }
 
     // Module-specific validation: check for store subscriptions.
     // In modules, $store references (where `store` is a binding) are invalid.
@@ -1004,47 +1114,41 @@ pub fn compile_module(
     let js_code = transform_result?.js;
 
     Ok(CompileResult {
-        js: CompileOutput {
-            code: js_code,
-            map: None,
-        },
+        js: CompileOutput { code: js_code, map: None },
         css: None,
-        warnings: analysis
-            .warnings
-            .iter()
-            .map(|w| {
-                let start_pos = w
-                    .start
-                    .map(|offset| byte_offset_to_position(source, offset as usize));
-                let end_pos = w
-                    .end
-                    .map(|offset| byte_offset_to_position(source, offset as usize));
-                let frame = start_pos
-                    .as_ref()
-                    .map(|sp| generate_frame(source, sp, end_pos.as_ref()));
-                let url_suffix = format!("\nhttps://svelte.dev/e/{}", w.code);
-                let message_with_url = if w.message.contains(&url_suffix) {
-                    w.message.clone()
-                } else {
-                    format!("{}{}", w.message, url_suffix)
-                };
-                Warning {
-                    code: w.code.clone(),
-                    message: message_with_url,
-                    filename: options.filename.clone(),
-                    start: start_pos,
-                    end: end_pos,
-                    frame,
-                }
-            })
-            // Apply the public `warning_filter` for module compilation too (H-083).
-            .filter(|w| {
-                options
-                    .warning_filter
-                    .as_ref()
-                    .is_none_or(|filter| filter(w))
-            })
-            .collect(),
+        warnings: if analysis.warnings.is_empty() {
+            Vec::new()
+        } else {
+            // One shared byte→UTF-16 position table for every module warning.
+            let pos_table = legacy::Utf8ToUtf16::new(source);
+            analysis
+                .warnings
+                .iter()
+                .map(|w| {
+                    let start_pos = w.start.map(|offset| warning_position(&pos_table, offset));
+                    let end_pos = w.end.map(|offset| warning_position(&pos_table, offset));
+                    let frame = start_pos
+                        .as_ref()
+                        .map(|sp| generate_frame(source, &pos_table, sp, end_pos.as_ref()));
+                    let url_suffix = format!("\nhttps://svelte.dev/e/{}", w.code);
+                    let message_with_url = if w.message.contains(&url_suffix) {
+                        w.message.clone()
+                    } else {
+                        format!("{}{}", w.message, url_suffix)
+                    };
+                    Warning {
+                        code: w.code.clone(),
+                        message: message_with_url,
+                        filename: options.filename.clone(),
+                        start: start_pos,
+                        end: end_pos,
+                        frame,
+                    }
+                })
+                // Apply the public `warning_filter` for module compilation too (H-083).
+                .filter(|w| options.warning_filter.as_ref().is_none_or(|filter| filter(w)))
+                .collect()
+        },
         metadata: CompileMetadata { runes: true },
         ast: None,
     })
@@ -1069,9 +1173,12 @@ fn check_module_store_subscriptions(
             if phases::phase2_analyze::visitors::shared::function::is_rune(&binding.name) {
                 continue;
             }
-            return Err(CompileError::Analysis(
-                phases::phase2_analyze::errors::store_invalid_subscription_module(),
-            ));
+            let error = phases::phase2_analyze::errors::store_invalid_subscription_module();
+            let error = match binding.references.first() {
+                Some(reference) => error.at(reference.start, reference.end),
+                None => error,
+            };
+            return Err(CompileError::Analysis(error));
         }
     }
     Ok(())
@@ -1083,7 +1190,10 @@ fn check_module_store_subscriptions(
 /// and if so, applies `remove_typescript_nodes` to strip type annotations.
 /// This matches the official Svelte compiler behavior where TypeScript stripping
 /// happens during compilation, not during parsing.
-fn remove_typescript_from_ast(ast: &mut crate::ast::Root) -> Result<(), crate::error::ParseError> {
+fn remove_typescript_from_ast(
+    ast: &mut crate::ast::Root,
+    retained: &crate::ast::oxc_program::RetainedScripts<'_>,
+) -> Result<(), crate::error::ParseError> {
     use crate::ast::AttributeValue;
     use crate::ast::AttributeValuePart;
 
@@ -1093,7 +1203,7 @@ fn remove_typescript_from_ast(ast: &mut crate::ast::Root) -> Result<(), crate::e
                 && let AttributeValue::Sequence(parts) = &attr.value
                 && let Some(AttributeValuePart::Text(t)) = parts.first()
             {
-                let lang = t.data.as_str();
+                let lang = t.data.as_ref();
                 return lang == "ts" || lang == "typescript";
             }
         }
@@ -1102,9 +1212,19 @@ fn remove_typescript_from_ast(ast: &mut crate::ast::Root) -> Result<(), crate::e
 
     fn strip_ts_from_script(
         script: &mut crate::ast::Script,
+        retained: Option<&crate::ast::oxc_program::RetainedProgram<'_>>,
     ) -> Result<(), crate::error::ParseError> {
         use crate::ast::js::Expression;
-        match &mut script.content {
+        // A decorator on anything but a class declaration has no typed
+        // representation, so it has to be found on the OXC program instead.
+        // `retained` is only `None` for an empty script, which cannot hold one.
+        let decorator = retained.and_then(|program| {
+            phases::phase1_parse::remove_typescript_nodes::first_decorator_span(
+                program.program(),
+                script.content_offset as usize,
+            )
+        });
+        let stripped = match &mut script.content {
             // Typed path: mutate the arena-backed typed tree in place, keeping
             // the script `Expression::Typed` (no expensive `as_json()` round
             // trip). The serialize arena is installed by the caller's
@@ -1120,24 +1240,31 @@ fn remove_typescript_from_ast(ast: &mut crate::ast::Root) -> Result<(), crate::e
             Expression::Lazy { .. } => {
                 unreachable!("Expression::Lazy must be resolved before strip_ts")
             }
+        };
+        // Upstream walks one tree, so the earliest offending node wins.
+        match (decorator, &stripped) {
+            (Some(span), Ok(())) => {
+                Err(phases::phase1_parse::remove_typescript_nodes::decorator_error(span))
+            }
+            (Some(span), Err(other)) if span.0 < other.span().0 => {
+                Err(phases::phase1_parse::remove_typescript_nodes::decorator_error(span))
+            }
+            _ => stripped,
         }
     }
 
     // In Svelte, if ANY script has lang="ts", ALL scripts are treated as TypeScript.
     // This matches the official compiler behavior where the module script's lang attribute
     // propagates to the instance script.
-    let any_is_typescript = ast
-        .instance
-        .as_ref()
-        .is_some_and(|s| is_typescript_script(s))
+    let any_is_typescript = ast.instance.as_ref().is_some_and(|s| is_typescript_script(s))
         || ast.module.as_ref().is_some_and(|s| is_typescript_script(s));
 
     if any_is_typescript {
         if let Some(ref mut instance) = ast.instance {
-            strip_ts_from_script(instance)?;
+            strip_ts_from_script(instance, retained.instance.as_ref())?;
         }
         if let Some(ref mut module) = ast.module {
-            strip_ts_from_script(module)?;
+            strip_ts_from_script(module, retained.module.as_ref())?;
         }
         // Also strip TypeScript from the fragment (template expressions).
         // The official Svelte compiler calls remove_typescript_nodes on the entire fragment:
@@ -1402,14 +1529,78 @@ fn strip_ts_from_attribute_value(
 ///     }
 /// }
 /// ```
-#[cfg(feature = "native")]
+#[cfg(feature = "parallel")]
 pub fn compile_batch(
     inputs: &[(&str, CompileOptions)],
 ) -> Vec<Result<CompileResult, CompileError>> {
     inputs
         .par_iter()
-        .map(|(source, options)| compile(source, options.clone()))
+        .map(|(source, options)| catch_compile_panic(|| compile(source, options.clone())))
         .collect()
+}
+
+#[doc(hidden)]
+#[cfg(feature = "parallel")]
+pub fn compile_batch_with_external_sourcemap_content(
+    inputs: &[(&str, CompileOptions)],
+) -> Vec<Result<CompileResult, CompileError>> {
+    inputs
+        .par_iter()
+        .map(|(source, options)| {
+            catch_compile_panic(|| compile_with_external_sourcemap_content(source, options.clone()))
+        })
+        .collect()
+}
+
+#[doc(hidden)]
+#[cfg(feature = "parallel")]
+pub fn compile_batch_without_ast(
+    inputs: &[(&str, CompileOptions)],
+) -> Vec<Result<CompileResult, CompileError>> {
+    inputs
+        .par_iter()
+        .map(|(source, options)| {
+            catch_compile_panic(|| compile_without_ast(source, options.clone()))
+        })
+        .collect()
+}
+
+#[doc(hidden)]
+#[cfg(feature = "parallel")]
+pub fn compile_batch_without_ast_with_external_sourcemap_content(
+    inputs: &[(&str, CompileOptions)],
+) -> Vec<Result<CompileResult, CompileError>> {
+    inputs
+        .par_iter()
+        .map(|(source, options)| {
+            catch_compile_panic(|| {
+                compile_without_ast_with_external_sourcemap_content(source, options.clone())
+            })
+        })
+        .collect()
+}
+
+/// Run one batch item's `compile()` call behind `catch_unwind`. Rayon
+/// re-raises a worker panic in the caller only after the whole `par_iter`
+/// finishes, discarding every other item's result — catching per item here
+/// keeps one pathological input from sinking the rest of the batch.
+///
+/// `AssertUnwindSafe`: a caught panic here always turns into an `Err` for
+/// this one item and nothing borrowed by `f` (the item's `&str` source /
+/// `CompileOptions`, including its optional `css_hash` callback `Arc`) is
+/// read again afterward, so a torn intermediate state can't leak out.
+#[cfg(feature = "parallel")]
+fn catch_compile_panic(
+    f: impl FnOnce() -> Result<CompileResult, CompileError>,
+) -> Result<CompileResult, CompileError> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_else(|payload| {
+        let msg = payload
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "unknown panic payload".to_string());
+        Err(CompileError::Panic(msg))
+    })
 }
 
 /// Error type for compilation failures.
@@ -1421,6 +1612,13 @@ pub enum CompileError {
     Analysis(AnalysisError),
     /// Transform error.
     Transform(TransformError),
+    /// A single item's `compile()` panicked inside `compile_batch` /
+    /// `compile_batch_with_external_sourcemap_content`'s rayon closure.
+    /// Rayon otherwise re-raises a worker panic in the caller once the whole
+    /// `par_iter` finishes, which would discard every other item's result —
+    /// catching it per item keeps one pathological input from sinking the
+    /// rest of the batch.
+    Panic(String),
 }
 
 impl From<crate::error::ParseError> for CompileError {
@@ -1441,12 +1639,106 @@ impl From<TransformError> for CompileError {
     }
 }
 
+/// The parts of a [`CompileError`] a diagnostic consumer needs: the Svelte
+/// error code, the human-readable message, and the byte span it points at.
+///
+/// `code`/`span` are `None` for the internal variants that carry neither, which
+/// is a real state a caller can observe — not a placeholder.
+#[derive(Debug, Clone)]
+pub struct CompileErrorDiagnostic {
+    /// Svelte error code (e.g. `attribute_duplicate`), when the raising site has one.
+    pub code: Option<String>,
+    /// Message text, in the same wording the official compiler emits.
+    pub message: String,
+    /// Source byte span, when the raising site attributed the error to a node.
+    pub span: Option<(u32, u32)>,
+}
+
+impl CompileError {
+    /// Destructure this error the way the official compiler's `CompileError`
+    /// exposes itself to JS consumers (`code`, `message`, `start`/`end`).
+    pub fn diagnostic(&self) -> CompileErrorDiagnostic {
+        let mut diagnostic = match self {
+            CompileError::Parse(e) => {
+                let (code, message) = match e {
+                    crate::error::ParseError::SvelteError { code, message, .. } => {
+                        (Some(code.clone()), message.clone())
+                    }
+                    other => (None, other.to_string()),
+                };
+                let (start, end) = e.span();
+                CompileErrorDiagnostic { code, message, span: Some((start as u32, end as u32)) }
+            }
+            CompileError::Analysis(AnalysisError::ValidationWithCode {
+                code,
+                message,
+                start,
+                end,
+            }) => CompileErrorDiagnostic {
+                code: Some(code.clone()),
+                message: message.clone(),
+                span: (*start).zip(*end),
+            },
+            CompileError::Analysis(e) => {
+                CompileErrorDiagnostic { code: None, message: e.to_string(), span: None }
+            }
+            CompileError::Transform(e) => {
+                CompileErrorDiagnostic { code: None, message: e.to_string(), span: None }
+            }
+            CompileError::Panic(msg) => CompileErrorDiagnostic {
+                code: None,
+                message: format!("Internal panic: {msg}"),
+                span: None,
+            },
+        };
+
+        // Official appends the help URL to every coded message, and a consumer
+        // reads that message verbatim -- upstream's own fixtures strip it for
+        // comparison rather than the compiler omitting it.
+        if let Some(code) = diagnostic.code.as_deref() {
+            let docs_url = format!("\nhttps://svelte.dev/e/{code}");
+            if !diagnostic.message.ends_with(&docs_url) {
+                diagnostic.message.push_str(&docs_url);
+            }
+        }
+
+        diagnostic
+    }
+}
+
+/// Resolve a byte `offset` in `source` to a JS-indexed [`Position`].
+pub fn source_position(source: &str, offset: u32) -> Position {
+    warning_position(&legacy::Utf8ToUtf16::new(source), offset)
+}
+
+/// The JS-visible location of a diagnostic: the two endpoints plus the rendered
+/// code frame, which upstream derives from `start.line` and `end.column`.
+#[derive(Debug, Clone)]
+pub struct SourceSpan {
+    /// Start of the highlighted range.
+    pub start: Position,
+    /// End of the highlighted range.
+    pub end: Position,
+    /// Rendered five-line code frame with a caret under the range.
+    pub frame: String,
+}
+
+/// Resolve a byte span in `source`, building the line index once for all three.
+pub fn source_span(source: &str, span: (u32, u32)) -> SourceSpan {
+    let table = legacy::Utf8ToUtf16::new(source);
+    let start = warning_position(&table, span.0);
+    let end = warning_position(&table, span.1);
+    let frame = generate_frame(source, &table, &start, Some(&end));
+    SourceSpan { start, end, frame }
+}
+
 impl std::fmt::Display for CompileError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             CompileError::Parse(e) => write!(f, "Parse error: {:?}", e),
             CompileError::Analysis(e) => write!(f, "Analysis error: {}", e),
             CompileError::Transform(e) => write!(f, "Transform error: {}", e),
+            CompileError::Panic(msg) => write!(f, "Internal panic: {}", msg),
         }
     }
 }
@@ -1457,6 +1749,259 @@ impl std::error::Error for CompileError {}
 mod tests {
     use super::*;
 
+    /// Upstream's `compiler-errors/test.ts` compares messages with the help URL
+    /// removed, because the compiler itself always emits it.
+    fn strip_link(message: &str) -> &str {
+        match message.rfind('\n') {
+            Some(at) if message[at + 1..].starts_with("https://svelte.dev/e/") => &message[..at],
+            _ => message,
+        }
+    }
+
+    #[test]
+    fn test_warning_position_clamps_to_char_boundary() {
+        // "é" is two UTF-8 bytes (0xC3 0xA9). An offset landing between them
+        // must rewind to the boundary instead of panicking on the slice.
+        let source = "aéb";
+        let table = legacy::Utf8ToUtf16::new(source);
+        let pos = warning_position(&table, 2);
+        // Rewound to offset 1 ("a"): one UTF-16 unit consumed.
+        assert_eq!(pos.character, 1);
+        assert_eq!(pos.column, 1);
+        assert_eq!(pos.line, 1);
+
+        // Past-the-end offset clamps to the string length.
+        let end = warning_position(&table, 999);
+        assert_eq!(end.character, 3);
+    }
+
+    #[test]
+    fn diagnostic_reports_code_message_and_span() {
+        let source = "<div a=\"1\" a=\"2\"></div>";
+        let err = compile(source, CompileOptions::default()).unwrap_err();
+        let d = err.diagnostic();
+        assert_eq!(d.code.as_deref(), Some("attribute_duplicate"));
+        assert!(!d.message.starts_with("Analysis("), "{}", d.message);
+        let (start, _) = d.span.expect("attribute_duplicate carries a span");
+        assert_eq!(&source[start as usize..], "a=\"2\"></div>");
+    }
+
+    #[test]
+    fn diagnostic_locates_dollar_binding_declarations() {
+        // Byte-for-byte upstream `compiler-errors/samples/dollar-binding-declaration-legacy`;
+        // inlined because this crate is also built without the submodule.
+        let source = "<svelte:options runes={false} />\n\n<script>\n\tfunction ok($) {}\n\tfunction ok2() {\n\t\tlet $;\n\t}\n\n\t// error\n\tlet $;\n</script>\n";
+        let diagnostic = compile(source, CompileOptions::default()).unwrap_err().diagnostic();
+        assert_eq!(diagnostic.code.as_deref(), Some("dollar_binding_invalid"));
+        assert_eq!(diagnostic.span, Some((108, 109)));
+    }
+
+    #[test]
+    fn diagnostic_locates_dollar_binding_imports() {
+        // Byte-for-byte upstream `compiler-errors/samples/dollar-binding-import`.
+        let source = "<script>\n\timport { $ } from './somewhere';\n</script>\n";
+        let diagnostic = compile(source, CompileOptions::default()).unwrap_err().diagnostic();
+        assert_eq!(diagnostic.code.as_deref(), Some("dollar_binding_invalid"));
+        assert_eq!(diagnostic.span, Some((19, 20)));
+    }
+
+    #[test]
+    fn diagnostic_locates_duplicate_component_slot_attributes() {
+        let source = "<Component><div slot=\"content\" /><span slot=\"content\" /></Component>";
+        let diagnostic = compile(source, CompileOptions::default()).unwrap_err().diagnostic();
+        assert_eq!(diagnostic.code.as_deref(), Some("slot_attribute_duplicate"));
+        let (start, end) = diagnostic.span.expect("duplicate slot has an attribute span");
+        assert_eq!(&source[start as usize..end as usize], "slot=\"content\"");
+    }
+
+    #[test]
+    fn diagnostic_locates_default_slot_content_conflict() {
+        let source = "<Component><div slot=\"default\" /><p>implicit</p></Component>";
+        let diagnostic = compile(source, CompileOptions::default()).unwrap_err().diagnostic();
+        assert_eq!(diagnostic.code.as_deref(), Some("slot_default_duplicate"));
+        let (start, end) = diagnostic.span.expect("implicit content has a span");
+        assert_eq!(&source[start as usize..end as usize], "<p>implicit</p>");
+    }
+
+    #[test]
+    fn diagnostic_locates_renamed_runes() {
+        let source = "<script>$effect.active</script>";
+        let diagnostic = compile(source, CompileOptions::default()).unwrap_err().diagnostic();
+        assert_eq!(diagnostic.code.as_deref(), Some("rune_renamed"));
+        assert_eq!(strip_link(&diagnostic.message), "`$effect.active` is now `$effect.tracking`");
+        let (start, end) = diagnostic.span.expect("renamed rune has a span");
+        assert_eq!(&source[start as usize..end as usize], "$effect.active");
+    }
+
+    #[test]
+    fn diagnostics_locate_global_css_validation_nodes() {
+        // Each source is byte-for-byte the upstream `compiler-errors/samples/<fixture>`,
+        // inlined because this crate is also built without the submodule.
+        for (fixture, source, code, span) in [
+            (
+                "css-global-block-declaration",
+                "<style>\n\t/* ok */\n\t.x :global {\n\t\tcolor: red;\n\t}\n\n\t:global .y {\n\t\tcolor: red;\n\t}\n\n\t/* not ok */\n\t:global {\n\t\tcolor: red;\n\t}\n</style>\n",
+                "css_global_block_invalid_declaration",
+                (109, 119),
+            ),
+            (
+                "css-global-block-combinator",
+                "<style>\n\t/* ok */\n\t.x :global {\n\t}\n\n\t/* not ok */\n\t.x > :global {\n\t}\n</style>\n",
+                "css_global_block_invalid_combinator",
+                (54, 63),
+            ),
+            (
+                "css-global-block-in-pseudoclass",
+                "<style>\n\t/* invalid */\n\t:is(:global) { color: red }\n</style>\n",
+                "css_global_block_invalid_placement",
+                (28, 35),
+            ),
+            (
+                "css-global-modifier",
+                "<style>\n\t/* ok */\n\tdiv :global.x {\n\t\tcolor: red;\n\t}\n\n\t/* not ok */\n\t.x:global {\n\t\tcolor: red;\n\t}\n</style>\n",
+                "css_global_block_invalid_modifier",
+                (70, 77),
+            ),
+            (
+                "css-global-modifier-start-1",
+                "<style>\n\t/* ok */\n\tdiv :global.x {\n\t\tcolor: red;\n\t}\n\n\t/* not ok */\n\t:global.x {\n\t\tcolor: red;\n\t}\n</style>\n",
+                "css_global_block_invalid_modifier_start",
+                (75, 77),
+            ),
+        ] {
+            let diagnostic = compile(source, CompileOptions::default()).unwrap_err().diagnostic();
+            assert_eq!(diagnostic.code.as_deref(), Some(code), "{fixture}");
+            assert_eq!(diagnostic.span, Some(span), "{fixture}");
+        }
+    }
+
+    #[test]
+    fn diagnostic_locates_invalid_svelte_self() {
+        let source = "<svelte:self />";
+        let err = compile(source, CompileOptions::default()).unwrap_err();
+        let diagnostic = err.diagnostic();
+        assert_eq!(diagnostic.code.as_deref(), Some("svelte_self_invalid_placement"));
+        assert_eq!(diagnostic.span, Some((0, source.len() as u32)));
+    }
+
+    #[test]
+    fn diagnostic_message_carries_the_documentation_url_like_official() {
+        let diagnostic =
+            compile("<script>function a(x) {} a($state(1));</script>", CompileOptions::default())
+                .unwrap_err()
+                .diagnostic();
+        assert_eq!(diagnostic.code.as_deref(), Some("state_invalid_placement"));
+        assert_eq!(
+            diagnostic.message,
+            "`$state(...)` can only be used as a variable declaration initializer, a class field declaration, or the first assignment to a class field at the top level of the constructor.\nhttps://svelte.dev/e/state_invalid_placement"
+        );
+    }
+
+    #[test]
+    fn rune_argument_diagnostic_uses_call_message_and_span() {
+        let source = "<script>let value = $derived(1, 2);</script>";
+        let diagnostic = compile(source, CompileOptions::default()).unwrap_err().diagnostic();
+        assert_eq!(diagnostic.code.as_deref(), Some("rune_invalid_arguments_length"));
+        assert_eq!(
+            strip_link(&diagnostic.message),
+            "`$derived` must be called with exactly one argument"
+        );
+        let (start, end) = diagnostic.span.expect("rune call has a span");
+        assert_eq!(&source[start as usize..end as usize], "$derived(1, 2)");
+    }
+
+    #[test]
+    fn props_placement_diagnostic_uses_call_message_and_span() {
+        let source = "<script>function invalid() { $props(); }</script>";
+        let diagnostic = compile(source, CompileOptions::default()).unwrap_err().diagnostic();
+        assert_eq!(diagnostic.code.as_deref(), Some("props_invalid_placement"));
+        assert_eq!(
+            strip_link(&diagnostic.message),
+            "`$props()` can only be used at the top level of components as a variable declaration initializer"
+        );
+        let (start, end) = diagnostic.span.expect("$props call has a span");
+        assert_eq!(&source[start as usize..end as usize], "$props()");
+    }
+
+    #[test]
+    fn dollar_import_diagnostic_uses_the_imported_identifier() {
+        let source = "<script>\n\timport { $ } from './store';\n</script>";
+        let diagnostic = compile(source, CompileOptions::default()).unwrap_err().diagnostic();
+        assert_eq!(diagnostic.code.as_deref(), Some("dollar_binding_invalid"));
+        assert_eq!(
+            strip_link(&diagnostic.message),
+            "The $ name is reserved, and cannot be used for variables and imports"
+        );
+        let (start, end) = diagnostic.span.expect("import binding has a span");
+        assert_eq!(&source[start as usize..end as usize], "$");
+    }
+
+    #[test]
+    fn diagnostic_span_is_a_utf16_position_not_a_byte_offset() {
+        // The JS side indexes by UTF-16 unit; a byte offset would report 30.
+        let source = "<!-- ééééé --><div a=\"1\" a=\"2\"></div>";
+        let d = compile(source, CompileOptions::default()).unwrap_err().diagnostic();
+        let (start, _) = d.span.unwrap();
+        assert_eq!(source_position(source, start).character, 25);
+    }
+
+    #[test]
+    fn frame_caret_stops_at_the_end_of_the_quoted_line() {
+        // The caret column comes from `end`, which for a multi-line construct
+        // sits past the end of the `start` line the frame quotes.
+        let source = "<table>\n\t<tr>\n\t\t<td>hi</td>\n\t</tr>\n</table>";
+        let span = compile(source, CompileOptions::default())
+            .unwrap_err()
+            .diagnostic()
+            .span
+            .expect("node_invalid_placement carries a span");
+        let frame = source_span(source, span).frame;
+        let caret = frame.lines().nth(2).unwrap();
+        assert_eq!(caret, "         ^", "{frame}");
+    }
+
+    #[test]
+    fn diagnostic_reports_no_code_for_an_internal_failure() {
+        // `code` absent is a state a consumer can observe, not a placeholder.
+        let d = CompileError::Panic("boom".into()).diagnostic();
+        assert_eq!(d.code, None);
+        assert_eq!(d.span, None);
+    }
+
+    #[test]
+    #[cfg(feature = "parallel")]
+    fn test_catch_compile_panic_isolates_one_item() {
+        // Suppress the panic hook's stderr dump for this expected panic.
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let result = catch_compile_panic(|| panic!("boom"));
+        std::panic::set_hook(prev_hook);
+        match result {
+            Err(CompileError::Panic(msg)) => assert_eq!(msg, "boom"),
+            other => panic!("expected CompileError::Panic, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "parallel")]
+    fn test_compile_batch_survives_one_panicking_item() {
+        // A source that panics deep in the pipeline would exercise the real
+        // path, but rune-free HTML never hits one; the isolation itself is
+        // covered directly by `test_catch_compile_panic_isolates_one_item`.
+        // This asserts the surrounding contract: batch results stay aligned
+        // with their inputs and unrelated items are unaffected by an error.
+        let inputs = vec![
+            ("<h1>ok</h1>", CompileOptions::default()),
+            ("<h1>{unterminated", CompileOptions::default()),
+            ("<p>also ok</p>", CompileOptions::default()),
+        ];
+        let results = compile_batch(&inputs);
+        assert_eq!(results.len(), 3);
+        assert!(results[0].is_ok());
+        assert!(results[1].is_err());
+        assert!(results[2].is_ok());
+    }
+
     #[test]
     fn test_compile_simple() {
         let source = "<h1>Hello World</h1>";
@@ -1466,12 +2011,29 @@ mod tests {
     }
 
     #[test]
+    fn test_compile_can_externalize_sourcemap_content() {
+        let source = "<style>h1 { color: red }</style><h1>Hello</h1>";
+        let options =
+            CompileOptions { filename: Some("App.svelte".to_string()), ..Default::default() };
+
+        let embedded = compile(source, options.clone()).unwrap();
+        let externalized = compile_with_external_sourcemap_content(source, options).unwrap();
+
+        assert_eq!(externalized.js.code, embedded.js.code);
+        let js_map: serde_json::Value =
+            serde_json::from_str(externalized.js.map.as_deref().unwrap()).unwrap();
+        let css_map: serde_json::Value = serde_json::from_str(
+            externalized.css.as_ref().and_then(|css| css.map.as_deref()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(js_map["sourcesContent"], serde_json::json!([null]));
+        assert_eq!(css_map["sourcesContent"], serde_json::json!([null]));
+    }
+
+    #[test]
     fn test_compile_client_mode() {
         let source = "<div>Test</div>";
-        let options = CompileOptions {
-            generate: GenerateMode::Client,
-            ..Default::default()
-        };
+        let options = CompileOptions { generate: GenerateMode::Client, ..Default::default() };
         let result = compile(source, options).unwrap();
         assert!(result.js.code.contains("svelte/internal/client"));
     }
@@ -1479,10 +2041,7 @@ mod tests {
     #[test]
     fn test_compile_server_mode() {
         let source = "<div>Test</div>";
-        let options = CompileOptions {
-            generate: GenerateMode::Server,
-            ..Default::default()
-        };
+        let options = CompileOptions { generate: GenerateMode::Server, ..Default::default() };
         let result = compile(source, options).unwrap();
         assert!(result.js.code.contains("svelte/internal/server"));
     }
@@ -1496,10 +2055,7 @@ mod tests {
 {#if visible}
   <div>Visible!</div>
 {/if}"#;
-        let options = CompileOptions {
-            generate: GenerateMode::Server,
-            ..Default::default()
-        };
+        let options = CompileOptions { generate: GenerateMode::Server, ..Default::default() };
         let result = compile(source, options).unwrap();
         let code = &result.js.code;
 
@@ -1524,10 +2080,7 @@ mod tests {
 {:else}
   <div>No</div>
 {/if}"#;
-        let options = CompileOptions {
-            generate: GenerateMode::Server,
-            ..Default::default()
-        };
+        let options = CompileOptions { generate: GenerateMode::Server, ..Default::default() };
         let result = compile(source, options).unwrap();
         let code = &result.js.code;
 
@@ -1537,10 +2090,7 @@ mod tests {
         // Should contain BLOCK_OPEN marker for if branch
         assert!(code.contains("<!--[0-->"), "Should have BLOCK_OPEN marker");
         // Should contain BLOCK_OPEN_ELSE marker for else branch
-        assert!(
-            code.contains("<!--[-1-->"),
-            "Should have BLOCK_OPEN_ELSE marker"
-        );
+        assert!(code.contains("<!--[-1-->"), "Should have BLOCK_OPEN_ELSE marker");
         // Should contain BLOCK_CLOSE marker
         assert!(code.contains("<!--]-->"), "Should have BLOCK_CLOSE marker");
     }
@@ -1558,34 +2108,19 @@ mod tests {
 {:else}
   <div>Other</div>
 {/if}"#;
-        let options = CompileOptions {
-            generate: GenerateMode::Server,
-            ..Default::default()
-        };
+        let options = CompileOptions { generate: GenerateMode::Server, ..Default::default() };
         let result = compile(source, options).unwrap();
         let code = &result.js.code;
-
-        // Print for debugging
-        println!("Generated else-if code:\n{}", code);
 
         // Following official Svelte compiler, else-if is rendered as nested if inside else block
         // Structure:
         // if (value === 1) { <!--[0--> ... } else { <!--[-1--> if (value === 2) { <!--[0--> ... } else { <!--[-1--> ... } <!--]--> } <!--]-->
-        assert!(
-            code.contains("if (value === 1)"),
-            "Should have outer if statement"
-        );
-        assert!(
-            code.contains("if (value === 2)"),
-            "Should have nested if statement for else-if"
-        );
+        assert!(code.contains("if (value === 1)"), "Should have outer if statement");
+        assert!(code.contains("if (value === 2)"), "Should have nested if statement for else-if");
         assert!(code.contains("else"), "Should have else branch");
         // Verify block markers
         assert!(code.contains("<!--[0-->"), "Should have BLOCK_OPEN markers");
-        assert!(
-            code.contains("<!--[-1-->"),
-            "Should have BLOCK_OPEN_ELSE markers"
-        );
+        assert!(code.contains("<!--[-1-->"), "Should have BLOCK_OPEN_ELSE markers");
         assert!(code.contains("<!--]-->"), "Should have BLOCK_CLOSE markers");
     }
 
@@ -1600,23 +2135,14 @@ mod tests {
 {:else}
   <div>Hidden</div>
 {/if}"#;
-        let options = CompileOptions {
-            generate: GenerateMode::Server,
-            ..Default::default()
-        };
+        let options = CompileOptions { generate: GenerateMode::Server, ..Default::default() };
         let result = compile(source, options).unwrap();
         let code = &result.js.code;
-
-        // Print for debugging
-        println!("Generated code:\n{}", code);
 
         // Verify structure
         assert!(code.contains("if (visible)"), "Should have if statement");
         assert!(code.contains("<!--[0-->"), "Should have BLOCK_OPEN marker");
-        assert!(
-            code.contains("<!--[-1-->"),
-            "Should have BLOCK_OPEN_ELSE marker"
-        );
+        assert!(code.contains("<!--[-1-->"), "Should have BLOCK_OPEN_ELSE marker");
         assert!(code.contains("<!--]-->"), "Should have BLOCK_CLOSE marker");
     }
 
@@ -1644,21 +2170,12 @@ mod tests {
 		<br />
 		second: {derivedSecond}
 {/if}"#;
-        let options = CompileOptions {
-            generate: GenerateMode::Server,
-            ..Default::default()
-        };
+        let options = CompileOptions { generate: GenerateMode::Server, ..Default::default() };
         let result = compile(source, options).unwrap();
         let code = &result.js.code;
 
-        // Print for debugging
-        println!("Generated code with derived:\n{}", code);
-
         // Should contain the expressions before if block
-        assert!(
-            code.contains("$.escape(first)"),
-            "Should have first expression"
-        );
+        assert!(code.contains("$.escape(first)"), "Should have first expression");
 
         // Should contain the button
         assert!(code.contains("<button"), "Should have button");
@@ -1691,35 +2208,20 @@ let promise = Promise.resolve(42);
 {:catch error}
   <p>error {error}</p>
 {/await}"#;
-        let options = CompileOptions {
-            generate: GenerateMode::Server,
-            ..Default::default()
-        };
+        let options = CompileOptions { generate: GenerateMode::Server, ..Default::default() };
         let result = compile(source, options).unwrap();
         let code = &result.js.code;
-
-        // Print for debugging
-        println!("Generated await code:\n{}", code);
 
         // Should contain $.await call
         assert!(code.contains("$.await("), "Should have $.await call");
         // Should contain $$renderer in first argument
-        assert!(
-            code.contains("$$renderer,"),
-            "Should have $$renderer parameter"
-        );
+        assert!(code.contains("$$renderer,"), "Should have $$renderer parameter");
         // Should contain the promise
         assert!(code.contains("promise"), "Should have promise parameter");
         // Should contain pending body with <p>pending</p>
-        assert!(
-            code.contains("<p>pending</p>"),
-            "Should have pending content"
-        );
+        assert!(code.contains("<p>pending</p>"), "Should have pending content");
         // Should contain then callback with value parameter
-        assert!(
-            code.contains("(value) =>"),
-            "Should have then callback with value"
-        );
+        assert!(code.contains("(value) =>"), "Should have then callback with value");
         // Should contain then body content
         assert!(
             code.contains("then ${$.escape(value)}")
@@ -1749,19 +2251,10 @@ export const message = "Hello";
         let result = compile(source, options).unwrap();
         let code = &result.js.code;
 
-        // Print for debugging
-        println!("Generated bind_props code:\n{}", code);
-
         // Should contain $.bind_props() call with message
-        assert!(
-            code.contains("$.bind_props("),
-            "Should have $.bind_props call"
-        );
+        assert!(code.contains("$.bind_props("), "Should have $.bind_props call");
         // Should contain $$props as first argument
-        assert!(
-            code.contains("$.bind_props($$props,"),
-            "Should have $$props as first argument"
-        );
+        assert!(code.contains("$.bind_props($$props,"), "Should have $$props as first argument");
         // Should contain message in the object
         assert!(
             code.contains("message") && code.contains("$.bind_props"),
@@ -1787,14 +2280,8 @@ export function greet(name) {
         let result = compile(source, options).unwrap();
         let code = &result.js.code;
 
-        // Print for debugging
-        println!("Generated bind_props with function export code:\n{}", code);
-
         // Should contain $.bind_props() call
-        assert!(
-            code.contains("$.bind_props("),
-            "Should have $.bind_props call"
-        );
+        assert!(code.contains("$.bind_props("), "Should have $.bind_props call");
         // Should contain greet in the object
         assert!(
             code.contains("greet") && code.contains("$.bind_props"),
@@ -1832,20 +2319,12 @@ export function greet(name) {
         let result = compile_module(source, options).unwrap();
         let code = &result.js.code;
         // The JSDoc lines must NOT have ';' appended
-        assert!(
-            !code.contains("/**;"),
-            "/**; found — block comment corrupted"
-        );
-        assert!(
-            !code.contains(" * Sets the field node.;"),
-            "comment line has ; appended"
-        );
+        assert!(!code.contains("/**;"), "/**; found — block comment corrupted");
+        assert!(!code.contains(" * Sets the field node.;"), "comment line has ; appended");
         // `*/` must be followed by a newline and then the method, not joined inline
         let lines: Vec<&str> = code.lines().collect();
         let star_close = lines.iter().position(|l| l.trim() == "*/");
-        let set_field = lines
-            .iter()
-            .position(|l| l.trim().starts_with("setFieldNode("));
+        let set_field = lines.iter().position(|l| l.trim().starts_with("setFieldNode("));
         assert!(
             star_close.is_some() && set_field.is_some(),
             "both */ and setFieldNode must appear in server output; got:\n{code}"

@@ -40,6 +40,7 @@
 use crate::ast::template::AwaitBlock;
 use crate::compiler::phases::phase3_transform::server::ast::ServerTransformState;
 use oxc_ast::ast::BindingPattern;
+use oxc_span::GetSpanMut;
 
 use super::shared::{
     BLOCK_CLOSE, TemplateEntry, build_fragment_block, create_child_block, expr_text_blockers,
@@ -60,21 +61,36 @@ use super::shared::{
 ///   `has_await`, so a blocker reference becomes
 ///   `$$renderer.async_block([$$promises[N]…], …)` and an inline await becomes
 ///   `$$renderer.child_block(async …)`.
-pub fn visit_await_block<'a>(node: &AwaitBlock, state: &mut ServerTransformState<'a>) {
+pub fn visit_await_block<'a>(node: &AwaitBlock<'a>, state: &mut ServerTransformState<'a>) {
     // Detect the async axes from the expression source against the precomputed
     // instance blocker map (only populated under `experimental.async`).
     let expr_text = state.expr_source(&node.expression).map(|s| s.to_string());
-    let blocker_indices: Vec<usize> = expr_text
-        .as_deref()
-        .map(|t| expr_text_blockers(state, t))
-        .unwrap_or_default();
+    let blocker_indices: Vec<usize> =
+        expr_text.as_deref().map(|t| expr_text_blockers(state, t)).unwrap_or_default();
     let has_await = expr_text.as_deref().is_some_and(text_has_await);
 
     // `context.visit(node.expression)` → `$.save`-wrap any inline await.
     let mut expression = if has_await {
         save_wrap_expr_text(state, expr_text.as_deref().unwrap_or(""))
     } else {
-        state.visit_expr(&node.expression)
+        state.visit_expr_claiming(&node.expression)
+    };
+    let has_header_comments = if let (Some(start), Some(end), Some(header_end)) = (
+        node.expression.start(),
+        node.expression.end(),
+        crate::compiler::phases::phase1_parse::utils::find_matching_bracket(
+            state.source,
+            node.start as usize + 1,
+            '{',
+        ),
+    ) {
+        state.place_template_expression_comments(
+            (node.start + 7, header_end as u32),
+            (start, end),
+            &mut expression,
+        )
+    } else {
+        false
     };
     // `has_await` → async-IIFE-wrap so `$.await` receives a promise (the inner
     // await is not eagerly awaited).
@@ -86,12 +102,15 @@ pub fn visit_await_block<'a>(node: &AwaitBlock, state: &mut ServerTransformState
 
     // Pending callback: `() => { <pending body> }` (thunk of a block).
     let pending_block = match &node.pending {
-        Some(frag) => build_fragment_block(frag, false, state),
+        Some(frag) => {
+            let saved = state.enter_template_scope(node.start);
+            let block = build_fragment_block(frag, false, state);
+            state.restore_scope(saved);
+            block
+        }
         None => state.b.block(vec![]),
     };
-    let pending_thunk = state
-        .b
-        .thunk_block(unwrap_block(pending_block, state), false);
+    let pending_thunk = state.b.thunk_block(unwrap_block(pending_block, state), false);
 
     // Then callback: `(value) => { <then body> }`.
     //
@@ -106,11 +125,22 @@ pub fn visit_await_block<'a>(node: &AwaitBlock, state: &mut ServerTransformState
     if let Some(v) = &node.value {
         super::snippet_block::collect_param_pattern_names(v, &mut shadow);
     }
-    state.shadowed_names.push(shadow);
+    // `slot_let_shadows` as well: the awaited value is a runtime value, so a
+    // body read must not constant-fold to a same-named instance literal.
+    state.shadowed_names.push(shadow.clone());
+    state.slot_let_shadows.push(shadow);
+    // The `then` fragment's scope is recorded under `block.start + 1` (an await
+    // block owns three fragment scopes under one start offset).
     let then_block = match &node.then {
-        Some(frag) => build_fragment_block(frag, false, state),
+        Some(frag) => {
+            let saved = state.enter_template_scope(node.start + 1);
+            let block = build_fragment_block(frag, false, state);
+            state.restore_scope(saved);
+            block
+        }
         None => state.b.block(vec![]),
     };
+    state.slot_let_shadows.pop();
     state.shadowed_names.pop();
     let then_params = match &node.value {
         Some(v) => vec![value_pattern(v, state)],
@@ -120,10 +150,14 @@ pub fn visit_await_block<'a>(node: &AwaitBlock, state: &mut ServerTransformState
     let then_body = b.body(unwrap_block(then_block, state));
     let then_arrow = b.arrow(b.params(then_params, None), then_body, false, false);
 
-    let call = b.call(
-        "$.await",
-        vec![b.id("$$renderer"), expression, pending_thunk, then_arrow],
-    );
+    let mut call =
+        b.call("$.await", vec![b.id("$$renderer"), expression, pending_thunk, then_arrow]);
+    if has_header_comments && let oxc_ast::ast::Expression::CallExpression(call) = &mut call {
+        *call.callee.span_mut() = oxc_span::Span::new(
+            rsvelte_esrap::COMMENT_ARGUMENT_CALLEE_BASE + 1,
+            rsvelte_esrap::COMMENT_ARGUMENT_CALLEE_BASE + 1,
+        );
+    }
 
     // create_child_block: blockers → `$$renderer.async_block([…], …)`, an inline
     // await → `$$renderer.child_block(async …)`, else the statement verbatim.
@@ -132,9 +166,7 @@ pub fn visit_await_block<'a>(node: &AwaitBlock, state: &mut ServerTransformState
     for stmt in wrapped {
         state.template.push(TemplateEntry::Stmt(stmt));
     }
-    state
-        .template
-        .push(TemplateEntry::Literal(BLOCK_CLOSE.to_string()));
+    state.template.push(TemplateEntry::Literal(BLOCK_CLOSE.to_string()));
 }
 
 /// Extract the statement list out of a `BlockStatement` we just built (so it can

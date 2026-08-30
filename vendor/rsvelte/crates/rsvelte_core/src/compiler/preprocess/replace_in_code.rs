@@ -8,9 +8,13 @@ use std::sync::LazyLock;
 use regex::Regex;
 
 use super::types::{MappedCode, PreprocessError, Replacement, SimpleDecodedMap, Source};
+use crate::compiler::utils::utf16_len;
 
-// Cached regex for tokenizing lines (for source map generation)
-static REGEX_LINE_TOKEN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"([^\w\s]|\s+)").unwrap());
+// Cached regex for tokenizing lines (for source map generation). The word class
+// is spelled out because JavaScript's `\w` is ASCII-only, so a non-ASCII letter
+// is its own token upstream but would join a word run under Unicode `\w`.
+static REGEX_LINE_TOKEN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"([^0-9A-Za-z_\s]|\s+)").unwrap());
 
 /// Create a slice of a Source at a given offset.
 ///
@@ -66,11 +70,7 @@ where
     // Wait for all replacement futures to complete
     for (future, length, offset) in futures {
         let replacement = future.await?;
-        replacements.push(Replacement {
-            offset,
-            length,
-            replacement,
-        });
+        replacements.push(Replacement { offset, length, replacement });
     }
 
     Ok(replacements)
@@ -83,12 +83,7 @@ fn perform_replacements(replacements: Vec<Replacement>, source: &Source) -> Mapp
     let mut out = MappedCode::new();
     let mut last_end = 0;
 
-    for Replacement {
-        offset,
-        length,
-        replacement,
-    } in replacements
-    {
+    for Replacement { offset, length, replacement } in replacements {
         // Add unchanged prefix
         if offset > last_end {
             let unchanged_prefix = source.source[last_end..offset].to_string();
@@ -149,10 +144,7 @@ impl MappedCode {
         };
 
         if source.source.is_empty() {
-            return MappedCode {
-                string: source.source.clone(),
-                map,
-            };
+            return MappedCode { string: source.source.clone(), map };
         }
 
         // Create high-resolution identity map
@@ -161,14 +153,14 @@ impl MappedCode {
 
         for (line_idx, line) in line_list.iter().enumerate() {
             let mut line_mappings = vec![];
-            let mut column = 0u32;
+            let mut column = 0usize;
 
             // Split line into tokens
             let mut last_end = 0;
             for token_match in REGEX_LINE_TOKEN.find_iter(line) {
                 // Add token before this match
                 if token_match.start() > last_end {
-                    let token_len = (token_match.start() - last_end) as u32;
+                    let token_len = utf16_len(&line[last_end..token_match.start()]);
                     if token_len > 0 {
                         line_mappings.push(vec![
                             column as i64,
@@ -181,7 +173,7 @@ impl MappedCode {
                 }
 
                 // Add the matched token
-                let token_len = token_match.as_str().len() as u32;
+                let token_len = utf16_len(token_match.as_str());
                 if token_len > 0 {
                     line_mappings.push(vec![
                         column as i64,
@@ -196,7 +188,7 @@ impl MappedCode {
 
             // Add remaining part of line
             if last_end < line.len() {
-                let token_len = (line.len() - last_end) as u32;
+                let token_len = utf16_len(&line[last_end..]);
                 if token_len > 0 {
                     line_mappings.push(vec![
                         column as i64,
@@ -219,10 +211,7 @@ impl MappedCode {
             }
         }
 
-        MappedCode {
-            string: source.source.clone(),
-            map,
-        }
+        MappedCode { string: source.source.clone(), map }
     }
 
     /// Concatenate two MappedCode instances.
@@ -342,32 +331,39 @@ impl MappedCode {
     }
 }
 
-/// Get the length of the last line in a string.
+/// UTF-16 length of the last line in a string — the column its end sits at.
 fn last_line_length(s: &str) -> usize {
-    s.len() - s.rfind('\n').map(|i| i + 1).unwrap_or(0)
+    utf16_len(&s[s.rfind('\n').map(|i| i + 1).unwrap_or(0)..])
 }
 
 /// Merge two tables (sources or names arrays) and return the merged table,
 /// index mapping, and whether values/indices changed.
 ///
+/// `this_table` is only cloned once an entry from `other_table` is actually
+/// missing from it — the common case (every `other_table` entry already
+/// present) skips the clone entirely. The caller only uses the returned
+/// table when `changed` is `true`, so an empty `Vec` is returned otherwise.
+///
 /// Returns: (new_table, idx_map, changed)
 fn merge_tables<T: Clone + Eq>(this_table: &[T], other_table: &[T]) -> (Vec<T>, Vec<usize>, bool) {
-    let mut new_table = this_table.to_vec();
+    let mut new_table: Option<Vec<T>> = None;
     let mut idx_map = Vec::with_capacity(other_table.len());
-    let mut val_changed = false;
 
     for other_val in other_table {
         if let Some(this_idx) = this_table.iter().position(|v| v == other_val) {
             idx_map.push(this_idx);
         } else {
-            let new_idx = new_table.len();
-            new_table.push(other_val.clone());
+            let table = new_table.get_or_insert_with(|| this_table.to_vec());
+            let new_idx = table.len();
+            table.push(other_val.clone());
             idx_map.push(new_idx);
-            val_changed = true;
         }
     }
 
-    (new_table, idx_map, val_changed)
+    match new_table {
+        Some(table) => (table, idx_map, true),
+        None => (Vec::new(), idx_map, false),
+    }
 }
 
 #[cfg(test)]
@@ -411,6 +407,16 @@ mod tests {
         assert!(changed);
     }
 
+    #[test]
+    fn test_merge_tables_no_new_entries() {
+        let t1 = vec!["a", "b", "c"];
+        let t2 = vec!["b", "a"];
+        let (_, idx_map, changed) = merge_tables(&t1, &t2);
+
+        assert_eq!(idx_map, vec![1, 0]);
+        assert!(!changed);
+    }
+
     fn mapped(string: &str, sources: Vec<String>, mappings: Vec<Vec<Vec<i64>>>) -> MappedCode {
         MappedCode {
             string: string.to_string(),
@@ -433,11 +439,7 @@ mod tests {
         let m1 = mapped("a", vec!["a.svelte".into()], vec![vec![vec![0, 0, 0, 0]]]);
         // segment source index 5 and name index 9 are both out of range for the
         // single-entry sources / empty names of m2.
-        let m2 = mapped(
-            "b",
-            vec!["b.svelte".into()],
-            vec![vec![vec![0, 5, 0, 0, 9]]],
-        );
+        let m2 = mapped("b", vec!["b.svelte".into()], vec![vec![vec![0, 5, 0, 0, 9]]]);
         let combined = m1.concat(m2);
         // The out-of-range indices are left unchanged rather than crashing.
         assert!(!combined.map.mappings.is_empty());

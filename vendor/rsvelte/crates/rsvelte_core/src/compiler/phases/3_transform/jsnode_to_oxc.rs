@@ -22,15 +22,20 @@
 //!
 //! All construction patterns are lifted verbatim from the proven
 //! `js_ast::to_oxc` converter (variant-complete against oxc 0.136), so the
-//! nodes produced print byte-identically through esrap. All spans are the
-//! dummy [`oxc_span::SPAN`]: esrap formats structurally.
+//! nodes produced print byte-identically through esrap. Most container spans
+//! are the dummy [`oxc_span::SPAN`]: esrap formats structurally. Identifier
+//! references and call expressions retain their source spans so a caller
+//! rebuilding an expression can place the comment cursor on surviving tokens
+//! rather than on a generated wrapper. Literals deliberately keep the dummy
+//! span to match upstream cursor placement: an interior comment remains pending
+//! until the enclosing argument boundary instead of moving before the literal.
 
 use crate::ast::arena::{IdRange, JsNodeId, ParseArena};
 use crate::ast::typed_expr::{JsNode, LiteralValue};
-use crate::compiler::phases::phase3_transform::builders::AstBuilder;
-use oxc_allocator::{Allocator, Box as ArenaBox, Vec as ArenaVec};
+use oxc_allocator::{Allocator, ArenaBox, ArenaVec, GetAllocator};
 use oxc_ast::ast::*;
-use oxc_span::SPAN;
+use oxc_ast::builder::AstBuilder;
+use oxc_span::{SPAN, Span};
 use oxc_syntax::number::NumberBase;
 use oxc_syntax::operator::{
     AssignmentOperator, BinaryOperator, LogicalOperator, UnaryOperator, UpdateOperator,
@@ -44,10 +49,7 @@ pub fn jsnode_to_oxc_expr<'a>(
     arena: &ParseArena,
     allocator: &'a Allocator,
 ) -> Option<Expression<'a>> {
-    let cx = Cx {
-        ab: AstBuilder::new(allocator),
-        arena,
-    };
+    let cx = Cx { ab: AstBuilder::new(allocator), arena };
     cx.expr(node)
 }
 
@@ -62,10 +64,7 @@ pub fn jsnode_to_oxc_program<'a>(
     let JsNode::Program { body, .. } = node else {
         return None;
     };
-    let cx = Cx {
-        ab: AstBuilder::new(allocator),
-        arena,
-    };
+    let cx = Cx { ab: AstBuilder::new(allocator), arena };
     let stmts = cx.statements(*body)?;
     Some(Program::new(
         SPAN,
@@ -75,34 +74,6 @@ pub fn jsnode_to_oxc_program<'a>(
         None,
         ArenaVec::new_in(&cx.ab),
         stmts,
-        &cx.ab,
-    ))
-}
-
-/// Convert a slice of top-level [`JsNode`] statements into an oxc
-/// [`oxc_ast::ast::Program`]. Returns `None` on any unhandled statement.
-pub fn jsnode_stmts_to_oxc_program<'a>(
-    stmts: &[JsNode],
-    arena: &ParseArena,
-    allocator: &'a Allocator,
-) -> Option<oxc_ast::ast::Program<'a>> {
-    let cx = Cx {
-        ab: AstBuilder::new(allocator),
-        arena,
-    };
-    let body: Vec<Statement<'a>> = stmts
-        .iter()
-        .map(|s| cx.stmt(s))
-        .collect::<Option<Vec<_>>>()?;
-    let body = ArenaVec::from_iter_in(body, &cx.ab);
-    Some(Program::new(
-        SPAN,
-        oxc_span::SourceType::mjs(),
-        "",
-        ArenaVec::new_in(&cx.ab),
-        None,
-        ArenaVec::new_in(&cx.ab),
-        body,
         &cx.ab,
     ))
 }
@@ -118,7 +89,7 @@ impl<'a, 'arena> Cx<'a, 'arena> {
     /// Allocate a string into the oxc arena, yielding an `&'a str`.
     #[inline]
     fn str(&self, s: &str) -> &'a str {
-        self.ab.allocator.alloc_str(s)
+        self.ab.allocator().alloc_str(s)
     }
 
     /// Resolve a [`JsNodeId`] and convert the pointed-to node as an expression.
@@ -148,9 +119,7 @@ impl<'a, 'arena> Cx<'a, 'arena> {
                     Some(id) => Some(self.expr_id(*id)?),
                     None => None,
                 };
-                Some(Statement::ReturnStatement(ReturnStatement::boxed(
-                    SPAN, arg, &self.ab,
-                )))
+                Some(Statement::ReturnStatement(ReturnStatement::boxed(SPAN, arg, &self.ab)))
             }
             JsNode::VariableDeclaration { .. } => {
                 let decl = self.variable_declaration_node(node)?;
@@ -158,40 +127,27 @@ impl<'a, 'arena> Cx<'a, 'arena> {
             }
             JsNode::BlockStatement { body, .. } => {
                 let stmts = self.statements(*body)?;
-                Some(Statement::BlockStatement(BlockStatement::boxed(
-                    SPAN, stmts, &self.ab,
-                )))
+                Some(Statement::BlockStatement(BlockStatement::boxed(SPAN, stmts, &self.ab)))
             }
-            JsNode::EmptyStatement { .. } => Some(Statement::EmptyStatement(
-                EmptyStatement::boxed(SPAN, &self.ab),
-            )),
-            JsNode::DebuggerStatement { .. } => Some(Statement::DebuggerStatement(
-                DebuggerStatement::boxed(SPAN, &self.ab),
-            )),
+            JsNode::EmptyStatement { .. } => {
+                Some(Statement::EmptyStatement(EmptyStatement::boxed(SPAN, &self.ab)))
+            }
+            JsNode::DebuggerStatement { .. } => {
+                Some(Statement::DebuggerStatement(DebuggerStatement::boxed(SPAN, &self.ab)))
+            }
             JsNode::ThrowStatement { argument, .. } => {
                 let arg = self.expr_id(*argument)?;
-                Some(Statement::ThrowStatement(ThrowStatement::boxed(
-                    SPAN, arg, &self.ab,
-                )))
+                Some(Statement::ThrowStatement(ThrowStatement::boxed(SPAN, arg, &self.ab)))
             }
             JsNode::BreakStatement { label, .. } => {
                 let label = self.opt_label(label)?;
-                Some(Statement::BreakStatement(BreakStatement::boxed(
-                    SPAN, label, &self.ab,
-                )))
+                Some(Statement::BreakStatement(BreakStatement::boxed(SPAN, label, &self.ab)))
             }
             JsNode::ContinueStatement { label, .. } => {
                 let label = self.opt_label(label)?;
-                Some(Statement::ContinueStatement(ContinueStatement::boxed(
-                    SPAN, label, &self.ab,
-                )))
+                Some(Statement::ContinueStatement(ContinueStatement::boxed(SPAN, label, &self.ab)))
             }
-            JsNode::IfStatement {
-                test,
-                consequent,
-                alternate,
-                ..
-            } => {
+            JsNode::IfStatement { test, consequent, alternate, .. } => {
                 let test = self.expr_id(*test)?;
                 let consequent = self.stmt_id(*consequent)?;
                 let alternate = match alternate {
@@ -218,9 +174,7 @@ impl<'a, 'arena> Cx<'a, 'arena> {
             JsNode::WhileStatement { test, body, .. } => {
                 let test = self.expr_id(*test)?;
                 let body = self.stmt_id(*body)?;
-                Some(Statement::WhileStatement(WhileStatement::boxed(
-                    SPAN, test, body, &self.ab,
-                )))
+                Some(Statement::WhileStatement(WhileStatement::boxed(SPAN, test, body, &self.ab)))
             }
             JsNode::DoWhileStatement { test, body, .. } => {
                 let body = self.stmt_id(*body)?;
@@ -269,14 +223,7 @@ impl<'a, 'arena> Cx<'a, 'arena> {
     }
 
     fn for_statement(&self, node: &JsNode) -> Option<Statement<'a>> {
-        let JsNode::ForStatement {
-            init,
-            test,
-            update,
-            body,
-            ..
-        } = node
-        else {
+        let JsNode::ForStatement { init, test, update, body, .. } = node else {
             return None;
         };
         let init = match init {
@@ -301,9 +248,7 @@ impl<'a, 'arena> Cx<'a, 'arena> {
             None => None,
         };
         let body = self.stmt_id(*body)?;
-        Some(Statement::ForStatement(ForStatement::boxed(
-            SPAN, init, test, update, body, &self.ab,
-        )))
+        Some(Statement::ForStatement(ForStatement::boxed(SPAN, init, test, update, body, &self.ab)))
     }
 
     /// Build `for (left of right)` / `for await (left of right)` /
@@ -311,16 +256,10 @@ impl<'a, 'arena> Cx<'a, 'arena> {
     /// or a plain assignment target (identifier / member); bails on others.
     fn for_of_statement(&self, node: &JsNode, is_for_in: bool) -> Option<Statement<'a>> {
         let (left_id, right_id, body_id, is_await) = match node {
-            JsNode::ForOfStatement {
-                left,
-                right,
-                body,
-                r#await,
-                ..
-            } => (*left, *right, *body, *r#await),
-            JsNode::ForInStatement {
-                left, right, body, ..
-            } => (*left, *right, *body, false),
+            JsNode::ForOfStatement { left, right, body, r#await, .. } => {
+                (*left, *right, *body, *r#await)
+            }
+            JsNode::ForInStatement { left, right, body, .. } => (*left, *right, *body, false),
             _ => return None,
         };
 
@@ -353,22 +292,14 @@ impl<'a, 'arena> Cx<'a, 'arena> {
     }
 
     fn switch_statement(&self, node: &JsNode) -> Option<Statement<'a>> {
-        let JsNode::SwitchStatement {
-            discriminant,
-            cases,
-            ..
-        } = node
-        else {
+        let JsNode::SwitchStatement { discriminant, cases, .. } = node else {
             return None;
         };
         let discriminant = self.expr_id(*discriminant)?;
         let case_nodes = self.arena.get_js_children(*cases);
         let mut out = ArenaVec::with_capacity_in(case_nodes.len(), &self.ab);
         for case in case_nodes {
-            let JsNode::SwitchCase {
-                test, consequent, ..
-            } = case
-            else {
+            let JsNode::SwitchCase { test, consequent, .. } = case else {
                 return None;
             };
             let test = match test {
@@ -378,22 +309,11 @@ impl<'a, 'arena> Cx<'a, 'arena> {
             let consequent = self.statements(*consequent)?;
             out.push(SwitchCase::new(SPAN, test, consequent, &self.ab));
         }
-        Some(Statement::SwitchStatement(SwitchStatement::boxed(
-            SPAN,
-            discriminant,
-            out,
-            &self.ab,
-        )))
+        Some(Statement::SwitchStatement(SwitchStatement::boxed(SPAN, discriminant, out, &self.ab)))
     }
 
     fn try_statement(&self, node: &JsNode) -> Option<Statement<'a>> {
-        let JsNode::TryStatement {
-            block,
-            handler,
-            finalizer,
-            ..
-        } = node
-        else {
+        let JsNode::TryStatement { block, handler, finalizer, .. } = node else {
             return None;
         };
 
@@ -409,11 +329,11 @@ impl<'a, 'arena> Cx<'a, 'arena> {
                     None => None,
                     Some(p) => {
                         let pattern = self.binding_pattern(self.arena.get_js_node(*p))?;
-                        Some(CatchParameter::new(SPAN, pattern, oxc_ast::builder::NONE, &self.ab))
+                        Some(CatchParameter::new(SPAN, pattern, None, &self.ab))
                     }
                 };
                 let body = self.block_statement_box(*body)?;
-                Some(CatchClause::new(SPAN, catch_param, body, &self.ab))
+                Some(CatchClause::boxed(SPAN, catch_param, body, &self.ab))
             }
         };
 
@@ -442,30 +362,16 @@ impl<'a, 'arena> Cx<'a, 'arena> {
     /// Build a module-source `StringLiteral`, preserving the raw `'source'` /
     /// `"source"` spelling so esrap reproduces it byte-for-byte.
     fn module_source_node(&self, id: JsNodeId) -> Option<oxc_ast::ast::StringLiteral<'a>> {
-        let JsNode::Literal {
-            value: LiteralValue::String(s),
-            raw,
-            ..
-        } = self.arena.get_js_node(id)
+        let JsNode::Literal { value: LiteralValue::String(s), raw, .. } =
+            self.arena.get_js_node(id)
         else {
             return None;
         };
-        Some(StringLiteral::new(
-            SPAN,
-            self.str(s),
-            Some(self.str(raw).into()),
-            &self.ab,
-        ))
+        Some(StringLiteral::new(SPAN, self.str(s), Some(self.str(raw).into()), &self.ab))
     }
 
     fn import_declaration(&self, node: &JsNode) -> Option<Statement<'a>> {
-        let JsNode::ImportDeclaration {
-            specifiers,
-            source,
-            import_kind,
-            ..
-        } = node
-        else {
+        let JsNode::ImportDeclaration { specifiers, source, import_kind, .. } = node else {
             return None;
         };
         // `import type … from …` is a TypeScript-only form; bail.
@@ -494,12 +400,7 @@ impl<'a, 'arena> Cx<'a, 'arena> {
                             SPAN, local, &self.ab,
                         ));
                     }
-                    JsNode::ImportSpecifier {
-                        imported,
-                        local,
-                        import_kind,
-                        ..
-                    } => {
+                    JsNode::ImportSpecifier { imported, local, import_kind, .. } => {
                         if import_kind.as_deref() == Some("type") {
                             return None;
                         }
@@ -526,7 +427,7 @@ impl<'a, 'arena> Cx<'a, 'arena> {
             specifiers,
             source,
             None,
-            oxc_ast::builder::NONE,
+            None,
             ImportOrExportKind::Value,
             &self.ab,
         );
@@ -537,15 +438,10 @@ impl<'a, 'arena> Cx<'a, 'arena> {
     /// imported/exported name node.
     fn module_export_name(&self, id: JsNodeId) -> Option<oxc_ast::ast::ModuleExportName<'a>> {
         match self.arena.get_js_node(id) {
-            JsNode::Identifier { name, .. } => Some(ModuleExportName::new_identifier_name(
-                SPAN,
-                self.str(name),
-                &self.ab,
-            )),
-            JsNode::Literal {
-                value: LiteralValue::String(s),
-                ..
-            } => {
+            JsNode::Identifier { name, .. } => {
+                Some(ModuleExportName::new_identifier_name(SPAN, self.str(name), &self.ab))
+            }
+            JsNode::Literal { value: LiteralValue::String(s), .. } => {
                 let lit = StringLiteral::new(SPAN, self.str(s), None, &self.ab);
                 Some(oxc_ast::ast::ModuleExportName::StringLiteral(lit))
             }
@@ -554,13 +450,8 @@ impl<'a, 'arena> Cx<'a, 'arena> {
     }
 
     fn export_named(&self, node: &JsNode) -> Option<Statement<'a>> {
-        let JsNode::ExportNamedDeclaration {
-            declaration,
-            specifiers,
-            source,
-            export_kind,
-            ..
-        } = node
+        let JsNode::ExportNamedDeclaration { declaration, specifiers, source, export_kind, .. } =
+            node
         else {
             return None;
         };
@@ -572,7 +463,7 @@ impl<'a, 'arena> Cx<'a, 'arena> {
             return None;
         }
 
-        let (declaration, specs) = if let Some(decl_id) = declaration {
+        let specs = if let Some(decl_id) = declaration {
             let decl_node = self.arena.get_js_node(*decl_id);
             let declaration = match decl_node {
                 JsNode::VariableDeclaration { .. } => {
@@ -585,18 +476,13 @@ impl<'a, 'arena> Cx<'a, 'arena> {
                 }
                 _ => return None,
             };
-            (Some(declaration), ArenaVec::new_in(&self.ab))
+            let decl = ModuleDeclaration::new_export_declaration(SPAN, declaration, &self.ab);
+            return Some(Statement::from(decl));
         } else {
             let spec_nodes = self.arena.get_js_children(*specifiers);
             let mut out = ArenaVec::with_capacity_in(spec_nodes.len(), &self.ab);
             for spec in spec_nodes {
-                let JsNode::ExportSpecifier {
-                    local,
-                    exported,
-                    export_kind,
-                    ..
-                } = spec
-                else {
+                let JsNode::ExportSpecifier { local, exported, export_kind, .. } = spec else {
                     return None;
                 };
                 if export_kind.as_deref() == Some("type") {
@@ -612,16 +498,13 @@ impl<'a, 'arena> Cx<'a, 'arena> {
                     &self.ab,
                 ));
             }
-            (None, out)
+            out
         };
 
         let decl = ModuleDeclaration::new_export_named_declaration(
             SPAN,
-            declaration,
             specs,
-            None,
             ImportOrExportKind::Value,
-            oxc_ast::builder::NONE,
             &self.ab,
         );
         Some(Statement::from(decl))
@@ -653,22 +536,12 @@ impl<'a, 'arena> Cx<'a, 'arena> {
         func_type: FunctionType,
     ) -> Option<oxc_allocator::Box<'a, oxc_ast::ast::Function<'a>>> {
         let (id, params, body, generator, is_async) = match node {
-            JsNode::FunctionDeclaration {
-                id,
-                params,
-                body,
-                generator,
-                r#async,
-                ..
-            } => (id, *params, body, *generator, *r#async),
-            JsNode::FunctionExpression {
-                id,
-                params,
-                body,
-                generator,
-                r#async,
-                ..
-            } => (id, *params, body, *generator, *r#async),
+            JsNode::FunctionDeclaration { id, params, body, generator, r#async, .. } => {
+                (id, *params, body, *generator, *r#async)
+            }
+            JsNode::FunctionExpression { id, params, body, generator, r#async, .. } => {
+                (id, *params, body, *generator, *r#async)
+            }
             _ => return None,
         };
         let id = match id {
@@ -687,11 +560,11 @@ impl<'a, 'arena> Cx<'a, 'arena> {
             generator,
             is_async,
             false,
-            oxc_ast::builder::NONE,
-            oxc_ast::builder::NONE,
-            params,
-            oxc_ast::builder::NONE,
-            Some(body),
+            None,
+            None,
+            ArenaBox::new_in(params, &self.ab),
+            None,
+            Some(ArenaBox::new_in(body, &self.ab)),
             &self.ab,
         ))
     }
@@ -713,10 +586,8 @@ impl<'a, 'arena> Cx<'a, 'arena> {
     /// Convert a child range of statement nodes into an arena `Vec`.
     fn statements(&self, range: IdRange) -> Option<ArenaVec<'a, Statement<'a>>> {
         let nodes = self.arena.get_js_children(range);
-        let v: Vec<Statement<'a>> = nodes
-            .iter()
-            .map(|s| self.stmt(s))
-            .collect::<Option<Vec<_>>>()?;
+        let v: Vec<Statement<'a>> =
+            nodes.iter().map(|s| self.stmt(s)).collect::<Option<Vec<_>>>()?;
         Some(ArenaVec::from_iter_in(v, &self.ab))
     }
 
@@ -725,13 +596,7 @@ impl<'a, 'arena> Cx<'a, 'arena> {
         &self,
         node: &JsNode,
     ) -> Option<oxc_allocator::Box<'a, oxc_ast::ast::VariableDeclaration<'a>>> {
-        let JsNode::VariableDeclaration {
-            declarations,
-            kind,
-            declare,
-            ..
-        } = node
-        else {
+        let JsNode::VariableDeclaration { declarations, kind, declare, .. } = node else {
             return None;
         };
         // `declare` is TypeScript-only.
@@ -757,23 +622,9 @@ impl<'a, 'arena> Cx<'a, 'arena> {
                 Some(id) => Some(self.expr_id(*id)?),
                 None => None,
             };
-            declarators.push(VariableDeclarator::new(
-                SPAN,
-                kind,
-                binding,
-                oxc_ast::builder::NONE,
-                init,
-                false,
-                &self.ab,
-            ));
+            declarators.push(VariableDeclarator::new(SPAN, binding, None, init, false, &self.ab));
         }
-        Some(VariableDeclaration::boxed(
-            SPAN,
-            kind,
-            declarators,
-            false,
-            &self.ab,
-        ))
+        Some(VariableDeclaration::boxed(SPAN, kind, declarators, false, &self.ab))
     }
 
     // -- binding patterns ---------------------------------------------------
@@ -784,11 +635,9 @@ impl<'a, 'arena> Cx<'a, 'arena> {
     /// pattern that itself bails.
     fn binding_pattern(&self, pat: &JsNode) -> Option<oxc_ast::ast::BindingPattern<'a>> {
         match pat {
-            JsNode::Identifier { name, .. } => Some(BindingPattern::new_binding_identifier(
-                SPAN,
-                self.str(name),
-                &self.ab,
-            )),
+            JsNode::Identifier { name, .. } => {
+                Some(BindingPattern::new_binding_identifier(SPAN, self.str(name), &self.ab))
+            }
             JsNode::ObjectPattern { properties, .. } => {
                 let prop_nodes = self.arena.get_js_children(*properties);
                 let mut props = ArenaVec::with_capacity_in(prop_nodes.len(), &self.ab);
@@ -796,13 +645,7 @@ impl<'a, 'arena> Cx<'a, 'arena> {
                 let last = prop_nodes.len().saturating_sub(1);
                 for (i, member) in prop_nodes.iter().enumerate() {
                     match member {
-                        JsNode::Property {
-                            key,
-                            value,
-                            computed,
-                            shorthand,
-                            ..
-                        } => {
+                        JsNode::Property { key, value, computed, shorthand, .. } => {
                             let key = self.binding_property_key(*key, *computed)?;
                             let value = self.binding_pattern(self.arena.get_js_node(*value))?;
                             props.push(BindingProperty::new(
@@ -819,9 +662,7 @@ impl<'a, 'arena> Cx<'a, 'arena> {
                         _ => return None,
                     }
                 }
-                Some(BindingPattern::new_object_pattern(
-                    SPAN, props, rest, &self.ab,
-                ))
+                Some(BindingPattern::new_object_pattern(SPAN, props, rest, &self.ab))
             }
             JsNode::ArrayPattern { elements, .. } => {
                 let mut out = ArenaVec::with_capacity_in(elements.len(), &self.ab);
@@ -845,9 +686,7 @@ impl<'a, 'arena> Cx<'a, 'arena> {
             JsNode::AssignmentPattern { left, right, .. } => {
                 let left = self.binding_pattern(self.arena.get_js_node(*left))?;
                 let right = self.expr_id(*right)?;
-                Some(BindingPattern::new_assignment_pattern(
-                    SPAN, left, right, &self.ab,
-                ))
+                Some(BindingPattern::new_assignment_pattern(SPAN, left, right, &self.ab))
             }
             _ => None,
         }
@@ -868,60 +707,45 @@ impl<'a, 'arena> Cx<'a, 'arena> {
 
     fn expr(&self, node: &JsNode) -> Option<Expression<'a>> {
         match node {
-            JsNode::Identifier { name, .. } => {
-                Some(Expression::new_identifier(SPAN, self.str(name), &self.ab))
+            JsNode::Identifier { start, end, name, .. } => {
+                Some(Expression::new_identifier(Span::new(*start, *end), self.str(name), &self.ab))
             }
             JsNode::Literal { .. } => self.literal(node),
-            JsNode::ThisExpression { .. } => Some(Expression::ThisExpression(
-                ThisExpression::boxed(SPAN, &self.ab),
-            )),
+            JsNode::ThisExpression { .. } => {
+                Some(Expression::ThisExpression(ThisExpression::boxed(SPAN, &self.ab)))
+            }
             JsNode::Super { .. } => Some(Expression::Super(Super::boxed(SPAN, &self.ab))),
-            JsNode::MetaProperty { meta, property, .. } => {
+            JsNode::MetaProperty { meta, .. } => {
+                // oxc 0.141 split `MetaProperty` into `ImportMeta` / `NewTarget`;
+                // the meta keyword (`import` vs `new`) selects the variant.
                 let meta = self.identifier_name_of(*meta)?;
-                let property = self.identifier_name_of(*property)?;
-                let meta = IdentifierName::new(SPAN, self.str(&meta), &self.ab);
-                let property = IdentifierName::new(SPAN, self.str(&property), &self.ab);
-                Some(Expression::new_meta_property(
-                    SPAN, meta, property, &self.ab,
-                ))
+                Some(if meta == "new" {
+                    Expression::new_new_target(SPAN, &self.ab)
+                } else {
+                    Expression::new_import_meta(SPAN, &self.ab)
+                })
             }
             JsNode::MemberExpression { .. } => Some(Expression::from(self.member_expr(node)?)),
-            JsNode::CallExpression {
-                callee,
-                arguments,
-                optional,
-                ..
-            } => {
+            JsNode::CallExpression { start, end, callee, arguments, optional, loc: _ } => {
                 let callee = self.expr_id(*callee)?;
                 let args = self.arguments(*arguments)?;
                 Some(Expression::CallExpression(CallExpression::boxed(
-                    SPAN,
+                    Span::new(*start, *end),
                     callee,
-                    oxc_ast::builder::NONE,
+                    None,
                     args,
                     *optional,
                     &self.ab,
                 )))
             }
-            JsNode::NewExpression {
-                callee, arguments, ..
-            } => {
+            JsNode::NewExpression { callee, arguments, .. } => {
                 let callee = self.expr_id(*callee)?;
                 let args = self.arguments(*arguments)?;
                 Some(Expression::NewExpression(NewExpression::boxed(
-                    SPAN,
-                    callee,
-                    oxc_ast::builder::NONE,
-                    args,
-                    &self.ab,
+                    SPAN, callee, None, args, &self.ab,
                 )))
             }
-            JsNode::BinaryExpression {
-                left,
-                operator,
-                right,
-                ..
-            } => {
+            JsNode::BinaryExpression { left, operator, right, .. } => {
                 let op = binary_op(operator)?;
                 let left = self.expr_id(*left)?;
                 let right = self.expr_id(*right)?;
@@ -929,12 +753,7 @@ impl<'a, 'arena> Cx<'a, 'arena> {
                     SPAN, left, op, right, &self.ab,
                 )))
             }
-            JsNode::LogicalExpression {
-                left,
-                operator,
-                right,
-                ..
-            } => {
+            JsNode::LogicalExpression { left, operator, right, .. } => {
                 let op = logical_op(operator)?;
                 let left = self.expr_id(*left)?;
                 let right = self.expr_id(*right)?;
@@ -942,27 +761,18 @@ impl<'a, 'arena> Cx<'a, 'arena> {
                     SPAN, left, op, right, &self.ab,
                 )))
             }
-            JsNode::UnaryExpression {
-                operator, argument, ..
-            } => {
+            JsNode::UnaryExpression { operator, argument, .. } => {
                 let op = unary_op(operator)?;
                 let arg = self.expr_id(*argument)?;
-                Some(Expression::UnaryExpression(UnaryExpression::boxed(
-                    SPAN, op, arg, &self.ab,
-                )))
+                Some(Expression::UnaryExpression(UnaryExpression::boxed(SPAN, op, arg, &self.ab)))
             }
-            JsNode::ConditionalExpression {
-                test,
-                consequent,
-                alternate,
-                ..
-            } => {
+            JsNode::ConditionalExpression { test, consequent, alternate, .. } => {
                 let test = self.expr_id(*test)?;
                 let consequent = self.expr_id(*consequent)?;
                 let alternate = self.expr_id(*alternate)?;
-                Some(Expression::ConditionalExpression(
-                    ConditionalExpression::boxed(SPAN, test, consequent, alternate, &self.ab),
-                ))
+                Some(Expression::ConditionalExpression(ConditionalExpression::boxed(
+                    SPAN, test, consequent, alternate, &self.ab,
+                )))
             }
             JsNode::SequenceExpression { expressions, .. } => {
                 let nodes = self.arena.get_js_children(*expressions);
@@ -989,16 +799,12 @@ impl<'a, 'arena> Cx<'a, 'arena> {
                     };
                     out.push(element);
                 }
-                Some(Expression::ArrayExpression(ArrayExpression::boxed(
-                    SPAN, out, &self.ab,
-                )))
+                Some(Expression::ArrayExpression(ArrayExpression::boxed(SPAN, out, &self.ab)))
             }
             JsNode::ObjectExpression { .. } => self.object(node),
             JsNode::AwaitExpression { argument, .. } => {
                 let arg = self.expr_id(*argument)?;
-                Some(Expression::AwaitExpression(AwaitExpression::boxed(
-                    SPAN, arg, &self.ab,
-                )))
+                Some(Expression::AwaitExpression(AwaitExpression::boxed(SPAN, arg, &self.ab)))
             }
             JsNode::ArrowFunctionExpression { .. } => self.arrow(node),
             JsNode::FunctionExpression { .. } => {
@@ -1012,29 +818,19 @@ impl<'a, 'arena> Cx<'a, 'arena> {
             JsNode::TaggedTemplateExpression { tag, quasi, .. } => {
                 let tag = self.expr_id(*tag)?;
                 let quasi = self.template_literal(self.arena.get_js_node(*quasi))?;
-                Some(Expression::TaggedTemplateExpression(
-                    TaggedTemplateExpression::boxed(SPAN, tag, oxc_ast::builder::NONE, quasi, &self.ab),
-                ))
+                Some(Expression::TaggedTemplateExpression(TaggedTemplateExpression::boxed(
+                    SPAN, tag, None, quasi, &self.ab,
+                )))
             }
-            JsNode::AssignmentExpression {
-                operator,
-                left,
-                right,
-                ..
-            } => {
+            JsNode::AssignmentExpression { operator, left, right, .. } => {
                 let op = assignment_op(operator)?;
                 let left = self.assignment_target(self.arena.get_js_node(*left))?;
                 let right = self.expr_id(*right)?;
-                Some(Expression::AssignmentExpression(
-                    AssignmentExpression::boxed(SPAN, op, left, right, &self.ab),
-                ))
+                Some(Expression::AssignmentExpression(AssignmentExpression::boxed(
+                    SPAN, op, left, right, &self.ab,
+                )))
             }
-            JsNode::UpdateExpression {
-                operator,
-                prefix,
-                argument,
-                ..
-            } => {
+            JsNode::UpdateExpression { operator, prefix, argument, .. } => {
                 let op = update_op(operator)?;
                 let target = self.simple_assignment_target(self.arena.get_js_node(*argument))?;
                 Some(Expression::UpdateExpression(UpdateExpression::boxed(
@@ -1048,9 +844,7 @@ impl<'a, 'arena> Cx<'a, 'arena> {
                     SPAN, source, None, None, &self.ab,
                 )))
             }
-            JsNode::YieldExpression {
-                delegate, argument, ..
-            } => {
+            JsNode::YieldExpression { delegate, argument, .. } => {
                 let argument = match argument {
                     Some(id) => Some(self.expr_id(*id)?),
                     None => None,
@@ -1061,16 +855,19 @@ impl<'a, 'arena> Cx<'a, 'arena> {
             }
             // Bail on opaque Raw / Null / ClassExpression (bodies use separate
             // ClassBody member variants we do not reproduce here) and any other
-            // variant not explicitly handled above (the CRITICAL RULE).
+            // variant not explicitly handled above (the CRITICAL RULE). The TS
+            // assertion wrappers (`TSAsExpression` / `TSSatisfiesExpression` /
+            // `TSNonNullExpression` / `TSTypeAssertion` / `TSInstantiationExpression`)
+            // are erased by `remove_typescript_nodes`
+            // before transform, so they never reach here; if one somehow did,
+            // `None` is the correct, safe answer — it falls back to the text
+            // printer rather than emitting wrong code.
             _ => None,
         }
     }
 
     fn literal(&self, node: &JsNode) -> Option<Expression<'a>> {
-        let JsNode::Literal {
-            value, raw, regex, ..
-        } = node
-        else {
+        let JsNode::Literal { value, raw, regex, .. } = node else {
             return None;
         };
         // A regex literal: build the flags bitset faithfully, preserving the
@@ -1081,10 +878,7 @@ impl<'a, 'arena> Cx<'a, 'arena> {
                 flag_bits |= RegExpFlags::try_from(ch).ok()?;
             }
             let regexp = RegExp {
-                pattern: RegExpPattern {
-                    text: self.str(&rx.pattern).into(),
-                    pattern: None,
-                },
+                pattern: RegExpPattern { text: self.str(&rx.pattern).into(), pattern: None },
                 flags: flag_bits,
             };
             return Some(Expression::new_reg_exp_literal(
@@ -1109,6 +903,25 @@ impl<'a, 'arena> Cx<'a, 'arena> {
                 NumberBase::Decimal,
                 &self.ab,
             )),
+            LiteralValue::BigInt(d) => {
+                let base = if raw.starts_with("0x") || raw.starts_with("0X") {
+                    oxc_ast::ast::BigintBase::Hex
+                } else if raw.starts_with("0o") || raw.starts_with("0O") {
+                    oxc_ast::ast::BigintBase::Octal
+                } else if raw.starts_with("0b") || raw.starts_with("0B") {
+                    oxc_ast::ast::BigintBase::Binary
+                } else {
+                    oxc_ast::ast::BigintBase::Decimal
+                };
+                let raw_text = if raw.is_empty() { format!("{d}n") } else { raw.to_string() };
+                Some(Expression::new_big_int_literal(
+                    SPAN,
+                    self.str(d),
+                    Some(self.str(&raw_text).into()),
+                    base,
+                    &self.ab,
+                ))
+            }
             LiteralValue::Bool(b) => Some(Expression::new_boolean_literal(SPAN, *b, &self.ab)),
             LiteralValue::Null => Some(Expression::new_null_literal(SPAN, &self.ab)),
             // Regex handled above; reaching here would be a `Regex` value with
@@ -1120,14 +933,7 @@ impl<'a, 'arena> Cx<'a, 'arena> {
     /// Build a `MemberExpression` node from a `MemberExpression` JsNode. Shared
     /// by the expression arm, the assignment-target helper, and the chain helper.
     fn member_expr(&self, node: &JsNode) -> Option<oxc_ast::ast::MemberExpression<'a>> {
-        let JsNode::MemberExpression {
-            object,
-            property,
-            computed,
-            optional,
-            ..
-        } = node
-        else {
+        let JsNode::MemberExpression { object, property, computed, optional, .. } = node else {
             return None;
         };
         let object = self.expr_id(*object)?;
@@ -1160,12 +966,7 @@ impl<'a, 'arena> Cx<'a, 'arena> {
     }
 
     fn template_literal(&self, node: &JsNode) -> Option<oxc_ast::ast::TemplateLiteral<'a>> {
-        let JsNode::TemplateLiteral {
-            quasis,
-            expressions,
-            ..
-        } = node
-        else {
+        let JsNode::TemplateLiteral { quasis, expressions, .. } = node else {
             return None;
         };
         let quasi_nodes = self.arena.get_js_children(*quasis);
@@ -1283,15 +1084,7 @@ impl<'a, 'arena> Cx<'a, 'arena> {
                     let target = self.assignment_target(self.arena.get_js_node(*argument))?;
                     rest = Some(AssignmentTargetRest::boxed(SPAN, target, &self.ab));
                 }
-                JsNode::Property {
-                    key,
-                    value,
-                    kind,
-                    method,
-                    shorthand,
-                    computed,
-                    ..
-                } => {
+                JsNode::Property { key, value, kind, method, shorthand, computed, .. } => {
                     if kind != "init" || *method {
                         return None;
                     }
@@ -1303,9 +1096,7 @@ impl<'a, 'arena> Cx<'a, 'arena> {
             }
         }
         let object = ObjectAssignmentTarget::boxed(SPAN, props, rest, &self.ab);
-        Some(oxc_ast::ast::AssignmentTarget::ObjectAssignmentTarget(
-            object,
-        ))
+        Some(oxc_ast::ast::AssignmentTarget::ObjectAssignmentTarget(object))
     }
 
     fn assignment_target_maybe_default(
@@ -1318,27 +1109,18 @@ impl<'a, 'arena> Cx<'a, 'arena> {
         if let JsNode::AssignmentPattern { left, right, .. } = node {
             let binding = self.assignment_target(self.arena.get_js_node(*left))?;
             let init = self.expr_id(*right)?;
-            return Some(
-                AssignmentTargetMaybeDefault::new_assignment_target_with_default(
-                    SPAN, binding, init, &self.ab,
-                ),
-            );
+            return Some(AssignmentTargetMaybeDefault::new_assignment_target_with_default(
+                SPAN, binding, init, &self.ab,
+            ));
         }
-        if let JsNode::AssignmentExpression {
-            operator,
-            left,
-            right,
-            ..
-        } = node
+        if let JsNode::AssignmentExpression { operator, left, right, .. } = node
             && operator == "="
         {
             let binding = self.assignment_target(self.arena.get_js_node(*left))?;
             let init = self.expr_id(*right)?;
-            return Some(
-                AssignmentTargetMaybeDefault::new_assignment_target_with_default(
-                    SPAN, binding, init, &self.ab,
-                ),
-            );
+            return Some(AssignmentTargetMaybeDefault::new_assignment_target_with_default(
+                SPAN, binding, init, &self.ab,
+            ));
         }
         let target = self.assignment_target(node)?;
         Some(oxc_ast::ast::AssignmentTargetMaybeDefault::from(target))
@@ -1365,17 +1147,14 @@ impl<'a, 'arena> Cx<'a, 'arena> {
                         _ => return None,
                     }
                 }
-                JsNode::AssignmentExpression {
-                    operator,
-                    left,
-                    right,
-                    ..
-                } if operator == "=" => match self.arena.get_js_node(*left) {
-                    JsNode::Identifier { name, .. } => {
-                        (name.to_string(), Some(self.expr_id(*right)?))
+                JsNode::AssignmentExpression { operator, left, right, .. } if operator == "=" => {
+                    match self.arena.get_js_node(*left) {
+                        JsNode::Identifier { name, .. } => {
+                            (name.to_string(), Some(self.expr_id(*right)?))
+                        }
+                        _ => return None,
                     }
-                    _ => return None,
-                },
+                }
                 _ => return None,
             };
             let binding = IdentifierReference::new(SPAN, self.str(&name), &self.ab);
@@ -1388,11 +1167,9 @@ impl<'a, 'arena> Cx<'a, 'arena> {
 
         let key = self.binding_property_key(key, computed)?;
         let binding = self.assignment_target_maybe_default(self.arena.get_js_node(value))?;
-        Some(
-            oxc_ast::ast::AssignmentTargetProperty::AssignmentTargetPropertyProperty(
-                AssignmentTargetPropertyProperty::boxed(SPAN, key, binding, computed, &self.ab),
-            ),
-        )
+        Some(oxc_ast::ast::AssignmentTargetProperty::AssignmentTargetPropertyProperty(
+            AssignmentTargetPropertyProperty::boxed(SPAN, key, binding, computed, &self.ab),
+        ))
     }
 
     fn object(&self, node: &JsNode) -> Option<Expression<'a>> {
@@ -1416,9 +1193,7 @@ impl<'a, 'arena> Cx<'a, 'arena> {
                 _ => return None,
             }
         }
-        Some(Expression::ObjectExpression(ObjectExpression::boxed(
-            SPAN, props, &self.ab,
-        )))
+        Some(Expression::ObjectExpression(ObjectExpression::boxed(SPAN, props, &self.ab)))
     }
 
     /// Build a boxed `ObjectProperty`. Handles plain `key: value`, computed
@@ -1429,16 +1204,7 @@ impl<'a, 'arena> Cx<'a, 'arena> {
         &self,
         node: &JsNode,
     ) -> Option<oxc_allocator::Box<'a, oxc_ast::ast::ObjectProperty<'a>>> {
-        let JsNode::Property {
-            key,
-            value,
-            kind,
-            method,
-            shorthand,
-            computed,
-            ..
-        } = node
-        else {
+        let JsNode::Property { key, value, kind, method, shorthand, computed, .. } = node else {
             return None;
         };
         let prop_kind = match kind.as_str() {
@@ -1448,10 +1214,8 @@ impl<'a, 'arena> Cx<'a, 'arena> {
             _ => return None,
         };
 
-        let value_is_function = matches!(
-            self.arena.get_js_node(*value),
-            JsNode::FunctionExpression { .. }
-        );
+        let value_is_function =
+            matches!(self.arena.get_js_node(*value), JsNode::FunctionExpression { .. });
         let is_accessor = kind != "init";
         let auto_method = !*computed && kind == "init" && value_is_function;
         let method = *method || auto_method;
@@ -1476,16 +1240,12 @@ impl<'a, 'arena> Cx<'a, 'arena> {
     /// Build a non-computed `PropertyKey` from an identifier / literal node.
     fn property_key(&self, node: &JsNode) -> Option<PropertyKey<'a>> {
         match node {
-            JsNode::Identifier { name, .. } => Some(PropertyKey::new_static_identifier(
-                SPAN,
-                self.str(name),
-                &self.ab,
-            )),
+            JsNode::Identifier { name, .. } => {
+                Some(PropertyKey::new_static_identifier(SPAN, self.str(name), &self.ab))
+            }
             JsNode::PrivateIdentifier { name, .. } => {
                 let field = PrivateIdentifier::new(SPAN, self.str(name), &self.ab);
-                Some(PropertyKey::PrivateIdentifier(ArenaBox::new_in(
-                    field, &self.ab,
-                )))
+                Some(PropertyKey::PrivateIdentifier(ArenaBox::new_in(field, &self.ab)))
             }
             JsNode::Literal { .. } => {
                 let expr = self.literal(node)?;
@@ -1496,50 +1256,34 @@ impl<'a, 'arena> Cx<'a, 'arena> {
     }
 
     fn arrow(&self, node: &JsNode) -> Option<Expression<'a>> {
-        let JsNode::ArrowFunctionExpression {
-            params,
-            body,
-            expression,
-            r#async,
-            ..
-        } = node
-        else {
+        let JsNode::ArrowFunctionExpression { params, body, expression, r#async, .. } = node else {
             return None;
         };
         let params = self.formal_params(*params)?;
         let body_node = self.arena.get_js_node(*body);
-        let (is_expr, fn_body) = if *expression {
-            // Concise-body arrow: a single implicit-return expression.
-            let expr = self.expr(body_node)?;
-            let stmt =
-                Statement::ExpressionStatement(ExpressionStatement::boxed(SPAN, expr, &self.ab));
-            let stmts = ArenaVec::from_value_in(stmt, &self.ab);
-            (
-                true,
-                FunctionBody::new(SPAN, ArenaVec::new_in(&self.ab), stmts, &self.ab),
-            )
+        let fn_body = if *expression {
+            ArrowFunctionBody::from(self.expr(body_node)?)
         } else {
             let JsNode::BlockStatement { body, .. } = body_node else {
                 return None;
             };
             let stmts = self.statements(*body)?;
-            (
-                false,
-                FunctionBody::new(SPAN, ArenaVec::new_in(&self.ab), stmts, &self.ab),
-            )
-        };
-        Some(Expression::ArrowFunctionExpression(
-            ArrowFunctionExpression::boxed(
+            ArrowFunctionBody::FunctionBody(FunctionBody::boxed(
                 SPAN,
-                is_expr,
-                *r#async,
-                oxc_ast::builder::NONE,
-                params,
-                oxc_ast::builder::NONE,
-                fn_body,
+                ArenaVec::new_in(&self.ab),
+                stmts,
                 &self.ab,
-            ),
-        ))
+            ))
+        };
+        Some(Expression::ArrowFunctionExpression(ArrowFunctionExpression::boxed(
+            SPAN,
+            *r#async,
+            None,
+            ArenaBox::new_in(params, &self.ab),
+            None,
+            fn_body,
+            &self.ab,
+        )))
     }
 
     /// Build an optional-chaining wrapper (`a?.b`, `a?.()`).
@@ -1550,23 +1294,15 @@ impl<'a, 'arena> Cx<'a, 'arena> {
                 let member = self.member_expr(inner)?;
                 ChainElement::from(member)
             }
-            JsNode::CallExpression {
-                callee,
-                arguments,
-                optional,
-                ..
-            } => {
+            JsNode::CallExpression { callee, arguments, optional, .. } => {
                 let callee = self.expr_id(*callee)?;
                 let args = self.arguments(*arguments)?;
-                let call =
-                    CallExpression::boxed(SPAN, callee, oxc_ast::builder::NONE, args, *optional, &self.ab);
+                let call = CallExpression::boxed(SPAN, callee, None, args, *optional, &self.ab);
                 ChainElement::CallExpression(call)
             }
             _ => return None,
         };
-        Some(Expression::ChainExpression(ChainExpression::boxed(
-            SPAN, element, &self.ab,
-        )))
+        Some(Expression::ChainExpression(ChainExpression::boxed(SPAN, element, &self.ab)))
     }
 
     /// Convert function parameters (a child range of pattern nodes), handling a
@@ -1587,7 +1323,7 @@ impl<'a, 'arena> Cx<'a, 'arena> {
                     SPAN,
                     ArenaVec::new_in(&self.ab),
                     rest_el,
-                    oxc_ast::builder::NONE,
+                    None,
                     &self.ab,
                 ));
                 continue;
@@ -1597,8 +1333,8 @@ impl<'a, 'arena> Cx<'a, 'arena> {
                 SPAN,
                 ArenaVec::new_in(&self.ab),
                 pattern,
-                oxc_ast::builder::NONE,
-                oxc_ast::builder::NONE,
+                None,
+                None,
                 false,
                 None,
                 false,
@@ -1722,7 +1458,9 @@ fn unary_op(op: &str) -> Option<UnaryOperator> {
 mod tests {
     use super::*;
     use crate::ast::js::Expression as RsExpression;
-    use crate::compiler::phases::phase1_parse::read::expression::parse_program_with_error;
+    use crate::compiler::phases::phase1_parse::read::expression::{
+        ProgramParseParams, parse_program_with_error,
+    };
 
     /// Parse `src` as a JS program with rsvelte's own parser, returning the
     /// `JsNode::Program` and the arena that owns its children.
@@ -1734,8 +1472,19 @@ mod tests {
         // children are resolved via `to_value()` during parsing they need the
         // arena pointer set, mirroring `parse_module_to_estree`.
         let node = crate::ast::arena::with_serialize_arena(&arena, || {
-            let (expr, err) =
-                parse_program_with_error(&arena, src, 0, &line_offsets, false, &[], 0, src.len());
+            let (expr, err) = parse_program_with_error(
+                &arena,
+                ProgramParseParams {
+                    content: src,
+                    offset: 0,
+                    line_offsets: &line_offsets,
+                    is_typescript: false,
+                    is_script: false,
+                    leading_comments: &[],
+                    script_tag_start: 0,
+                    script_tag_end: src.len(),
+                },
+            );
             assert!(err.is_none(), "parse error for {src:?}: {err:?}");
             match expr {
                 RsExpression::Typed(te) => te.node,
@@ -1834,14 +1583,8 @@ mod tests {
         assert_rt("({ ...rest });", "({ ...rest });");
         assert_rt("({ [k]: v });", "({ [k]: v });");
         // Getter / method values are now typed and round-trip faithfully.
-        assert_rt(
-            "({ get x() { return 1; } });",
-            "({\n\tget x() {\n\t\treturn 1;\n\t}\n});",
-        );
-        assert_rt(
-            "({ m() { return 2; } });",
-            "({\n\tm() {\n\t\treturn 2;\n\t}\n});",
-        );
+        assert_rt("({ get x() { return 1; } });", "({\n\tget x() {\n\t\treturn 1;\n\t}\n});");
+        assert_rt("({ m() { return 2; } });", "({\n\tm() {\n\t\treturn 2;\n\t}\n});");
     }
 
     #[test]
@@ -1859,10 +1602,7 @@ mod tests {
 
     #[test]
     fn if_for_while() {
-        assert_rt(
-            "if (a) { b(); } else { c(); }",
-            "if (a) {\n\tb();\n} else {\n\tc();\n}",
-        );
+        assert_rt("if (a) { b(); } else { c(); }", "if (a) {\n\tb();\n} else {\n\tc();\n}");
         assert_rt(
             "for (let i = 0; i < 10; i++) { f(i); }",
             "for (let i = 0; i < 10; i++) {\n\tf(i);\n}",
@@ -1900,22 +1640,13 @@ mod tests {
             "switch (x) { case 1: a(); break; default: b(); }",
             "switch (x) {\n\tcase 1:\n\t\ta();\n\t\tbreak;\n\n\tdefault:\n\t\tb();\n}",
         );
-        assert_rt(
-            "for (const x of xs) { f(x); }",
-            "for (const x of xs) {\n\tf(x);\n}",
-        );
-        assert_rt(
-            "for (const k in o) { f(k); }",
-            "for (const k in o) {\n\tf(k);\n}",
-        );
+        assert_rt("for (const x of xs) { f(x); }", "for (const x of xs) {\n\tf(x);\n}");
+        assert_rt("for (const k in o) { f(k); }", "for (const k in o) {\n\tf(k);\n}");
     }
 
     #[test]
     fn imports_and_exports() {
-        assert_rt(
-            "import { a, b as c } from 'mod';",
-            "import { a, b as c } from 'mod';",
-        );
+        assert_rt("import { a, b as c } from 'mod';", "import { a, b as c } from 'mod';");
         assert_rt("import Foo from 'mod';", "import Foo from 'mod';");
         assert_rt("import * as ns from 'mod';", "import * as ns from 'mod';");
         // `export` declarations are now typed in the parse IR and round-trip.
@@ -1927,6 +1658,9 @@ mod tests {
         assert_rt("async () => await f();", "async () => await f();");
         assert_rt("a?.b;", "a?.b;");
         assert_rt("a?.b();", "a?.b();");
+        assert_rt("(a?.b).c;", "(a?.b).c;");
+        assert_rt("(a?.b)();", "(a?.b)();");
+        assert_rt("new (a?.b)();", "new (a?.b)();");
         assert_rt("[...a, b];", "[...a, b];");
     }
 

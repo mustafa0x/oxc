@@ -11,8 +11,8 @@ use tower_lsp_server::{
     jsonrpc::ErrorCode,
     ls_types::{
         CodeActionKind, CodeActionOptions, CodeActionOrCommand, CodeActionProviderCapability,
-        Diagnostic, ExecuteCommandOptions, Pattern, ServerCapabilities, Uri,
-        WorkDoneProgressOptions, WorkspaceEdit,
+        Diagnostic, DiagnosticSeverity, ExecuteCommandOptions, NumberOrString, Pattern, Position,
+        Range, ServerCapabilities, Uri, WorkDoneProgressOptions, WorkspaceEdit,
     },
 };
 use tracing::{debug, error, warn};
@@ -839,7 +839,6 @@ impl ServerLinter {
                         message_to_lsp_diagnostic(
                             message,
                             uri,
-                            path,
                             source_text,
                             self.rules_customization.as_ref(),
                         )
@@ -853,6 +852,10 @@ impl ServerLinter {
             };
 
         messages.append(&mut generate_inverted_diagnostics(&messages, uri));
+
+        if self.runner.has_type_aware() && is_svelte_path(path) {
+            messages.push(type_aware_svelte_unsupported_report());
+        }
 
         // Take directives once to avoid separate get/remove lock acquisitions.
         let directives = self.runner.directives_coordinator().take(path);

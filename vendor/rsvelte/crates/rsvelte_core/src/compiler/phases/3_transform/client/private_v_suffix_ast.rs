@@ -22,7 +22,6 @@
 //!   `$.update_pre(` first-arg.
 //! - Assignment LHS (`this.#count = ...`).
 //! - Argument of an UpdateExpression (`this.#count++`).
-//! - `.object` of an enclosing member chain (`this.#count.foo`).
 //!
 //! `==` / `===` ARE wrapped (reads), matching text behaviour.
 //!
@@ -68,10 +67,7 @@ pub fn transform_private_v_suffix_ast(source: &str, qualified_names: &[String]) 
             &MODULE_PRIVATE_V_SUFFIX_ALLOC,
             src,
             SourceType::mjs(),
-            ParseOptions {
-                allow_return_outside_function: true,
-                ..ParseOptions::default()
-            },
+            ParseOptions { allow_return_outside_function: true, ..ParseOptions::default() },
             true,
             |program| {
                 let mut collector = PrivateVSuffixCollector {
@@ -145,8 +141,7 @@ impl<'a, 'ast> Visit<'ast> for PrivateVSuffixCollector<'a> {
             } else {
                 format!("$.get({})", span_text)
             };
-            self.replacements
-                .push((expr.span.start, expr.span.end, rewrite));
+            self.replacements.push((expr.span.start, expr.span.end, rewrite));
         }
     }
 
@@ -177,17 +172,15 @@ impl<'a, 'ast> Visit<'ast> for PrivateVSuffixCollector<'a> {
     }
 
     fn visit_static_member_expression(&mut self, member: &StaticMemberExpression<'ast>) {
-        if let Expression::PrivateFieldExpression(pf) = &member.object {
+        // Only `<qualified>.v` is skipped: that is this pass's own output, and the
+        // fixed-point loop re-parses it. Any other property (`this.#count.length`)
+        // is a read whose object still has to be wrapped.
+        if member.property.name == "v"
+            && let Expression::PrivateFieldExpression(pf) = &member.object
+        {
             self.push_skip(pf.as_ref());
         }
         walk::walk_static_member_expression(self, member);
-    }
-
-    fn visit_computed_member_expression(&mut self, member: &ComputedMemberExpression<'ast>) {
-        if let Expression::PrivateFieldExpression(pf) = &member.object {
-            self.push_skip(pf.as_ref());
-        }
-        walk::walk_computed_member_expression(self, member);
     }
 
     fn visit_call_expression(&mut self, call: &CallExpression<'ast>) {
@@ -228,10 +221,35 @@ mod tests {
     fn top_level_read_still_v_with_nested_function_present() {
         let src = "let x = this.#count;\nrAF(() => this.#count);";
         let out = transform_private_v_suffix_ast(src, &ssv(&["this.#count"])).unwrap();
-        assert_eq!(
-            out,
-            "let x = this.#count.v;\nrAF(() => $.get(this.#count));"
-        );
+        assert_eq!(out, "let x = this.#count.v;\nrAF(() => $.get(this.#count));");
+    }
+
+    #[test]
+    fn member_chain_read_appends_v_to_the_field() {
+        let src = "console.log(this.#count.length);";
+        let out = transform_private_v_suffix_ast(src, &ssv(&["this.#count"])).unwrap();
+        assert_eq!(out, "console.log(this.#count.v.length);");
+    }
+
+    #[test]
+    fn nested_function_member_chain_read_uses_get() {
+        let src = "rAF(() => this.#count.includes(k));";
+        let out = transform_private_v_suffix_ast(src, &ssv(&["this.#count"])).unwrap();
+        assert_eq!(out, "rAF(() => $.get(this.#count).includes(k));");
+    }
+
+    #[test]
+    fn computed_member_read_appends_v_to_the_field() {
+        let src = "let x = this.#count[0];";
+        let out = transform_private_v_suffix_ast(src, &ssv(&["this.#count"])).unwrap();
+        assert_eq!(out, "let x = this.#count.v[0];");
+    }
+
+    #[test]
+    fn member_write_target_appends_v_to_the_field() {
+        let src = "this.#count.length = 0;";
+        let out = transform_private_v_suffix_ast(src, &ssv(&["this.#count"])).unwrap();
+        assert_eq!(out, "this.#count.v.length = 0;");
     }
 
     #[test]
@@ -274,9 +292,10 @@ mod tests {
     }
 
     #[test]
-    fn deeper_member_chain_left_alone() {
+    fn deeper_member_chain_wraps_the_field() {
         let src = "let x = this.#count.foo;";
-        assert!(transform_private_v_suffix_ast(src, &ssv(&["this.#count"])).is_none());
+        let out = transform_private_v_suffix_ast(src, &ssv(&["this.#count"])).unwrap();
+        assert_eq!(out, "let x = this.#count.v.foo;");
     }
 
     #[test]

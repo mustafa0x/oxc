@@ -21,21 +21,22 @@ use crate::ast::css::{StyleSheet, StyleSheetContent, StyleSheetType};
 use crate::ast::template::{AttributeValue, AttributeValuePart, TemplateNode};
 use crate::error::ParseResult;
 
-use super::super::parser::Parser;
+use super::super::parser::{MAX_NESTING_DEPTH, Parser, is_js_whitespace};
+use super::super::utils::TrimWs;
 
 /// Returns `true` when the `<style>` has a `lang` attribute whose value is not
 /// plain CSS (e.g. `sass`, `scss`, `stylus`, `less`, `postcss`). Such a block
 /// is preprocessed before the compiler normally sees it, so its body is NOT
 /// CSS — used (in lenient/lint mode only) to skip CSS-shaped validation that
 /// would otherwise abort the whole-file parse.
-fn has_non_css_lang(attributes: &[crate::ast::Attribute]) -> bool {
+fn has_non_css_lang<'a>(attributes: &[crate::ast::Attribute<'a>]) -> bool {
     for attr in attributes {
         if let crate::ast::Attribute::Attribute(node) = attr
             && node.name.as_str() == "lang"
             && let AttributeValue::Sequence(parts) = &node.value
             && let Some(AttributeValuePart::Text(t)) = parts.first()
         {
-            let lang = t.data.as_str().trim().to_ascii_lowercase();
+            let lang = t.data.as_ref().trim_ws().to_ascii_lowercase();
             return !lang.is_empty() && lang != "css";
         }
     }
@@ -68,6 +69,90 @@ pub(crate) fn parse_css_strict(
     Ok(rules)
 }
 
+fn collect_css_comments(content: &str, offset: usize) -> Vec<Value> {
+    let mut comments = Vec::new();
+    let bytes = content.as_bytes();
+    let mut index = 0;
+    let mut quote = None;
+
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte == b'\\' {
+            index += 1;
+            if index < bytes.len() {
+                index += content[index..].chars().next().map_or(1, char::len_utf8);
+            }
+            continue;
+        }
+        if let Some(mark) = quote {
+            if byte == mark {
+                quote = None;
+            }
+            index += 1;
+            continue;
+        }
+        if byte == b'\'' || byte == b'\"' {
+            quote = Some(byte);
+            index += 1;
+            continue;
+        }
+        if byte == b'/' && bytes.get(index + 1) == Some(&b'*') {
+            let start = index;
+            index += 2;
+            let value_start = index;
+            while index + 1 < bytes.len() && !(bytes[index] == b'*' && bytes[index + 1] == b'/') {
+                index += content[index..].chars().next().map_or(1, char::len_utf8);
+            }
+            let value_end = index;
+            if index + 1 < bytes.len() {
+                index += 2;
+            }
+            let prev = content[..start].chars().rev().find(|c| !c.is_whitespace());
+            let next = content[index..].chars().find(|c| !c.is_whitespace());
+            if prev.is_some_and(|c| c.is_ascii_alphanumeric() || c == '-')
+                && next.is_some_and(|c| c.is_ascii_alphanumeric() || c == '-')
+            {
+                continue;
+            }
+            let mut comment = Map::new();
+            comment.insert("type".to_string(), Value::String("CSSComment".to_string()));
+            comment.insert(
+                "value".to_string(),
+                Value::String(content[value_start..value_end].to_string()),
+            );
+            comment.insert("start".to_string(), Value::Number(((offset + start) as i64).into()));
+            comment.insert("end".to_string(), Value::Number(((offset + index) as i64).into()));
+            comments.push(Value::Object(comment));
+            continue;
+        }
+        index += content[index..].chars().next().map_or(1, char::len_utf8);
+    }
+
+    comments
+}
+
+/// Helper: build a CSS `Block` node.
+/// The combinator token starting at `i`, mirroring upstream's
+/// `REGEX_COMBINATOR = /(\+|~|>|\|\|)/y` — a lone `|` is a namespace separator.
+fn combinator_at(bytes: &[u8], i: usize) -> Option<&'static str> {
+    match bytes[i] {
+        b'+' => Some("+"),
+        b'>' => Some(">"),
+        b'~' => Some("~"),
+        b'|' if bytes.get(i + 1) == Some(&b'|') => Some("||"),
+        _ => None,
+    }
+}
+
+fn block_value(start: usize, end: usize, children: Vec<Value>) -> Value {
+    let mut obj = Map::new();
+    obj.insert("type".to_string(), Value::String("Block".to_string()));
+    obj.insert("start".to_string(), Value::Number((start as i64).into()));
+    obj.insert("end".to_string(), Value::Number((end as i64).into()));
+    obj.insert("children".to_string(), Value::Array(children));
+    Value::Object(obj)
+}
+
 /// Helper: record a selector-level error on a `CssParser`'s shared error
 /// cell, preserving the first error encountered.
 fn record_first_error(
@@ -82,18 +167,259 @@ fn record_first_error(
     }
 }
 
+/// Length of the leading JS-whitespace run of `text`.
+fn leading_ws_len(text: &str) -> usize {
+    text.len() - text.trim_start_ws().len()
+}
+
+/// Port of upstream's sticky `REGEX_NTH_OF` (`1-parse/read/style.js`):
+/// `(even|odd|\+?(\d+|\d*n(\s*[+-]\s*\d+)?)|-\d*n(\s*\+\s*\d+))((?=\s*[,)])|\s+of\s+)`
+///
+/// `text` must start at the candidate token. The caller has already stripped the
+/// enclosing parentheses and split on top-level commas, so end-of-text stands in
+/// for the `,`/`)` the lookahead requires. Returns the whole match length (the
+/// `Nth` node's text, `of` separator included).
+fn match_nth_of(text: &str) -> Option<usize> {
+    for anb in nth_anb_candidates(text) {
+        if let Some(total) = nth_of_tail(text, anb) {
+            return Some(total);
+        }
+    }
+    None
+}
+
+/// End offsets for the An+B part, in the alternation/backtracking order a JS
+/// regex would try them.
+fn nth_anb_candidates(text: &str) -> Vec<usize> {
+    let b = text.as_bytes();
+    let mut out = Vec::new();
+
+    if text.starts_with("even") {
+        out.push(4);
+    }
+    if text.starts_with("odd") {
+        out.push(3);
+    }
+
+    // `\+?(\d+|\d*n(\s*[+-]\s*\d+)?)`
+    let p = usize::from(b.first() == Some(&b'+'));
+    let mut d = p;
+    while d < b.len() && b[d].is_ascii_digit() {
+        d += 1;
+    }
+    // `\d+` is greedy and backtracks one digit at a time.
+    let mut k = d;
+    while k > p {
+        out.push(k);
+        k -= 1;
+    }
+    push_nth_n_form(text, p, false, &mut out);
+
+    // `-\d*n(\s*\+\s*\d+)`
+    if b.first() == Some(&b'-') {
+        push_nth_n_form(text, 1, true, &mut out);
+    }
+
+    out
+}
+
+/// `\d*n(\s*[+-]\s*\d+)?` (or, when `plus_only`, a required `(\s*\+\s*\d+)`)
+/// starting at `p`.
+fn push_nth_n_form(text: &str, p: usize, plus_only: bool, out: &mut Vec<usize>) {
+    let b = text.as_bytes();
+    let mut d = p;
+    while d < b.len() && b[d].is_ascii_digit() {
+        d += 1;
+    }
+    if b.get(d) != Some(&b'n') {
+        return;
+    }
+    let q = d + 1;
+
+    // The trailing group is greedy, so it is attempted before the empty match.
+    let mut i = q + leading_ws_len(&text[q..]);
+    let sign_ok = match b.get(i) {
+        Some(&b'+') => true,
+        Some(&b'-') => !plus_only,
+        _ => false,
+    };
+    if sign_ok {
+        i += 1;
+        i += leading_ws_len(&text[i..]);
+        let digits_start = i;
+        while i < b.len() && b[i].is_ascii_digit() {
+            i += 1;
+        }
+        let mut k = i;
+        while k > digits_start {
+            out.push(k);
+            k -= 1;
+        }
+    }
+
+    if !plus_only {
+        out.push(q);
+    }
+}
+
+/// `((?=\s*[,)])|\s+of\s+)` at `anb`. Returns the total match length.
+fn nth_of_tail(text: &str, anb: usize) -> Option<usize> {
+    let rest = &text[anb..];
+    let after_ws = rest.trim_start_ws();
+    if after_ws.is_empty() || after_ws.starts_with(',') || after_ws.starts_with(')') {
+        return Some(anb);
+    }
+
+    // `\s+of` followed by whitespace or an unambiguous selector-start token.
+    let ws = leading_ws_len(rest);
+    if ws == 0 {
+        return None;
+    }
+    let after = &rest[ws..];
+    let after = after.strip_prefix("of")?;
+    let trailing_ws = leading_ws_len(after);
+    if trailing_ws > 0 {
+        return Some(anb + ws + 2 + trailing_ws);
+    }
+
+    matches!(after.as_bytes().first(), Some(b'.' | b'#' | b'[' | b'*' | b':' | b'&'))
+        .then_some(anb + ws + 2)
+}
+
+/// A comment where a compound selector should begin. Upstream's `read_selector`
+/// tolerates one only immediately before `,`, `{` or `)`; anywhere else the loop
+/// falls through to `read_identifier`, which rejects the `/`.
+fn record_selector_comment_error(
+    cell: &std::cell::Cell<Option<crate::error::ParseError>>,
+    pos: usize,
+) {
+    record_first_error(
+        cell,
+        crate::error::ParseError::svelte(
+            "css_expected_identifier",
+            "Expected a valid CSS identifier",
+            (pos, pos),
+        ),
+    );
+}
+
 // ============================================================================
 // Parser implementation for style tags
 // ============================================================================
 
-impl Parser<'_> {
+impl<'a> Parser<'a> {
+    /// Advance `self.index` to the `</style` that closes the current block,
+    /// mirroring the CSS tokenisation upstream's readers perform: a `</style`
+    /// inside a CSS string, a `/* */` or `<!-- -->` comment, or an unquoted
+    /// `url(...)` is content, not a closing tag.
+    ///
+    /// Returns the first `<` that could not start a closing tag (used for the
+    /// `css_expected_identifier` diagnostic), whether the scan ran out of
+    /// input inside a `url(`, and the first CSS-invalid `//`. The last value is
+    /// needed because an apostrophe later in an SCSS line comment must not hide
+    /// the earlier identifier error behind `unexpected_eof`.
+    ///
+    /// `tokenise` is off for a non-CSS `lang` block in lenient (lint) mode: a
+    /// SCSS `// don't` would otherwise open a string that never closes.
+    fn scan_to_style_close(&mut self, tokenise: bool) -> (Option<usize>, bool, Option<usize>) {
+        let content_start = self.index;
+        let bytes = self.bytes;
+        let len = bytes.len();
+        let mut first_invalid_lt: Option<usize> = None;
+        let mut first_line_comment: Option<usize> = None;
+        let mut quote: Option<u8> = None;
+        let mut in_url = false;
+        let mut escaped = false;
+        // Upstream tests `</style` only between rules, so a `<` inside a block or
+        // a parenthesised value is CSS text: `.a { color: red; </style> }` is a
+        // `css_empty_declaration` and `calc(</style>)` a declaration value.
+        let mut brace_depth = 0usize;
+        let mut paren_depth = 0usize;
+        let mut i = self.index;
+
+        if !tokenise {
+            while let Some(offset) = memchr::memchr(b'<', &bytes[i..]) {
+                i += offset;
+                self.index = i;
+                if self.is_valid_closing_tag("</style") {
+                    return (first_invalid_lt, false, None);
+                }
+                if first_invalid_lt.is_none() {
+                    first_invalid_lt = Some(i);
+                }
+                i += 1;
+            }
+            self.index = len;
+            return (first_invalid_lt, false, None);
+        }
+
+        while i < len {
+            let ch = bytes[i];
+            // Mirrors the branch order of upstream's `read_value`.
+            if escaped {
+                escaped = false;
+            } else if ch == b'\\' {
+                escaped = true;
+            } else if Some(ch) == quote {
+                quote = None;
+            } else if ch == b')' {
+                in_url = false;
+                if quote.is_none() {
+                    paren_depth = paren_depth.saturating_sub(1);
+                }
+            } else if quote.is_none() && (ch == b'"' || ch == b'\'') {
+                quote = Some(ch);
+            } else if ch == b'(' && i >= content_start + 3 && &bytes[i - 3..i] == b"url" {
+                in_url = true;
+                paren_depth += 1;
+            } else if quote.is_none() && !in_url {
+                if ch == b'(' {
+                    paren_depth += 1;
+                } else if ch == b'{' {
+                    brace_depth += 1;
+                } else if ch == b'}' {
+                    brace_depth = brace_depth.saturating_sub(1);
+                } else if ch == b'/' && bytes.get(i + 1) == Some(&b'*') {
+                    // An unterminated comment keeps the old behaviour: fall
+                    // through so the CSS parse reports it.
+                    if let Some(off) = memchr::memmem::find(&bytes[i + 2..], b"*/") {
+                        i += 2 + off + 2;
+                        continue;
+                    }
+                } else if ch == b'/' && bytes.get(i + 1) == Some(&b'/') {
+                    first_line_comment.get_or_insert(i);
+                } else if ch == b'<' {
+                    if bytes[i..].starts_with(b"<!--")
+                        && let Some(off) = memchr::memmem::find(&bytes[i + 4..], b"-->")
+                    {
+                        i += 4 + off + 3;
+                        continue;
+                    }
+                    if brace_depth == 0 && paren_depth == 0 {
+                        self.index = i;
+                        if self.is_valid_closing_tag("</style") {
+                            return (first_invalid_lt, false, first_line_comment);
+                        }
+                        if first_invalid_lt.is_none() {
+                            first_invalid_lt = Some(i);
+                        }
+                    }
+                }
+            }
+            i += 1;
+        }
+
+        self.index = len;
+        (first_invalid_lt, in_url, first_line_comment)
+    }
+
     /// Parse a `<style>` tag and store it in stylesheet.
     pub fn parse_style_tag(
         &mut self,
         start: usize,
         attributes: Vec<crate::ast::Attribute>,
         self_closing: bool,
-    ) -> ParseResult<Option<TemplateNode>> {
+    ) -> ParseResult<Option<TemplateNode<'a>>> {
         // Check for duplicate style tags
         if self.stylesheet.is_some() {
             return Err(crate::error::ParseError::svelte(
@@ -124,6 +450,7 @@ impl Parser<'_> {
                 end: here as u32,
                 attributes: style_attributes,
                 children: Vec::new(),
+                comments: Vec::new(),
                 content: StyleSheetContent {
                     start: here as u32,
                     end: here as u32,
@@ -145,26 +472,13 @@ impl Parser<'_> {
 
         let content_start = self.index;
 
-        // Use SIMD-accelerated search for </style and check for invalid '<' along the way
-        let mut first_invalid_lt: Option<usize> = None;
-        loop {
-            // Search for next '<' using memchr
-            if let Some(offset) = memchr::memchr(b'<', &self.bytes[self.index..]) {
-                let lt_pos = self.index + offset;
-                self.index = lt_pos;
-                if self.is_valid_closing_tag("</style") {
-                    break;
-                }
-                // Track first invalid '<' that is not part of </style
-                if first_invalid_lt.is_none() {
-                    first_invalid_lt = Some(lt_pos);
-                }
-                self.index = lt_pos + 1;
-            } else {
-                self.index = self.bytes.len();
-                break;
-            }
-        }
+        // Upstream never scans the block as raw text: `read_body` only tests
+        // `parser.match('</style')` at a rule boundary, so a `</style` inside a
+        // CSS string, comment or `url()` is swallowed by `read_value` /
+        // `read_comment` / `allow_comment_or_whitespace`. Mirror that
+        // tokenisation instead of a plain byte search.
+        let (first_invalid_lt, unterminated_url, first_line_comment) =
+            self.scan_to_style_close(!lenient_non_css);
 
         let content_end = self.index;
         let style_content = &self.source[content_start..content_end];
@@ -217,24 +531,39 @@ impl Parser<'_> {
                 }
                 i += 1;
             }
-            if in_string {
-                // String was not closed - report unexpected_eof at the end of style content
+            if in_string || unterminated_url {
+                // `//` is not a CSS comment. Upstream reaches that slash and
+                // raises from `read_identifier` before text later on the same
+                // SCSS line (for example `don't`) can look like the start of an
+                // unterminated CSS string to this closing-tag scan.
+                if let Some(pos) = first_line_comment {
+                    return Err(crate::error::ParseError::svelte(
+                        "css_expected_identifier",
+                        "Expected a valid CSS identifier",
+                        (pos, pos),
+                    ));
+                }
+                // Upstream's CSS reader always reports EOF at `parser.template.length`,
+                // and its template is the source with trailing whitespace trimmed.
                 return Err(crate::error::ParseError::svelte(
                     "unexpected_eof",
                     "Unexpected end of input",
-                    (content_end, content_end),
+                    (self.content_end, self.content_end),
                 ));
             }
         }
 
-        // Consume </style followed by optional whitespace and >
         if self.match_str("</style") {
             self.advance_by(7); // consume '</style'
-            // Skip whitespace before >
-            while !self.is_eof() && self.current_char() != '>' {
+            // Upstream reads `/\s*>/y`, so the run is consumed only when a `>`
+            // really follows: `</style x>` leaves ` x>` as template text.
+            let after_name = self.index;
+            while !self.is_eof() && is_js_whitespace(self.current_char()) {
                 self.advance();
             }
-            self.eat_optional(">"); // consume '>'
+            if !self.eat_optional(">") {
+                self.index = after_name;
+            }
         } else if self.is_eof() {
             // Style tag was not closed - check if there was invalid '<' in content
             if let Some(lt_pos) = first_invalid_lt {
@@ -244,12 +573,21 @@ impl Parser<'_> {
                     (lt_pos, lt_pos),
                 ));
             }
-            // Style tag was not closed
-            return Err(crate::error::ParseError::svelte(
-                "expected_token",
-                "Expected token </style",
-                (self.index, self.index),
-            ));
+            // A CSS-invalid `//` can make the closing-tag scan treat later
+            // apostrophes as quotes. If two of those apostrophes balance, the
+            // quote check above passes, but braces skipped between them can
+            // still leave the scanner unable to see the real `</style>`.
+            // Upstream stops at the earlier slash instead.
+            if let Some(pos) = first_line_comment {
+                return Err(crate::error::ParseError::svelte(
+                    "css_expected_identifier",
+                    "Expected a valid CSS identifier",
+                    (pos, pos),
+                ));
+            }
+            // Style tag was not closed. Upstream's `eat('</style', true)` runs
+            // against the right-trimmed template, so the point is its end.
+            return Err(crate::error::ParseError::expected_token("</style", self.content_end));
         }
 
         let end = self.index;
@@ -275,49 +613,67 @@ impl Parser<'_> {
         // Skipped only for a non-CSS `lang` block in lenient (lint) mode (see
         // the string-quote check above).
         if !lenient_non_css {
-            let trimmed = style_content.trim();
+            let trimmed = style_content.trim_ws();
             if !trimmed.is_empty() {
-                // Strip CSS comments to check if there's real content
-                let mut stripped = String::new();
-                let bytes = trimmed.as_bytes();
-                let mut i = 0;
-                let mut segment_start = 0;
-                while i < bytes.len() {
-                    if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
-                        // Flush non-comment segment
-                        if segment_start < i {
-                            stripped.push_str(&trimmed[segment_start..i]);
-                        }
-                        // Skip block comment
-                        i += 2;
-                        while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                // Fast path: no block comments present, so there is nothing to
+                // strip and `trimmed` itself already reflects the real content.
+                if !trimmed.contains("/*") {
+                    if !trimmed.contains('{') && !trimmed.contains(';') && !trimmed.starts_with('@')
+                    {
+                        // Non-empty CSS content with no blocks and no at-rules - invalid
+                        let err_pos =
+                            first_line_comment.unwrap_or(content_start + style_content.len());
+                        return Err(crate::error::ParseError::svelte(
+                            "css_expected_identifier",
+                            "Expected a valid CSS identifier",
+                            (err_pos, err_pos),
+                        ));
+                    }
+                } else {
+                    // Strip CSS comments to check if there's real content
+                    let mut stripped = String::new();
+                    let bytes = trimmed.as_bytes();
+                    let mut i = 0;
+                    let mut segment_start = 0;
+                    while i < bytes.len() {
+                        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+                            // Flush non-comment segment
+                            if segment_start < i {
+                                stripped.push_str(&trimmed[segment_start..i]);
+                            }
+                            // Skip block comment
+                            i += 2;
+                            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/')
+                            {
+                                i += 1;
+                            }
+                            if i + 1 < bytes.len() {
+                                i += 2; // skip */
+                            }
+                            segment_start = i;
+                        } else {
                             i += 1;
                         }
-                        if i + 1 < bytes.len() {
-                            i += 2; // skip */
-                        }
-                        segment_start = i;
-                    } else {
-                        i += 1;
                     }
-                }
-                // Flush remaining segment
-                if segment_start < bytes.len() {
-                    stripped.push_str(&trimmed[segment_start..]);
-                }
-                let stripped = stripped.trim();
-                if !stripped.is_empty()
-                    && !stripped.contains('{')
-                    && !stripped.contains(';')
-                    && !stripped.starts_with('@')
-                {
-                    // Non-empty CSS content with no blocks and no at-rules - invalid
-                    let err_pos = content_start + style_content.len();
-                    return Err(crate::error::ParseError::svelte(
-                        "css_expected_identifier",
-                        "Expected a valid CSS identifier",
-                        (err_pos, err_pos),
-                    ));
+                    // Flush remaining segment
+                    if segment_start < bytes.len() {
+                        stripped.push_str(&trimmed[segment_start..]);
+                    }
+                    let stripped = stripped.trim_ws();
+                    if !stripped.is_empty()
+                        && !stripped.contains('{')
+                        && !stripped.contains(';')
+                        && !stripped.starts_with('@')
+                    {
+                        // Non-empty CSS content with no blocks and no at-rules - invalid
+                        let err_pos =
+                            first_line_comment.unwrap_or(content_start + style_content.len());
+                        return Err(crate::error::ParseError::svelte(
+                            "css_expected_identifier",
+                            "Expected a valid CSS identifier",
+                            (err_pos, err_pos),
+                        ));
+                    }
                 }
             }
         }
@@ -327,7 +683,7 @@ impl Parser<'_> {
         // by the underlying CSS parser (e.g. `css_expected_identifier` for
         // tokens like `$blue`) propagate to the user instead of being
         // silently dropped.
-        let css_children = if self.options.defer_script_parse {
+        let css_children = if self.should_defer_template_parse() {
             Vec::new() // Will be resolved by ensure_css_parsed() before analysis
         } else if lenient_non_css {
             // Non-CSS `lang` block in lint mode: the body is sass/scss/stylus/…,
@@ -352,6 +708,7 @@ impl Parser<'_> {
             end: end as u32,
             attributes: style_attributes,
             children: css_children,
+            comments: collect_css_comments(style_content, content_start),
             content: StyleSheetContent {
                 start: content_start as u32,
                 end: content_end as u32,
@@ -382,16 +739,13 @@ struct CssParser<'a> {
     /// so that helper methods which take `&self` (because they mutate only
     /// `self.index` indirectly via sub-parsers) can still record errors.
     error: std::cell::Cell<Option<crate::error::ParseError>>,
+    /// Current nested-rule depth, bounded by `MAX_NESTING_DEPTH`.
+    depth: u32,
 }
 
 impl<'a> CssParser<'a> {
     fn new(source: &'a str, offset: usize) -> Self {
-        Self {
-            source,
-            offset,
-            index: 0,
-            error: std::cell::Cell::new(None),
-        }
+        Self { source, offset, index: 0, error: std::cell::Cell::new(None), depth: 0 }
     }
 
     fn parse(&mut self) -> Vec<Value> {
@@ -413,17 +767,24 @@ impl<'a> CssParser<'a> {
                 continue;
             }
 
+            let index_before = self.index;
+
             // Check for at-rules
             if self.current_char() == '@' {
                 if let Some(rule) = self.parse_atrule() {
                     rules.push(rule);
                 }
-                continue;
+            } else if let Some(rule) = self.parse_rule() {
+                // Parse regular rule
+                rules.push(rule);
             }
 
-            // Parse regular rule
-            if let Some(rule) = self.parse_rule() {
-                rules.push(rule);
+            // Progress guard: if the sub-parser consumed no input (e.g. an empty
+            // selector at a block start like `{}`, where `parse_rule` records
+            // `css_expected_identifier` and returns `None`), stop instead of
+            // spinning forever.
+            if self.index == index_before {
+                break;
             }
         }
 
@@ -435,7 +796,25 @@ impl<'a> CssParser<'a> {
         self.advance(); // consume '@'
 
         // Read at-rule name
+        let name_start = self.offset + self.index;
+        // Upstream's `read_identifier` rejects a name starting `-?\d` before reading it.
+        let leading_digit = {
+            let rest = &self.source[self.index..];
+            let rest = rest.strip_prefix('-').unwrap_or(rest);
+            rest.starts_with(|c: char| c.is_ascii_digit())
+        };
         let name = self.read_identifier();
+        if leading_digit || name.is_empty() {
+            record_first_error(
+                &self.error,
+                crate::error::ParseError::svelte(
+                    "css_expected_identifier",
+                    "Expected a valid CSS identifier",
+                    (name_start, name_start),
+                ),
+            );
+            return None;
+        }
         self.skip_whitespace();
 
         // Read prelude (until { or ;)
@@ -452,67 +831,13 @@ impl<'a> CssParser<'a> {
             }
             self.advance();
         }
-        let prelude = self.source[prelude_start..self.index].trim().to_string();
-
-        let _end = self.offset + self.index;
+        let prelude = self.source[prelude_start..self.index].trim_ws().to_string();
 
         // Check if there's a block
         let block = if self.current_char() == '{' {
             let block_start = self.offset + self.index;
             self.advance(); // consume '{'
-            self.skip_whitespace();
-
-            // Parse rules inside the block
-            let mut children = Vec::new();
-            while !self.is_eof() && self.current_char() != '}' {
-                self.skip_whitespace();
-                if self.is_eof() || self.current_char() == '}' {
-                    break;
-                }
-
-                // Skip comments so they don't get folded into the next child's
-                // span (they're preserved via source gap copying in the printer).
-                if self.match_str("/*") {
-                    self.skip_block_comment();
-                    continue;
-                }
-
-                // Check for nested at-rule
-                if self.current_char() == '@' {
-                    if let Some(rule) = self.parse_atrule() {
-                        children.push(rule);
-                    }
-                } else if self.peek_block_item_is_rule() {
-                    // Selector followed by `{` → rule (e.g. `0% { ... }` in @keyframes,
-                    // `.foo { ... }` in @media/@supports).
-                    if let Some(rule) = self.parse_rule() {
-                        children.push(rule);
-                    }
-                } else if let Some(decl) = self.parse_declaration() {
-                    // `prop: value;` declaration (used by @page, @font-face,
-                    // @counter-style, @property, etc., which take declarations
-                    // directly inside their block instead of nested rules).
-                    children.push(decl);
-                } else {
-                    // Couldn't make progress — bail to avoid infinite loop.
-                    self.advance();
-                }
-                self.skip_whitespace();
-            }
-
-            // Consume closing brace
-            self.eat_optional("}");
-            let block_end = self.offset + self.index;
-
-            let mut block_obj = Map::new();
-            block_obj.insert("type".to_string(), Value::String("Block".to_string()));
-            block_obj.insert(
-                "start".to_string(),
-                Value::Number((block_start as i64).into()),
-            );
-            block_obj.insert("end".to_string(), Value::Number((block_end as i64).into()));
-            block_obj.insert("children".to_string(), Value::Array(children));
-            Value::Object(block_obj)
+            self.with_block_depth(block_start, |parser| parser.parse_atrule_block(block_start))
         } else {
             self.eat_optional(";");
             Value::Null
@@ -531,6 +856,61 @@ impl<'a> CssParser<'a> {
         Some(Value::Object(obj))
     }
 
+    /// Parse the body of an at-rule, whose `{` has already been consumed.
+    fn parse_atrule_block(&mut self, block_start: usize) -> Value {
+        self.skip_whitespace();
+
+        // Parse rules inside the block
+        let mut children = Vec::new();
+        while !self.is_eof() && self.current_char() != '}' {
+            self.skip_whitespace();
+            if self.is_eof() || self.current_char() == '}' {
+                break;
+            }
+            let index_before = self.index;
+
+            // Skip comments so they don't get folded into the next child's
+            // span (they're preserved via source gap copying in the printer).
+            if self.match_str("/*") {
+                self.skip_block_comment();
+                continue;
+            }
+
+            // Check for nested at-rule
+            if self.current_char() == '@' {
+                if let Some(rule) = self.parse_atrule() {
+                    children.push(rule);
+                }
+            } else if self.peek_block_item_is_rule() {
+                // Selector followed by `{` → rule (e.g. `0% { ... }` in @keyframes,
+                // `.foo { ... }` in @media/@supports).
+                if let Some(rule) = self.parse_rule() {
+                    children.push(rule);
+                }
+            } else if let Some(decl) = self.parse_declaration() {
+                // `prop: value;` declaration (used by @page, @font-face,
+                // @counter-style, @property, etc., which take declarations
+                // directly inside their block instead of nested rules).
+                children.push(decl);
+            } else {
+                // Couldn't make progress — bail to avoid infinite loop.
+                self.advance();
+            }
+            // `parse_rule` consumes nothing when the selector is empty (a block
+            // item starting at `{`), which upstream rejects outright.
+            if self.index == index_before {
+                self.advance();
+            }
+            self.skip_whitespace();
+        }
+
+        // Consume closing brace
+        self.eat_optional("}");
+        let block_end = self.offset + self.index;
+
+        block_value(block_start, block_end, children)
+    }
+
     /// Peek ahead from the current position (without advancing) to decide
     /// whether the upcoming block item is a nested rule or a declaration.
     /// Mirrors the official `read_block_item` look-ahead (style.js:444-457):
@@ -540,6 +920,7 @@ impl<'a> CssParser<'a> {
     fn peek_block_item_is_rule(&self) -> bool {
         let bytes = self.source.as_bytes();
         let mut i = self.index;
+
         let mut paren_depth = 0i32;
         let mut bracket_depth = 0i32;
         let mut in_string: Option<u8> = None;
@@ -597,12 +978,26 @@ impl<'a> CssParser<'a> {
         let selector_end = self.index;
         let selector_text = &self.source[selector_start..selector_end];
 
-        if selector_text.trim().is_empty() {
+        if selector_text.trim_ws().is_empty() {
+            // An empty selector at a block start (e.g. `{}`) mirrors the official
+            // `read_selector` → `read_identifier` path, which raises
+            // `css_expected_identifier` at the block-start position.
+            if !self.is_eof() {
+                let pos = self.offset + self.index;
+                record_first_error(
+                    &self.error,
+                    crate::error::ParseError::svelte(
+                        "css_expected_identifier",
+                        "Expected a valid CSS identifier",
+                        (pos, pos),
+                    ),
+                );
+            }
             return None;
         }
 
         // Calculate the actual start position (skipping leading whitespace)
-        let leading_ws = selector_text.len() - selector_text.trim_start().len();
+        let leading_ws = selector_text.len() - selector_text.trim_start_ws().len();
         let adjusted_start = self.offset + selector_start + leading_ws;
 
         let prelude = self.parse_selector_list(selector_text, adjusted_start);
@@ -637,7 +1032,25 @@ impl<'a> CssParser<'a> {
         let selectors: Vec<Value> = self
             .split_by_comma_respecting_parens(text, offset)
             .into_iter()
-            .filter(|(s, _)| !Self::is_only_whitespace_and_comments(s))
+            .filter(|(s, selector_offset)| {
+                if !Self::is_only_whitespace_and_comments(s) {
+                    return true;
+                }
+                // Upstream runs `read_selector` on every comma-separated
+                // segment, so an empty one reaches `read_identifier` and raises
+                // there — at the index the leading whitespace and comments have
+                // been consumed to.
+                let pos = *selector_offset + Self::leading_ws_and_comments_len(s);
+                record_first_error(
+                    &self.error,
+                    crate::error::ParseError::svelte(
+                        "css_expected_identifier",
+                        "Expected a valid CSS identifier",
+                        (pos, pos),
+                    ),
+                );
+                false
+            })
             .map(|(selector, selector_offset)| {
                 // Strip leading whitespace AND CSS comments to find the actual selector start
                 let leading_skip = Self::leading_ws_and_comments_len(selector);
@@ -652,10 +1065,7 @@ impl<'a> CssParser<'a> {
             .collect();
 
         let mut obj = Map::new();
-        obj.insert(
-            "type".to_string(),
-            Value::String("SelectorList".to_string()),
-        );
+        obj.insert("type".to_string(), Value::String("SelectorList".to_string()));
         obj.insert("start".to_string(), Value::Number((start as i64).into()));
         obj.insert("end".to_string(), Value::Number((end as i64).into()));
         obj.insert("children".to_string(), Value::Array(selectors));
@@ -671,10 +1081,7 @@ impl<'a> CssParser<'a> {
         let relative_selectors = self.parse_relative_selectors_with_combinators(text, offset);
 
         let mut obj = Map::new();
-        obj.insert(
-            "type".to_string(),
-            Value::String("ComplexSelector".to_string()),
-        );
+        obj.insert("type".to_string(), Value::String("ComplexSelector".to_string()));
         obj.insert("start".to_string(), Value::Number((start as i64).into()));
         obj.insert("end".to_string(), Value::Number((end as i64).into()));
         obj.insert("children".to_string(), Value::Array(relative_selectors));
@@ -684,31 +1091,22 @@ impl<'a> CssParser<'a> {
 
     fn create_empty_relative_selector_with_combinator(
         &self,
-        comb: char,
+        comb: &str,
         comb_start: usize,
         comb_end: usize,
     ) -> Value {
         let mut obj = Map::new();
-        obj.insert(
-            "type".to_string(),
-            Value::String("RelativeSelector".to_string()),
-        );
+        obj.insert("type".to_string(), Value::String("RelativeSelector".to_string()));
 
         let mut comb_obj = Map::new();
         comb_obj.insert("type".to_string(), Value::String("Combinator".to_string()));
         comb_obj.insert("name".to_string(), Value::String(comb.to_string()));
-        comb_obj.insert(
-            "start".to_string(),
-            Value::Number((comb_start as i64).into()),
-        );
+        comb_obj.insert("start".to_string(), Value::Number((comb_start as i64).into()));
         comb_obj.insert("end".to_string(), Value::Number((comb_end as i64).into()));
         obj.insert("combinator".to_string(), Value::Object(comb_obj));
 
         obj.insert("selectors".to_string(), Value::Array(Vec::new()));
-        obj.insert(
-            "start".to_string(),
-            Value::Number((comb_start as i64).into()),
-        );
+        obj.insert("start".to_string(), Value::Number((comb_start as i64).into()));
         obj.insert("end".to_string(), Value::Number((comb_end as i64).into()));
 
         Value::Object(obj)
@@ -730,7 +1128,7 @@ impl<'a> CssParser<'a> {
             }
             if !bytes[i].is_ascii()
                 && let Some(ch) = text[i..].chars().next()
-                && ch.is_whitespace()
+                && is_js_whitespace(ch)
             {
                 i += ch.len_utf8();
                 continue;
@@ -853,13 +1251,15 @@ impl<'a> CssParser<'a> {
         let mut current_start = 0;
         let mut i = 0;
         let bytes = text.as_bytes();
-        let mut last_combinator: Option<(char, usize, usize)> = None;
+        let mut last_combinator: Option<(&'static str, usize, usize)> = None;
 
         while i < bytes.len() {
             let c = bytes[i];
 
-            // Skip CSS comments
+            // Leading and trailing comments were stripped before this scan, so one
+            // reached here starts a compound — where upstream reads an identifier.
             if c == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+                record_selector_comment_error(&self.error, base_offset + i);
                 i += 2; // skip /*
                 while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
                     i += 1;
@@ -936,8 +1336,8 @@ impl<'a> CssParser<'a> {
             }
 
             // Check for combinators (+, >, ~)
-            if c == b'+' || c == b'>' || c == b'~' {
-                let selector_text = text[current_start..i].trim();
+            if let Some(comb_name) = combinator_at(bytes, i) {
+                let selector_text = text[current_start..i].trim_ws();
                 if !selector_text.is_empty() {
                     let selector_offset = base_offset + current_start;
                     let rel_selector = self.create_relative_selector(
@@ -949,10 +1349,10 @@ impl<'a> CssParser<'a> {
                 }
 
                 let combinator_start = base_offset + i;
-                let combinator_end = combinator_start + 1;
-                last_combinator = Some((c as char, combinator_start, combinator_end));
+                let combinator_end = combinator_start + comb_name.len();
+                last_combinator = Some((comb_name, combinator_start, combinator_end));
 
-                i += 1;
+                i += comb_name.len();
                 // Skip whitespace after combinator
                 while i < bytes.len() && bytes[i].is_ascii_whitespace() {
                     i += 1;
@@ -970,6 +1370,7 @@ impl<'a> CssParser<'a> {
                 }
                 // Also skip comments in look-ahead
                 while j + 1 < bytes.len() && bytes[j] == b'/' && bytes[j + 1] == b'*' {
+                    record_selector_comment_error(&self.error, base_offset + j);
                     j += 2; // skip /*
                     while j + 1 < bytes.len() && !(bytes[j] == b'*' && bytes[j + 1] == b'/') {
                         j += 1;
@@ -982,7 +1383,7 @@ impl<'a> CssParser<'a> {
                         j += 1;
                     }
                 }
-                if j < bytes.len() && !matches!(bytes[j], b'+' | b'>' | b'~' | b')' | b']') {
+                if j < bytes.len() && !matches!(bytes[j], b'+' | b'>' | b'~' | b'|' | b')' | b']') {
                     // Check if next is a selector start
                     if bytes[j].is_ascii_alphabetic()
                         || bytes[j] == b':'
@@ -993,7 +1394,7 @@ impl<'a> CssParser<'a> {
                         || bytes[j] == b'&'
                     {
                         // This is a descendant combinator (space)
-                        let selector_text = text[current_start..i].trim();
+                        let selector_text = text[current_start..i].trim_ws();
                         // Only treat as descendant if there's actual selector content before the whitespace
                         // (not just whitespace and comments)
                         if !selector_text.is_empty()
@@ -1010,7 +1411,7 @@ impl<'a> CssParser<'a> {
                             // Set up space combinator for next selector
                             let combinator_start = base_offset + i;
                             let combinator_end = combinator_start + 1;
-                            last_combinator = Some((' ', combinator_start, combinator_end));
+                            last_combinator = Some((" ", combinator_start, combinator_end));
 
                             // Skip whitespace and continue from next selector
                             i = j;
@@ -1027,9 +1428,9 @@ impl<'a> CssParser<'a> {
         // Add the last selector
         if current_start < text.len() {
             let selector_text = &text[current_start..];
-            if !selector_text.trim().is_empty() {
+            if !selector_text.trim_ws().is_empty() {
                 // Calculate offset skipping leading whitespace
-                let leading_ws = selector_text.len() - selector_text.trim_start().len();
+                let leading_ws = selector_text.len() - selector_text.trim_start_ws().len();
                 let selector_offset = base_offset + current_start + leading_ws;
                 let rel_selector =
                     self.create_relative_selector(selector_text, selector_offset, last_combinator);
@@ -1049,9 +1450,9 @@ impl<'a> CssParser<'a> {
         }
 
         // If no selectors were found, create one for the whole text
-        if result.is_empty() && !text.trim().is_empty() {
+        if result.is_empty() && !text.trim_ws().is_empty() {
             // Calculate offset skipping leading whitespace
-            let leading_ws = text.len() - text.trim_start().len();
+            let leading_ws = text.len() - text.trim_start_ws().len();
             let adjusted_offset = base_offset + leading_ws;
             let rel_selector = self.create_relative_selector(text, adjusted_offset, None);
             result.push(rel_selector);
@@ -1064,13 +1465,9 @@ impl<'a> CssParser<'a> {
         &self,
         text: &str,
         offset: usize,
-        combinator: Option<(char, usize, usize)>,
+        combinator: Option<(&'static str, usize, usize)>,
     ) -> Value {
-        let start = if let Some((_, comb_start, _)) = combinator {
-            comb_start
-        } else {
-            offset
-        };
+        let start = if let Some((_, comb_start, _)) = combinator { comb_start } else { offset };
         let end = offset + text.len();
 
         let selectors = self.parse_simple_selectors(text, offset);
@@ -1079,10 +1476,7 @@ impl<'a> CssParser<'a> {
             let mut comb_obj = Map::new();
             comb_obj.insert("type".to_string(), Value::String("Combinator".to_string()));
             comb_obj.insert("name".to_string(), Value::String(c.to_string()));
-            comb_obj.insert(
-                "start".to_string(),
-                Value::Number((comb_start as i64).into()),
-            );
+            comb_obj.insert("start".to_string(), Value::Number((comb_start as i64).into()));
             comb_obj.insert("end".to_string(), Value::Number((comb_end as i64).into()));
             Value::Object(comb_obj)
         } else {
@@ -1090,10 +1484,7 @@ impl<'a> CssParser<'a> {
         };
 
         let mut obj = Map::new();
-        obj.insert(
-            "type".to_string(),
-            Value::String("RelativeSelector".to_string()),
-        );
+        obj.insert("type".to_string(), Value::String("RelativeSelector".to_string()));
         obj.insert("combinator".to_string(), combinator_value);
         obj.insert("selectors".to_string(), Value::Array(selectors));
         obj.insert("start".to_string(), Value::Number((start as i64).into()));
@@ -1107,7 +1498,7 @@ impl<'a> CssParser<'a> {
 
         // Don't trim the text - we need to preserve Unicode escape sequence terminators
         // which may be whitespace characters
-        if text.trim().is_empty() {
+        if text.trim_ws().is_empty() {
             return selectors;
         }
 
@@ -1191,8 +1582,40 @@ impl<'a> CssParser<'a> {
         result
     }
 
+    /// Parse a `{ … }` body one level deeper. Nested rules and at-rules recurse
+    /// through here, so this is where CSS nesting is bounded: past the limit the
+    /// body is skipped rather than descended into, and the error is recorded for
+    /// `parse_css_strict` to report.
+    fn with_block_depth(
+        &mut self,
+        block_start: usize,
+        parse: impl FnOnce(&mut Self) -> Value,
+    ) -> Value {
+        if self.depth >= MAX_NESTING_DEPTH {
+            record_first_error(
+                &self.error,
+                crate::error::ParseError::svelte(
+                    "css_nesting_too_deep",
+                    format!("CSS is nested more than {MAX_NESTING_DEPTH} levels deep"),
+                    (block_start, block_start + 1),
+                ),
+            );
+            self.skip_until_block_end();
+            return block_value(block_start, self.offset + self.index, Vec::new());
+        }
+
+        self.depth += 1;
+        let block = parse(self);
+        self.depth -= 1;
+        block
+    }
+
     fn parse_block(&mut self) -> Value {
         let start = self.offset + self.index - 1; // -1 to include the '{'
+        self.with_block_depth(start, |parser| parser.parse_block_inner(start))
+    }
+
+    fn parse_block_inner(&mut self, start: usize) -> Value {
         let mut declarations = Vec::new();
 
         self.skip_whitespace();
@@ -1218,10 +1641,15 @@ impl<'a> CssParser<'a> {
             }
 
             // Check if this looks like a nested rule (selector followed by {)
-            // Look ahead to see if { comes before : or ;
-            if self.is_nested_rule() {
+            // using the same value scan as upstream's `read_block_item`.
+            if self.peek_block_item_is_rule() {
+                let index_before = self.index;
                 if let Some(rule) = self.parse_rule() {
                     declarations.push(rule);
+                } else if self.index == index_before {
+                    // Empty selector (`{` at a block-item position): `parse_rule`
+                    // records the error and consumes nothing.
+                    self.advance();
                 }
                 self.skip_whitespace();
                 continue;
@@ -1242,205 +1670,95 @@ impl<'a> CssParser<'a> {
         self.eat_optional("}");
         let end = self.offset + self.index;
 
-        let mut obj = Map::new();
-        obj.insert("type".to_string(), Value::String("Block".to_string()));
-        obj.insert("start".to_string(), Value::Number((start as i64).into()));
-        obj.insert("end".to_string(), Value::Number((end as i64).into()));
-        obj.insert("children".to_string(), Value::Array(declarations));
-
-        Value::Object(obj)
+        block_value(start, end, declarations)
     }
 
-    /// Check if the current position looks like a nested rule (selector followed by {)
-    /// by looking ahead to see if { comes before a declaration-style : (property: value)
-    fn is_nested_rule(&self) -> bool {
-        let remaining = &self.source[self.index..];
-        let bytes = remaining.as_bytes();
-        let mut depth: i32 = 0;
-        let mut i = 0;
+    /// Consume the remainder of the block whose `{` was already eaten, without
+    /// recursing into it.
+    fn skip_until_block_end(&mut self) {
+        let mut brace_depth = 1;
+        let mut in_string = false;
+        let mut string_char = '\0';
 
-        // If it starts with & (nesting selector), it's always a nested rule
-        // Skip the & and any following selector parts including pseudo-classes
-        if bytes.first() == Some(&b'&') {
-            i = 1;
-            // After &, skip any combination of selector parts
-            // (identifiers, pseudo-classes like :hover, classes like .foo, etc.)
-            // until we find a { which confirms it's a nested rule
-            while i < bytes.len() {
-                let c = bytes[i];
-                match c {
-                    b'(' | b'[' => depth += 1,
-                    b')' | b']' => depth -= 1,
-                    b'{' if depth == 0 => return true,
-                    b';' | b'}' if depth == 0 => return false,
-                    _ => {}
+        while !self.is_eof() {
+            let c = self.current_char();
+
+            if c == '\\' {
+                self.advance();
+                if !self.is_eof() {
+                    self.advance();
                 }
-                i += 1;
+                continue;
             }
-            return false;
-        }
 
-        // If it starts with : followed by an identifier and then {, it's a pseudo-class selector
-        // like :global { ... } or :hover { ... }
-        if bytes.first() == Some(&b':') {
-            // Skip past the pseudo-class/pseudo-element
-            i = 1;
-            // Skip any additional ':'
-            while i < bytes.len() && bytes[i] == b':' {
-                i += 1;
-            }
-            // Skip the identifier
-            while i < bytes.len()
-                && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'-' || bytes[i] == b'_')
-            {
-                i += 1;
-            }
-        }
-
-        while i < bytes.len() {
-            let c = bytes[i];
-            match c {
-                b'(' | b'[' => depth += 1,
-                b')' | b']' => depth -= 1,
-                b'{' if depth == 0 => return true,
-                b':' if depth == 0 => {
-                    // Distinguish between property: value (declaration) and selector :pseudo-class
-                    // If the ':' follows whitespace, it's likely a pseudo-class in a selector
-                    // (e.g., "p :global", "div :hover")
-                    // If the ':' directly follows a non-whitespace char, check if it's a pseudo-class
-                    // (e.g., "header:has(&)", "div:hover") or a declaration (e.g., "color:", "font-size:")
-                    if i > 0 && bytes[i - 1].is_ascii_whitespace() {
-                        // ':' after whitespace - likely a pseudo-class selector, skip it
-                        // Skip past the pseudo-class name
-                        i += 1;
-                        while i < bytes.len()
-                            && (bytes[i].is_ascii_alphanumeric()
-                                || bytes[i] == b'-'
-                                || bytes[i] == b'_')
-                        {
-                            i += 1;
-                        }
-                        continue;
-                    }
-                    // ':' directly after non-whitespace - could be a declaration OR a pseudo-class
-                    // Check if it's followed by a known CSS pseudo-class pattern
-                    // A pseudo-class is `:<identifier>` optionally followed by `(...)` or `{`
-                    // A declaration is `<property>: <value>`
-                    // Key difference: declarations have whitespace or value after `:`,
-                    // pseudo-classes have an identifier (no whitespace) directly after `:`
-                    let mut j = i + 1;
-                    // Skip any additional ':' (for pseudo-elements like ::before)
-                    while j < bytes.len() && bytes[j] == b':' {
-                        j += 1;
-                    }
-                    // Check if an identifier follows directly (pseudo-class like :has, :hover, :is)
-                    if j < bytes.len()
-                        && (bytes[j].is_ascii_alphabetic() || bytes[j] == b'-' || bytes[j] == b'_')
-                    {
-                        // Skip the identifier
-                        while j < bytes.len()
-                            && (bytes[j].is_ascii_alphanumeric()
-                                || bytes[j] == b'-'
-                                || bytes[j] == b'_')
-                        {
-                            j += 1;
-                        }
-                        // After the identifier, check what follows:
-                        // - '(' means it's a functional pseudo-class like :has(), :is()
-                        // - '{' means it's a selector like div:hover { }
-                        // - whitespace followed by '{' or selector parts means it's a selector
-                        // - ',' means it's a selector list
-                        if j < bytes.len()
-                            && (bytes[j] == b'(' || bytes[j] == b'{' || bytes[j] == b',')
-                        {
-                            // This is a pseudo-class selector, not a declaration
-                            // Skip past the pseudo-class and continue checking
-                            i = j;
-                            continue;
-                        }
-                        // Check if whitespace follows and then eventually a {
-                        if j < bytes.len() && bytes[j].is_ascii_whitespace() {
-                            // Could be "div:hover {" or "font-size: 12px" - look ahead for '{'
-                            let mut k = j;
-                            while k < bytes.len() && bytes[k].is_ascii_whitespace() {
-                                k += 1;
-                            }
-                            if k < bytes.len() && bytes[k] == b'{' {
-                                // "selector:pseudo {" - it's a nested rule
-                                return true;
-                            }
-                            // "selector:pseudo something" or "property: value" - ambiguous
-                            // Continue scanning (could be "div:hover .foo {")
-                            i = j;
-                            continue;
-                        }
-                        // Skip past the pseudo-class content and continue
-                        i = j;
-                        continue;
-                    }
-                    // ':' not followed by identifier - this is a property: value declaration
-                    return false;
+            if in_string {
+                if c == string_char {
+                    in_string = false;
                 }
-                b';' | b'}' if depth == 0 => return false,
-                _ => {}
+                self.advance();
+                continue;
             }
-            i += 1;
-        }
 
-        false
+            if c == '"' || c == '\'' {
+                in_string = true;
+                string_char = c;
+                self.advance();
+                continue;
+            }
+
+            if self.match_str("/*") {
+                self.skip_block_comment();
+                continue;
+            }
+
+            if c == '{' {
+                brace_depth += 1;
+            } else if c == '}' {
+                brace_depth -= 1;
+                if brace_depth == 0 {
+                    self.advance();
+                    return;
+                }
+            }
+            self.advance();
+        }
     }
 
     fn parse_declaration(&mut self) -> Option<Value> {
         self.skip_whitespace();
         let start = self.offset + self.index;
-
-        // Read property name
         let property_start = self.index;
+
+        // Upstream's `read_declaration` reads the property only up to the first
+        // whitespace or `:`. This matters for invalid SCSS `//` comments: the
+        // first word becomes the property and the rest of the comment becomes
+        // the value, so semicolons and quotes in prose determine where the next
+        // block item starts.
         while !self.is_eof() {
             let c = self.current_char();
-            if c == ':' || c == '}' || c == ';' {
+            if is_js_whitespace(c) || c == ':' {
                 break;
             }
             self.advance();
         }
-        let property = self.source[property_start..self.index].trim().to_string();
+        let property = self.source[property_start..self.index].to_string();
 
-        if property.is_empty() || self.is_eof() || self.current_char() != ':' {
-            // No `property: value` shape. Upstream's `read_declaration` reads
-            // the property up to the first whitespace-or-colon, optionally eats
-            // a `:`, then reads the value up to `;` / `}`. When that value is
-            // empty (and the property is not a `--custom-property`), it raises
-            // `css_empty_declaration` (read/style.js L474-476). Examples:
-            // `div { ... }`, `div { ; }`, `:global { p {...} }`.
-            // A non-empty remainder after the first token (`div { foo bar }`)
-            // parses upstream as a declaration with property `foo` and value
-            // `bar`, so it is NOT an error — keep skipping it silently.
-            let upstream_property = property.split_whitespace().next().unwrap_or("");
-            let upstream_value = property
-                .split_once(char::is_whitespace)
-                .map(|(_, rest)| rest.trim())
-                .unwrap_or("");
-            if upstream_value.is_empty() && !upstream_property.starts_with("--") {
-                record_first_error(
-                    &self.error,
-                    crate::error::ParseError::svelte(
-                        "css_empty_declaration",
-                        "Declaration cannot be empty",
-                        (start, self.offset + self.index),
-                    ),
-                );
-            }
-            return None;
-        }
-
-        self.advance(); // consume ':'
+        self.skip_whitespace();
+        self.eat_optional(":");
+        let empty_declaration_end = self.offset + self.index;
         self.skip_whitespace();
 
         // Read value, respecting parentheses, strings, and CSS escape sequences so
         // values like `content: "{};[]";` or `content: ';'` aren't terminated by
         // a `;`/`}` that lives inside a string literal or after a backslash escape.
+        // A custom property's `<declaration-value>` additionally admits balanced
+        // square- and curly-bracket blocks. The outer rule's `}` only terminates
+        // the value after those blocks close.
+        let is_custom_property = property.starts_with("--");
         let value_start = self.index;
-        let mut depth = 0;
+        let mut paren_depth = 0;
+        let mut bracket_depth = 0;
+        let mut brace_depth = 0;
         let mut in_string: Option<char> = None;
         while !self.is_eof() {
             let c = self.current_char();
@@ -1464,20 +1782,54 @@ impl<'a> CssParser<'a> {
                 self.advance();
                 continue;
             }
-            if c == '(' {
-                depth += 1;
-            } else if c == ')' {
-                depth -= 1;
-            } else if depth == 0 && (c == ';' || c == '}') {
-                break;
+
+            if is_custom_property && self.match_str("/*") {
+                self.skip_block_comment();
+                continue;
+            }
+
+            match c {
+                '(' => paren_depth += 1,
+                ')' => paren_depth -= 1,
+                '[' if is_custom_property => bracket_depth += 1,
+                ']' if is_custom_property && bracket_depth > 0 => bracket_depth -= 1,
+                '{' if is_custom_property => brace_depth += 1,
+                '}' if is_custom_property && brace_depth > 0 => brace_depth -= 1,
+                '}' if paren_depth == 0
+                    && (!is_custom_property || (bracket_depth == 0 && brace_depth == 0)) =>
+                {
+                    break;
+                }
+                ';' if paren_depth == 0
+                    && (!is_custom_property || (bracket_depth == 0 && brace_depth == 0)) =>
+                {
+                    break;
+                }
+                _ => {}
             }
             self.advance();
         }
-        let value = self.source[value_start..self.index].trim().to_string();
+        let value = self.source[value_start..self.index].trim_ws().to_string();
+
+        if value.is_empty() && !property.starts_with("--") {
+            record_first_error(
+                &self.error,
+                crate::error::ParseError::svelte(
+                    "css_empty_declaration",
+                    "Declaration cannot be empty",
+                    (start, empty_declaration_end),
+                ),
+            );
+        }
 
         // End position is before the semicolon
         let end = self.offset + self.index;
-        self.eat_optional(";");
+        if self.current_char() != '}' && !self.eat_optional(";") {
+            record_first_error(
+                &self.error,
+                crate::error::ParseError::expected_token(";", self.offset + self.index),
+            );
+        }
 
         let mut obj = Map::new();
         obj.insert("type".to_string(), Value::String("Declaration".to_string()));
@@ -1566,11 +1918,7 @@ impl<'a> CssParser<'a> {
     }
 
     fn current_char(&self) -> char {
-        if self.is_eof() {
-            '\0'
-        } else {
-            self.source[self.index..].chars().next().unwrap_or('\0')
-        }
+        if self.is_eof() { '\0' } else { self.source[self.index..].chars().next().unwrap_or('\0') }
     }
 
     fn advance(&mut self) {
@@ -1605,59 +1953,95 @@ impl<'a> CssParser<'a> {
     }
 
     fn skip_whitespace(&mut self) {
-        while !self.is_eof() && self.current_char().is_whitespace() {
+        while !self.is_eof() && is_js_whitespace(self.current_char()) {
             self.advance();
         }
     }
 
-    /// Read a CSS identifier, handling CSS escape sequences.
+    /// Read a CSS identifier, decoding CSS escape sequences.
     fn read_identifier(&mut self) -> String {
-        let start = self.index;
+        read_css_identifier(self.source, &mut self.index)
+    }
+}
 
-        while !self.is_eof() {
-            let c = self.current_char();
+/// Read a CSS identifier starting at `*index` in `source`, decoding escape
+/// sequences exactly the way the official `read_identifier` does.
+///
+/// The AST stores the *decoded* name — `\31 23` is the identifier `123` — and
+/// the printer re-escapes it on the way out (`escape_identifier`). Returning the
+/// raw source slice instead would double-escape every name that contains an
+/// escape sequence.
+///
+/// Two cases, mirroring upstream's `REGEX_UNICODE_SEQUENCE`:
+/// - `\` + 1-6 hex digits + an optional `\r\n` or single whitespace character
+///   decodes to that code point. A decoded backslash is re-emitted as `\\` so
+///   that the name still says "one literal backslash" rather than starting a
+///   fresh escape.
+/// - `\` + any other single character is kept verbatim (`\.` stays `\.`).
+fn read_css_identifier(source: &str, index: &mut usize) -> String {
+    let mut identifier = String::new();
 
-            if c == '\\' {
-                // CSS escape sequence
-                self.advance(); // consume '\'
+    while *index < source.len() {
+        let rest = &source[*index..];
+        let Some(c) = rest.chars().next() else { break };
 
-                if self.is_eof() {
-                    break;
+        if c == '\\' {
+            let after = &rest[1..];
+            // Hex digits are ASCII, so the char count is also the byte length.
+            let hex_len = after.chars().take(6).take_while(char::is_ascii_hexdigit).count();
+
+            if hex_len > 0 {
+                let code = u32::from_str_radix(&after[..hex_len], 16).unwrap_or(0);
+                let mut consumed = 1 + hex_len;
+
+                // One optional whitespace terminator, with `\r\n` counting as one.
+                let tail = &after[hex_len..];
+                if tail.starts_with("\r\n") {
+                    consumed += 2;
+                } else if let Some(w) = tail.chars().next()
+                    && w.is_whitespace()
+                {
+                    consumed += w.len_utf8();
                 }
 
-                let next = self.current_char();
-
-                if next.is_ascii_hexdigit() {
-                    // Read 1-6 hex digits
-                    let mut hex_count = 0;
-                    while !self.is_eof() && hex_count < 6 {
-                        let hc = self.current_char();
-                        if !hc.is_ascii_hexdigit() {
-                            break;
-                        }
-                        self.advance();
-                        hex_count += 1;
-                    }
-                    // After hex digits, optionally consume one whitespace
-                    if !self.is_eof() {
-                        let after = self.current_char();
-                        if after == ' ' || after == '\t' || after == '\n' || after == '\r' {
-                            self.advance();
-                        }
-                    }
-                } else {
-                    // Escape of a single non-hex character
-                    self.advance();
+                match char::from_u32(code) {
+                    Some('\\') => identifier.push_str("\\\\"),
+                    Some(ch) => identifier.push(ch),
+                    // Surrogates and out-of-range code points are not characters;
+                    // CSS replaces them with U+FFFD.
+                    None => identifier.push('\u{FFFD}'),
                 }
-            } else if c.is_alphanumeric() || c == '-' || c == '_' {
-                self.advance();
-            } else {
-                break;
+
+                *index += consumed;
+                continue;
             }
+
+            match after.chars().next() {
+                Some(n) => {
+                    identifier.push('\\');
+                    identifier.push(n);
+                    *index += 1 + n.len_utf8();
+                }
+                None => {
+                    // Trailing backslash at EOF — keep it; the printer escapes it.
+                    identifier.push('\\');
+                    *index += 1;
+                }
+            }
+            continue;
         }
 
-        self.source[start..self.index].to_string()
+        // Upstream's valid-character set: `[a-zA-Z0-9_-]` plus every code point
+        // >= 160 (CSS treats those as identifier characters, e.g. `×`).
+        if (c as u32) >= 160 || c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+            identifier.push(c);
+            *index += c.len_utf8();
+        } else {
+            break;
+        }
     }
+
+    identifier
 }
 
 // ============================================================================
@@ -1672,17 +2056,34 @@ struct SelectorParser<'a> {
     /// First parse error encountered while reading selector tokens. Mirrors the
     /// "throw on first invalid identifier" behaviour of the official Svelte
     /// CSS parser without adding a `Result` return type to every helper.
-    error: Option<crate::error::ParseError>,
+    /// `Cell` so the `&self` helpers that spawn sub-parsers for pseudo-class
+    /// arguments can hand the sub-parser's error back up.
+    error: std::cell::Cell<Option<crate::error::ParseError>>,
+    /// Depth of enclosing pseudo-class argument lists (`:is(:is(…))`), bounded
+    /// by `MAX_NESTING_DEPTH`. Carried across sub-parsers because the
+    /// recursion runs through freshly constructed `SelectorParser`s.
+    depth: u32,
 }
 
 impl<'a> SelectorParser<'a> {
     fn new(source: &'a str, offset: usize) -> Self {
-        Self {
-            source,
-            offset,
-            index: 0,
-            error: None,
-        }
+        Self { source, offset, index: 0, error: std::cell::Cell::new(None), depth: 0 }
+    }
+
+    /// A sub-parser for the arguments of a pseudo-class inside this selector.
+    /// See [`Self::absorb_nesting_error`] for how its errors are handled.
+    fn nested(&self, source: &'a str, offset: usize) -> Self {
+        Self { source, offset, index: 0, error: std::cell::Cell::new(None), depth: self.depth + 1 }
+    }
+
+    /// Take over a sub-parser's error. Upstream parses pseudo-class arguments
+    /// with the same recursive `read_selector`, so a token that cannot start a
+    /// selector is rejected inside `:global(…)` exactly as it is outside.
+    fn absorb_nesting_error(&self, sub: &Self) {
+        let Some(err) = sub.error.take() else {
+            return;
+        };
+        record_first_error(&self.error, err);
     }
 
     fn parse_selectors(&mut self, selectors: &mut Vec<Value>) {
@@ -1725,21 +2126,42 @@ impl<'a> SelectorParser<'a> {
                 }
             } else if c == '[' {
                 // Attribute selector
-                if let Some(selector) = self.parse_attribute_selector() {
-                    selectors.push(selector);
+                match self.parse_attribute_selector() {
+                    Some(selector) => selectors.push(selector),
+                    // The error is already recorded; upstream throws here, so
+                    // nothing after it is part of the selector.
+                    None => break,
                 }
             } else if c == '*' {
                 // Universal selector
                 let start = self.offset + self.index;
                 self.advance();
+                // `*|el` / `*|*` — `*` is the namespace and is kept, so the
+                // printer can put it back and the scoping pass can tell a bare
+                // `*` (which it rewrites in place) from a namespaced one.
+                let mut name = "*".to_string();
+                let mut namespace: Option<String> = None;
+                if self.current_char() == '|' {
+                    self.advance();
+                    namespace = Some(name);
+                    if self.current_char() == '*' {
+                        self.advance();
+                        name = "*".to_string();
+                    } else {
+                        match self.read_namespaced_local_name() {
+                            Some(local) => name = local,
+                            None => break,
+                        }
+                    }
+                }
                 let end = self.offset + self.index;
 
                 let mut obj = Map::new();
-                obj.insert(
-                    "type".to_string(),
-                    Value::String("TypeSelector".to_string()),
-                );
-                obj.insert("name".to_string(), Value::String("*".to_string()));
+                obj.insert("type".to_string(), Value::String("TypeSelector".to_string()));
+                obj.insert("name".to_string(), Value::String(name));
+                if let Some(ns) = namespace {
+                    obj.insert("namespace".to_string(), Value::String(ns));
+                }
                 obj.insert("start".to_string(), Value::Number((start as i64).into()));
                 obj.insert("end".to_string(), Value::Number((end as i64).into()));
                 selectors.push(Value::Object(obj));
@@ -1750,20 +2172,36 @@ impl<'a> SelectorParser<'a> {
                 let end = self.offset + self.index;
 
                 let mut obj = Map::new();
-                obj.insert(
-                    "type".to_string(),
-                    Value::String("NestingSelector".to_string()),
-                );
+                obj.insert("type".to_string(), Value::String("NestingSelector".to_string()));
                 obj.insert("name".to_string(), Value::String("&".to_string()));
                 obj.insert("start".to_string(), Value::Number((start as i64).into()));
                 obj.insert("end".to_string(), Value::Number((end as i64).into()));
                 selectors.push(Value::Object(obj));
-            } else if c.is_alphabetic() || c == '-' || c == '_' || c == '\\' || (c as u32) >= 160 {
+            } else if c.is_alphabetic()
+                || (c == '-' && !self.peek_next_char().is_ascii_digit())
+                || c == '_'
+                || c == '\\'
+                || (c as u32) >= 160
+            {
                 // Type selector (element name) - mirrors the official
                 // `read_identifier` valid character set: ASCII letters/digits,
                 // `-`, `_`, code points >= 160, and `\`-escapes.
                 if let Some(selector) = self.parse_type_selector() {
                     selectors.push(selector);
+                } else {
+                    // An empty identifier here would leave `self.index`
+                    // unchanged and spin the loop; mirror the official
+                    // `read_identifier` empty-identifier error and stop.
+                    let pos = self.offset + self.index;
+                    record_first_error(
+                        &self.error,
+                        crate::error::ParseError::svelte(
+                            "css_expected_identifier",
+                            "Expected a valid CSS identifier",
+                            (pos, pos),
+                        ),
+                    );
+                    break;
                 }
             } else if c.is_ascii_digit() || (c == '.' && self.peek_next_char().is_ascii_digit()) {
                 // Percentage selector (used inside @keyframes blocks): `0%`, `33.3%`, `.5%`.
@@ -1773,14 +2211,15 @@ impl<'a> SelectorParser<'a> {
                     selectors.push(selector);
                 } else {
                     // Not a valid percentage — fall through to the identifier error.
-                    if self.error.is_none() {
-                        let pos = self.offset + self.index;
-                        self.error = Some(crate::error::ParseError::svelte(
+                    let pos = self.offset + self.index;
+                    record_first_error(
+                        &self.error,
+                        crate::error::ParseError::svelte(
                             "css_expected_identifier",
                             "Expected a valid CSS identifier",
                             (pos, pos),
-                        ));
-                    }
+                        ),
+                    );
                     break;
                 }
             } else {
@@ -1788,14 +2227,15 @@ impl<'a> SelectorParser<'a> {
                 // falls through to `read_identifier` and the first character
                 // is not a valid identifier-start, `read_identifier` returns
                 // an empty string and raises `css_expected_identifier`.
-                if self.error.is_none() {
-                    let pos = self.offset + self.index;
-                    self.error = Some(crate::error::ParseError::svelte(
+                let pos = self.offset + self.index;
+                record_first_error(
+                    &self.error,
+                    crate::error::ParseError::svelte(
                         "css_expected_identifier",
                         "Expected a valid CSS identifier",
                         (pos, pos),
-                    ));
-                }
+                    ),
+                );
                 // Stop parsing further selectors once we've recorded an error;
                 // the surrounding parser will surface it.
                 break;
@@ -1848,16 +2288,10 @@ impl<'a> SelectorParser<'a> {
 
         let name = self.read_identifier();
 
-        // Record end position right after the name, BEFORE any arguments
-        // This matches the official Svelte compiler behavior
-        let end = self.offset + self.index;
-
-        // Consume any arguments in parentheses (e.g., ::view-transition-group(foo))
-        // Arguments are consumed but NOT included in the end position
-        if self.current_char() == '(' {
+        let args = if self.current_char() == '(' {
+            let args_start = self.offset + self.index + 1;
             self.advance(); // consume '('
-
-            // Skip content inside parentheses
+            let content_start = self.index;
             let mut depth = 1;
             while !self.is_eof() && depth > 0 {
                 let c = self.current_char();
@@ -1880,16 +2314,29 @@ impl<'a> SelectorParser<'a> {
                 }
                 self.advance();
             }
-
+            let content_end = self.index;
             self.advance(); // consume ')'
-        }
+
+            let content = &self.source[content_start..content_end];
+            let leading = content.len() - content.trim_start_ws().len();
+            let trailing = content.len() - content.trim_end_ws().len();
+            Some(self.parse_args_selector_list(
+                content.trim_ws(),
+                args_start + leading,
+                self.offset + content_end - trailing,
+            ))
+        } else {
+            None
+        };
+
+        let end = self.offset + self.index;
 
         let mut obj = Map::new();
-        obj.insert(
-            "type".to_string(),
-            Value::String("PseudoElementSelector".to_string()),
-        );
+        obj.insert("type".to_string(), Value::String("PseudoElementSelector".to_string()));
         obj.insert("name".to_string(), Value::String(name));
+        if let Some(args) = args {
+            obj.insert("args".to_string(), args);
+        }
         obj.insert("start".to_string(), Value::Number((start as i64).into()));
         obj.insert("end".to_string(), Value::Number((end as i64).into()));
 
@@ -1900,8 +2347,24 @@ impl<'a> SelectorParser<'a> {
         let start = self.offset + self.index;
         self.advance(); // consume ':'
 
+        let name_start = self.offset + self.index;
         let name = self.read_identifier();
-
+        if name.is_empty() {
+            // Upstream delegates the name to `read_identifier`, which throws
+            // at the byte immediately after `:` when there is no identifier.
+            // This also matters for unprocessed indented Sass: `color: red`
+            // is first read as a descendant selector, and this is its earliest
+            // syntax error rather than the eventual end of the style block.
+            record_first_error(
+                &self.error,
+                crate::error::ParseError::svelte(
+                    "css_expected_identifier",
+                    "Expected a valid CSS identifier",
+                    (name_start, name_start),
+                ),
+            );
+            return None;
+        }
         // Check for arguments in parentheses
         let args = if self.current_char() == '(' {
             let args_start = self.offset + self.index + 1;
@@ -1938,170 +2401,23 @@ impl<'a> SelectorParser<'a> {
 
             self.advance(); // consume ')'
 
-            // Check if this is an nth-* pseudo-class that uses special An+B syntax
-            let is_nth_pseudo = matches!(
-                name.as_str(),
-                "nth-child" | "nth-last-child" | "nth-of-type" | "nth-last-of-type"
-            );
-
-            if is_nth_pseudo {
-                // For nth-* pseudo-classes, parse the An+B syntax and optional 'of S' selector
-                let trimmed = content.trim();
-                let leading_ws = content.len() - content.trim_start().len();
-                let nth_start = args_start + leading_ws;
-
-                // Check for 'of ' keyword to split An+B from selector
-                let (nth_value, selector_part, nth_end_pos) = if let Some(of_pos) =
-                    memmem::find(trimmed.as_bytes(), b" of ")
-                {
-                    // Split at ' of ' - include the ' of ' in the Nth value
-                    let nth_val = &trimmed[..of_pos + 4]; // Include ' of '
-                    let sel_part = &trimmed[of_pos + 4..];
-                    let end_pos = nth_start + of_pos + 4;
-                    (nth_val, Some((sel_part, end_pos)), end_pos)
-                } else {
-                    // Check if it's a valid An+B expression or just a selector
-                    // An+B patterns: contains n, digits, +/-, or is even/odd
-                    let is_nth_pattern = trimmed == "even"
-                        || trimmed == "odd"
-                        || trimmed.contains('n')
-                        || trimmed.chars().any(|c| c.is_ascii_digit())
-                        || trimmed.starts_with('+')
-                        || trimmed.starts_with('-');
-
-                    if is_nth_pattern {
-                        let trailing_ws = content.len() - content.trim_end().len();
-                        let end_pos = self.offset + content_end - trailing_ws;
-                        (trimmed, None, end_pos)
-                    } else {
-                        // Not an An+B pattern, treat as regular selector
-                        // Fall through to the non-nth parsing below
-                        let mut trimmed_inner = content.trim();
-                        let mut leading_skip = content.len() - content.trim_start().len();
-
-                        loop {
-                            if trimmed_inner.starts_with("/*") {
-                                if let Some(end_pos) = memmem::find(trimmed_inner.as_bytes(), b"*/")
-                                {
-                                    leading_skip += end_pos + 2;
-                                    trimmed_inner = &trimmed_inner[end_pos + 2..];
-                                    let ws_skip =
-                                        trimmed_inner.len() - trimmed_inner.trim_start().len();
-                                    leading_skip += ws_skip;
-                                    trimmed_inner = trimmed_inner.trim_start();
-                                } else {
-                                    break;
-                                }
-                            } else {
-                                break;
-                            }
-                        }
-
-                        let trailing_ws = content.len() - content.trim_end().len();
-                        let trimmed_start = args_start + leading_skip;
-                        let trimmed_end = self.offset + content_end - trailing_ws;
-
-                        // Parse as regular selector list and set as args for the PseudoClassSelector
-                        let args = self.parse_args_selector_list(
-                            trimmed_inner,
-                            trimmed_start,
-                            trimmed_end,
-                        );
-                        let end = self.offset + self.index;
-
-                        let mut obj = Map::new();
-                        obj.insert(
-                            "type".to_string(),
-                            Value::String("PseudoClassSelector".to_string()),
-                        );
-                        obj.insert("name".to_string(), Value::String(name));
-                        obj.insert("args".to_string(), args);
-                        obj.insert("start".to_string(), Value::Number((start as i64).into()));
-                        obj.insert("end".to_string(), Value::Number((end as i64).into()));
-
-                        return Some(Value::Object(obj));
-                    }
-                };
-
-                // Build the selectors array
-                let mut selectors = Vec::new();
-
-                // Add Nth object
-                let mut nth_obj = Map::new();
-                nth_obj.insert("type".to_string(), Value::String("Nth".to_string()));
-                nth_obj.insert("value".to_string(), Value::String(nth_value.to_string()));
-                nth_obj.insert(
-                    "start".to_string(),
-                    Value::Number((nth_start as i64).into()),
+            // The arguments are the only recursive part of selector parsing, so
+            // this is where the nesting bound applies. The parenthesised text is
+            // already consumed above, so bailing out costs only the args AST.
+            if self.depth >= MAX_NESTING_DEPTH {
+                record_first_error(
+                    &self.error,
+                    crate::error::ParseError::svelte(
+                        "css_nesting_too_deep",
+                        format!("CSS is nested more than {MAX_NESTING_DEPTH} levels deep"),
+                        (start, start + 1),
+                    ),
                 );
-                nth_obj.insert(
-                    "end".to_string(),
-                    Value::Number((nth_end_pos as i64).into()),
-                );
-                selectors.push(Value::Object(nth_obj));
-
-                // Parse selector part if present
-                if let Some((sel_text, sel_start)) = selector_part {
-                    let sel_parser = SelectorParser::new(sel_text, sel_start);
-                    let parsed = sel_parser.parse_simple_selectors();
-                    selectors.extend(parsed);
-                }
-
-                // Get the actual end position
-                let trailing_ws = content.len() - content.trim_end().len();
-                let actual_end = self.offset + content_end - trailing_ws;
-
-                // Wrap in RelativeSelector
-                let mut rel_sel = Map::new();
-                rel_sel.insert(
-                    "type".to_string(),
-                    Value::String("RelativeSelector".to_string()),
-                );
-                rel_sel.insert("combinator".to_string(), Value::Null);
-                rel_sel.insert("selectors".to_string(), Value::Array(selectors));
-                rel_sel.insert(
-                    "start".to_string(),
-                    Value::Number((nth_start as i64).into()),
-                );
-                rel_sel.insert("end".to_string(), Value::Number((actual_end as i64).into()));
-
-                // Wrap in ComplexSelector
-                let mut complex_sel = Map::new();
-                complex_sel.insert(
-                    "type".to_string(),
-                    Value::String("ComplexSelector".to_string()),
-                );
-                complex_sel.insert(
-                    "start".to_string(),
-                    Value::Number((nth_start as i64).into()),
-                );
-                complex_sel.insert("end".to_string(), Value::Number((actual_end as i64).into()));
-                complex_sel.insert(
-                    "children".to_string(),
-                    Value::Array(vec![Value::Object(rel_sel)]),
-                );
-
-                // Wrap in SelectorList
-                let mut sel_list = Map::new();
-                sel_list.insert(
-                    "type".to_string(),
-                    Value::String("SelectorList".to_string()),
-                );
-                sel_list.insert(
-                    "start".to_string(),
-                    Value::Number((nth_start as i64).into()),
-                );
-                sel_list.insert("end".to_string(), Value::Number((actual_end as i64).into()));
-                sel_list.insert(
-                    "children".to_string(),
-                    Value::Array(vec![Value::Object(complex_sel)]),
-                );
-
-                Some(Value::Object(sel_list))
+                None
             } else {
                 // Calculate trimmed content positions (strip whitespace and leading comments)
-                let mut trimmed = content.trim();
-                let mut leading_skip = content.len() - content.trim_start().len();
+                let mut trimmed = content.trim_ws();
+                let mut leading_skip = content.len() - content.trim_start_ws().len();
 
                 // Also skip leading comments for the SelectorList start
                 // And update `trimmed` to not include the leading comment
@@ -2110,9 +2426,9 @@ impl<'a> SelectorParser<'a> {
                         if let Some(end_pos) = memmem::find(trimmed.as_bytes(), b"*/") {
                             leading_skip += end_pos + 2;
                             trimmed = &trimmed[end_pos + 2..];
-                            let ws_skip = trimmed.len() - trimmed.trim_start().len();
+                            let ws_skip = trimmed.len() - trimmed.trim_start_ws().len();
                             leading_skip += ws_skip;
-                            trimmed = trimmed.trim_start();
+                            trimmed = trimmed.trim_start_ws();
                         } else {
                             break;
                         }
@@ -2121,7 +2437,9 @@ impl<'a> SelectorParser<'a> {
                     }
                 }
 
-                let trailing_ws = content.len() - content.trim_end().len();
+                // Upstream ends the list at the last selector, so a comment before
+                // the `)` belongs to the enclosing pseudo-class, not to the list.
+                let trailing_ws = CssParser::css_safe_trailing_ws_and_comments_len(content);
                 let trimmed_start = args_start + leading_skip;
                 let trimmed_end = self.offset + content_end - trailing_ws;
 
@@ -2135,10 +2453,7 @@ impl<'a> SelectorParser<'a> {
         let end = self.offset + self.index;
 
         let mut obj = Map::new();
-        obj.insert(
-            "type".to_string(),
-            Value::String("PseudoClassSelector".to_string()),
-        );
+        obj.insert("type".to_string(), Value::String("PseudoClassSelector".to_string()));
         obj.insert("name".to_string(), Value::String(name));
         if let Some(args_value) = args {
             obj.insert("args".to_string(), args_value);
@@ -2157,17 +2472,14 @@ impl<'a> SelectorParser<'a> {
             .into_iter()
             .map(|(selector_text, selector_offset)| {
                 // Adjust offset for leading whitespace when trimming
-                let leading_ws = selector_text.len() - selector_text.trim_start().len();
+                let leading_ws = selector_text.len() - selector_text.trim_start_ws().len();
                 let adjusted_offset = selector_offset + leading_ws;
-                self.parse_complex_selector_from_text(selector_text.trim(), adjusted_offset)
+                self.parse_complex_selector_from_text(selector_text.trim_ws(), adjusted_offset)
             })
             .collect();
 
         let mut obj = Map::new();
-        obj.insert(
-            "type".to_string(),
-            Value::String("SelectorList".to_string()),
-        );
+        obj.insert("type".to_string(), Value::String("SelectorList".to_string()));
         obj.insert("start".to_string(), Value::Number((start as i64).into()));
         obj.insert("end".to_string(), Value::Number((end as i64).into()));
         obj.insert("children".to_string(), Value::Array(children));
@@ -2204,9 +2516,24 @@ impl<'a> SelectorParser<'a> {
             }
 
             let c = bytes[i] as char;
-            if c == '(' {
+            if c == '\\' {
+                // A CSS escape makes the next character literal, so `\,` never separates.
+                i += 1;
+                i += text[i..].chars().next().map_or(0, char::len_utf8);
+                continue;
+            }
+            if c == '"' || c == '\'' {
+                let quote = bytes[i];
+                i += 1;
+                while i < bytes.len() && bytes[i] != quote {
+                    i += if bytes[i] == b'\\' { 2 } else { 1 };
+                }
+                i += 1;
+                continue;
+            }
+            if c == '(' || c == '[' {
                 depth += 1;
-            } else if c == ')' {
+            } else if c == ')' || c == ']' {
                 depth -= 1;
             } else if c == ',' && depth == 0 {
                 let selector = &text[last_start..i];
@@ -2233,7 +2560,7 @@ impl<'a> SelectorParser<'a> {
         loop {
             let before_len = current.len();
             // Strip leading whitespace
-            let trimmed = current.trim_start();
+            let trimmed = current.trim_start_ws();
             current_offset += before_len - trimmed.len();
             current = trimmed;
 
@@ -2250,11 +2577,17 @@ impl<'a> SelectorParser<'a> {
             }
         }
 
+        // Upstream gates the `An+B` branch on `inside_pseudo_class` alone, not on
+        // the pseudo-class name, and every caller of this function is a
+        // pseudo-class/-element argument list.
+        if let Some(nth_len) = match_nth_of(current) {
+            return self.build_nth_complex_selector(current, current_offset, nth_len);
+        }
+
         // Strip trailing whitespace and comments
         let mut end_current = current;
         loop {
-            let _before_len = end_current.len();
-            let trimmed = end_current.trim_end();
+            let trimmed = end_current.trim_end_ws();
             end_current = trimmed;
 
             // Strip trailing comment
@@ -2269,7 +2602,7 @@ impl<'a> SelectorParser<'a> {
             }
         }
 
-        let trimmed = end_current.trim();
+        let trimmed = end_current.trim_ws();
         let start = current_offset;
         let end = start + trimmed.len();
 
@@ -2277,13 +2610,73 @@ impl<'a> SelectorParser<'a> {
         let relative_selectors = self.parse_relative_selectors_from_text(trimmed, start);
 
         let mut obj = Map::new();
-        obj.insert(
-            "type".to_string(),
-            Value::String("ComplexSelector".to_string()),
-        );
+        obj.insert("type".to_string(), Value::String("ComplexSelector".to_string()));
         obj.insert("start".to_string(), Value::Number((start as i64).into()));
         obj.insert("end".to_string(), Value::Number((end as i64).into()));
         obj.insert("children".to_string(), Value::Array(relative_selectors));
+
+        Value::Object(obj)
+    }
+
+    /// Build the `ComplexSelector` for an argument list that starts with an
+    /// `An+B` token. `text[..nth_len]` is the `Nth` node; anything after it is
+    /// the `of S` selector, which shares the `Nth`'s relative selector.
+    fn build_nth_complex_selector(&self, text: &str, offset: usize, nth_len: usize) -> Value {
+        let nth_end = offset + nth_len;
+
+        let mut nth_obj = Map::new();
+        nth_obj.insert("type".to_string(), Value::String("Nth".to_string()));
+        nth_obj.insert("value".to_string(), Value::String(text[..nth_len].to_string()));
+        nth_obj.insert("start".to_string(), Value::Number((offset as i64).into()));
+        nth_obj.insert("end".to_string(), Value::Number((nth_end as i64).into()));
+
+        let rest_raw = &text[nth_len..];
+        let rest_offset = nth_end + leading_ws_len(rest_raw);
+        let mut rest = rest_raw.trim_ws();
+        loop {
+            rest = rest.trim_end_ws();
+            match rest
+                .strip_suffix("*/")
+                .and_then(|head| memchr::memmem::rfind(head.as_bytes(), b"/*"))
+            {
+                Some(pos) => rest = &rest[..pos],
+                None => break,
+            }
+        }
+
+        let mut children = if rest.is_empty() {
+            Vec::new()
+        } else {
+            self.parse_relative_selectors_from_text(rest, rest_offset)
+        };
+
+        let end = if rest.is_empty() { nth_end } else { rest_offset + rest.len() };
+
+        match children.first_mut() {
+            Some(first) => {
+                if let Some(o) = first.as_object_mut() {
+                    o.insert("start".to_string(), Value::Number((offset as i64).into()));
+                    if let Some(sels) = o.get_mut("selectors").and_then(|s| s.as_array_mut()) {
+                        sels.insert(0, Value::Object(nth_obj));
+                    }
+                }
+            }
+            None => {
+                let mut rel_sel = Map::new();
+                rel_sel.insert("type".to_string(), Value::String("RelativeSelector".to_string()));
+                rel_sel.insert("combinator".to_string(), Value::Null);
+                rel_sel.insert("selectors".to_string(), Value::Array(vec![Value::Object(nth_obj)]));
+                rel_sel.insert("start".to_string(), Value::Number((offset as i64).into()));
+                rel_sel.insert("end".to_string(), Value::Number((end as i64).into()));
+                children.push(Value::Object(rel_sel));
+            }
+        }
+
+        let mut obj = Map::new();
+        obj.insert("type".to_string(), Value::String("ComplexSelector".to_string()));
+        obj.insert("start".to_string(), Value::Number((offset as i64).into()));
+        obj.insert("end".to_string(), Value::Number((end as i64).into()));
+        obj.insert("children".to_string(), Value::Array(children));
 
         Value::Object(obj)
     }
@@ -2293,10 +2686,24 @@ impl<'a> SelectorParser<'a> {
         let mut current_start = 0;
         let mut i = 0;
         let bytes = text.as_bytes();
-        let mut last_combinator: Option<(char, usize, usize)> = None;
+        let mut last_combinator: Option<(&'static str, usize, usize)> = None;
 
         while i < bytes.len() {
             let c = bytes[i];
+
+            // Leading and trailing comments were stripped before this scan, so one
+            // reached here starts a compound — where upstream reads an identifier.
+            if c == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+                record_selector_comment_error(&self.error, base_offset + i);
+                i += 2;
+                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                if i + 1 < bytes.len() {
+                    i += 2;
+                }
+                continue;
+            }
 
             // Skip content in parentheses
             if c == b'(' {
@@ -2312,6 +2719,31 @@ impl<'a> SelectorParser<'a> {
                         depth += 1;
                     } else if bytes[i] == b')' {
                         depth -= 1;
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+
+            // An attribute selector is one simple selector however much whitespace
+            // its quoted value carries, so no combinator can be found inside it.
+            if c == b'[' {
+                let mut depth = 1;
+                let mut quote: Option<u8> = None;
+                i += 1;
+                while i < bytes.len() && depth > 0 {
+                    let b = bytes[i];
+                    if b == b'\\' && i + 1 < bytes.len() {
+                        i += 2;
+                        continue;
+                    }
+                    match quote {
+                        Some(q) if b == q => quote = None,
+                        Some(_) => {}
+                        None if b == b'"' || b == b'\'' => quote = Some(b),
+                        None if b == b'[' => depth += 1,
+                        None if b == b']' => depth -= 1,
+                        None => {}
                     }
                     i += 1;
                 }
@@ -2337,9 +2769,9 @@ impl<'a> SelectorParser<'a> {
             }
 
             // Check for combinators
-            if c == b'+' || c == b'>' || c == b'~' {
+            if let Some(comb_name) = combinator_at(bytes, i) {
                 // Found a combinator
-                let selector_text = text[current_start..i].trim();
+                let selector_text = text[current_start..i].trim_ws();
                 if !selector_text.is_empty() {
                     let selector_offset = base_offset + current_start;
                     let rel_selector = self.create_relative_selector(
@@ -2351,10 +2783,10 @@ impl<'a> SelectorParser<'a> {
                 }
 
                 let combinator_start = base_offset + i;
-                let combinator_end = combinator_start + 1;
-                last_combinator = Some((c as char, combinator_start, combinator_end));
+                let combinator_end = combinator_start + comb_name.len();
+                last_combinator = Some((comb_name, combinator_start, combinator_end));
 
-                i += 1;
+                i += comb_name.len();
                 // Skip whitespace after combinator
                 while i < bytes.len() && bytes[i].is_ascii_whitespace() {
                     i += 1;
@@ -2371,7 +2803,7 @@ impl<'a> SelectorParser<'a> {
                     j += 1;
                 }
                 if j < bytes.len()
-                    && !matches!(bytes[j], b'+' | b'>' | b'~' | b')')
+                    && !matches!(bytes[j], b'+' | b'>' | b'~' | b'|' | b')')
                     && bytes[j] != b'('
                 {
                     // Check if next is a selector start
@@ -2384,7 +2816,7 @@ impl<'a> SelectorParser<'a> {
                         || bytes[j] == b'&'
                     {
                         // This is a descendant combinator (space)
-                        let selector_text = text[current_start..i].trim();
+                        let selector_text = text[current_start..i].trim_ws();
                         if !selector_text.is_empty() {
                             let selector_offset = base_offset + current_start;
                             let rel_selector = self.create_relative_selector(
@@ -2397,7 +2829,7 @@ impl<'a> SelectorParser<'a> {
                             // Set up space combinator for next selector
                             let combinator_start = base_offset + i;
                             let combinator_end = combinator_start + 1;
-                            last_combinator = Some((' ', combinator_start, combinator_end));
+                            last_combinator = Some((" ", combinator_start, combinator_end));
 
                             // Skip whitespace and continue from next selector
                             i = j;
@@ -2414,9 +2846,9 @@ impl<'a> SelectorParser<'a> {
         // Add the last selector
         if current_start < text.len() {
             let selector_text = &text[current_start..];
-            if !selector_text.trim().is_empty() {
+            if !selector_text.trim_ws().is_empty() {
                 // Calculate offset skipping leading whitespace
-                let leading_ws = selector_text.len() - selector_text.trim_start().len();
+                let leading_ws = selector_text.len() - selector_text.trim_start_ws().len();
                 let selector_offset = base_offset + current_start + leading_ws;
                 let rel_selector =
                     self.create_relative_selector(selector_text, selector_offset, last_combinator);
@@ -2424,10 +2856,24 @@ impl<'a> SelectorParser<'a> {
             }
         }
 
+        // Upstream reads a combinator and then requires a compound after it;
+        // hitting the argument list's `)` instead is `css_selector_invalid`.
+        if last_combinator.is_some() && text[current_start..].trim_ws().is_empty() {
+            let pos = base_offset + text.len();
+            record_first_error(
+                &self.error,
+                crate::error::ParseError::svelte(
+                    "css_selector_invalid",
+                    "Invalid selector",
+                    (pos, pos),
+                ),
+            );
+        }
+
         // If no selectors were found, create one for the whole text
-        if result.is_empty() && !text.trim().is_empty() {
+        if result.is_empty() && !text.trim_ws().is_empty() {
             // Calculate offset skipping leading whitespace
-            let leading_ws = text.len() - text.trim_start().len();
+            let leading_ws = text.len() - text.trim_start_ws().len();
             let adjusted_offset = base_offset + leading_ws;
             let rel_selector = self.create_relative_selector(text, adjusted_offset, None);
             result.push(rel_selector);
@@ -2440,27 +2886,21 @@ impl<'a> SelectorParser<'a> {
         &self,
         text: &str,
         offset: usize,
-        combinator: Option<(char, usize, usize)>,
+        combinator: Option<(&'static str, usize, usize)>,
     ) -> Value {
-        let start = if let Some((_, comb_start, _)) = combinator {
-            comb_start
-        } else {
-            offset
-        };
+        let start = if let Some((_, comb_start, _)) = combinator { comb_start } else { offset };
         let end = offset + text.len();
 
         let mut selectors = Vec::new();
-        let mut parser = SelectorParser::new(text, offset);
+        let mut parser = self.nested(text, offset);
         parser.parse_selectors(&mut selectors);
+        self.absorb_nesting_error(&parser);
 
         let combinator_value = if let Some((c, comb_start, comb_end)) = combinator {
             let mut comb_obj = Map::new();
             comb_obj.insert("type".to_string(), Value::String("Combinator".to_string()));
             comb_obj.insert("name".to_string(), Value::String(c.to_string()));
-            comb_obj.insert(
-                "start".to_string(),
-                Value::Number((comb_start as i64).into()),
-            );
+            comb_obj.insert("start".to_string(), Value::Number((comb_start as i64).into()));
             comb_obj.insert("end".to_string(), Value::Number((comb_end as i64).into()));
             Value::Object(comb_obj)
         } else {
@@ -2468,10 +2908,7 @@ impl<'a> SelectorParser<'a> {
         };
 
         let mut obj = Map::new();
-        obj.insert(
-            "type".to_string(),
-            Value::String("RelativeSelector".to_string()),
-        );
+        obj.insert("type".to_string(), Value::String("RelativeSelector".to_string()));
         obj.insert("combinator".to_string(), combinator_value);
         obj.insert("selectors".to_string(), Value::Array(selectors));
         obj.insert("start".to_string(), Value::Number((start as i64).into()));
@@ -2488,10 +2925,7 @@ impl<'a> SelectorParser<'a> {
         let end = self.offset + self.index;
 
         let mut obj = Map::new();
-        obj.insert(
-            "type".to_string(),
-            Value::String("ClassSelector".to_string()),
-        );
+        obj.insert("type".to_string(), Value::String("ClassSelector".to_string()));
         obj.insert("name".to_string(), Value::String(name));
         obj.insert("start".to_string(), Value::Number((start as i64).into()));
         obj.insert("end".to_string(), Value::Number((end as i64).into()));
@@ -2520,15 +2954,29 @@ impl<'a> SelectorParser<'a> {
         self.advance(); // consume '['
 
         // Skip whitespace
-        while !self.is_eof() && self.current_char().is_whitespace() {
+        while !self.is_eof() && is_js_whitespace(self.current_char()) {
             self.advance();
         }
 
         // Read attribute name (identifier)
+        let name_pos = self.offset + self.index;
         let name = self.read_identifier();
+        if name.is_empty() {
+            // Upstream reads the name with the same `read_identifier`, which
+            // rejects an empty one — there is no namespace syntax inside `[…]`.
+            record_first_error(
+                &self.error,
+                crate::error::ParseError::svelte(
+                    "css_expected_identifier",
+                    "Expected a valid CSS identifier",
+                    (name_pos, name_pos),
+                ),
+            );
+            return None;
+        }
 
         // Skip whitespace
-        while !self.is_eof() && self.current_char().is_whitespace() {
+        while !self.is_eof() && is_js_whitespace(self.current_char()) {
             self.advance();
         }
 
@@ -2537,14 +2985,15 @@ impl<'a> SelectorParser<'a> {
         let mut value: Option<String> = None;
         let mut flags: Option<String> = None;
 
+        // `/[~^$*|]?=/y` — a sticky match, so a prefix char with no `=` after it
+        // consumes nothing and leaves the `]` check to reject the selector.
         let c = self.current_char();
-        if c == '~' || c == '|' || c == '^' || c == '$' || c == '*' {
-            let op_char = c;
+        if (c == '~' || c == '|' || c == '^' || c == '$' || c == '*')
+            && self.peek_next_char() == '='
+        {
             self.advance();
-            if self.current_char() == '=' {
-                self.advance();
-                matcher = Some(format!("{}=", op_char));
-            }
+            self.advance();
+            matcher = Some(format!("{}=", c));
         } else if c == '=' {
             self.advance();
             matcher = Some("=".to_string());
@@ -2552,7 +3001,7 @@ impl<'a> SelectorParser<'a> {
 
         if matcher.is_some() {
             // Skip whitespace
-            while !self.is_eof() && self.current_char().is_whitespace() {
+            while !self.is_eof() && is_js_whitespace(self.current_char()) {
                 self.advance();
             }
 
@@ -2584,7 +3033,7 @@ impl<'a> SelectorParser<'a> {
                 let val_start = self.index;
                 while !self.is_eof() {
                     let ch = self.current_char();
-                    if ch == ']' || ch.is_whitespace() {
+                    if ch == ']' || is_js_whitespace(ch) {
                         break;
                     }
                     self.advance();
@@ -2595,42 +3044,41 @@ impl<'a> SelectorParser<'a> {
             }
 
             // Skip whitespace
-            while !self.is_eof() && self.current_char().is_whitespace() {
-                self.advance();
-            }
-
-            // Read flags (e.g., 'i' or 's')
-            let c = self.current_char();
-            if c != ']' && c.is_alphabetic() {
-                let flags_start = self.index;
-                while !self.is_eof() && self.current_char().is_alphabetic() {
-                    self.advance();
-                }
-                flags = Some(self.source[flags_start..self.index].to_string());
-
-                // Skip whitespace
-                while !self.is_eof() && self.current_char().is_whitespace() {
-                    self.advance();
-                }
-            }
-        } else {
-            // No matcher - skip to ']'
-            while !self.is_eof() && self.current_char() != ']' {
+            while !self.is_eof() && is_js_whitespace(self.current_char()) {
                 self.advance();
             }
         }
 
-        // consume ']'
-        if !self.is_eof() && self.current_char() == ']' {
-            self.advance();
+        // Read flags (e.g., 'i' or 's')
+        let c = self.current_char();
+        if c != ']' && c.is_alphabetic() {
+            let flags_start = self.index;
+            while !self.is_eof() && self.current_char().is_alphabetic() {
+                self.advance();
+            }
+            flags = Some(self.source[flags_start..self.index].to_string());
+
+            // Skip whitespace
+            while !self.is_eof() && is_js_whitespace(self.current_char()) {
+                self.advance();
+            }
         }
+
+        // consume ']' — upstream's `parser.eat(']', true)`, so anything else
+        // ends the selector rather than being skipped over.
+        if self.is_eof() || self.current_char() != ']' {
+            let pos = self.offset + self.index;
+            record_first_error(
+                &self.error,
+                crate::error::ParseError::svelte("expected_token", "Expected token ]", (pos, pos)),
+            );
+            return None;
+        }
+        self.advance();
         let end = self.offset + self.index;
 
         let mut obj = Map::new();
-        obj.insert(
-            "type".to_string(),
-            Value::String("AttributeSelector".to_string()),
-        );
+        obj.insert("type".to_string(), Value::String("AttributeSelector".to_string()));
         obj.insert("name".to_string(), Value::String(name));
         if let Some(m) = matcher {
             obj.insert("matcher".to_string(), Value::String(m));
@@ -2655,23 +3103,60 @@ impl<'a> SelectorParser<'a> {
 
     fn parse_type_selector(&mut self) -> Option<Value> {
         let start = self.offset + self.index;
-        let name = self.read_identifier();
-        let end = self.offset + self.index;
+        let mut name = self.read_identifier();
 
         if name.is_empty() {
             return None;
         }
 
+        // `ns|el` / `ns|*` — the namespace is kept alongside the local name.
+        let mut namespace: Option<String> = None;
+        if self.current_char() == '|' {
+            self.advance();
+            namespace = Some(name);
+            if self.current_char() == '*' {
+                self.advance();
+                name = "*".to_string();
+            } else {
+                name = self.read_namespaced_local_name()?;
+            }
+        }
+
+        let end = self.offset + self.index;
+
         let mut obj = Map::new();
-        obj.insert(
-            "type".to_string(),
-            Value::String("TypeSelector".to_string()),
-        );
+        obj.insert("type".to_string(), Value::String("TypeSelector".to_string()));
         obj.insert("name".to_string(), Value::String(name));
+        if let Some(ns) = namespace {
+            obj.insert("namespace".to_string(), Value::String(ns));
+        }
         obj.insert("start".to_string(), Value::Number((start as i64).into()));
         obj.insert("end".to_string(), Value::Number((end as i64).into()));
 
         Some(Value::Object(obj))
+    }
+
+    /// Read the local name after a `|` namespace separator, which upstream
+    /// reads with the same `read_identifier` — so an empty one is an error.
+    fn read_namespaced_local_name(&mut self) -> Option<String> {
+        let pos = self.offset + self.index;
+        if self.current_char() == '*' {
+            self.advance();
+            return Some("*".to_string());
+        }
+        let local = self.read_identifier();
+        if local.is_empty() {
+            record_first_error(
+                &self.error,
+                crate::error::ParseError::svelte(
+                    "css_expected_identifier",
+                    "Expected a valid CSS identifier",
+                    (pos, pos),
+                ),
+            );
+            return None;
+        }
+        Some(local)
     }
 
     fn is_eof(&self) -> bool {
@@ -2679,11 +3164,7 @@ impl<'a> SelectorParser<'a> {
     }
 
     fn current_char(&self) -> char {
-        if self.is_eof() {
-            '\0'
-        } else {
-            self.source[self.index..].chars().next().unwrap_or('\0')
-        }
+        if self.is_eof() { '\0' } else { self.source[self.index..].chars().next().unwrap_or('\0') }
     }
 
     fn peek_next_char(&self) -> char {
@@ -2700,7 +3181,7 @@ impl<'a> SelectorParser<'a> {
     }
 
     fn skip_whitespace(&mut self) {
-        while !self.is_eof() && self.current_char().is_whitespace() {
+        while !self.is_eof() && is_js_whitespace(self.current_char()) {
             self.advance();
         }
     }
@@ -2725,65 +3206,8 @@ impl<'a> SelectorParser<'a> {
         }
     }
 
-    /// Read a CSS identifier, handling CSS escape sequences.
-    ///
-    /// CSS escape sequences:
-    /// - `\XXXXXX` where X are hex digits (1-6 digits) - represents a unicode code point
-    /// - After hex digits, an optional single whitespace (space/tab/newline) terminates the escape
-    /// - `\c` where c is any non-hex character - represents the literal character c
+    /// Read a CSS identifier, decoding CSS escape sequences.
     fn read_identifier(&mut self) -> String {
-        let start = self.index;
-
-        while !self.is_eof() {
-            let c = self.current_char();
-
-            if c == '\\' {
-                // CSS escape sequence
-                self.advance(); // consume '\'
-
-                if self.is_eof() {
-                    break;
-                }
-
-                let next = self.current_char();
-
-                if next.is_ascii_hexdigit() {
-                    // Read 1-6 hex digits
-                    let mut hex_count = 0;
-                    while !self.is_eof() && hex_count < 6 {
-                        let hc = self.current_char();
-                        if !hc.is_ascii_hexdigit() {
-                            break;
-                        }
-                        self.advance();
-                        hex_count += 1;
-                    }
-                    // After hex digits, optionally consume one whitespace character
-                    // but this whitespace is part of the escape and should be preserved
-                    if !self.is_eof() {
-                        let after = self.current_char();
-                        if after == ' ' || after == '\t' || after == '\n' || after == '\r' {
-                            self.advance();
-                        }
-                    }
-                } else {
-                    // Escape of a single non-hex character (e.g., \. means literal .)
-                    self.advance();
-                }
-            } else if c.is_alphanumeric() || c == '-' || c == '_' {
-                self.advance();
-            } else {
-                break;
-            }
-        }
-
-        self.source[start..self.index].to_string()
-    }
-
-    /// Parse simple selectors from the current source and return them as a Vec.
-    fn parse_simple_selectors(mut self) -> Vec<Value> {
-        let mut selectors = Vec::new();
-        self.parse_selectors(&mut selectors);
-        selectors
+        read_css_identifier(self.source, &mut self.index)
     }
 }

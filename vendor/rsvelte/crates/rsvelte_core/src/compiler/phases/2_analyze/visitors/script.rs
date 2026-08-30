@@ -27,23 +27,25 @@ pub fn visit_script_expr(
 ) -> Result<(), AnalysisError> {
     match script_expr {
         Expression::Typed(te) => {
-            if let JsNode::Program {
-                body,
-                ignore_comment_map,
-                ..
-            } = &te.node
-            {
+            if let JsNode::Program { body, metadata, .. } = &te.node {
                 // Install this program's svelte-ignore map for the duration of the body
                 // walk, so the typed walker can surface statement-level svelte-ignore
                 // suppression without the nodes being materialized as `JsNode::Raw`.
                 // Save/restore the previous map (module vs instance scripts each set
                 // their own; template walks expect an empty map).
                 let saved_ignores = std::mem::take(&mut context.script_ignore_comments);
-                context.script_ignore_comments = ignore_comment_map.iter().cloned().collect();
+                context.script_ignore_comments =
+                    metadata.ignore_comment_map.iter().cloned().collect();
 
-                // Fast path: push a lazily-computed Value for js_path, then walk body typed
-                let program_value = te.as_json();
-                context.js_path.push(super::JsPathEntry::new(program_value));
+                // Push the Program as a TYPED js_path entry, like every other node
+                // the walker pushes below. `as_json()` here used to materialize the
+                // entire program into a `serde_json::Value` up front, on every script
+                // walk, purely to occupy `js_path[0]` — which consumers only read the
+                // type off of. `JsPathEntry::TypedNode` answers `get_type_str()` from
+                // the `JsNode` directly and falls back to the same `to_value()` lazily
+                // if a consumer really needs the Value, so the observable path is
+                // unchanged.
+                context.js_path.push(super::JsPathEntry::new_typed(&te.node));
 
                 let arena = context.parse_arena;
                 let mut result = Ok(());
@@ -261,13 +263,10 @@ fn visit_children_typed(node: &JsNode, context: &mut VisitorContext) -> Result<(
             Ok(())
         }
 
-        // SpreadElement: `[...x]` is treated like `[...x.values()]` — the
-        // spread itself is a call/state read for blocker tracking.
+        // SpreadElement children are still walked here, but expression
+        // metadata is populated by the template-expression walker. This
+        // script walker is never entered while `context.expression` is set.
         JsNode::SpreadElement { argument, .. } => {
-            if let Some(expression) = context.current_expression() {
-                expression.set_has_call(true);
-                expression.set_has_state(true);
-            }
             walk_js_node_typed(arena.get_js_node(*argument), context)?;
             Ok(())
         }
@@ -279,12 +278,7 @@ fn visit_children_typed(node: &JsNode, context: &mut VisitorContext) -> Result<(
         }
 
         // Conditional: test + consequent + alternate (all JsNodeId)
-        JsNode::ConditionalExpression {
-            test,
-            consequent,
-            alternate,
-            ..
-        } => {
+        JsNode::ConditionalExpression { test, consequent, alternate, .. } => {
             walk_js_node_typed(arena.get_js_node(*test), context)?;
             walk_js_node_typed(arena.get_js_node(*consequent), context)?;
             walk_js_node_typed(arena.get_js_node(*alternate), context)?;
@@ -292,12 +286,7 @@ fn visit_children_typed(node: &JsNode, context: &mut VisitorContext) -> Result<(
         }
 
         // IfStatement: test + consequent (JsNodeId), alternate (Option<JsNodeId>)
-        JsNode::IfStatement {
-            test,
-            consequent,
-            alternate,
-            ..
-        } => {
+        JsNode::IfStatement { test, consequent, alternate, .. } => {
             walk_js_node_typed(arena.get_js_node(*test), context)?;
             walk_js_node_typed(arena.get_js_node(*consequent), context)?;
             if let Some(alt) = alternate {
@@ -331,12 +320,7 @@ fn visit_children_typed(node: &JsNode, context: &mut VisitorContext) -> Result<(
         }
 
         // Property: key + value (JsNodeId)
-        JsNode::Property {
-            key,
-            value,
-            computed,
-            ..
-        } => {
+        JsNode::Property { key, value, computed, .. } => {
             if *computed {
                 walk_js_node_typed(arena.get_js_node(*key), context)?;
             }
@@ -345,12 +329,7 @@ fn visit_children_typed(node: &JsNode, context: &mut VisitorContext) -> Result<(
         }
 
         // MethodDefinition: key + value (JsNodeId)
-        JsNode::MethodDefinition {
-            key,
-            value,
-            computed,
-            ..
-        } => {
+        JsNode::MethodDefinition { key, value, computed, .. } => {
             if *computed {
                 walk_js_node_typed(arena.get_js_node(*key), context)?;
             }
@@ -367,11 +346,7 @@ fn visit_children_typed(node: &JsNode, context: &mut VisitorContext) -> Result<(
         }
 
         // TemplateLiteral: quasis + expressions (IdRange)
-        JsNode::TemplateLiteral {
-            quasis,
-            expressions,
-            ..
-        } => {
+        JsNode::TemplateLiteral { quasis, expressions, .. } => {
             for quasi in arena.get_js_children(*quasis) {
                 walk_js_node_typed(quasi, context)?;
             }
@@ -381,30 +356,29 @@ fn visit_children_typed(node: &JsNode, context: &mut VisitorContext) -> Result<(
             Ok(())
         }
 
-        // TaggedTemplateExpression: tag + quasi (JsNodeId).
-        // `tag\`...\`` invokes `tag(strings, ...exprs)` — counts as a call
-        // and state read unless the tag is a pure reference.
+        // TaggedTemplateExpression: tag + quasi (JsNodeId). Expression
+        // metadata is populated by the template-expression walker; this
+        // script walker is never entered while `context.expression` is set.
         JsNode::TaggedTemplateExpression { tag, quasi, .. } => {
             let tag_node = arena.get_js_node(*tag);
-            if !super::shared::utils::is_pure_node(tag_node, context)
-                && let Some(expression) = context.current_expression()
-            {
-                expression.set_has_call(true);
-                expression.set_has_state(true);
-            }
             walk_js_node_typed(tag_node, context)?;
             walk_js_node_typed(arena.get_js_node(*quasi), context)?;
             Ok(())
         }
 
         // ForStatement: init/test/update (Option<JsNodeId>), body (JsNodeId)
-        JsNode::ForStatement {
-            init,
-            test,
-            update,
-            body,
-            ..
-        } => {
+        JsNode::ForStatement { init, test, update, body, .. } => {
+            // Enter the for-loop's lexical scope (registered by scope_builder when the
+            // init declares `let`/`const`) so the loop variable shadows outer bindings
+            // during mutation/reference resolution — an `i++` in the update clause must
+            // resolve to the loop's own `let i`, not a same-named `const` in a sibling
+            // scope (which would falsely trip `constant_assignment`).
+            let saved_scope = context.scope;
+            if let Some(start) = node.start()
+                && let Some(&scope_idx) = context.analysis.root.function_scope_map.get(&start)
+            {
+                context.scope = scope_idx;
+            }
             if let Some(init) = init {
                 walk_js_node_typed(arena.get_js_node(*init), context)?;
             }
@@ -415,6 +389,7 @@ fn visit_children_typed(node: &JsNode, context: &mut VisitorContext) -> Result<(
                 walk_js_node_typed(arena.get_js_node(*update), context)?;
             }
             walk_js_node_typed(arena.get_js_node(*body), context)?;
+            context.scope = saved_scope;
             Ok(())
         }
 
@@ -482,24 +457,27 @@ fn visit_children_typed(node: &JsNode, context: &mut VisitorContext) -> Result<(
         }
 
         // ForOfStatement / ForInStatement: left + right + body (JsNodeId)
-        JsNode::ForOfStatement {
-            left, right, body, ..
-        }
-        | JsNode::ForInStatement {
-            left, right, body, ..
-        } => {
-            walk_js_node_typed(arena.get_js_node(*left), context)?;
+        JsNode::ForOfStatement { left, right, body, .. }
+        | JsNode::ForInStatement { left, right, body, .. } => {
+            // The iterable (`right`) is evaluated in the enclosing scope, so walk it
+            // first. Then enter the loop's lexical scope (registered by scope_builder
+            // when `left` declares `let`/`const`) for `left`/`body` so the loop binding
+            // resolves within the loop rather than to a same-named sibling binding.
             walk_js_node_typed(arena.get_js_node(*right), context)?;
+            let saved_scope = context.scope;
+            if let Some(start) = node.start()
+                && let Some(&scope_idx) = context.analysis.root.function_scope_map.get(&start)
+            {
+                context.scope = scope_idx;
+            }
+            walk_js_node_typed(arena.get_js_node(*left), context)?;
             walk_js_node_typed(arena.get_js_node(*body), context)?;
+            context.scope = saved_scope;
             Ok(())
         }
 
         // SwitchStatement: discriminant (JsNodeId), cases (IdRange)
-        JsNode::SwitchStatement {
-            discriminant,
-            cases,
-            ..
-        } => {
+        JsNode::SwitchStatement { discriminant, cases, .. } => {
             walk_js_node_typed(arena.get_js_node(*discriminant), context)?;
             for case in arena.get_js_children(*cases) {
                 walk_js_node_typed(case, context)?;
@@ -508,9 +486,7 @@ fn visit_children_typed(node: &JsNode, context: &mut VisitorContext) -> Result<(
         }
 
         // SwitchCase: test (Option<JsNodeId>), consequent (IdRange)
-        JsNode::SwitchCase {
-            test, consequent, ..
-        } => {
+        JsNode::SwitchCase { test, consequent, .. } => {
             if let Some(t) = test {
                 walk_js_node_typed(arena.get_js_node(*t), context)?;
             }
@@ -521,12 +497,7 @@ fn visit_children_typed(node: &JsNode, context: &mut VisitorContext) -> Result<(
         }
 
         // TryStatement: block (JsNodeId), handler/finalizer (Option<JsNodeId>)
-        JsNode::TryStatement {
-            block,
-            handler,
-            finalizer,
-            ..
-        } => {
+        JsNode::TryStatement { block, handler, finalizer, .. } => {
             walk_js_node_typed(arena.get_js_node(*block), context)?;
             if let Some(h) = handler {
                 walk_js_node_typed(arena.get_js_node(*h), context)?;
@@ -539,17 +510,24 @@ fn visit_children_typed(node: &JsNode, context: &mut VisitorContext) -> Result<(
 
         // CatchClause: param (Option<JsNodeId>), body (JsNodeId)
         JsNode::CatchClause { param, body, .. } => {
+            // The clause's own scope holds the parameter, so `catch (x)` must
+            // shadow an outer `x` for both the binding and the body.
+            let saved_scope = context.scope;
+            if let Some(start) = node.start()
+                && let Some(&scope_idx) = context.analysis.root.function_scope_map.get(&start)
+            {
+                context.scope = scope_idx;
+            }
             if let Some(p) = param {
                 walk_js_node_typed(arena.get_js_node(*p), context)?;
             }
             walk_js_node_typed(arena.get_js_node(*body), context)?;
+            context.scope = saved_scope;
             Ok(())
         }
 
         // ClassExpression: super_class (Option<JsNodeId>), body (JsNodeId)
-        JsNode::ClassExpression {
-            super_class, body, ..
-        } => {
+        JsNode::ClassExpression { super_class, body, .. } => {
             if let Some(sc) = super_class {
                 walk_js_node_typed(arena.get_js_node(*sc), context)?;
             }

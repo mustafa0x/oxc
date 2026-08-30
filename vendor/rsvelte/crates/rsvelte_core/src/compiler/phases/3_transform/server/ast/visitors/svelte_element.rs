@@ -45,10 +45,13 @@ use crate::ast::template::{
 use crate::compiler::phases::phase3_transform::server::ast::ServerTransformState;
 
 use super::element::build_element_attributes;
-use super::shared::{TemplateEntry, build_fragment_body, build_template};
+use super::shared::{PromiseOptimiser, TemplateEntry, build_fragment_body, build_template};
 
 /// Visit a `<svelte:element this={tag}>…</svelte:element>` element (static path).
-pub fn visit_svelte_element<'a>(node: &SvelteDynamicElement, state: &mut ServerTransformState<'a>) {
+pub fn visit_svelte_element<'a>(
+    node: &SvelteDynamicElement<'a>,
+    state: &mut ServerTransformState<'a>,
+) {
     // -- tag expression -----------------------------------------------------
     // For a string-literal tag (`this={"div"}` / `this="svg"`) reparse the raw
     // literal text so the authored quoting is preserved (mirrors the oracle's
@@ -63,9 +66,9 @@ pub fn visit_svelte_element<'a>(node: &SvelteDynamicElement, state: &mut ServerT
                 let owned = state.allocator.alloc_str(&r);
                 state
                     .reparse_slice_owned(owned)
-                    .unwrap_or_else(|| state.visit_expr(&node.tag))
+                    .unwrap_or_else(|| state.visit_expr_claiming(&node.tag))
             }
-            None => state.visit_expr(&node.tag),
+            None => state.visit_expr_claiming(&node.tag),
         }
     } else {
         // 写经 `context.visit(node.tag)`: the tag expression is visited by the
@@ -73,7 +76,38 @@ pub fn visit_svelte_element<'a>(node: &SvelteDynamicElement, state: &mut ServerT
         // is read-wrapped (`$.store_get(...)`). Route through `visit_expr` (which
         // applies the read-wrapping pass) rather than the verbatim
         // `reparse_slice` so the store/derived lowering fires.
-        state.visit_expr(&node.tag)
+        state.visit_expr_claiming(&node.tag)
+    };
+
+    let tag = if state.options.dev {
+        let b = state.b;
+        let name = match tag {
+            oxc_ast::ast::Expression::Identifier(id) => id.name.to_string(),
+            tag => {
+                let name = state.next_dynamic_tag_name();
+                state.template.push(TemplateEntry::HoistableDecl(b.const_id(&name, tag)));
+                name
+            }
+        };
+        state.template.push(TemplateEntry::HoistableDecl(
+            b.stmt(b.call("$.validate_dynamic_element_tag", vec![b.thunk(b.id(&name), false)])),
+        ));
+        if !node.fragment.nodes.is_empty() {
+            state.template.push(TemplateEntry::HoistableDecl(b.stmt(
+                b.call("$.validate_void_dynamic_element", vec![b.thunk(b.id(&name), false)]),
+            )));
+        }
+        let (line, col) = crate::compiler::phases::phase3_transform::utils::locate_in_source(
+            state.source,
+            node.start as usize,
+        );
+        state.template.push(TemplateEntry::Stmt(b.stmt(b.call(
+            "$.push_element",
+            vec![b.id("$$renderer"), b.id(&name), b.number(line as f64), b.number(col as f64)],
+        ))));
+        b.id(&name)
+    } else {
+        tag
     };
 
     // -- attributes ---------------------------------------------------------
@@ -115,26 +149,29 @@ pub fn visit_svelte_element<'a>(node: &SvelteDynamicElement, state: &mut ServerT
     };
 
     let saved_template = std::mem::take(&mut state.template);
+    // `SvelteElement.js` gives every dynamic element its own optimiser and its
+    // own attribute state. In particular, do not let a surrounding async
+    // regular element's optimiser consume this element's attributes.
+    let parent_optimiser = state.attr_optimiser.take();
+    state.attr_optimiser = Some(PromiseOptimiser::new());
     build_element_attributes(&adapter, css_hash.as_deref(), state);
     let attr_entries = std::mem::replace(&mut state.template, saved_template);
+    let mut optimiser = state.attr_optimiser.take().unwrap_or_default();
+    state.attr_optimiser = parent_optimiser;
     let attr_body = build_template(attr_entries, state);
 
     let b = state.b;
-    let attrs_thunk = if attr_body.is_empty() {
-        None
-    } else {
-        Some(b.thunk_block(attr_body, false))
-    };
+    let attrs_thunk =
+        if attr_body.is_empty() { None } else { Some(b.thunk_block(attr_body, false)) };
 
     // -- children -----------------------------------------------------------
     // SvelteElement children are NOT an `is_text_first` parent.
-    let children_body = build_fragment_body(&node.fragment, false, false, state);
+    let saved_scope = state.enter_template_scope(node.start);
+    let children_body = build_fragment_body(&node.fragment.nodes, false, false, state);
+    state.restore_scope(saved_scope);
     let b = state.b;
-    let children_thunk = if children_body.is_empty() {
-        None
-    } else {
-        Some(b.thunk_block(children_body, false))
-    };
+    let children_thunk =
+        if children_body.is_empty() { None } else { Some(b.thunk_block(children_body, false)) };
 
     // `$.element($$renderer, tag, attrs?, children?)`. `call_opt` drops trailing
     // `None`s and prints interior `None`s as `void 0` — so `(attrs=None,
@@ -142,13 +179,13 @@ pub fn visit_svelte_element<'a>(node: &SvelteDynamicElement, state: &mut ServerT
     // children=None)` collapses to `$.element($$renderer, tag)`.
     let call = b.call_opt(
         "$.element",
-        vec![
-            Some(b.id("$$renderer")),
-            Some(tag),
-            attrs_thunk,
-            children_thunk,
-        ],
+        vec![Some(b.id("$$renderer")), Some(tag), attrs_thunk, children_thunk],
     );
 
-    state.template.push(TemplateEntry::Stmt(b.stmt(call)));
+    for statement in optimiser.render(state, vec![b.stmt(call)]) {
+        state.template.push(TemplateEntry::Stmt(statement));
+    }
+    if state.options.dev {
+        state.template.push(TemplateEntry::Stmt(b.stmt(b.call("$.pop_element", vec![]))));
+    }
 }

@@ -352,12 +352,7 @@ impl CliRunner {
         .with_filters(&filters);
 
         if misc_options.print_config {
-            return crate::mode::run_print_config(
-                &config_builder,
-                &external_plugin_store,
-                root_config,
-                stdout,
-            );
+            return crate::mode::run_print_config(&config_builder, root_config, stdout);
         }
 
         let lint_config = match config_builder.build(&mut external_plugin_store) {
@@ -438,6 +433,12 @@ impl CliRunner {
                 "The `--type-check-only` option cannot be used with fix flags.\nRemove `--fix`, `--fix-suggestions`, and `--fix-dangerously`.\n",
             );
             return CliRunResult::InvalidOptionTypeCheckOnlyWithFix;
+        }
+        if type_aware && has_svelte_file(&files_to_lint) {
+            print_and_flush_stdout(
+                stdout,
+                "Type-aware Svelte linting is not supported yet; `.svelte` files are excluded from TypeScript type-aware checks and use rsvelte syntax plus native script linting instead.\n",
+            );
         }
         if type_check_only
             && (suppression_options.suppress_all || suppression_options.prune_suppressions)

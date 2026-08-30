@@ -3,8 +3,8 @@
 //!
 //! Output depends on three axes:
 //!
-//! * Whether the enclosing binding is reassigned somewhere
-//!   (computed by the caller and passed in via `non_reactive_vars`).
+//! * Whether the enclosing binding is reassigned somewhere (`non_reactive_vars`,
+//!   resolved per binding for the names listed in `ambiguous_vars`).
 //! * Whether the argument value needs `$.proxy(...)` wrapping
 //!   (object / array / await — delegated to the existing
 //!   `expression_utils::expression_needs_proxy` helper, which
@@ -30,75 +30,90 @@
 //! The AST visitor descends only into expression positions and
 //! reads the binding name straight off the `BindingIdentifier`.
 
-use std::cell::RefCell;
-
-use oxc_allocator::Allocator;
 use oxc_ast::ast::*;
 use oxc_ast_visit::Visit;
 use oxc_ast_visit::walk;
-use oxc_parser::ParseOptions;
-use oxc_span::{GetSpan, SourceType};
+use oxc_semantic::{Semantic, SemanticBuilder};
+use oxc_span::GetSpan;
+use oxc_syntax::symbol::SymbolId;
 
-use super::ast_rewrite::{self, Edit};
+use super::ast_rewrite::Edit;
 use super::expression_utils::{collapse_to_single_line, expression_needs_proxy_with_scope};
 
-thread_local! {
-    static MODULE_STATE_CALL_ALLOC: RefCell<Allocator> = RefCell::new(Allocator::default());
-}
-
-/// AST-based rewrite of `$state(value)`.
-///
-/// `non_reactive_vars` lists module-level bindings that are known
-/// never to be reassigned. Returns `None` when nothing changed.
-pub fn transform_state_call_ast(
+/// Collect the bare `$state(value)` rewrite edits for an already-parsed program.
+/// Shared with the batched module-rune driver so the call rewrite can ride along
+/// on a single parse. `source` must be the exact text `program` was parsed from
+/// (spans index into it).
+pub(super) fn collect_state_call_edits(
+    program: &Program<'_>,
     source: &str,
     non_reactive_vars: &[String],
+    ambiguous_vars: &[String],
     non_proxy_vars: &[String],
-    is_ts: bool,
-) -> Option<String> {
-    memchr::memmem::find(source.as_bytes(), b"$state")?;
-
-    ast_rewrite::rewrite_once(
-        &MODULE_STATE_CALL_ALLOC,
+) -> Vec<Edit> {
+    let semantic_ret = super::super::profile::semantic_build(
+        super::super::profile::SEM_STATE_CALL,
+        program.source_text.len(),
+        || SemanticBuilder::new().build(program),
+    );
+    let mut collector = StateCallCollector {
         source,
-        if is_ts {
-            SourceType::ts().with_module(true)
-        } else {
-            SourceType::mjs()
-        },
-        ParseOptions::default(),
-        false,
-        |program| {
-            let mut collector = StateCallCollector {
-                source,
-                non_reactive_vars,
-                non_proxy_vars,
-                current_var: None,
-                replacements: Vec::new(),
-            };
-            collector.visit_program(program);
-            collector.replacements
-        },
-    )
+        semantic: &semantic_ret.semantic,
+        non_reactive_vars,
+        ambiguous_vars,
+        non_proxy_vars,
+        current_var: None,
+        replacements: Vec::new(),
+    };
+    collector.visit_program(program);
+    collector.replacements
 }
 
 /// Stateful visitor — `current_var` tracks the binding name being
 /// initialised so the call-expression rewrite knows which non-reactive
 /// list to consult. Destructuring patterns leave `current_var` empty
 /// (mirrors the text version), falling into the reactive branch.
-struct StateCallCollector<'a, 'src> {
+struct StateCallCollector<'a, 'src, 'sem> {
     source: &'src str,
+    semantic: &'sem Semantic<'sem>,
     non_reactive_vars: &'a [String],
+    ambiguous_vars: &'a [String],
     non_proxy_vars: &'a [String],
-    current_var: Option<String>,
+    current_var: Option<(String, Option<SymbolId>)>,
     replacements: Vec<Edit>,
 }
 
-impl<'a, 'src, 'ast> Visit<'ast> for StateCallCollector<'a, 'src> {
+impl StateCallCollector<'_, '_, '_> {
+    /// A name in `ambiguous_vars` covers `$state` bindings that disagree on
+    /// reassignment, so the caller's name-keyed answer cannot be trusted; ask the
+    /// binding actually being initialised (upstream's `binding.reassigned`).
+    fn is_non_reactive(&self, name: &str, symbol_id: Option<SymbolId>) -> bool {
+        if self.ambiguous_vars.iter().any(|v| v == name) {
+            return !symbol_id.is_some_and(|id| {
+                self.semantic
+                    .scoping()
+                    .get_resolved_references(id)
+                    .any(|reference| reference.is_write())
+            });
+        }
+        self.non_reactive_vars.iter().any(|v| v == name)
+    }
+
+    /// True when the `$state` reference resolves to a declaration (a parameter,
+    /// a local), in which case the call is a plain call and not the rune —
+    /// upstream's `get_rune` returns null for exactly that case (#3237).
+    fn is_bound(&self, ident: &IdentifierReference) -> bool {
+        ident.reference_id.get().is_some_and(|reference_id| {
+            self.semantic.scoping().get_reference(reference_id).symbol_id().is_some()
+        })
+    }
+}
+
+impl<'ast> Visit<'ast> for StateCallCollector<'_, '_, '_> {
     fn visit_variable_declarator(&mut self, decl: &VariableDeclarator<'ast>) {
         let saved = self.current_var.take();
         if let BindingPattern::BindingIdentifier(id) = &decl.id {
-            self.current_var = Some(id.name.to_string());
+            self.current_var = Some((id.name.to_string(), id.symbol_id.get()));
         }
         walk::walk_variable_declarator(self, decl);
         self.current_var = saved;
@@ -111,7 +126,7 @@ impl<'a, 'src, 'ast> Visit<'ast> for StateCallCollector<'a, 'src> {
         let Expression::Identifier(id) = &call.callee else {
             return;
         };
-        if id.name != "$state" {
+        if id.name != "$state" || self.is_bound(id) {
             return;
         }
 
@@ -129,8 +144,8 @@ impl<'a, 'src, 'ast> Visit<'ast> for StateCallCollector<'a, 'src> {
 
         let is_non_reactive = self
             .current_var
-            .as_deref()
-            .is_some_and(|name| self.non_reactive_vars.iter().any(|v| v == name));
+            .as_ref()
+            .is_some_and(|(name, symbol_id)| self.is_non_reactive(name, *symbol_id));
         let needs_proxy = !trimmed_is_empty
             && expression_needs_proxy_with_scope(content.trim(), self.non_proxy_vars);
 
@@ -143,14 +158,46 @@ impl<'a, 'src, 'ast> Visit<'ast> for StateCallCollector<'a, 'src> {
             (false, false, false) => format!("$.state({})", collapsed),
         };
 
-        self.replacements
-            .push((call.span.start, call.span.end, rewrite));
+        self.replacements.push((call.span.start, call.span.end, rewrite));
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+
+    use oxc_allocator::Allocator;
+    use oxc_parser::ParseOptions;
+    use oxc_span::SourceType;
+
+    use super::super::ast_rewrite;
     use super::*;
+
+    thread_local! {
+        static TEST_ALLOC: RefCell<Allocator> = RefCell::new(Allocator::default());
+    }
+
+    /// Drives `collect_state_call_edits` in isolation over its own parse —
+    /// mirrors how the batched module-rune driver runs it, but for the bare
+    /// `$state(...)` rewrite alone so these assertions stay scoped to this pass.
+    fn transform_state_call_ast(
+        source: &str,
+        non_reactive_vars: &[String],
+        non_proxy_vars: &[String],
+        is_ts: bool,
+    ) -> Option<String> {
+        memchr::memmem::find(source.as_bytes(), b"$state")?;
+        ast_rewrite::rewrite_once(
+            &TEST_ALLOC,
+            source,
+            if is_ts { SourceType::ts().with_module(true) } else { SourceType::mjs() },
+            ParseOptions::default(),
+            false,
+            |program| {
+                collect_state_call_edits(program, source, non_reactive_vars, &[], non_proxy_vars)
+            },
+        )
+    }
 
     fn nrv(names: &[&str]) -> Vec<String> {
         names.iter().map(|s| s.to_string()).collect()
@@ -180,6 +227,26 @@ mod tests {
     fn reactive_empty_emits_state_void_zero() {
         let out = transform_state_call_ast("let x = $state();", &[], &[], false).unwrap();
         assert_eq!(out, "let x = $.state(void 0);");
+    }
+
+    #[test]
+    fn same_named_siblings_resolve_per_binding() {
+        let source = "function a() { let count = $state(0); count++; }\nfunction b() { const count = $state(0); use(count); }";
+        let out = ast_rewrite::rewrite_once(
+            &TEST_ALLOC,
+            source,
+            SourceType::mjs(),
+            ParseOptions::default(),
+            false,
+            |program| {
+                collect_state_call_edits(program, source, &nrv(&["count"]), &nrv(&["count"]), &[])
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            "function a() { let count = $.state(0); count++; }\nfunction b() { const count = 0; use(count); }"
+        );
     }
 
     // --- non-reactive cases (binding in non_reactive_vars) ---

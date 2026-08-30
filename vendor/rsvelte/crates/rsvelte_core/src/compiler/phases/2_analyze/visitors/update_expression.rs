@@ -9,16 +9,15 @@ use super::assignment_expression::mark_binding_mutation_node;
 use super::shared::utils::validate_assignment_node;
 use crate::ast::typed_expr::JsNode;
 use crate::compiler::phases::phase2_analyze::AnalysisError;
-use serde_json::Value;
 
 /// Visit an update expression (typed JsNode path).
 pub fn visit_typed(node: &JsNode, context: &mut VisitorContext) -> Result<(), AnalysisError> {
-    if let JsNode::UpdateExpression { argument, .. } = node {
+    if let JsNode::UpdateExpression { argument, start, end, .. } = node {
         let arena = context.parse_arena;
         let arg_node = arena.get_js_node(*argument);
 
         // Validate assignment
-        validate_assignment_node(arg_node, context, false)?;
+        validate_assignment_node((*start, *end), arg_node, context, false)?;
 
         // Mark the binding as reassigned
         mark_binding_mutation_node(arg_node, context);
@@ -45,43 +44,15 @@ pub fn visit_typed(node: &JsNode, context: &mut VisitorContext) -> Result<(), An
                 reactive_stmt.assignments.insert(binding_idx);
             }
         }
+
+        // Mark expression as having assignment
+        if let Some(expression) = context.current_expression() {
+            expression.set_has_assignment(true);
+        }
+
+        // Visit children
+        super::script::walk_js_node_typed(arg_node, context)?;
     }
 
     Ok(())
-}
-
-/// Get the leftmost identifier in a MemberExpression chain.
-///
-/// For example:
-/// - `foo.bar.baz` returns `foo`
-/// - `foo` returns `foo`
-/// - `this.foo` returns `None` (not an Identifier)
-///
-/// Corresponds to the `object()` function in Svelte's utils/ast.js.
-///
-/// # Arguments
-///
-/// * `expression` - The expression to analyze
-///
-/// # Returns
-///
-/// The leftmost identifier, or None if not found or not an Identifier
-fn get_object_identifier(expression: &Value) -> Option<Value> {
-    let mut current = expression;
-
-    // Walk through MemberExpression chain to find the base object
-    while current.get("type").and_then(|t| t.as_str()) == Some("MemberExpression") {
-        if let Some(object) = current.get("object") {
-            current = object;
-        } else {
-            break;
-        }
-    }
-
-    // Return the identifier if we found one
-    if current.get("type").and_then(|t| t.as_str()) == Some("Identifier") {
-        Some(current.clone())
-    } else {
-        None
-    }
 }

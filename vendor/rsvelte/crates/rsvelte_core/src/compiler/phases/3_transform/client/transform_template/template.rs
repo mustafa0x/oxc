@@ -12,6 +12,7 @@ use crate::compiler::phases::phase3_transform::js_ast::nodes::JsExpr;
 use crate::compiler::phases::phase3_transform::shared::template::{escape_attr, is_void_element};
 use indexmap::IndexMap;
 use regex::Regex;
+use std::borrow::Cow;
 use std::fmt::Write as _;
 use std::sync::LazyLock;
 
@@ -116,21 +117,28 @@ impl Template {
 
     /// Push a comment node.
     pub fn push_comment(&mut self, data: Option<String>) {
-        let comment = Comment {
-            node_type: "comment",
-            data,
-        };
+        let comment = Comment { node_type: "comment", data };
 
         let fragment = self.current_fragment_mut();
         fragment.push(Node::Comment(comment));
     }
 
     /// Push text nodes.
-    pub fn push_text(&mut self, nodes: Vec<Text>) {
-        let text = TextNode {
-            node_type: "text",
-            nodes,
-        };
+    ///
+    /// The parse-borrowed `Text` slices are converted to owned here: this
+    /// codegen IR outlives the source borrow, so the stored nodes are
+    /// `Text<'static>`.
+    pub fn push_text(&mut self, nodes: Vec<Text<'_>>) {
+        let nodes: Vec<Text<'static>> = nodes
+            .into_iter()
+            .map(|t| Text {
+                start: t.start,
+                end: t.end,
+                raw: Cow::Owned(t.raw.into_owned()),
+                data: Cow::Owned(t.data.into_owned()),
+            })
+            .collect();
+        let text = TextNode { node_type: "text", nodes };
 
         let fragment = self.current_fragment_mut();
         fragment.push(Node::Text(text));
@@ -165,12 +173,7 @@ impl Template {
 
     /// Convert template to HTML string expression.
     pub fn as_html(&self) -> JsExpr {
-        let html = self
-            .nodes
-            .iter()
-            .map(stringify)
-            .collect::<Vec<_>>()
-            .join("");
+        let html = self.nodes.iter().map(stringify).collect::<Vec<_>>().join("");
         // Escape backticks and `${` in the HTML content so they don't break
         // the surrounding JavaScript template literal (backtick string).
         let escaped = if !html.contains('\\')
@@ -193,22 +196,16 @@ impl Template {
     pub fn as_tree(&mut self, arena: &JsArena) -> JsExpr {
         // If the first item is a comment we need to add another comment for effect.start
         if let Some(Node::Comment(_)) = self.nodes.first() {
-            self.nodes.insert(
-                0,
-                Node::Comment(Comment {
-                    node_type: "comment",
-                    data: None,
-                }),
-            );
+            self.nodes.insert(0, Node::Comment(Comment { node_type: "comment", data: None }));
         }
 
-        let elements: Vec<JsExpr> = self
-            .nodes
-            .iter()
-            .filter_map(|n| objectify(arena, n))
-            .collect();
+        // A data-less comment is an anchor: upstream's `objectify` returns
+        // `null` for it and `b.array` prints a hole, so dropping it would shift
+        // every later slot of the tree the runtime walks positionally.
+        let elements: Vec<Option<JsExpr>> =
+            self.nodes.iter().map(|n| objectify(arena, n)).collect();
 
-        b::array(elements)
+        b::array_with_holes(elements)
     }
 }
 
@@ -227,7 +224,7 @@ fn stringify(item: &Node) -> String {
         Node::Text(text) => {
             // Simply concatenate raw text values — no normalization.
             // Whitespace has already been processed by clean_nodes.
-            text.nodes.iter().map(|node| node.raw.as_str()).collect()
+            text.nodes.iter().map(|node| node.raw.as_ref()).collect()
         }
         Node::Comment(comment) => {
             // Match JavaScript falsy semantics: empty string is treated as no data
@@ -260,14 +257,7 @@ fn stringify(item: &Node) -> String {
                 str.push('>');
                 // Simply map children through stringify and join — no extra whitespace handling.
                 // Mirrors: str += item.children.map(stringify).join('');
-                str.push_str(
-                    &element
-                        .children
-                        .iter()
-                        .map(stringify)
-                        .collect::<Vec<_>>()
-                        .join(""),
-                );
+                str.push_str(&element.children.iter().map(stringify).collect::<Vec<_>>().join(""));
                 let _ = write!(str, "</{}>", element.name);
             }
 
@@ -280,13 +270,8 @@ fn stringify(item: &Node) -> String {
 fn objectify(arena: &JsArena, item: &Node) -> Option<JsExpr> {
     match item {
         Node::Text(text) => {
-            let data = text
-                .nodes
-                .iter()
-                .map(|node| &node.data)
-                .cloned()
-                .collect::<Vec<_>>()
-                .join("");
+            let data =
+                text.nodes.iter().map(|node| &node.data).cloned().collect::<Vec<_>>().join("");
             Some(b::string(data))
         }
         Node::Comment(comment) => comment
@@ -295,7 +280,7 @@ fn objectify(arena: &JsArena, item: &Node) -> Option<JsExpr> {
             .filter(|data| !data.is_empty())
             .map(|data| b::array(vec![b::string(format!("// {}", data))])),
         Node::Element(element) => {
-            let mut element_array = vec![b::string(element.name.clone())];
+            let mut element_array = vec![Some(b::string(element.name.clone()))];
 
             let mut attributes_props = Vec::new();
             for (key, value) in &element.attributes {
@@ -312,36 +297,32 @@ fn objectify(arena: &JsArena, item: &Node) -> Option<JsExpr> {
             let attributes = b::object(attributes_props);
 
             if has_attributes || !element.children.is_empty() {
-                element_array.push(if has_attributes {
-                    attributes
-                } else {
-                    b::null()
-                });
+                element_array.push(Some(if has_attributes { attributes } else { b::null() }));
             }
 
             if !element.children.is_empty() {
-                let children: Vec<JsExpr> = element
-                    .children
-                    .iter()
-                    .filter_map(|n| objectify(arena, n))
-                    .collect();
+                let children: Vec<Option<JsExpr>> =
+                    element.children.iter().map(|n| objectify(arena, n)).collect();
 
                 // Special case — strip leading newline from `<pre>` and `<textarea>`
-                if (element.name == "pre" || element.name == "textarea") && !children.is_empty()
-                    && let Some(first) = children.first()
-                        && let JsExpr::Literal(lit) = first
-                            && let crate::compiler::phases::phase3_transform::js_ast::nodes::JsLiteral::String(s) = lit {
-                                let new_value = REGEX_LEADING_NEWLINE.replace(s, "").to_string();
-                                let mut modified_children = children.clone();
-                                modified_children[0] = b::string(new_value);
-                                element_array.extend(modified_children);
-                                return Some(b::array(element_array));
-                            }
+                if (element.name == "pre" || element.name == "textarea")
+                    && let Some(Some(JsExpr::Literal(
+                        crate::compiler::phases::phase3_transform::js_ast::nodes::JsLiteral::String(
+                            s,
+                        ),
+                    ))) = children.first()
+                {
+                    let new_value = REGEX_LEADING_NEWLINE.replace(s, "").to_string();
+                    let mut modified_children = children.clone();
+                    modified_children[0] = Some(b::string(new_value));
+                    element_array.extend(modified_children);
+                    return Some(b::array_with_holes(element_array));
+                }
 
                 element_array.extend(children);
             }
 
-            Some(b::array(element_array))
+            Some(b::array_with_holes(element_array))
         }
     }
 }

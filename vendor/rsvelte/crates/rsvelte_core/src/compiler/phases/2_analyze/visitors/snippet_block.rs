@@ -11,12 +11,15 @@ use super::shared::fragment;
 use super::shared::snippets::validate_snippet;
 use super::shared::utils::validate_block_not_empty;
 use crate::ast::js::Expression;
-use crate::ast::template::{SnippetBlock, TemplateNode};
+use crate::ast::template::{ExpressionMetadata, SnippetBlock, TemplateNode};
 use crate::ast::typed_expr::JsNode;
 use crate::compiler::phases::phase2_analyze::AnalysisError;
 
 /// Visit a snippet block.
-pub fn visit(block: &mut SnippetBlock, context: &mut VisitorContext) -> Result<(), AnalysisError> {
+pub fn visit<'a, 'b: 'a>(
+    block: &mut SnippetBlock<'b>,
+    context: &mut VisitorContext<'a>,
+) -> Result<(), AnalysisError> {
     // Mark that we have control flow affecting sibling relationships
     // (snippets can be rendered at any point via @render)
     context.analysis.css.has_control_flow = true;
@@ -25,10 +28,44 @@ pub fn visit(block: &mut SnippetBlock, context: &mut VisitorContext) -> Result<(
     // Validate and register the snippet
     validate_snippet(block, context)?;
 
+    // A snippet declared directly inside a component is rendered by that
+    // component, so the component's position is one of its render sites.
+    if matches!(
+        context.path.last(),
+        Some(
+            TemplateNode::Component(_)
+                | TemplateNode::SvelteComponent(_)
+                | TemplateNode::SvelteSelf(_)
+        )
+    ) && let Some(name) = super::shared::snippets::get_snippet_name(block)
+    {
+        let site = super::super::types::CssRenderSite {
+            parent_idx: context.current_parent_idx(),
+            snippet_name: context.current_snippet_name(),
+        };
+        context.analysis.css.dom_structure.snippet_render_sites.entry(name).or_default().push(site);
+    }
+
     // Validate block is not empty (warn if only whitespace)
     // Reference: SnippetBlock.js L14 - validate_block_not_empty(node.body, context)
     if let Some(warning) = validate_block_not_empty(Some(&block.body))? {
         context.emit_warning(warning);
+    }
+
+    // Reference: SnippetBlock.js L19 — a rest parameter is rejected here, not in
+    // the parser, so `parse()` still accepts one for the formatter and the LSP.
+    for parameter in &block.parameters {
+        let Expression::Typed(expression) = parameter else {
+            panic!("Expression::Lazy must be resolved before analysis");
+        };
+        if let crate::ast::typed_expr::JsNode::RestElement { start, end, .. } = &expression.node {
+            return Err(AnalysisError::validation_at(
+                "snippet_invalid_rest_parameter",
+                "Snippets do not support rest parameters; use an array instead",
+                *start,
+                *end,
+            ));
+        }
     }
 
     // Note: snippet_shadowing_prop validation is done in component.rs since the path
@@ -36,15 +73,13 @@ pub fn visit(block: &mut SnippetBlock, context: &mut VisitorContext) -> Result<(
 
     // Increment block depth for child analysis
     context.block_depth += 1;
+    context.svelte_self_parent_depth += 1;
 
     // Push fragment owner type for const_tag placement validation
     let snippet_name = super::shared::snippets::get_snippet_name(block).unwrap_or_default();
     context
         .fragment_owner_stack
-        .push(super::FragmentOwnerType::SnippetBlock(
-            context.scope,
-            snippet_name,
-        ));
+        .push(super::FragmentOwnerType::SnippetBlock(context.scope, snippet_name));
 
     // Reset parent_element to None for snippet body analysis
     // Snippets create their own rendering context, so text node validation
@@ -64,16 +99,30 @@ pub fn visit(block: &mut SnippetBlock, context: &mut VisitorContext) -> Result<(
         context.scope = snippet_scope_idx;
     }
 
+    let mut parameter_metadata = ExpressionMetadata::default();
+    for parameter in &block.parameters {
+        match parameter {
+            Expression::Typed(expression) => {
+                visit_parameter_expressions(&expression.node, context, &mut parameter_metadata)?
+            }
+            Expression::Lazy { .. } => panic!("Expression::Lazy must be resolved before analysis"),
+        }
+    }
+
     // Direct children of the snippet body are direct children of a SnippetBlock,
     // which `validate_slot_attribute` treats specially (a `slot="…"` text attribute
     // there is allowed). Nested elements/blocks reset this flag.
     let was_direct_snippet = context.is_direct_child_of_snippet;
+    let was_direct_child = context.direct_component_parent;
     context.is_direct_child_of_snippet = true;
+    context.direct_component_parent = super::DirectComponentParent::None;
 
     // Analyze the body
-    fragment::analyze(&mut block.body, context)?;
+    let result = fragment::analyze(&mut block.body, context);
 
     context.is_direct_child_of_snippet = was_direct_snippet;
+    context.direct_component_parent = was_direct_child;
+    result?;
 
     // Restore parent_element and scope
     context.parent_element = old_parent_element;
@@ -84,6 +133,7 @@ pub fn visit(block: &mut SnippetBlock, context: &mut VisitorContext) -> Result<(
 
     // Decrement block depth
     context.block_depth -= 1;
+    context.svelte_self_parent_depth -= 1;
 
     // Determine if the snippet can be hoisted to module level.
     // A snippet can be hoisted if:
@@ -117,18 +167,108 @@ pub fn visit(block: &mut SnippetBlock, context: &mut VisitorContext) -> Result<(
         && let Some(name) = super::shared::snippets::get_snippet_name(block)
         && let Some(binding_idx) = context.analysis.root.find_binding_any_scope(&name)
     {
-        context
-            .analysis
-            .root
-            .scope
-            .declarations
-            .insert(name.clone(), binding_idx);
+        context.analysis.root.scope.declarations.insert(name.clone(), binding_idx);
         // Track that this snippet was hoisted to module scope.
         // This is used by the snippet_invalid_export validation to distinguish
         // hoisted snippets (which are OK to export) from instance-level ones.
         context.analysis.template.hoisted_snippets.insert(name);
     }
 
+    Ok(())
+}
+
+/// Fixed-point pass over the ROOT fragment's snippets: a snippet blocked ONLY
+/// by references to sibling root snippets becomes hoistable when those
+/// siblings are — upstream's `can_hoist_snippet` recursion with a `visited`
+/// set makes MUTUALLY recursive snippets hoistable, while the in-order walk
+/// above can only see snippets declared earlier. Optimistically assume every
+/// still-unhoisted root snippet is hoistable, then evict any that fails under
+/// that assumption until the set is stable (the greatest fixed point, matching
+/// the cycle-tolerant `visited` semantics).
+pub fn promote_mutual_snippet_hoists<'a, 'b: 'a>(
+    nodes: &mut [TemplateNode<'b>],
+    context: &mut VisitorContext<'a>,
+) {
+    let mut candidates: Vec<(usize, String)> = Vec::new();
+    for (i, node) in nodes.iter().enumerate() {
+        if let TemplateNode::SnippetBlock(b) = node
+            && !b.metadata.can_hoist
+            && let Some(name) = super::shared::snippets::get_snippet_name(b)
+        {
+            candidates.push((i, name));
+        }
+    }
+    if candidates.is_empty() {
+        return;
+    }
+    for (_, name) in &candidates {
+        context.analysis.template.hoisted_snippets.insert(name.clone());
+    }
+    loop {
+        let failed = candidates.iter().position(|(i, _)| {
+            let TemplateNode::SnippetBlock(b) = &nodes[*i] else {
+                return false;
+            };
+            !can_hoist_snippet(b, context)
+        });
+        match failed {
+            Some(k) => {
+                let (_, name) = candidates.remove(k);
+                context.analysis.template.hoisted_snippets.remove(&name);
+            }
+            None => break,
+        }
+    }
+    for (i, name) in candidates {
+        if let TemplateNode::SnippetBlock(b) = &mut nodes[i] {
+            b.metadata.can_hoist = true;
+        }
+        if let Some(binding_idx) = context.analysis.root.find_binding_any_scope(&name) {
+            context.analysis.root.scope.declarations.insert(name, binding_idx);
+        }
+    }
+}
+
+fn visit_parameter_expressions(
+    node: &JsNode,
+    context: &mut VisitorContext,
+    metadata: &mut ExpressionMetadata,
+) -> Result<(), AnalysisError> {
+    let arena = context.parse_arena;
+    match node {
+        JsNode::AssignmentPattern { left, right, .. } => {
+            super::shared::utils::walk_js_expression_node(
+                arena.get_js_node(*right),
+                context,
+                metadata,
+            )?;
+            visit_parameter_expressions(arena.get_js_node(*left), context, metadata)?;
+        }
+        JsNode::ObjectPattern { properties, .. } => {
+            for property in arena.get_js_children(*properties) {
+                visit_parameter_expressions(property, context, metadata)?;
+            }
+        }
+        JsNode::ArrayPattern { elements, .. } => {
+            for element in elements.iter().flatten() {
+                visit_parameter_expressions(element, context, metadata)?;
+            }
+        }
+        JsNode::Property { key, value, computed, .. } => {
+            if *computed {
+                super::shared::utils::walk_js_expression_node(
+                    arena.get_js_node(*key),
+                    context,
+                    metadata,
+                )?;
+            }
+            visit_parameter_expressions(arena.get_js_node(*value), context, metadata)?;
+        }
+        JsNode::RestElement { argument, .. } => {
+            visit_parameter_expressions(arena.get_js_node(*argument), context, metadata)?;
+        }
+        _ => {}
+    }
     Ok(())
 }
 
@@ -147,11 +287,8 @@ pub fn visit(block: &mut SnippetBlock, context: &mut VisitorContext) -> Result<(
 /// binding.scope.function_depth to determine hoistability.
 fn can_hoist_snippet(snippet: &SnippetBlock, context: &VisitorContext) -> bool {
     // Collect ALL parameter names from the snippet (including destructured names)
-    let mut param_names: FxHashSet<String> = snippet
-        .parameters
-        .iter()
-        .flat_map(extract_all_param_names)
-        .collect();
+    let mut param_names: FxHashSet<String> =
+        snippet.parameters.iter().flat_map(extract_all_param_names).collect();
 
     // A snippet may render ITSELF recursively (`{#snippet S}…{@render S(…)}…`).
     // Such a self-reference must not block hoisting — mirrors upstream's
@@ -188,21 +325,6 @@ fn extract_pattern_names_for_expr(expr: &Expression) -> Option<Vec<String>> {
     let json = expr.as_json();
     extract_pattern_names(json)
 }
-
-/// Dispatch to JsNode or JSON version of check_pattern_defaults_hoistable.
-fn check_pattern_defaults_for_expr(
-    expr: &Expression,
-    param_names: &FxHashSet<String>,
-    context: &VisitorContext,
-) -> bool {
-    match expr {
-        Expression::Typed(te) => {
-            check_pattern_defaults_hoistable_node(&te.node, param_names, context)
-        }
-        Expression::Lazy { .. } => panic!("Expression::Lazy must be resolved before analysis"),
-    }
-}
-
 // ── JsNode-based implementations ─────────────────────────────────────────────
 
 /// Check if an expression (as JsNode) only uses hoistable identifiers.
@@ -219,12 +341,8 @@ fn expression_only_uses_params_node(
 
         JsNode::Literal { .. } => true,
 
-        JsNode::CallExpression {
-            callee, arguments, ..
-        }
-        | JsNode::NewExpression {
-            callee, arguments, ..
-        } => {
+        JsNode::CallExpression { callee, arguments, .. }
+        | JsNode::NewExpression { callee, arguments, .. } => {
             if !expression_only_uses_params_node(arena.get_js_node(*callee), param_names, context) {
                 return false;
             }
@@ -236,12 +354,11 @@ fn expression_only_uses_params_node(
             true
         }
 
-        JsNode::MemberExpression {
-            object,
-            property,
-            computed,
-            ..
-        } => {
+        JsNode::ChainExpression { expression, .. } => {
+            expression_only_uses_params_node(arena.get_js_node(*expression), param_names, context)
+        }
+
+        JsNode::MemberExpression { object, property, computed, .. } => {
             if !expression_only_uses_params_node(arena.get_js_node(*object), param_names, context) {
                 return false;
             }
@@ -268,12 +385,7 @@ fn expression_only_uses_params_node(
             true
         }
 
-        JsNode::ConditionalExpression {
-            test,
-            consequent,
-            alternate,
-            ..
-        } => {
+        JsNode::ConditionalExpression { test, consequent, alternate, .. } => {
             expression_only_uses_params_node(arena.get_js_node(*test), param_names, context)
                 && expression_only_uses_params_node(
                     arena.get_js_node(*consequent),
@@ -308,12 +420,7 @@ fn expression_only_uses_params_node(
         JsNode::ObjectExpression { properties, .. } => {
             for prop in arena.get_js_children(*properties) {
                 match prop {
-                    JsNode::Property {
-                        key,
-                        value,
-                        computed,
-                        ..
-                    } => {
+                    JsNode::Property { key, value, computed, .. } => {
                         if *computed
                             && !expression_only_uses_params_node(
                                 arena.get_js_node(*key),
@@ -383,68 +490,15 @@ fn expression_only_uses_params_node(
             }
         }
 
-        _ => false,
+        // Upstream decides from the snippet scope's REFERENCES, so an expression
+        // kind this list does not name is transparent there; rejecting it here
+        // pinned the snippet on nothing but the arm being absent.
+        _ => match serde_json::from_str::<serde_json::Value>(&node.to_json_string()) {
+            Ok(v) => refs_hoistable(&v, param_names, context),
+            Err(_) => false,
+        },
     }
 }
-
-/// Extract all names from a pattern (as JsNode).
-fn extract_pattern_names_node(
-    node: &JsNode,
-    arena: &crate::ast::arena::ParseArena,
-) -> Option<Vec<String>> {
-    match node {
-        JsNode::Identifier { name, .. } => Some(vec![name.to_string()]),
-
-        JsNode::ObjectPattern { properties, .. } => {
-            let mut names = Vec::new();
-            for prop in arena.get_js_children(*properties) {
-                match prop {
-                    JsNode::Property { value, .. } => {
-                        // If value is AssignmentPattern, extract from left
-                        let value_node = arena.get_js_node(*value);
-                        let actual = match value_node {
-                            JsNode::AssignmentPattern { left, .. } => arena.get_js_node(*left),
-                            other => other,
-                        };
-                        if let Some(inner_names) = extract_pattern_names_node(actual, arena) {
-                            names.extend(inner_names);
-                        }
-                    }
-                    JsNode::RestElement { argument, .. } => {
-                        if let Some(inner_names) =
-                            extract_pattern_names_node(arena.get_js_node(*argument), arena)
-                        {
-                            names.extend(inner_names);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            Some(names)
-        }
-
-        JsNode::ArrayPattern { elements, .. } => {
-            let mut names = Vec::new();
-            for e in elements.iter().flatten() {
-                if let Some(inner_names) = extract_pattern_names_node(e, arena) {
-                    names.extend(inner_names);
-                }
-            }
-            Some(names)
-        }
-
-        JsNode::AssignmentPattern { left, .. } => {
-            extract_pattern_names_node(arena.get_js_node(*left), arena)
-        }
-
-        JsNode::RestElement { argument, .. } => {
-            extract_pattern_names_node(arena.get_js_node(*argument), arena)
-        }
-
-        _ => None,
-    }
-}
-
 /// Check if default values inside a destructuring pattern (as JsNode) are hoistable.
 fn check_pattern_defaults_hoistable_node(
     node: &JsNode,
@@ -529,27 +583,39 @@ fn check_hoistable(
     param_names: &FxHashSet<String>,
     context: &VisitorContext,
 ) -> bool {
-    // `{@const x = …}` declarations create local bindings that are in scope for the
-    // whole fragment. A later reference to `x` is therefore local (declared inside
-    // the snippet, function_depth >= snippet), NOT an instance-level reference, so
-    // it must not block hoisting — mirrors upstream `can_hoist_snippet`'s
-    // `binding.scope.function_depth >= scope.function_depth` skip. (Each const's
-    // own initializer is still checked individually in the ConstTag arm below.)
+    // `{@const x = …}` and `{let x = …}` / `{const x = …}` declarations create
+    // local bindings that are in scope for the whole fragment. A later reference to
+    // `x` is therefore local (declared inside the snippet, function_depth >=
+    // snippet), NOT an instance-level reference, so it must not block hoisting —
+    // mirrors upstream `can_hoist_snippet`'s
+    // `binding.scope.function_depth >= scope.function_depth` skip. (Each
+    // initializer is still checked individually in the arms below.)
     let mut local_params = param_names.clone();
     for node in nodes {
-        if let TemplateNode::ConstTag(tag) = node {
-            let json = tag.declaration.as_json();
-            if let Some(obj) = json.as_object()
-                && obj.get("type").and_then(|t| t.as_str()) == Some("VariableDeclaration")
-                && let Some(decls) = obj.get("declarations").and_then(|d| d.as_array())
-            {
-                for d in decls {
-                    if let Some(id) = d.get("id")
-                        && let Some(names) = extract_pattern_names(id)
-                    {
-                        for n in names {
-                            local_params.insert(n);
-                        }
+        let declaration = match node {
+            TemplateNode::ConstTag(tag) => &tag.declaration,
+            TemplateNode::DeclarationTag(tag) => &tag.declaration,
+            // A nested snippet binds its name in this same fragment, so
+            // rendering it is a local reference, not an instance-level one.
+            TemplateNode::SnippetBlock(b) => {
+                if let Some(name) = super::shared::snippets::get_snippet_name(b) {
+                    local_params.insert(name);
+                }
+                continue;
+            }
+            _ => continue,
+        };
+        let json = declaration.as_json();
+        if let Some(obj) = json.as_object()
+            && obj.get("type").and_then(|t| t.as_str()) == Some("VariableDeclaration")
+            && let Some(decls) = obj.get("declarations").and_then(|d| d.as_array())
+        {
+            for d in decls {
+                if let Some(id) = d.get("id")
+                    && let Some(names) = extract_pattern_names(id)
+                {
+                    for n in names {
+                        local_params.insert(n);
                     }
                 }
             }
@@ -590,14 +656,42 @@ fn check_hoistable(
                         return false;
                     }
                 }
-                if !check_hoistable(&comp.fragment.nodes, param_names, context) {
+                let inner = with_let_names(&comp.attributes, param_names);
+                if !check_hoistable(&comp.fragment.nodes, &inner, context) {
                     return false;
                 }
             }
 
-            // `<svelte:element>` (runtime tag) and `<svelte:self>` (recursive)
-            // conservatively prevent hoisting (not exercised by the in-scope fixtures).
-            TemplateNode::SvelteElement(_) | TemplateNode::SvelteSelf(_) => return false,
+            // Upstream decides hoisting from the snippet scope's REFERENCES, and
+            // neither of these contributes one of its own: `<svelte:element>`
+            // reaches instance state only through its `this` expression, and
+            // `<svelte:self>` names the module's own component.
+            TemplateNode::SvelteElement(el) => {
+                if !expr_only_uses_params(&el.tag, param_names, context) {
+                    return false;
+                }
+                for attr in &el.attributes {
+                    if !check_attribute_hoistable(attr, param_names, context) {
+                        return false;
+                    }
+                }
+                let inner = with_let_names(&el.attributes, param_names);
+                if !check_hoistable(&el.fragment.nodes, &inner, context) {
+                    return false;
+                }
+            }
+
+            TemplateNode::SvelteSelf(el) => {
+                for attr in &el.attributes {
+                    if !check_attribute_hoistable(attr, param_names, context) {
+                        return false;
+                    }
+                }
+                let inner = with_let_names(&el.attributes, param_names);
+                if !check_hoistable(&el.fragment.nodes, &inner, context) {
+                    return false;
+                }
+            }
 
             // Components - check attributes/props for instance-level references
             TemplateNode::Component(comp) => {
@@ -615,7 +709,8 @@ fn check_hoistable(
                     }
                 }
                 // Check children
-                if !check_hoistable(&comp.fragment.nodes, param_names, context) {
+                let inner = with_let_names(&comp.attributes, param_names);
+                if !check_hoistable(&comp.fragment.nodes, &inner, context) {
                     return false;
                 }
             }
@@ -716,8 +811,18 @@ fn check_hoistable(
                 return false;
             }
 
-            // Nested snippet - has its own scope, don't check internals
-            TemplateNode::SnippetBlock(_) => {}
+            // A nested snippet resolves its own parameters, but a reference it
+            // makes to anything outside still propagates to this snippet's
+            // scope and blocks hoisting.
+            TemplateNode::SnippetBlock(b) => {
+                let mut inner_params = param_names.clone();
+                inner_params.extend(b.parameters.iter().flat_map(extract_all_param_names));
+                if !check_hoistable(&b.body.nodes, &inner_params, context)
+                    || !check_params_hoistable(&b.parameters, &inner_params, context)
+                {
+                    return false;
+                }
+            }
 
             // Regular elements - check attributes and children
             TemplateNode::RegularElement(elem) => {
@@ -726,7 +831,8 @@ fn check_hoistable(
                         return false;
                     }
                 }
-                if !check_hoistable(&elem.fragment.nodes, param_names, context) {
+                let inner = with_let_names(&elem.attributes, param_names);
+                if !check_hoistable(&elem.fragment.nodes, &inner, context) {
                     return false;
                 }
             }
@@ -739,6 +845,42 @@ fn check_hoistable(
             // `{@const _a = await gate('a')}` references `gate`, so the snippet
             // must not be hoisted.
             TemplateNode::ConstTag(tag) => {
+                let json = tag.declaration.as_json();
+                if let Some(obj) = json.as_object()
+                    && obj.get("type").and_then(|t| t.as_str()) == Some("VariableDeclaration")
+                    && let Some(decls) = obj.get("declarations").and_then(|d| d.as_array())
+                {
+                    for d in decls {
+                        if let Some(init) = d.get("init")
+                            && !init.is_null()
+                            && !expression_only_uses_params(init, param_names, context)
+                        {
+                            return false;
+                        }
+                    }
+                }
+            }
+
+            // A bare `{@attach expr}` fragment node (the attribute form is
+            // handled by `check_attribute_hoistable`).
+            TemplateNode::AttachTag(tag)
+                if !expr_only_uses_params(&tag.expression, param_names, context) =>
+            {
+                return false;
+            }
+
+            // `{@debug a, b}` references each identifier.
+            TemplateNode::DebugTag(tag) => {
+                for id in &tag.identifiers {
+                    if !expr_only_uses_params(id, param_names, context) {
+                        return false;
+                    }
+                }
+            }
+
+            // `{let x = expr}` / `{const x = expr}` — check each initializer, as
+            // for ConstTag. (The declared names were registered above.)
+            TemplateNode::DeclarationTag(tag) => {
                 let json = tag.declaration.as_json();
                 if let Some(obj) = json.as_object()
                     && obj.get("type").and_then(|t| t.as_str()) == Some("VariableDeclaration")
@@ -774,7 +916,8 @@ fn check_hoistable(
                         return false;
                     }
                 }
-                if !check_hoistable(&elem.fragment.nodes, param_names, context) {
+                let inner = with_let_names(&elem.attributes, param_names);
+                if !check_hoistable(&elem.fragment.nodes, &inner, context) {
                     return false;
                 }
             }
@@ -803,50 +946,126 @@ fn check_hoistable(
                 }
             }
 
-            // Other nodes - assume safe to hoist
+            // Required, not a convenience: guarded arms (ExpressionTag / HtmlTag /
+            // RenderTag / AttachTag) don't count towards exhaustiveness, so this is
+            // their "check passed" fall-through. `<svelte:options>` is the only
+            // variant reaching it unguarded, and it carries no expressions.
             _ => {}
         }
     }
     true
 }
 
+/// Check if an attribute value is hoistable.
+fn check_attribute_value_hoistable(
+    value: &crate::ast::template::AttributeValue,
+    param_names: &FxHashSet<String>,
+    context: &VisitorContext,
+) -> bool {
+    match value {
+        crate::ast::template::AttributeValue::Sequence(parts) => {
+            for p in parts {
+                if let crate::ast::template::AttributeValuePart::ExpressionTag(tag) = p
+                    && !expr_only_uses_params(&tag.expression, param_names, context)
+                {
+                    return false;
+                }
+            }
+            true
+        }
+        crate::ast::template::AttributeValue::Expression(tag) => {
+            expr_only_uses_params(&tag.expression, param_names, context)
+        }
+        crate::ast::template::AttributeValue::True(_) => true,
+    }
+}
+
+/// Check if a `use:` / `transition:` / `in:` / `out:` / `animate:` directive is
+/// hoistable. Mirrors upstream `scope.js`'s `SvelteDirective`, which references
+/// `node.name.split('.')[0]` in addition to visiting the optional expression.
+fn check_svelte_directive_hoistable(
+    name: &str,
+    expression: Option<&Expression>,
+    param_names: &FxHashSet<String>,
+    context: &VisitorContext,
+) -> bool {
+    let root = name.split('.').next().unwrap_or(name);
+    if !is_identifier_hoistable(root, param_names, context) {
+        return false;
+    }
+    expression.is_none_or(|expr| expr_only_uses_params(expr, param_names, context))
+}
+
 /// Check if an attribute is hoistable.
+///
+/// The match is exhaustive on purpose: a silent `_ => true` arm is what let
+/// `{@attach …}` expressions escape the free-variable walk (issue #1982).
+/// The names a node's `let:` directives declare for its own children. Upstream
+/// resolves them through the scope chain, where they sit at or below the
+/// snippet's own depth and so never block hoisting.
+fn with_let_names(
+    attributes: &[crate::ast::template::Attribute],
+    param_names: &FxHashSet<String>,
+) -> FxHashSet<String> {
+    let mut out = param_names.clone();
+    for attr in attributes {
+        if let crate::ast::template::Attribute::LetDirective(d) = attr {
+            match d.expression.as_ref() {
+                Some(expr) => {
+                    for n in extract_pattern_names_for_expr(expr).unwrap_or_default() {
+                        out.insert(n);
+                    }
+                }
+                // `let:v` with no value binds the directive's own name.
+                None => {
+                    out.insert(d.name.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
 fn check_attribute_hoistable(
     attr: &crate::ast::template::Attribute,
     param_names: &FxHashSet<String>,
     context: &VisitorContext,
 ) -> bool {
+    use crate::ast::template::Attribute as A;
     match attr {
-        crate::ast::template::Attribute::Attribute(a) => match &a.value {
-            crate::ast::template::AttributeValue::Sequence(parts) => {
-                for p in parts {
-                    if let crate::ast::template::AttributeValuePart::ExpressionTag(tag) = p
-                        && !expr_only_uses_params(&tag.expression, param_names, context)
-                    {
-                        return false;
-                    }
-                }
-                true
-            }
-            crate::ast::template::AttributeValue::Expression(tag) => {
-                expr_only_uses_params(&tag.expression, param_names, context)
-            }
-            _ => true,
-        },
-        crate::ast::template::Attribute::BindDirective(bind) => {
-            expr_only_uses_params(&bind.expression, param_names, context)
-        }
-        crate::ast::template::Attribute::OnDirective(on) => {
-            if let Some(ref expr) = on.expression {
-                expr_only_uses_params(expr, param_names, context)
-            } else {
-                true
-            }
-        }
-        crate::ast::template::Attribute::SpreadAttribute(spread) => {
+        A::Attribute(a) => check_attribute_value_hoistable(&a.value, param_names, context),
+        A::BindDirective(bind) => expr_only_uses_params(&bind.expression, param_names, context),
+        A::OnDirective(on) => on
+            .expression
+            .as_ref()
+            .is_none_or(|expr| expr_only_uses_params(expr, param_names, context)),
+        A::SpreadAttribute(spread) => {
             expr_only_uses_params(&spread.expression, param_names, context)
         }
-        _ => true,
+        A::AttachTag(attach) => expr_only_uses_params(&attach.expression, param_names, context),
+        // `class:name` shorthand is parsed into `Identifier(name)`, so the
+        // expression alone covers both forms.
+        A::ClassDirective(class) => expr_only_uses_params(&class.expression, param_names, context),
+        A::StyleDirective(style) => {
+            // `style:height` shorthand references a variable named after the property.
+            if matches!(style.value, crate::ast::template::AttributeValue::True(true))
+                && !is_identifier_hoistable(style.name.as_str(), param_names, context)
+            {
+                return false;
+            }
+            check_attribute_value_hoistable(&style.value, param_names, context)
+        }
+        A::UseDirective(d) => {
+            check_svelte_directive_hoistable(&d.name, d.expression.as_ref(), param_names, context)
+        }
+        A::TransitionDirective(d) => {
+            check_svelte_directive_hoistable(&d.name, d.expression.as_ref(), param_names, context)
+        }
+        A::AnimateDirective(d) => {
+            check_svelte_directive_hoistable(&d.name, d.expression.as_ref(), param_names, context)
+        }
+        // `let:x` declares a name rather than referencing one.
+        A::LetDirective(_) => true,
     }
 }
 
@@ -1138,12 +1357,9 @@ fn refs_hoistable(
                 {
                     return false;
                 }
-                o.get("value")
-                    .is_none_or(|v| refs_hoistable(v, params, context))
+                o.get("value").is_none_or(|v| refs_hoistable(v, params, context))
             }
-            _ => o
-                .iter()
-                .all(|(k, v)| k == "type" || refs_hoistable(v, params, context)),
+            _ => o.iter().all(|(k, v)| k == "type" || refs_hoistable(v, params, context)),
         },
         _ => true,
     }
@@ -1202,16 +1418,17 @@ fn expression_only_uses_params(
                 true
             }
 
+            Some("ChainExpression") => obj
+                .get("expression")
+                .is_none_or(|e| expression_only_uses_params(e, param_names, context)),
+
             Some("MemberExpression") => {
                 if let Some(object) = obj.get("object")
                     && !expression_only_uses_params(object, param_names, context)
                 {
                     return false;
                 }
-                if obj
-                    .get("computed")
-                    .and_then(|c| c.as_bool())
-                    .unwrap_or(false)
+                if obj.get("computed").and_then(|c| c.as_bool()).unwrap_or(false)
                     && let Some(prop) = obj.get("property")
                     && !expression_only_uses_params(prop, param_names, context)
                 {
@@ -1273,10 +1490,7 @@ fn expression_only_uses_params(
                 if let Some(props) = obj.get("properties").and_then(|p| p.as_array()) {
                     for prop in props {
                         if let Some(prop_obj) = prop.as_object() {
-                            if prop_obj
-                                .get("computed")
-                                .and_then(|c| c.as_bool())
-                                .unwrap_or(false)
+                            if prop_obj.get("computed").and_then(|c| c.as_bool()).unwrap_or(false)
                                 && let Some(key) = prop_obj.get("key")
                                 && !expression_only_uses_params(key, param_names, context)
                             {
@@ -1340,62 +1554,11 @@ fn expression_only_uses_params(
                 arrow_hoistable(val, param_names, context)
             }
 
-            _ => false,
+            // Same reason as the typed twin above: an unnamed expression kind is
+            // walked for references rather than treated as instance-level.
+            _ => refs_hoistable(val, param_names, context),
         }
     } else {
         true
     }
-}
-
-/// Check if default values inside a destructuring pattern are hoistable - JSON version.
-fn check_pattern_defaults_hoistable(
-    val: &serde_json::Value,
-    param_names: &FxHashSet<String>,
-    context: &VisitorContext,
-) -> bool {
-    if let Some(obj) = val.as_object() {
-        let val_type = obj.get("type").and_then(|v| v.as_str());
-        match val_type {
-            Some("ObjectPattern") => {
-                if let Some(props) = obj.get("properties").and_then(|p| p.as_array()) {
-                    for prop in props {
-                        if let Some(prop_obj) = prop.as_object()
-                            && let Some(value) = prop_obj.get("value")
-                            && !check_pattern_defaults_hoistable(value, param_names, context)
-                        {
-                            return false;
-                        }
-                    }
-                }
-            }
-            Some("ArrayPattern") => {
-                if let Some(elements) = obj.get("elements").and_then(|e| e.as_array()) {
-                    for elem in elements {
-                        if !elem.is_null()
-                            && !check_pattern_defaults_hoistable(elem, param_names, context)
-                        {
-                            return false;
-                        }
-                    }
-                }
-            }
-            Some("AssignmentPattern") => {
-                if let Some(right) = obj.get("right")
-                    && !expression_only_uses_params(right, param_names, context)
-                {
-                    return false;
-                }
-            }
-            _ => {}
-        }
-    }
-    true
-}
-
-/// Alias for visit function.
-pub fn visit_snippet_block(
-    block: &mut SnippetBlock,
-    context: &mut VisitorContext,
-) -> Result<(), AnalysisError> {
-    visit(block, context)
 }

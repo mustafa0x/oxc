@@ -2,15 +2,22 @@
 
 use memchr::memmem;
 use rustc_hash::FxHashSet;
+use std::borrow::Cow;
 
+use super::STATE_TMP_COUNTER;
+use super::destructure_transforms::{ArrayHelperRead, extract_destructure_paths};
 use super::expression_utils::{
     byte_pos_to_char_index, find_statement_end_client, is_shadowed_by_for_loop_var,
 };
 use super::rune_transforms::{
-    find_derived_property_colon, split_derived_array_elements, split_derived_object_properties,
+    find_default_equals, find_derived_property_colon, split_derived_array_elements,
+    split_derived_object_properties,
 };
-use super::{SCRIPT_ARRAY_COUNTER, STATE_TMP_COUNTER, get_or_compile_regex};
 use crate::compiler::phases::phase2_analyze::scope::DeclarationKind;
+#[cfg(test)]
+use crate::compiler::phases::phase3_transform::shared::js_scan::code_bytes_from;
+use crate::compiler::phases::phase3_transform::shared::js_scan::{code_bytes, skip_opaque};
+use crate::compiler::phases::phase3_transform::shared::offsets::{ByteLen, ByteOffset};
 
 // ---------------------------------------------------------------------------
 // Identifier reference detection (lines 7653-8602 of mod.rs)
@@ -26,45 +33,16 @@ use crate::compiler::phases::phase2_analyze::scope::DeclarationKind;
 /// because it appears on the RHS.
 /// For block bodies like `{ c = a + b; count = count + 1; }`, we check each statement
 /// within the block.
+#[cfg(test)]
 pub(super) fn body_references_identifier(body: &str, identifier: &str) -> bool {
-    // The Rust regex crate does NOT support lookbehind assertions.
-    // We use alternation-based boundary matching instead:
-    //   (^|[^a-zA-Z0-9_$])identifier([^a-zA-Z0-9_$]|$)
-    //
-    // This handles two important cases:
-    // 1. `$foo` (store subscriptions) - `\b` doesn't work because `$` is not a word char.
-    //    e.g., "bar = $foo" must match `$foo` but NOT "bar = $foobar"
-    // 2. For plain identifiers like `count`, we must NOT match `count` inside `$count`.
-    //    e.g., `$count * 2` - `count` should NOT be considered a dependency here
-    //    because `$count` already tracks the store subscription.
-    let escaped = regex::escape(identifier);
-    // Use alternation boundary for ALL identifiers (both `$foo` and `count`)
-    // to correctly handle the `$`-prefixed store subscription case.
-    // Also exclude `.` from valid preceding characters to avoid matching property
-    // accesses like `obj.prop` when checking for standalone `prop` references.
-    //
-    // EXCEPTION: the `$$`-prefixed compiler specials (`$$props` / `$$restProps` /
-    // `$$slots`) are never member-access targets, but they DO appear after a `.`
-    // in a spread — `{ ...$$restProps }`. Excluding `.` there made
-    // `body_references_identifier(body, "$$restProps")` miss the spread, so a
-    // `$: x = { ...$$restProps }` reactive statement dropped its
-    // `$.deep_read_state($$restProps)` dependency (emitting `() => {}`). Allow a
-    // leading `.` for `$$`-names so the spread form is detected.
-    let preceding = if identifier.starts_with("$$") {
-        r"[^a-zA-Z0-9_$]"
-    } else {
-        // Exclude `.` so member access (`obj.prop`) does not match a standalone
-        // `prop`, but DO allow a spread prefix (`...prop`): three dots before the
-        // name are a read, not a member access (`$: x = f(...prop)` reads `prop`).
-        // The regex crate has no lookbehind, so add `...` as an explicit
-        // alternative in the leading-boundary group.
-        r"[^a-zA-Z0-9_$\.]|\.\.\."
-    };
-    let pattern = format!(r"(^|{}){}([^a-zA-Z0-9_$]|$)", preceding, escaped);
-    let re = match get_or_compile_regex(&pattern) {
-        Some(re) => re,
-        None => return false,
-    };
+    // Every strip below only blanks or deletes characters, so a name absent from
+    // the raw body is absent from all of them. Callers ask this once per
+    // (statement, reactive variable) pair, and almost every pair is a miss.
+    if memmem::find(body.as_bytes(), identifier.as_bytes()).is_none() {
+        return false;
+    }
+
+    let matcher = IdentifierMatcher::new(identifier);
 
     // Before checking, strip out function/arrow bodies that shadow the identifier
     // as a parameter. This prevents false positives where a function parameter
@@ -84,12 +62,95 @@ pub(super) fn body_references_identifier(body: &str, identifier: &str) -> bool {
     let stripped_body = strip_object_property_keys(&stripped_body);
 
     // Check if identifier appears in the stripped body at all
-    if !re.is_match(&stripped_body) {
+    if !matcher.is_match(&stripped_body) {
         return false;
     }
 
     // Use the recursive check that handles if/else, blocks, and compound statements
-    body_references_identifier_recursive(stripped_body.trim(), identifier, &re)
+    body_references_identifier_recursive(stripped_body.trim(), identifier, &matcher)
+}
+
+/// Whether an identifier occurs in a body as a standalone reference.
+///
+/// This used to be a regex, rebuilt from a formatted pattern for every
+/// (statement, variable) pair the dependency scan asks about; escaping the name,
+/// formatting the pattern and hashing it to reach the cache was 70% of that
+/// scan's cost. The rule it encodes needs no engine:
+///
+/// - `(^|[^a-zA-Z0-9_$])name([^a-zA-Z0-9_$]|$)` for the `$$`-prefixed compiler
+///   specials, which are never member-access targets but do appear after a `.`
+///   in a spread (`{ ...$$restProps }`)
+/// - the same with `.` also excluded before the name for every other identifier,
+///   so `obj.prop` does not match a standalone `prop` — except for a spread
+///   prefix (`f(...prop)`), which reads it
+#[cfg(test)]
+pub(super) struct IdentifierMatcher<'a> {
+    identifier: &'a str,
+    /// `$$`-names accept a `.` immediately before them; the rest do not.
+    allows_leading_dot: bool,
+}
+
+#[cfg(test)]
+impl<'a> IdentifierMatcher<'a> {
+    pub(super) fn new(identifier: &'a str) -> Self {
+        Self { identifier, allows_leading_dot: identifier.starts_with("$$") }
+    }
+
+    pub(super) fn is_match(&self, text: &str) -> bool {
+        let needle = self.identifier.as_bytes();
+        if needle.is_empty() {
+            return false;
+        }
+        let bytes = text.as_bytes();
+        let mut from = 0;
+        // Advancing by one keeps overlapping occurrences reachable, which a
+        // non-overlapping iterator would skip.
+        while let Some(offset) = memmem::find(&bytes[from..], needle) {
+            let start = from + offset;
+            let end = start + needle.len();
+            if self.boundaries_hold(bytes, start, end) {
+                return true;
+            }
+            from = start + 1;
+        }
+        false
+    }
+
+    fn boundaries_hold(&self, bytes: &[u8], start: usize, end: usize) -> bool {
+        // A UTF-8 continuation byte is never one of the ASCII characters the
+        // classes below list, so comparing bytes answers the same question the
+        // char classes did.
+        if end < bytes.len() && continues_identifier(bytes[end]) {
+            return false;
+        }
+        if start == 0 {
+            return true;
+        }
+        let before = bytes[start - 1];
+        if !continues_identifier(before) && (self.allows_leading_dot || before != b'.') {
+            return true;
+        }
+        // `...name` is a spread, which reads the name rather than accessing it
+        // as a member.
+        !self.allows_leading_dot && start >= 3 && &bytes[start - 3..start] == b"..."
+    }
+}
+
+#[cfg(test)]
+fn continues_identifier(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'$'
+}
+
+/// Byte just past the comment or regex literal starting at `i`, plus whether it
+/// was a comment. Restricted to `/`-led runs on purpose: this scanner's whole job
+/// is to descend into string and template literals, which `skip_opaque` — the
+/// same lexer this delegates to — treats as opaque.
+#[cfg(test)]
+fn skip_slash_run(bytes: &[u8], i: usize, prev: Option<u8>) -> Option<(usize, bool)> {
+    if bytes[i] != b'/' {
+        return None;
+    }
+    skip_opaque(bytes, i, prev)
 }
 
 /// Strip text content from string literals and template literals, keeping expression parts.
@@ -101,11 +162,12 @@ pub(super) fn body_references_identifier(body: &str, identifier: &str) -> bool {
 ///
 /// This prevents false identifier matches inside literal text, e.g., `<circle>` in
 /// a template literal won't match the variable name `circle`.
-pub(super) fn strip_string_literal_text(code: &str) -> String {
+#[cfg(test)]
+pub(super) fn strip_string_literal_text(code: &str) -> std::borrow::Cow<'_, str> {
     // Fast path: if no string delimiters exist, return as-is
     // Uses memchr3 for SIMD-accelerated search of all three delimiters at once
     if memchr::memchr3(b'\'', b'"', b'`', code.as_bytes()).is_none() {
-        return code.to_string();
+        return std::borrow::Cow::Borrowed(code);
     }
 
     // Work with bytes for performance (string literal delimiters are all ASCII)
@@ -113,8 +175,22 @@ pub(super) fn strip_string_literal_text(code: &str) -> String {
     let mut result: Vec<u8> = bytes.to_vec();
     let len = bytes.len();
     let mut i = 0;
+    // Last significant code byte, to tell a regex literal from a division.
+    let mut prev: Option<u8> = None;
 
     while i < len {
+        // A quote inside a comment (`// don't`) or a regex literal (`/'/g`) must
+        // not open a string and blank out every live read that follows it.
+        if let Some((next, is_comment)) = skip_slash_run(bytes, i, prev) {
+            if !is_comment {
+                prev = Some(b'x');
+            }
+            i = next;
+            continue;
+        }
+        if !bytes[i].is_ascii_whitespace() {
+            prev = Some(bytes[i]);
+        }
         match bytes[i] {
             // Handle single/double-quoted strings
             b'\'' | b'"' => {
@@ -147,7 +223,18 @@ pub(super) fn strip_string_literal_text(code: &str) -> String {
                         i += 2; // skip `${`
                         // Find matching `}` - track depth
                         let mut depth = 1;
+                        let mut inner_prev: Option<u8> = None;
                         while i < len && depth > 0 {
+                            if let Some((next, is_comment)) = skip_slash_run(bytes, i, inner_prev) {
+                                if !is_comment {
+                                    inner_prev = Some(b'x');
+                                }
+                                i = next;
+                                continue;
+                            }
+                            if !bytes[i].is_ascii_whitespace() {
+                                inner_prev = Some(bytes[i]);
+                            }
                             match bytes[i] {
                                 b'{' => depth += 1,
                                 b'}' => {
@@ -223,7 +310,9 @@ pub(super) fn strip_string_literal_text(code: &str) -> String {
         }
     }
 
-    String::from_utf8(result).unwrap_or_else(|_| code.to_string())
+    String::from_utf8(result)
+        .map(std::borrow::Cow::Owned)
+        .unwrap_or(std::borrow::Cow::Borrowed(code))
 }
 
 /// Strip non-shorthand, non-computed object property keys from code.
@@ -236,7 +325,13 @@ pub(super) fn strip_string_literal_text(code: &str) -> String {
 /// - `{ key: value }` -> `{     value }` (non-shorthand key blanked)
 /// - `{ key }` -> `{ key }` (shorthand preserved)
 /// - `{ [expr]: value }` -> `{ [expr]: value }` (computed preserved)
-pub(super) fn strip_object_property_keys(code: &str) -> String {
+#[cfg(test)]
+pub(super) fn strip_object_property_keys(code: &str) -> std::borrow::Cow<'_, str> {
+    // A key can only be blanked at a `:`, and the two `Vec<char>` below cost four
+    // bytes per source byte, so the absence of one is worth checking for.
+    if memchr::memchr(b':', code.as_bytes()).is_none() {
+        return std::borrow::Cow::Borrowed(code);
+    }
     let chars: Vec<char> = code.chars().collect();
     let len = chars.len();
     let mut result: Vec<char> = chars.clone();
@@ -308,7 +403,15 @@ pub(super) fn strip_object_property_keys(code: &str) -> String {
         i += 1;
     }
 
-    result.into_iter().collect()
+    std::borrow::Cow::Owned(result.into_iter().collect())
+}
+
+/// Whether `c` can follow the last character of a parameter name. Spelled over
+/// characters rather than the single space the ASCII whitelist accepted, because
+/// `U+3000` and NBSP separate a parameter exactly as a space does.
+#[cfg(test)]
+fn ends_a_parameter_name(c: char) -> bool {
+    c == ',' || c == ')' || c == ':' || c.is_whitespace()
 }
 
 /// Strip out function/arrow expression bodies where the identifier is declared as a parameter.
@@ -319,40 +422,46 @@ pub(super) fn strip_object_property_keys(code: &str) -> String {
 /// - `function (a) { ... }` -> `                   `
 /// - `(a) => { ... }` -> `              `
 /// - `(a) => expr` -> `            `
-pub(super) fn strip_function_scopes_that_shadow(body: &str, identifier: &str) -> String {
+#[cfg(test)]
+pub(super) fn strip_function_scopes_that_shadow<'a>(
+    body: &'a str,
+    identifier: &str,
+) -> std::borrow::Cow<'a, str> {
+    // Only a `function` keyword or an arrow can introduce a shadowing parameter,
+    // and the common reactive body has neither.
+    if memmem::find(body.as_bytes(), b"function").is_none()
+        && memmem::find(body.as_bytes(), b"=>").is_none()
+    {
+        return std::borrow::Cow::Borrowed(body);
+    }
     let mut result = body.to_string();
 
     // Pattern: `function identifier(params) { body }` or `function (params) { body }`
     // where params contain our identifier
-    let fn_patterns = [
-        format!("function ({}", identifier),
-        format!("function({}", identifier),
-    ];
+    let fn_patterns = [format!("function ({}", identifier), format!("function({}", identifier)];
 
     for pat in &fn_patterns {
         while let Some(pos) = result.find(pat.as_str()) {
             // Verify the identifier is actually a parameter (followed by `,` or `)`)
             let after_ident = pos + pat.len();
-            if after_ident < result.len() {
-                let next_char = result.as_bytes()[after_ident] as char;
-                if next_char != ',' && next_char != ')' && next_char != ' ' && next_char != ':' {
-                    // Not a word boundary - the pattern is a prefix of a longer name
-                    // Replace just this occurrence to prevent infinite loop
-                    result.replace_range(pos..pos + 1, " ");
-                    continue;
-                }
+            if crate::compiler::utils::char_at(&result, after_ident)
+                .is_some_and(|next_char| !ends_a_parameter_name(next_char))
+            {
+                // Not a word boundary - the pattern is a prefix of a longer name
+                // Replace just this occurrence to prevent infinite loop
+                result.replace_range(pos..pos + 1, " ");
+                continue;
             }
 
             // Find the opening brace of the function body
-            let after_pat = &result[after_ident..];
             let mut found_paren_close = false;
             let mut brace_start = None;
             let mut depth = 1; // We're inside the opening (
-            for (i, ch) in after_pat.char_indices() {
+            for (i, ch) in code_bytes_from(result.as_bytes(), after_ident) {
                 if !found_paren_close {
                     match ch {
-                        '(' => depth += 1,
-                        ')' => {
+                        b'(' => depth += 1,
+                        b')' => {
                             depth -= 1;
                             if depth == 0 {
                                 found_paren_close = true;
@@ -360,10 +469,10 @@ pub(super) fn strip_function_scopes_that_shadow(body: &str, identifier: &str) ->
                         }
                         _ => {}
                     }
-                } else if ch == '{' {
-                    brace_start = Some(after_ident + i);
+                } else if ch == b'{' {
+                    brace_start = Some(i);
                     break;
-                } else if !ch.is_whitespace() {
+                } else if !ch.is_ascii_whitespace() {
                     break;
                 }
             }
@@ -371,34 +480,18 @@ pub(super) fn strip_function_scopes_that_shadow(body: &str, identifier: &str) ->
             if let Some(brace_pos) = brace_start {
                 // Find matching closing brace
                 let mut brace_depth = 1;
-                let mut in_string = false;
-                let mut string_char = ' ';
                 let mut end_pos = brace_pos + 1;
-                for (i, ch) in result[brace_pos + 1..].char_indices() {
-                    if in_string {
-                        if ch == '\\' {
-                            // Skip next char
-                            continue;
-                        }
-                        if ch == string_char {
-                            in_string = false;
-                        }
-                    } else {
-                        match ch {
-                            '"' | '\'' | '`' => {
-                                in_string = true;
-                                string_char = ch;
+                for (i, ch) in code_bytes_from(result.as_bytes(), brace_pos + 1) {
+                    match ch {
+                        b'{' => brace_depth += 1,
+                        b'}' => {
+                            brace_depth -= 1;
+                            if brace_depth == 0 {
+                                end_pos = i + 1;
+                                break;
                             }
-                            '{' => brace_depth += 1,
-                            '}' => {
-                                brace_depth -= 1;
-                                if brace_depth == 0 {
-                                    end_pos = brace_pos + 1 + i + 1;
-                                    break;
-                                }
-                            }
-                            _ => {}
                         }
+                        _ => {}
                     }
                 }
 
@@ -430,30 +523,30 @@ pub(super) fn strip_function_scopes_that_shadow(body: &str, identifier: &str) ->
             if after_ident >= result.len() {
                 break;
             }
-            let next_char = result.as_bytes()[after_ident] as char;
-            if next_char != ',' && next_char != ')' && next_char != ' ' && next_char != ':' {
-                search_from = pos + 1;
+            if !crate::compiler::utils::char_at(&result, after_ident)
+                .is_some_and(ends_a_parameter_name)
+            {
+                search_from = crate::compiler::utils::next_char_boundary(&result, pos);
                 continue;
             }
 
             // Check if preceded by `function` keyword - already handled above
             let before = result[..pos].trim_end();
             if before.ends_with("function") {
-                search_from = pos + 1;
+                search_from = crate::compiler::utils::next_char_boundary(&result, pos);
                 continue;
             }
 
             // Find `) =>`  after the params
-            let after_params = &result[after_ident..];
             let mut paren_depth = 1;
             let mut paren_close_idx = None;
-            for (i, ch) in after_params.char_indices() {
+            for (i, ch) in code_bytes_from(result.as_bytes(), after_ident) {
                 match ch {
-                    '(' => paren_depth += 1,
-                    ')' => {
+                    b'(' => paren_depth += 1,
+                    b')' => {
                         paren_depth -= 1;
                         if paren_depth == 0 {
-                            paren_close_idx = Some(after_ident + i);
+                            paren_close_idx = Some(i);
                             break;
                         }
                     }
@@ -476,33 +569,18 @@ pub(super) fn strip_function_scopes_that_shadow(body: &str, identifier: &str) ->
                     if body_text.starts_with('{') {
                         // Block body arrow - find matching brace
                         let mut brace_depth = 1;
-                        let mut in_string = false;
-                        let mut string_char = ' ';
                         let mut end_pos = body_offset + 1;
-                        for (i, ch) in result[body_offset + 1..].char_indices() {
-                            if in_string {
-                                if ch == '\\' {
-                                    continue;
-                                }
-                                if ch == string_char {
-                                    in_string = false;
-                                }
-                            } else {
-                                match ch {
-                                    '"' | '\'' | '`' => {
-                                        in_string = true;
-                                        string_char = ch;
+                        for (i, ch) in code_bytes_from(result.as_bytes(), body_offset + 1) {
+                            match ch {
+                                b'{' => brace_depth += 1,
+                                b'}' => {
+                                    brace_depth -= 1;
+                                    if brace_depth == 0 {
+                                        end_pos = i + 1;
+                                        break;
                                     }
-                                    '{' => brace_depth += 1,
-                                    '}' => {
-                                        brace_depth -= 1;
-                                        if brace_depth == 0 {
-                                            end_pos = body_offset + 1 + i + 1;
-                                            break;
-                                        }
-                                    }
-                                    _ => {}
                                 }
+                                _ => {}
                             }
                         }
                         let spaces = " ".repeat(end_pos - pos);
@@ -510,56 +588,38 @@ pub(super) fn strip_function_scopes_that_shadow(body: &str, identifier: &str) ->
                     } else {
                         // Expression body arrow: scan forward from body_offset to find the
                         // end of the expression (top-level `,` `)` `]` `;` or end of string).
-                        let bytes = result.as_bytes();
-                        let mut p = body_offset;
+                        let mut end_pos = result.len();
                         let mut pdepth = 0i32;
                         let mut bdepth = 0i32;
                         let mut brdepth = 0i32;
-                        let mut in_s: Option<u8> = None;
-                        while p < bytes.len() {
-                            let c = bytes[p];
-                            if let Some(q) = in_s {
-                                if c == b'\\' && p + 1 < bytes.len() {
-                                    p += 2;
-                                    continue;
-                                }
-                                if c == q {
-                                    in_s = None;
-                                }
-                                p += 1;
-                                continue;
-                            }
+                        for (p, c) in code_bytes_from(result.as_bytes(), body_offset) {
+                            let at_top = pdepth == 0 && bdepth == 0 && brdepth == 0;
                             match c {
-                                b'\'' | b'"' | b'`' => in_s = Some(c),
                                 b'(' => pdepth += 1,
-                                b')' => {
-                                    if pdepth == 0 && bdepth == 0 && brdepth == 0 {
-                                        break;
-                                    }
-                                    pdepth -= 1;
+                                b')' if at_top => {
+                                    end_pos = p;
+                                    break;
                                 }
+                                b')' => pdepth -= 1,
                                 b'{' => bdepth += 1,
-                                b'}' => {
-                                    if bdepth == 0 && pdepth == 0 && brdepth == 0 {
-                                        break;
-                                    }
-                                    bdepth -= 1;
+                                b'}' if at_top => {
+                                    end_pos = p;
+                                    break;
                                 }
+                                b'}' => bdepth -= 1,
                                 b'[' => brdepth += 1,
-                                b']' => {
-                                    if brdepth == 0 && pdepth == 0 && bdepth == 0 {
-                                        break;
-                                    }
-                                    brdepth -= 1;
+                                b']' if at_top => {
+                                    end_pos = p;
+                                    break;
                                 }
-                                b',' | b';' if pdepth == 0 && bdepth == 0 && brdepth == 0 => {
+                                b']' => brdepth -= 1,
+                                b',' | b';' if at_top => {
+                                    end_pos = p;
                                     break;
                                 }
                                 _ => {}
                             }
-                            p += 1;
                         }
-                        let end_pos = p;
                         let spaces = " ".repeat(end_pos - pos);
                         result.replace_range(pos..end_pos, &spaces);
                     }
@@ -567,20 +627,21 @@ pub(super) fn strip_function_scopes_that_shadow(body: &str, identifier: &str) ->
                     search_from = paren_close + 1;
                 }
             } else {
-                search_from = pos + 1;
+                search_from = crate::compiler::utils::next_char_boundary(&result, pos);
             }
         }
     }
 
-    result
+    std::borrow::Cow::Owned(result)
 }
 
 /// Recursively check if an identifier is read (not just assigned to) in a body of code.
 /// Handles block statements, if/else blocks, and compound statements.
+#[cfg(test)]
 pub(super) fn body_references_identifier_recursive(
     body: &str,
     identifier: &str,
-    re: &regex::Regex,
+    re: &IdentifierMatcher<'_>,
 ) -> bool {
     let trimmed = body.trim();
 
@@ -601,10 +662,10 @@ pub(super) fn body_references_identifier_recursive(
             // Find matching closing paren for the condition
             let mut depth = 0i32;
             let mut cond_end = None;
-            for (i, ch) in after_if.char_indices() {
+            for (i, ch) in code_bytes(after_if.as_bytes()) {
                 match ch {
-                    '(' => depth += 1,
-                    ')' => {
+                    b'(' => depth += 1,
+                    b')' => {
                         depth -= 1;
                         if depth == 0 {
                             cond_end = Some(i);
@@ -628,10 +689,10 @@ pub(super) fn body_references_identifier_recursive(
                     // Block body
                     let mut brace_depth = 0i32;
                     let mut block_end = None;
-                    for (i, ch) in after_cond.char_indices() {
+                    for (i, ch) in code_bytes(after_cond.as_bytes()) {
                         match ch {
-                            '{' => brace_depth += 1,
-                            '}' => {
+                            b'{' => brace_depth += 1,
+                            b'}' => {
                                 brace_depth -= 1;
                                 if brace_depth == 0 {
                                     block_end = Some(i);
@@ -672,24 +733,24 @@ pub(super) fn body_references_identifier_recursive(
 }
 
 /// Check if an identifier is referenced as a read across multiple statements.
+#[cfg(test)]
 pub(super) fn body_references_identifier_in_statements(
     content: &str,
     identifier: &str,
-    re: &regex::Regex,
+    re: &IdentifierMatcher<'_>,
 ) -> bool {
     // Split by semicolons and newlines, but be careful with nested blocks
     // Simple approach: scan for statements at depth 0
     let mut depth = 0;
     let mut start = 0;
-    let chars: Vec<char> = content.chars().collect();
 
-    for i in 0..chars.len() {
-        match chars[i] {
-            '(' | '[' | '{' => depth += 1,
-            ')' | ']' | '}' if depth > 0 => {
+    for (i, c) in code_bytes(content.as_bytes()) {
+        match c {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' if depth > 0 => {
                 depth -= 1;
             }
-            ';' | '\n' if depth == 0 => {
+            b';' | b'\n' if depth == 0 => {
                 let stmt = content[start..i].trim();
                 if !stmt.is_empty() && check_identifier_in_statement(stmt, identifier, re) {
                     return true;
@@ -710,10 +771,11 @@ pub(super) fn body_references_identifier_in_statements(
 }
 
 /// Check if an identifier appears as a read (not just assignment target) in a single statement.
+#[cfg(test)]
 pub(super) fn check_identifier_in_statement(
     stmt: &str,
     identifier: &str,
-    re: &regex::Regex,
+    re: &IdentifierMatcher<'_>,
 ) -> bool {
     if !re.is_match(stmt) {
         return false;
@@ -851,42 +913,57 @@ pub(super) fn lhs_starts_with_keyword(lhs: &str) -> bool {
 
 /// Find the position of the assignment operator (=) that's not part of ==, ===, !=, !==
 pub(super) fn find_assignment_position(expr: &str) -> Option<usize> {
-    let chars: Vec<char> = expr.chars().collect();
+    let bytes = expr.as_bytes();
     let mut i = 0;
-    let mut depth = 0;
+    let mut depth = 0i32;
+    // Last significant code byte, both for the operator lookbehind and to tell a
+    // regex literal from a division.
+    let mut prev: Option<u8> = None;
 
-    while i < chars.len() {
-        let c = chars[i];
+    while i < bytes.len() {
+        if let Some((next, is_comment)) = skip_opaque(bytes, i, prev) {
+            if !is_comment {
+                prev = Some(b'x');
+            }
+            i = next;
+            continue;
+        }
+        let c = bytes[i];
         match c {
-            '(' | '[' | '{' => depth += 1,
-            ')' | ']' | '}' => depth -= 1,
-            '=' if depth == 0 => {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            b'=' if depth == 0 => {
                 // Check it's not ==, ===, !=, !==, <=, >=, =>,
                 // or compound assignment operators: +=, -=, *=, /=, %=, **=,
                 // <<=, >>=, >>>=, &=, |=, ^=, &&=, ||=, ??=
-                let prev = if i > 0 { Some(chars[i - 1]) } else { None };
-                let next = chars.get(i + 1).copied();
+                let next = bytes.get(i + 1).copied();
 
-                if prev != Some('=')
-                    && prev != Some('!')
-                    && prev != Some('<')
-                    && prev != Some('>')
-                    && prev != Some('+')
-                    && prev != Some('-')
-                    && prev != Some('*')
-                    && prev != Some('/')
-                    && prev != Some('%')
-                    && prev != Some('&')
-                    && prev != Some('|')
-                    && prev != Some('^')
-                    && prev != Some('?')
-                    && next != Some('=')
-                    && next != Some('>')
+                if !matches!(
+                    prev,
+                    Some(
+                        b'=' | b'!'
+                            | b'<'
+                            | b'>'
+                            | b'+'
+                            | b'-'
+                            | b'*'
+                            | b'/'
+                            | b'%'
+                            | b'&'
+                            | b'|'
+                            | b'^'
+                            | b'?'
+                    )
+                ) && next != Some(b'=')
+                    && next != Some(b'>')
                 {
                     return Some(i);
                 }
             }
             _ => {}
+        }
+        if !c.is_ascii_whitespace() {
+            prev = Some(c);
         }
         i += 1;
     }
@@ -895,37 +972,55 @@ pub(super) fn find_assignment_position(expr: &str) -> Option<usize> {
 
 /// Find the position of a `:` at depth 0 in an expression.
 /// This is used to split ternary expressions like `true_rhs : false_branch`.
+/// The returned position is a **byte** offset: the caller slices `expr` with it.
+#[cfg(test)]
 pub(super) fn find_colon_at_depth0(expr: &str) -> Option<usize> {
-    let chars: Vec<char> = expr.chars().collect();
+    // Not `code_bytes`: `${`/`}` move the outer depth here and the bookkeeping is
+    // preserved exactly rather than re-derived. UTF-8 continuation bytes are all
+    // >= 0x80, so they never match an ASCII arm.
+    let bytes = expr.as_bytes();
     let mut depth = 0;
     let mut i = 0;
 
-    while i < chars.len() {
-        match chars[i] {
-            '(' | '[' | '{' => depth += 1,
-            ')' | ']' | '}' => depth -= 1,
-            ':' if depth == 0 => return Some(i),
-            '\'' | '"' => {
-                // Skip string literals
-                let quote = chars[i];
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            b':' if depth == 0 => return Some(i),
+            b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                i += 2;
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                while i < bytes.len() && !(bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/')) {
+                    i += 1;
+                }
                 i += 1;
-                while i < chars.len() && chars[i] != quote {
-                    if chars[i] == '\\' && i + 1 < chars.len() {
+            }
+            quote @ (b'\'' | b'"') => {
+                // Skip string literals
+                i += 1;
+                while i < bytes.len() && bytes[i] != quote {
+                    if bytes[i] == b'\\' && i + 1 < bytes.len() {
                         i += 1;
                     }
                     i += 1;
                 }
             }
-            '`' => {
+            b'`' => {
                 // Skip template literals
                 i += 1;
-                while i < chars.len() && chars[i] != '`' {
-                    if chars[i] == '$' && i + 1 < chars.len() && chars[i + 1] == '{' {
+                while i < bytes.len() && bytes[i] != b'`' {
+                    if bytes[i] == b'$' && bytes.get(i + 1) == Some(&b'{') {
                         depth += 1;
                         i += 1;
-                    } else if chars[i] == '}' && depth > 0 {
+                    } else if bytes[i] == b'}' && depth > 0 {
                         depth -= 1;
-                    } else if chars[i] == '\\' && i + 1 < chars.len() {
+                    } else if bytes[i] == b'\\' && i + 1 < bytes.len() {
                         i += 1;
                     }
                     i += 1;
@@ -964,14 +1059,8 @@ pub(super) fn extract_member_expression_base(lhs: &str) -> Option<&str> {
         // Must be a valid identifier (alphanumeric, underscore, dollar sign)
         // and non-empty
         if !base.is_empty()
-            && base
-                .chars()
-                .all(|c| c.is_alphanumeric() || c == '_' || c == '$')
-            && base
-                .chars()
-                .next()
-                .map(|c| !c.is_ascii_digit())
-                .unwrap_or(false)
+            && base.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+            && base.chars().next().map(|c| !c.is_ascii_digit()).unwrap_or(false)
         {
             Some(base)
         } else {
@@ -1016,16 +1105,46 @@ pub(super) fn is_inside_string_literal(code: &str, pos: usize) -> bool {
             if c == string_char {
                 in_string = false;
             }
-        } else if !template_interp_depth.is_empty() {
+            continue;
+        }
+
+        // A quote inside a comment is text: `// it doesn't matter` would
+        // otherwise open a string that nothing closes, so every position after
+        // it reads as "inside a string" and its rewrite is skipped.
+        if c == '/' {
+            match chars.peek() {
+                Some('/') => {
+                    chars.next();
+                    for ch in chars.by_ref() {
+                        if ch == '\n' {
+                            break;
+                        }
+                    }
+                    continue;
+                }
+                Some('*') => {
+                    chars.next();
+                    let mut prev = '\0';
+                    for ch in chars.by_ref() {
+                        if prev == '*' && ch == '/' {
+                            break;
+                        }
+                        prev = ch;
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+        }
+
+        if !template_interp_depth.is_empty() {
             // Inside a template literal interpolation - track braces
             if c == '{' {
                 if let Some(depth) = template_interp_depth.last_mut() {
                     *depth += 1;
                 }
             } else if c == '}' {
-                let should_pop = template_interp_depth
-                    .last()
-                    .is_some_and(|depth| *depth == 0);
+                let should_pop = template_interp_depth.last().is_some_and(|depth| *depth == 0);
                 if should_pop {
                     template_interp_depth.pop();
                     // We're back inside the template literal string
@@ -1047,6 +1166,95 @@ pub(super) fn is_inside_string_literal(code: &str, pos: usize) -> bool {
     in_string
 }
 
+/// Check if a position is inside a regex literal.
+///
+/// A regex's source is text: `/\$s/` names a store nowhere, and rewriting the
+/// `$s` inside it to `$s()` changes what the regex matches. This is the third
+/// opaque kind beside the string and comment `is_inside_string_literal`
+/// answers, and it is separate because telling `/re/` from a division needs the
+/// previous significant code byte, which that scan does not track.
+pub(super) fn is_inside_regex_literal(code: &str, pos: usize) -> bool {
+    let bytes = code.as_bytes();
+    let mut i = 0usize;
+    let mut prev: Option<u8> = None;
+    // `${ … }` re-enters code, so a template is a stack of frames rather than
+    // one opaque run: a regex can sit inside an interpolation.
+    // `None` is an open template's quasi, `Some(depth)` an open `${ … }`.
+    let mut frames: Vec<Option<usize>> = Vec::new();
+    while i < bytes.len() && i <= pos {
+        if matches!(frames.last(), Some(None)) {
+            match bytes[i] {
+                b'\\' => i += 2,
+                b'`' => {
+                    frames.pop();
+                    prev = Some(b'`');
+                    i += 1;
+                }
+                b'$' if bytes.get(i + 1) == Some(&b'{') => {
+                    frames.push(Some(0));
+                    prev = None;
+                    i += 2;
+                }
+                _ => i += 1,
+            }
+            continue;
+        }
+        match bytes[i] {
+            b'`' => {
+                frames.push(None);
+                i += 1;
+                continue;
+            }
+            b'{' => {
+                if let Some(Some(depth)) = frames.last_mut() {
+                    *depth += 1;
+                }
+                prev = Some(b'{');
+                i += 1;
+                continue;
+            }
+            b'}' => {
+                if let Some(Some(depth)) = frames.last_mut() {
+                    if *depth == 0 {
+                        frames.pop();
+                        prev = Some(b'`');
+                        i += 1;
+                        continue;
+                    }
+                    *depth -= 1;
+                }
+                prev = Some(b'}');
+                i += 1;
+                continue;
+            }
+            _ => {}
+        }
+        let starts_regex = bytes[i] == b'/'
+            && !matches!(bytes.get(i + 1), Some(b'/') | Some(b'*'))
+            && crate::compiler::phases::phase3_transform::shared::js_scan::slash_starts_regex_at(
+                bytes, i, prev,
+            );
+        match skip_opaque(bytes, i, prev) {
+            Some((next, was_comment)) => {
+                if starts_regex && pos < next {
+                    return true;
+                }
+                if !was_comment && next > 0 {
+                    prev = Some(bytes[next - 1]);
+                }
+                i = next.max(i + 1);
+            }
+            None => {
+                if !bytes[i].is_ascii_whitespace() {
+                    prev = Some(bytes[i]);
+                }
+                i += 1;
+            }
+        }
+    }
+    false
+}
+
 // ---------------------------------------------------------------------------
 // State/prop assignments and legacy transforms (lines 11933-13491 of mod.rs)
 // ---------------------------------------------------------------------------
@@ -1061,19 +1269,19 @@ pub(super) fn is_inside_string_literal(code: &str, pos: usize) -> bool {
 /// - `$.set(foo, writable(42))` → `$.store_unsub($.set(foo, writable(42)), '$foo', $$stores)`
 ///
 /// Reference: declarations.js `add_state_transformers` → `assign_value_with_store`
-pub(super) fn wrap_store_unsub_for_state_sets(
-    line: &str,
+pub(super) fn wrap_store_unsub_for_state_sets<'a>(
+    line: &'a str,
     state_vars: &[String],
     store_sub_vars: &[String],
-) -> String {
+) -> Cow<'a, str> {
     if state_vars.is_empty() || store_sub_vars.is_empty() {
-        return line.to_string();
+        return Cow::Borrowed(line);
     }
     if memmem::find(line.as_bytes(), b"$.set(").is_none() {
-        return line.to_string();
+        return Cow::Borrowed(line);
     }
     super::store_unsub_wrap_ast::transform_store_unsub_wrap_ast(line, state_vars, store_sub_vars)
-        .unwrap_or_else(|| line.to_string())
+        .map_or(Cow::Borrowed(line), Cow::Owned)
 }
 
 /// Transform prop assignments to getter/setter function call syntax.
@@ -1087,14 +1295,14 @@ pub(super) fn wrap_store_unsub_for_state_sets(
 ///
 /// Note: Update expressions (x++, --x, etc.) are handled by transform_prop_update_expressions
 /// which must be called BEFORE this function.
-pub(super) fn transform_prop_assignments(
-    line: &str,
+pub(super) fn transform_prop_assignments<'a>(
+    line: &'a str,
     prop_vars: &[String],
     non_bindable_prop_vars: &[String],
     prop_invalidate_bodies: &rustc_hash::FxHashMap<String, String>,
-) -> String {
+) -> Cow<'a, str> {
     if prop_vars.is_empty() {
-        return line.to_string();
+        return Cow::Borrowed(line);
     }
 
     // Skip lines that are prop declarations (contain $.prop() or $.rest_props())
@@ -1105,13 +1313,13 @@ pub(super) fn transform_prop_assignments(
     if memmem::find(line.as_bytes(), b"$.prop(").is_some()
         || memmem::find(line.as_bytes(), b"$.rest_props(").is_some()
     {
-        return line.to_string();
+        return Cow::Borrowed(line);
     }
 
     // Quick pre-check: if none of the prop vars appear as identifiers, skip expensive transforms
     let var_set: FxHashSet<&str> = prop_vars.iter().map(|v| v.as_str()).collect();
     if !super::utils::text_contains_any_identifier(line, &var_set) {
-        return line.to_string();
+        return Cow::Borrowed(line);
     }
 
     // Two AST passes — both cover every shape the text loops
@@ -1122,13 +1330,13 @@ pub(super) fn transform_prop_assignments(
     //    member mutations) → `name(name().foo = expr, true)`
     let after_assigns = super::prop_assign_ast::transform_prop_assign_ast(line, prop_vars);
     let stage1: &str = after_assigns.as_deref().unwrap_or(line);
-    super::prop_member_mutate_ast::transform_prop_member_mutate_ast(
+    let mutated = super::prop_member_mutate_ast::transform_prop_member_mutate_ast(
         stage1,
         prop_vars,
         non_bindable_prop_vars,
         prop_invalidate_bodies,
-    )
-    .unwrap_or_else(|| stage1.to_string())
+    );
+    mutated.or(after_assigns).map_or(Cow::Borrowed(line), Cow::Owned)
 }
 
 /// Split a multi-declarator variable statement into individual declarations.
@@ -1149,96 +1357,53 @@ pub(super) fn split_multi_declarator(line: &str) -> Option<Vec<String>> {
         ("var", r)
     };
 
-    // Check if there's a comma at depth 0 (indicating multiple declarators)
+    // Split at every top-level `,`, stopping at a top-level `;`. `code_bytes`
+    // yields only the delimiters that are code, so the text between two cut
+    // points — comments and literals included — is copied verbatim.
     let mut depth = 0;
-    let mut in_string = false;
-    let mut string_char = ' ';
-    let mut has_top_level_comma = false;
-    let chars: Vec<char> = rest.chars().collect();
-
-    for (i, &c) in chars.iter().enumerate() {
-        if (c == '"' || c == '\'' || c == '`') && (i == 0 || chars[i - 1] != '\\') {
-            if !in_string {
-                in_string = true;
-                string_char = c;
-            } else if c == string_char {
-                in_string = false;
-            }
-            continue;
-        }
-        if in_string {
-            continue;
-        }
+    let mut cuts: Vec<(usize, u8)> = Vec::new();
+    for (i, c) in code_bytes(rest.as_bytes()) {
         match c {
-            '(' | '[' | '{' => depth += 1,
-            ')' | ']' | '}' if depth > 0 => {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' if depth > 0 => {
                 depth -= 1;
             }
-            ',' if depth == 0 => {
-                has_top_level_comma = true;
+            b',' if depth == 0 => cuts.push((i, c)),
+            b';' if depth == 0 => {
+                cuts.push((i, c));
                 break;
             }
             _ => {}
         }
     }
 
-    if !has_top_level_comma {
+    if !cuts.iter().any(|&(_, c)| c == b',') {
         return None;
     }
 
-    // Split into declarators at top-level commas
     let mut declarators: Vec<String> = Vec::new();
-    let mut current = String::new();
-    depth = 0;
-    in_string = false;
-    string_char = ' ';
-
-    for (i, &c) in chars.iter().enumerate() {
-        if (c == '"' || c == '\'' || c == '`') && (i == 0 || chars[i - 1] != '\\') {
-            if !in_string {
-                in_string = true;
-                string_char = c;
-            } else if c == string_char {
-                in_string = false;
+    let mut start = 0usize;
+    let mut ended_at_semicolon = false;
+    for &(i, c) in &cuts {
+        let piece = &rest[start..i];
+        if c == b';' {
+            if !piece.trim().is_empty() {
+                declarators.push(piece.trim().to_string());
             }
-            current.push(c);
-            continue;
+            ended_at_semicolon = true;
+        } else {
+            declarators.push(piece.trim().trim_end_matches(';').trim().to_string());
         }
-        if in_string {
-            current.push(c);
-            continue;
-        }
-        match c {
-            '(' | '[' | '{' => {
-                depth += 1;
-                current.push(c);
-            }
-            ')' | ']' | '}' => {
-                if depth > 0 {
-                    depth -= 1;
-                }
-                current.push(c);
-            }
-            ',' if depth == 0 => {
-                // End of current declarator
-                declarators.push(current.trim().trim_end_matches(';').trim().to_string());
-                current = String::new();
-            }
-            ';' if depth == 0 => {
-                // End of statement
-                if !current.trim().is_empty() {
-                    declarators.push(current.trim().to_string());
-                }
-                current = String::new();
-                break;
-            }
-            _ => {
-                current.push(c);
-            }
+        start = i + 1;
+        if ended_at_semicolon {
+            break;
         }
     }
-    if !current.trim().is_empty() {
-        declarators.push(current.trim().trim_end_matches(';').trim().to_string());
+    if !ended_at_semicolon {
+        let piece = &rest[start..];
+        if !piece.trim().is_empty() {
+            declarators.push(piece.trim().trim_end_matches(';').trim().to_string());
+        }
     }
 
     if declarators.len() <= 1 {
@@ -1249,10 +1414,8 @@ pub(super) fn split_multi_declarator(line: &str) -> Option<Vec<String>> {
     let leading_ws: String = line.chars().take_while(|c| c.is_whitespace()).collect();
 
     // Convert to individual declarations
-    let result: Vec<String> = declarators
-        .iter()
-        .map(|d| format!("{}{} {};", leading_ws, keyword, d))
-        .collect();
+    let result: Vec<String> =
+        declarators.iter().map(|d| format!("{}{} {};", leading_ws, keyword, d)).collect();
 
     Some(result)
 }
@@ -1267,11 +1430,12 @@ pub(super) fn split_multi_declarator(line: &str) -> Option<Vec<String>> {
 ///   `let tmp = expr, foo = $.mutable_source(tmp.foo), bar = tmp.bar;`
 ///
 /// Reference: `create_state_declarators` in VariableDeclaration.js
-pub(super) fn transform_legacy_destructure_declarations(
-    statement: &str,
+pub(super) fn transform_legacy_destructure_declarations<'a>(
+    statement: &'a str,
     legacy_state_var_names: &[String],
     immutable: bool,
-) -> String {
+    dev: bool,
+) -> Cow<'a, str> {
     // Only look at the first line to determine if this is a destructuring declaration
     let first_line = statement.lines().next().unwrap_or("");
     let trimmed = first_line.trim();
@@ -1284,14 +1448,14 @@ pub(super) fn transform_legacy_destructure_declarations(
     } else if let Some(r) = trimmed.strip_prefix("var ") {
         ("var", r)
     } else {
-        return statement.to_string();
+        return Cow::Borrowed(statement);
     };
 
     let rest_start = rest_start.trim();
 
     // Check if this is a destructuring pattern (starts with { or [)
     if !rest_start.starts_with('{') && !rest_start.starts_with('[') {
-        return statement.to_string();
+        return Cow::Borrowed(statement);
     }
 
     // For the full pattern matching, we need the complete statement (multi-line)
@@ -1300,26 +1464,15 @@ pub(super) fn transform_legacy_destructure_declarations(
     let rest = full_trimmed[keyword_len..].trim();
 
     let is_object = rest.starts_with('{');
-    let close_bracket = if is_object { '}' } else { ']' };
+    let close_bracket = if is_object { b'}' } else { b']' };
 
     // Find the matching close bracket in the PATTERN (not the expression)
     let mut depth = 0i32;
     let mut pattern_end = None;
-    let mut in_string: Option<char> = None;
-    for (i, c) in rest.chars().enumerate() {
-        if let Some(quote) = in_string {
-            if c == quote && (i == 0 || rest.as_bytes().get(i - 1) != Some(&b'\\')) {
-                in_string = None;
-            }
-            continue;
-        }
-        if c == '\'' || c == '"' || c == '`' {
-            in_string = Some(c);
-            continue;
-        }
-        if c == '{' || c == '[' || c == '(' {
+    for (i, c) in code_bytes(rest.as_bytes()) {
+        if c == b'{' || c == b'[' || c == b'(' {
             depth += 1;
-        } else if c == '}' || c == ']' || c == ')' {
+        } else if c == b'}' || c == b']' || c == b')' {
             depth -= 1;
             if depth == 0 && c == close_bracket {
                 pattern_end = Some(i);
@@ -1330,7 +1483,7 @@ pub(super) fn transform_legacy_destructure_declarations(
 
     let pattern_end = match pattern_end {
         Some(e) => e,
-        None => return statement.to_string(),
+        None => return Cow::Borrowed(statement),
     };
 
     let pattern_str = &rest[..=pattern_end];
@@ -1338,7 +1491,7 @@ pub(super) fn transform_legacy_destructure_declarations(
 
     // Must have `= expr` after the pattern
     if !after_pattern.starts_with('=') {
-        return statement.to_string();
+        return Cow::Borrowed(statement);
     }
 
     let expr = after_pattern[1..].trim().trim_end_matches(';').trim();
@@ -1347,12 +1500,10 @@ pub(super) fn transform_legacy_destructure_declarations(
     let var_names = extract_legacy_destructure_var_names(pattern_str);
 
     // Check if any destructured variable is a state variable
-    let has_state = var_names
-        .iter()
-        .any(|name| legacy_state_var_names.contains(name));
+    let has_state = var_names.iter().any(|name| legacy_state_var_names.contains(name));
 
     if !has_state {
-        return statement.to_string();
+        return Cow::Borrowed(statement);
     }
 
     // Generate tmp variable name
@@ -1361,191 +1512,109 @@ pub(super) fn transform_legacy_destructure_declarations(
         c.set(current + 1);
         current
     });
-    let tmp_name = if tmp_idx == 0 {
-        "tmp".to_string()
-    } else {
-        format!("tmp_{}", tmp_idx)
-    };
+    let tmp_name = if tmp_idx == 0 { "tmp".to_string() } else { format!("tmp_{}", tmp_idx) };
 
     let immutable_arg = if immutable { ", true" } else { "" };
 
-    if is_object {
-        // Object destructuring: { a, b: c, d = default, ...rest }
-        let inner = &pattern_str[1..pattern_str.len() - 1];
-        let props = split_derived_object_properties(inner);
-        let mut parts = vec![format!("{} = {}", tmp_name, expr)];
+    let mut paths = Vec::new();
+    let mut inserts = Vec::new();
+    extract_destructure_paths(
+        pattern_str,
+        &tmp_name,
+        ArrayHelperRead::Signal,
+        &mut paths,
+        &mut inserts,
+    );
 
-        for prop in &props {
-            let prop = prop.trim();
-            if prop.is_empty() {
-                continue;
-            }
-
-            if let Some(rest_name) = prop.strip_prefix("...") {
-                let rest_name = rest_name.trim();
-                parts.push(format!("{} = {}.{}", rest_name, tmp_name, rest_name));
-                continue;
-            }
-
-            if let Some(colon_pos) = find_derived_property_colon(prop) {
-                let key = prop[..colon_pos].trim();
-                let value_part = prop[colon_pos + 1..].trim();
-                let var_name = if let Some(eq_pos) = value_part.find('=') {
-                    value_part[..eq_pos].trim()
-                } else {
-                    value_part
-                };
-
-                let is_state = legacy_state_var_names.contains(&var_name.to_string());
-                let member = format!("{}.{}", tmp_name, key);
-                if is_state {
-                    parts.push(format!(
-                        "{} = $.mutable_source({}{})",
-                        var_name, member, immutable_arg
-                    ));
-                } else {
-                    parts.push(format!("{} = {}", var_name, member));
-                }
-            } else {
-                let var_name = if let Some(eq_pos) = prop.find('=') {
-                    prop[..eq_pos].trim()
-                } else {
-                    prop
-                };
-
-                let is_state = legacy_state_var_names.contains(&var_name.to_string());
-                let member = format!("{}.{}", tmp_name, var_name);
-                if is_state {
-                    parts.push(format!(
-                        "{} = $.mutable_source({}{})",
-                        var_name, member, immutable_arg
-                    ));
-                } else {
-                    parts.push(format!("{} = {}", var_name, member));
-                }
-            }
+    // Upstream emits `tmp`, then every `$$array` insert, then every path.
+    let mut parts = vec![format!("{} = {}", tmp_name, expr)];
+    parts.extend(
+        inserts.into_iter().map(|(name, value)| format!("{} = $.derived(() => {})", name, value)),
+    );
+    for (name, access) in paths {
+        if legacy_state_var_names.contains(&name) {
+            let source = format!("$.mutable_source({}{})", access, immutable_arg);
+            parts.push(format!("{} = {}", name, tag_legacy_source(source, &name, dev)));
+        } else {
+            parts.push(format!("{} = {}", name, access));
         }
+    }
 
-        let trailing = if full_trimmed.ends_with(';') { ";" } else { "" };
-        format!("{} {}{}", keyword, parts.join(", "), trailing)
+    let trailing = if full_trimmed.ends_with(';') { ";" } else { "" };
+    Cow::Owned(format!("{} {}{}", keyword, parts.join(", "), trailing))
+}
+
+/// Every name bound by a destructuring pattern, nested leaves included.
+pub(super) fn extract_legacy_destructure_var_names(pattern: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    collect_legacy_destructure_var_names(pattern, &mut names);
+    names
+}
+
+fn collect_legacy_destructure_var_names(pattern: &str, names: &mut Vec<String>) {
+    let pattern = pattern.trim();
+    if pattern.is_empty() {
+        return;
+    }
+
+    if let Some(rest_target) = pattern.strip_prefix("...") {
+        collect_legacy_destructure_var_names(rest_target, names);
+        return;
+    }
+    if let Some(eq_pos) = find_default_equals(pattern) {
+        collect_legacy_destructure_var_names(&pattern[..eq_pos], names);
+        return;
+    }
+
+    if pattern.starts_with('{') && pattern.ends_with('}') {
+        for prop in split_derived_object_properties(&pattern[1..pattern.len() - 1]) {
+            let value = match find_derived_property_colon(&prop) {
+                Some(colon_pos) => &prop[colon_pos + 1..],
+                None => prop.as_str(),
+            };
+            collect_legacy_destructure_var_names(value, names);
+        }
+    } else if pattern.starts_with('[') && pattern.ends_with(']') {
+        for element in split_derived_array_elements(&pattern[1..pattern.len() - 1]) {
+            collect_legacy_destructure_var_names(&element, names);
+        }
     } else {
-        // Array destructuring: [a, b, ...rest]
-        let inner = &pattern_str[1..pattern_str.len() - 1];
-        let elements = split_derived_array_elements(inner);
-
-        let has_rest = elements.iter().any(|e| e.trim().starts_with("..."));
-        let element_count = elements.len();
-
-        let global_counter = SCRIPT_ARRAY_COUNTER.with(|c| {
-            let current = c.get();
-            c.set(current + 1);
-            current
-        });
-
-        let array_var = if global_counter == 0 {
-            "$$array".to_string()
-        } else {
-            format!("$$array_{}", global_counter)
-        };
-
-        let to_array_args = if has_rest {
-            format!("$.to_array({})", tmp_name)
-        } else {
-            format!("$.to_array({}, {})", tmp_name, element_count)
-        };
-
-        let mut parts = vec![
-            format!("{} = {}", tmp_name, expr),
-            format!("{} = $.derived(() => {})", array_var, to_array_args),
-        ];
-
-        for (i, element) in elements.iter().enumerate() {
-            let element = element.trim();
-            if element.is_empty() {
-                continue;
-            }
-
-            if let Some(rest_name) = element.strip_prefix("...") {
-                let rest_name = rest_name.trim();
-                let access = format!("$.get({}).slice({})", array_var, i);
-                let is_state = legacy_state_var_names.contains(&rest_name.to_string());
-                if is_state {
-                    parts.push(format!(
-                        "{} = $.mutable_source({}{})",
-                        rest_name, access, immutable_arg
-                    ));
-                } else {
-                    parts.push(format!("{} = {}", rest_name, access));
-                }
-                continue;
-            }
-
-            let access = format!("$.get({})[{}]", array_var, i);
-            let is_state = legacy_state_var_names.contains(&element.to_string());
-            if is_state {
-                parts.push(format!(
-                    "{} = $.mutable_source({}{})",
-                    element, access, immutable_arg
-                ));
-            } else {
-                parts.push(format!("{} = {}", element, access));
-            }
-        }
-
-        let trailing = if full_trimmed.ends_with(';') { ";" } else { "" };
-        format!("{} {}{}", keyword, parts.join(", "), trailing)
+        names.push(pattern.to_string());
     }
 }
 
-/// Extract variable names from a destructuring pattern.
-pub(super) fn extract_legacy_destructure_var_names(pattern: &str) -> Vec<String> {
-    let mut names = Vec::new();
-    let pattern = pattern.trim();
-
-    if pattern.starts_with('{') && pattern.ends_with('}') {
-        let inner = &pattern[1..pattern.len() - 1];
-        let props = split_derived_object_properties(inner);
-        for prop in &props {
-            let prop = prop.trim();
-            if prop.is_empty() {
-                continue;
-            }
-            if let Some(rest_name) = prop.strip_prefix("...") {
-                names.push(rest_name.trim().to_string());
-            } else if let Some(colon_pos) = find_derived_property_colon(prop) {
-                let value_part = prop[colon_pos + 1..].trim();
-                let var_name = if let Some(eq_pos) = value_part.find('=') {
-                    value_part[..eq_pos].trim()
-                } else {
-                    value_part
-                };
-                names.push(var_name.to_string());
-            } else {
-                let var_name = if let Some(eq_pos) = prop.find('=') {
-                    prop[..eq_pos].trim()
-                } else {
-                    prop
-                };
-                names.push(var_name.to_string());
-            }
-        }
-    } else if pattern.starts_with('[') && pattern.ends_with(']') {
-        let inner = &pattern[1..pattern.len() - 1];
-        let elements = split_derived_array_elements(inner);
-        for el in &elements {
-            let el = el.trim();
-            if el.is_empty() {
-                continue;
-            }
-            if let Some(rest_name) = el.strip_prefix("...") {
-                names.push(rest_name.trim().to_string());
-            } else {
-                names.push(el.to_string());
-            }
-        }
+/// Whether a statement is the chained `<keyword> tmp = expr, … ` expansion built
+/// by `transform_legacy_destructure_declarations`; those must not be split into
+/// one declaration per declarator, because the later ones read the `tmp` /
+/// `$$array` helpers declared alongside them.
+fn is_legacy_destructure_expansion(line: &str) -> bool {
+    if memmem::find(line.as_bytes(), b"$.mutable_source(").is_none() {
+        return false;
     }
+    let trimmed = line.trim_start();
+    let after_keyword = ["let ", "const ", "var "].iter().find_map(|kw| trimmed.strip_prefix(kw));
+    let Some(rest) = after_keyword.and_then(|rest| rest.trim_start().strip_prefix("tmp")) else {
+        return false;
+    };
+    let rest = rest.trim_start_matches(|c: char| c == '_' || c.is_ascii_digit());
+    rest.trim_start().starts_with('=')
+}
 
-    names
+/// Dev-mode `$.tag(<source>, '<name>')` label for a legacy state source.
+///
+/// Only declarations reaching this emitter are tagged: `legacy_reactive`
+/// sources (`$: x = …`) are built as AST elsewhere and upstream leaves those
+/// untagged even though they print the same `$.mutable_source()` call.
+/// A line comment swallows the rest of its line, so when an initializer ends
+/// inside one the generated `)` has to start on the next line — upstream breaks
+/// the line for the same reason.
+fn break_after_line_comment(expr: &str) -> &'static str {
+    let last_line = expr.rsplit('\n').next().unwrap_or(expr);
+    if super::props_transforms::find_line_comment_position(last_line).is_some() { "\n" } else { "" }
+}
+
+fn tag_legacy_source(call: String, name: &str, dev: bool) -> String {
+    if dev { format!("$.tag({}, '{}')", call, name) } else { call }
 }
 
 /// Transform legacy state declarations to $.mutable_source() calls.
@@ -1558,32 +1627,41 @@ pub(super) fn extract_legacy_destructure_var_names(pattern: &str) -> Vec<String>
 /// - `let state = 'foo'` → `let state = $.mutable_source('foo')`
 /// - `let count = 0` → `let count = $.mutable_source(0)`
 /// - `const arr = [1, 2]` → `const arr = $.mutable_source([1, 2])`
-pub(super) fn transform_legacy_state_declarations(
-    line: &str,
+pub(super) fn transform_legacy_state_declarations<'a>(
+    line: &'a str,
     legacy_state_vars: &[(String, Option<String>, DeclarationKind)],
     immutable: bool,
-) -> String {
+    dev: bool,
+) -> Cow<'a, str> {
     if legacy_state_vars.is_empty() {
-        return line.to_string();
+        return Cow::Borrowed(line);
     }
 
     // Handle multi-declarator statements like `let a = 1, b = 2, c = 3;`
     // Split into individual declarations first to handle each one separately.
     // BUT skip declarations produced by transform_legacy_destructure_declarations
     // (which chain `tmp = expr, foo = $.mutable_source(tmp.foo), ...` and must stay chained).
-    let is_destructure_expansion = memmem::find(line.as_bytes(), b"$.mutable_source(tmp").is_some()
-        || memmem::find(line.as_bytes(), b"$.mutable_source(tmp_").is_some();
-    if !is_destructure_expansion && let Some(split_lines) = split_multi_declarator(line) {
-        let transformed_lines: Vec<String> = split_lines
+    if !is_legacy_destructure_expansion(line)
+        && let Some(split_lines) = split_multi_declarator(line)
+    {
+        // The split itself re-renders the statement, so this branch answers with
+        // its own text even when no declarator was rewritten.
+        let transformed_lines: Vec<Cow<'_, str>> = split_lines
             .iter()
-            .map(|l| transform_legacy_state_declarations(l, legacy_state_vars, immutable))
+            .map(|l| transform_legacy_state_declarations(l, legacy_state_vars, immutable, dev))
             .collect();
-        return transformed_lines.join("\n");
+        return Cow::Owned(transformed_lines.join("\n"));
     }
 
-    let mut result = line.to_string();
+    let mut result = Cow::Borrowed(line);
 
     for (var, _initial, decl_kind) in legacy_state_vars {
+        // Every pattern below is `"<keyword> <var>…"`, so one scan rules the whole
+        // variable out instead of formatting and searching four needles per keyword.
+        if memmem::find(result.as_bytes(), var.as_bytes()).is_none() {
+            continue;
+        }
+
         // Determine the keyword(s) to look for based on declaration kind
         let keywords: Vec<&str> = match decl_kind {
             DeclarationKind::Let => vec!["let"],
@@ -1632,7 +1710,8 @@ pub(super) fn transform_legacy_state_declarations(
                     // Check if this declaration is inside a for-loop header.
                     // Scan backwards from `pos` to see if we find `for (` with unmatched parens.
                     let chars: Vec<char> = result.chars().collect();
-                    let char_pos = byte_pos_to_char_index(&result, pos + keyword.len() + 1);
+                    let byte_pos = ByteOffset::new(pos) + ByteLen::of(keyword) + ByteLen::ONE;
+                    let char_pos = byte_pos_to_char_index(&result, byte_pos);
                     if is_shadowed_by_for_loop_var(&chars, char_pos, var) {
                         // This `let x = ...` is inside a for-loop header, skip it
                         search_offset = pos + pattern_with_init.len();
@@ -1644,19 +1723,25 @@ pub(super) fn transform_legacy_state_declarations(
                     let expr = after[..expr_end].trim().trim_end_matches(';').trim();
 
                     // Build the replacement
-                    let replacement = if immutable {
-                        format!("{} {} = $.mutable_source({}, true)", keyword, var, expr)
+                    let call = if immutable {
+                        format!(
+                            "$.mutable_source({}{}, true)",
+                            expr,
+                            break_after_line_comment(expr)
+                        )
                     } else {
-                        format!("{} {} = $.mutable_source({})", keyword, var, expr)
+                        format!("$.mutable_source({}{})", expr, break_after_line_comment(expr))
                     };
+                    let replacement =
+                        format!("{} {} = {}", keyword, var, tag_legacy_source(call, var, dev));
 
                     // Replace the declaration
-                    result = format!(
+                    result = Cow::Owned(format!(
                         "{}{}{}",
                         &result[..pos],
                         replacement,
                         &result[pos + pattern_with_init.len() + ws + expr_end..]
-                    );
+                    ));
                     matched = true;
                     break;
                 }
@@ -1676,18 +1761,16 @@ pub(super) fn transform_legacy_state_declarations(
                 if let Some(pos) = result.find(pat.as_str()) {
                     // Find the `=` that ends the type annotation, respecting nested braces/brackets.
                     let type_start = pos + pat.len();
-                    let chars: Vec<char> = result[type_start..].chars().collect();
                     let mut depth = 0i32;
                     let mut eq_pos: Option<usize> = None;
-                    let mut j = 0;
-                    while j < chars.len() {
-                        let c = chars[j];
+                    let mut iter = result[type_start..].char_indices().peekable();
+                    while let Some((j, c)) = iter.next() {
                         match c {
                             '{' | '[' | '(' | '<' => depth += 1,
                             '}' | ']' | ')' | '>' => depth -= 1,
                             '=' if depth == 0 => {
                                 // Make sure it's not `==` or `=>`
-                                let next = chars.get(j + 1).copied();
+                                let next = iter.peek().map(|&(_, ch)| ch);
                                 if !matches!(next, Some('=') | Some('>')) {
                                     eq_pos = Some(j);
                                     break;
@@ -1696,7 +1779,6 @@ pub(super) fn transform_legacy_state_declarations(
                             ';' | '\n' if depth == 0 => break,
                             _ => {}
                         }
-                        j += 1;
                     }
                     if let Some(eq) = eq_pos {
                         let after_eq = type_start + eq + 1;
@@ -1711,17 +1793,23 @@ pub(super) fn transform_legacy_state_declarations(
                         let after = &after_raw[ws..];
                         let expr_end = find_statement_end_client(after);
                         let expr = after[..expr_end].trim().trim_end_matches(';').trim();
-                        let replacement = if immutable {
-                            format!("{} {} = $.mutable_source({}, true)", keyword, var, expr)
+                        let call = if immutable {
+                            format!(
+                                "$.mutable_source({}{}, true)",
+                                expr,
+                                break_after_line_comment(expr)
+                            )
                         } else {
-                            format!("{} {} = $.mutable_source({})", keyword, var, expr)
+                            format!("$.mutable_source({}{})", expr, break_after_line_comment(expr))
                         };
-                        result = format!(
+                        let replacement =
+                            format!("{} {} = {}", keyword, var, tag_legacy_source(call, var, dev));
+                        result = Cow::Owned(format!(
                             "{}{}{}",
                             &result[..pos],
                             replacement,
                             &result[after_eq + ws + expr_end..]
-                        );
+                        ));
                         matched = true;
                         break;
                     }
@@ -1740,7 +1828,8 @@ pub(super) fn transform_legacy_state_declarations(
 
                     // Check if this declaration is inside a for-loop header
                     let chars: Vec<char> = result.chars().collect();
-                    let char_pos = byte_pos_to_char_index(&result, pos + keyword.len() + 1);
+                    let byte_pos = ByteOffset::new(pos) + ByteLen::of(keyword) + ByteLen::ONE;
+                    let char_pos = byte_pos_to_char_index(&result, byte_pos);
                     if is_shadowed_by_for_loop_var(&chars, char_pos, var) {
                         search_offset = pos + pattern_no_init.len();
                         continue;
@@ -1748,19 +1837,21 @@ pub(super) fn transform_legacy_state_declarations(
 
                     // Build the replacement - no initial value, so pass nothing to $.mutable_source()
                     // (upstream emits `void 0`, not the `undefined` identifier).
-                    let replacement = if immutable {
-                        format!("{} {} = $.mutable_source(void 0, true);", keyword, var)
+                    let call = if immutable {
+                        "$.mutable_source(void 0, true)".to_string()
                     } else {
-                        format!("{} {} = $.mutable_source();", keyword, var)
+                        "$.mutable_source()".to_string()
                     };
+                    let replacement =
+                        format!("{} {} = {};", keyword, var, tag_legacy_source(call, var, dev));
 
                     // Replace the declaration
-                    result = format!(
+                    result = Cow::Owned(format!(
                         "{}{}{}",
                         &result[..pos],
                         replacement,
                         &result[pos + pattern_no_init.len()..]
-                    );
+                    ));
                     matched = true;
                     break;
                 }
@@ -1786,16 +1877,15 @@ pub(super) fn transform_legacy_state_declarations(
 
                     // Check if this declaration is inside a for-loop header
                     let chars: Vec<char> = result.chars().collect();
-                    let char_pos = byte_pos_to_char_index(&result, pos + keyword.len() + 1);
+                    let byte_pos = ByteOffset::new(pos) + ByteLen::of(keyword) + ByteLen::ONE;
+                    let char_pos = byte_pos_to_char_index(&result, byte_pos);
                     if is_shadowed_by_for_loop_var(&chars, char_pos, var) {
                         search_offset = pos + pattern_no_semi.len();
                         continue;
                     }
 
                     if after_pos < result.len()
-                        && result[after_pos..]
-                            .trim_start()
-                            .starts_with("= $.mutable_source(")
+                        && result[after_pos..].trim_start().starts_with("= $.mutable_source(")
                     {
                         matched = true;
                         break;
@@ -1817,26 +1907,39 @@ pub(super) fn transform_legacy_state_declarations(
                         let after = &result[after_eq..];
                         let expr_end = find_statement_end_client(after);
                         let expr = after[..expr_end].trim().trim_end_matches(';').trim();
-                        let replacement = if immutable {
-                            format!("{} {} = $.mutable_source({}, true)", keyword, var, expr)
+                        let call = if immutable {
+                            format!(
+                                "$.mutable_source({}{}, true)",
+                                expr,
+                                break_after_line_comment(expr)
+                            )
                         } else {
-                            format!("{} {} = $.mutable_source({})", keyword, var, expr)
+                            format!("$.mutable_source({}{})", expr, break_after_line_comment(expr))
                         };
-                        result = format!(
+                        let replacement =
+                            format!("{} {} = {}", keyword, var, tag_legacy_source(call, var, dev));
+                        result = Cow::Owned(format!(
                             "{}{}{}",
                             &result[..pos],
                             replacement,
                             &result[after_eq + expr_end..]
-                        );
+                        ));
                         matched = true;
                         break;
                     }
-                    let replacement = if immutable {
-                        format!("{} {} = $.mutable_source(void 0, true)", keyword, var)
+                    let call = if immutable {
+                        "$.mutable_source(void 0, true)".to_string()
                     } else {
-                        format!("{} {} = $.mutable_source()", keyword, var)
+                        "$.mutable_source()".to_string()
                     };
-                    result = format!("{}{}{}", &result[..pos], replacement, &result[after_pos..]);
+                    let replacement =
+                        format!("{} {} = {}", keyword, var, tag_legacy_source(call, var, dev));
+                    result = Cow::Owned(format!(
+                        "{}{}{}",
+                        &result[..pos],
+                        replacement,
+                        &result[after_pos..]
+                    ));
                     matched = true;
                     break;
                 }
@@ -1845,4 +1948,218 @@ pub(super) fn transform_legacy_state_declarations(
     }
 
     result
+}
+
+#[cfg(test)]
+mod scan_lexing_tests {
+    use super::{
+        body_references_identifier, split_multi_declarator,
+        transform_legacy_destructure_declarations,
+    };
+
+    #[test]
+    fn apostrophe_in_a_line_comment_does_not_blank_the_code_after_it() {
+        // `don't` must not open a string literal and swallow the following read.
+        assert!(body_references_identifier("a = 1; // don't\nb = width", "width"));
+    }
+
+    #[test]
+    fn apostrophe_in_a_regex_literal_does_not_blank_the_code_after_it() {
+        // `replace(/'/g, …)` — the quote is regex source, not a string opener.
+        assert!(body_references_identifier(
+            "a = raw.replace(/'/g, \"&#39;\");\nb = width",
+            "width"
+        ));
+    }
+
+    #[test]
+    fn a_division_after_a_value_is_not_read_as_a_regex() {
+        // Negative control for the regex arm: a `/` after a value divides, so the
+        // bytes after it are still code.
+        assert!(body_references_identifier("a = n / 2;\nb = width", "width"));
+    }
+
+    #[test]
+    fn brace_in_a_block_comment_does_not_close_a_shadowing_function() {
+        // `a` is a parameter of the arrow, so it is shadowed, not a dependency —
+        // the `}` inside the comment must not end the body early.
+        assert!(!body_references_identifier("f((a) => { /* } */ return a; })", "a"));
+    }
+
+    #[test]
+    fn brace_in_a_line_comment_does_not_close_a_shadowing_function() {
+        assert!(!body_references_identifier("f(function (a) {\n\t// }\n\treturn a;\n})", "a"));
+    }
+
+    #[test]
+    fn brace_in_a_comment_does_not_merge_two_statements() {
+        // Two statements; `x` is only ever assigned, so it is not a dependency.
+        // A `{` inside the comment must not raise the depth and swallow the `;`,
+        // which would fold both statements into one and read `x` off the RHS.
+        assert!(!body_references_identifier("{ y = 1 /* { */; x = 2 }", "x"));
+    }
+
+    #[test]
+    fn comma_in_a_comment_does_not_split_declarators() {
+        assert_eq!(split_multi_declarator("let a = 1 /* , */ + 2;"), None);
+    }
+
+    #[test]
+    fn non_ascii_identifier_in_a_destructure_pattern_does_not_panic() {
+        // The pattern scan enumerated chars but sliced by bytes.
+        let out = transform_legacy_destructure_declarations(
+            "let { ああ } = obj;",
+            &["ああ".to_string()],
+            false,
+            false,
+        );
+        assert!(out.contains("ああ"), "got: {out}");
+    }
+
+    #[test]
+    fn brace_in_a_comment_does_not_end_a_destructure_pattern() {
+        let out = transform_legacy_destructure_declarations(
+            "let { a = 1 /* } */ } = obj;",
+            &["a".to_string()],
+            false,
+            false,
+        );
+        assert!(out.contains("$.mutable_source("), "got: {out}");
+    }
+}
+
+#[cfg(test)]
+mod non_ascii_tests {
+    use super::{
+        body_references_identifier, byte_pos_to_char_index, transform_legacy_state_declarations,
+    };
+    use crate::compiler::phases::phase2_analyze::scope::DeclarationKind;
+    use crate::compiler::phases::phase3_transform::shared::offsets::{ByteOffset, CharOffset};
+
+    #[test]
+    fn body_references_identifier_handles_non_ascii_statement() {
+        // A non-ASCII token before a `;`/newline statement boundary must not panic
+        // when scanning statements (byte vs char index).
+        assert!(body_references_identifier("café; return count", "count"));
+        assert!(!body_references_identifier("café; return other", "count"));
+    }
+
+    #[test]
+    fn byte_position_conversion_is_typed_after_non_ascii() {
+        assert_eq!(
+            byte_pos_to_char_index("名let", ByteOffset::new("名".len())),
+            CharOffset::new(1),
+        );
+    }
+
+    #[test]
+    fn transform_legacy_state_declarations_handles_non_ascii_type() {
+        // `let x: Café = 0` — the `=` sits past a multi-byte char in the type
+        // annotation; slicing must use byte offsets (no panic).
+        let vars = vec![("x".to_string(), None, DeclarationKind::Let)];
+        let out = transform_legacy_state_declarations("let x: Café = 0", &vars, false, false);
+        assert!(out.contains("$.mutable_source(0)"), "got: {out}");
+    }
+
+    #[test]
+    fn for_loop_shadow_scan_converts_a_byte_position_after_non_ascii() {
+        let vars = vec![("x".to_string(), None, DeclarationKind::Let)];
+        let out = transform_legacy_state_declarations("名(); let x = 0;", &vars, false, false);
+        assert_eq!(out, "名(); let x = $.mutable_source(0);");
+    }
+}
+
+#[cfg(test)]
+mod colon_depth0_tests {
+    use super::*;
+
+    #[test]
+    fn colon_position_is_a_byte_offset() {
+        // The caller slices `&str` with this, so it must be a byte offset.
+        let expr = "\"ああa\" : x";
+        let pos = find_colon_at_depth0(expr).unwrap();
+        assert_eq!(pos, expr.find(':').unwrap());
+    }
+
+    #[test]
+    fn colon_in_comment_is_not_depth0() {
+        assert_eq!(find_colon_at_depth0("a /* : */ : b"), Some(10));
+        assert_eq!(find_colon_at_depth0("a // : b"), None);
+    }
+
+    #[test]
+    fn identifier_matcher_agrees_with_the_regex_it_replaced() {
+        // The pattern this matcher encodes, kept here so the two can be
+        // compared rather than the rule being restated in prose.
+        fn reference_regex(identifier: &str) -> regex::Regex {
+            let preceding = if identifier.starts_with("$$") {
+                r"[^a-zA-Z0-9_$]"
+            } else {
+                r"[^a-zA-Z0-9_$\.]|\.\.\."
+            };
+            regex::Regex::new(&format!(
+                r"(^|{}){}([^a-zA-Z0-9_$]|$)",
+                preceding,
+                regex::escape(identifier)
+            ))
+            .unwrap()
+        }
+
+        let cases = [
+            ("count", "count + 1"),
+            ("count", "$count * 2"),
+            ("count", "counter + 1"),
+            ("count", "obj.count"),
+            ("count", "f(...count)"),
+            ("count", "a.b.count"),
+            ("count", "{ count }"),
+            ("count", "count"),
+            ("count", ""),
+            ("count", "\u{3042}count\u{3042}"),
+            ("count", "acount"),
+            ("count", "count.value"),
+            ("$foo", "bar = $foo"),
+            ("$foo", "bar = $foobar"),
+            ("$$restProps", "{ ...$$restProps }"),
+            ("$$restProps", "$$restPropsX"),
+            ("$$props", "a.$$props"),
+            ("x", "xx x xx"),
+            ("aa", "aaa"),
+            ("aa", "aa"),
+        ];
+        for (identifier, text) in cases {
+            assert_eq!(
+                IdentifierMatcher::new(identifier).is_match(text),
+                reference_regex(identifier).is_match(text),
+                "identifier {identifier:?} in {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ternary_branch_split_survives_non_ascii() {
+        let re = IdentifierMatcher::new("component");
+        // `cond ? component = "ああa" : component = other`
+        let stmt = "cond ? component = \"ああa\" : component = other";
+        let _ = check_identifier_in_statement(stmt, "component", &re);
+    }
+}
+
+#[cfg(test)]
+mod prefilter_tests {
+    use super::*;
+
+    #[test]
+    fn transform_legacy_state_declarations_leaves_an_absent_name_alone() {
+        // The scan that rules a variable out has to agree with the four
+        // `"<keyword> <var>…"` patterns it stands in for.
+        let vars = vec![
+            ("absent".to_string(), None, DeclarationKind::Let),
+            ("x".to_string(), None, DeclarationKind::Let),
+        ];
+        let out = transform_legacy_state_declarations("let x = 1;", &vars, false, false);
+        assert_eq!(out, "let x = $.mutable_source(1);");
+        let untouched = transform_legacy_state_declarations("foo();", &vars, false, false);
+        assert_eq!(untouched, "foo();");
+    }
 }

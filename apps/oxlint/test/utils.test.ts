@@ -1,7 +1,3 @@
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join as pathJoin } from "node:path";
-
 import { describe, it, expect, beforeEach } from "vitest";
 import {
   PATH_REGEXP,
@@ -10,9 +6,6 @@ import {
   normalizeStdout,
   convertSubPath,
   convertFixturesSubPath,
-  getMissingPackages,
-  getMissingPackagesForFixture,
-  getMissingPackagesFromImportError,
 } from "./utils.ts";
 
 describe("PATH_REGEXP", () => {
@@ -191,71 +184,6 @@ describe("convertSubPath", () => {
   it("handles different fixture in fixtures directory", () => {
     const result = convertSubPath(`${FIXTURES_SUBPATH}/other-fixture/file.js`, fixtureName);
     expect(result).toBe("<fixtures>/other-fixture/file.js");
-  });
-});
-
-describe("getMissingPackages", () => {
-  const fixtureDir = `${NORMALIZED_REPO_ROOT}/apps/oxlint`;
-
-  it("returns an empty array when all packages can be imported from the provided directory", () => {
-    expect(getMissingPackages(["oxc-parser"], fixtureDir)).toEqual([]);
-  });
-
-  it("returns only packages that cannot be imported", () => {
-    expect(
-      getMissingPackages(["oxc-parser", "definitely-not-a-real-package"], fixtureDir),
-    ).toEqual(["definitely-not-a-real-package"]);
-  });
-});
-
-describe("getMissingPackagesFromImportError", () => {
-  it("maps missing subpath imports back to their package names", () => {
-    const errorText =
-      "Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'svelte/compiler' imported from /tmp/fixture/oxlint.config.ts";
-
-    expect(
-      getMissingPackagesFromImportError(errorText, ["svelte", "svelte-eslint-parser"]),
-    ).toEqual(["svelte"]);
-  });
-
-  it("ignores unrelated import failures", () => {
-    const errorText =
-      "Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'another-package' imported from /tmp/fixture/oxlint.config.ts";
-
-    expect(getMissingPackagesFromImportError(errorText, ["svelte-eslint-parser"])).toEqual([]);
-  });
-});
-
-describe("getMissingPackagesForFixture", () => {
-  it("treats config-local missing package imports as optional-package skips", async () => {
-    const fixtureDir = await mkdtemp(pathJoin(tmpdir(), "oxlint-fixture-"));
-
-    try {
-      await mkdir(pathJoin(fixtureDir, "files"));
-      await writeFile(
-        pathJoin(fixtureDir, "oxlint.config.ts"),
-        'import "definitely-not-a-real-package";\nexport default {};\n',
-      );
-
-      const missingPackages = getMissingPackagesForFixture({
-        name: "temp-fixture",
-        dirPath: fixtureDir,
-        options: {
-          oxlint: true,
-          eslint: false,
-          fix: false,
-          fixSuggestions: false,
-          singleThread: false,
-          cwd: null,
-          args: [],
-          requiredPackages: ["definitely-not-a-real-package"],
-        },
-      });
-
-      expect(missingPackages).toEqual(["definitely-not-a-real-package"]);
-    } finally {
-      await rm(fixtureDir, { recursive: true, force: true });
-    }
   });
 });
 

@@ -8,15 +8,19 @@
 //! between an inline hug and a fresh-line break depends on column-aware
 //! measurement of the surrounding content.
 
-use unicode_width::UnicodeWidthStr;
+use crate::width::{IndentUnit, VisualWidth};
+
+fn signed_width(width: usize) -> isize {
+    isize::try_from(width).expect("document width exceeds isize range")
+}
 
 // Several variants below (`Literalline`, `ForcedGroup`, `Dedent`, `BreakParent`)
 // and `propagate_breaks` are the IR scaffolding for the prettier-plugin-svelte
-// child-layout port (see docs/fmt-layout-port-plan.md); they are exercised by
-// unit tests here and consumed by the markup child-printer in the next milestone.
+// child-layout port; they are exercised by unit tests here and consumed by the
+// markup child-printer.
 #[derive(Clone)]
 #[allow(dead_code)]
-pub(crate) enum Doc {
+pub enum Doc {
     Text(String),
     /// flat: a space; break: newline + indent.
     Line,
@@ -27,18 +31,18 @@ pub(crate) enum Doc {
     /// always a raw newline with NO indentation (prettier's `literalline`) —
     /// for verbatim content such as `<pre>` bodies.
     Literalline,
-    Group(Vec<Doc>),
+    Group(Vec<Self>),
     /// A group already forced into break mode (prettier's broken group, produced
     /// by [`propagate_breaks`] from a group containing a [`Doc::BreakParent`] or a
     /// hard break). Never measured with `fits`.
-    ForcedGroup(Vec<Doc>),
-    Indent(Vec<Doc>),
+    ForcedGroup(Vec<Self>),
+    Indent(Vec<Self>),
     /// `-1` indent level for its contents (prettier's `dedent`) — puts a wrapped
     /// open tag's trailing `>` back at the outer column.
-    Dedent(Vec<Doc>),
+    Dedent(Vec<Self>),
     /// Alternating `[content, sep, content, sep, …]` greedily packed.
-    Fill(Vec<Doc>),
-    Concat(Vec<Doc>),
+    Fill(Vec<Self>),
+    Concat(Vec<Self>),
     /// A pre-formatted embedded expression (`{expr}`) whose JS was formatted by
     /// the external engine (oxc) into a string, not a Doc. In `Flat` mode it
     /// prints `flat`; in `Break` mode it prints `broken` — the multi-line form,
@@ -68,37 +72,76 @@ enum Mode {
 /// line begins at (so `fits` measures correctly when the output is spliced after
 /// a prefix). The first line is NOT prefixed with indentation — the caller owns
 /// that.
-pub(crate) fn print(
-    doc: Doc,
+pub fn print(
+    doc: &Doc,
     width: usize,
-    unit: &str,
+    unit: IndentUnit,
     base_indent: usize,
     start_col: usize,
 ) -> String {
+    print_inner(doc, width, unit, base_indent, start_col, Mode::Break)
+}
+
+/// Like [`print`] but starts in flat mode — the byte-for-byte equivalent of
+/// printing `Group([doc])` at infinite width, without cloning `doc` into a
+/// wrapper group. Used by the collapse pass's one-line fit test.
+pub fn print_flat(
+    doc: &Doc,
+    width: usize,
+    unit: IndentUnit,
+    base_indent: usize,
+    start_col: usize,
+) -> String {
+    print_inner(doc, width, unit, base_indent, start_col, Mode::Flat)
+}
+
+/// A pending print command: a doc to render at an indent/mode, or a `Fill`
+/// continuation over a borrowed slice — the greedy fill advances by re-pushing
+/// the tail slice instead of allocating a fresh `Doc::Fill` each step.
+enum Cmd<'a> {
+    Doc(usize, Mode, &'a Doc),
+    Fill(usize, Mode, &'a [Doc]),
+}
+
+fn print_inner(
+    doc: &Doc,
+    width: usize,
+    unit: IndentUnit,
+    base_indent: usize,
+    start_col: usize,
+    start_mode: Mode,
+) -> String {
     let mut out = String::new();
     let mut pos = start_col;
-    let mut cmds: Vec<(usize, Mode, Doc)> = vec![(base_indent, Mode::Break, doc)];
+    let mut cmds: Vec<Cmd> = vec![Cmd::Doc(base_indent, start_mode, doc)];
 
-    while let Some((ind, mode, d)) = cmds.pop() {
+    while let Some(cmd) = cmds.pop() {
+        let (ind, mode, d) = match cmd {
+            Cmd::Doc(ind, mode, d) => (ind, mode, d),
+            Cmd::Fill(ind, mode, ps) => {
+                print_fill(ind, mode, ps, width, pos, unit, &mut cmds);
+                continue;
+            }
+        };
         match d {
             Doc::Text(s) => {
-                pos += s.width();
-                out.push_str(&s);
+                pos += s.visual_width(unit.tab_width());
+                out.push_str(s);
             }
             Doc::Concat(ps) => {
-                for p in ps.into_iter().rev() {
-                    cmds.push((ind, mode, p));
+                for p in ps.iter().rev() {
+                    cmds.push(Cmd::Doc(ind, mode, p));
                 }
             }
             Doc::Indent(ps) => {
-                for p in ps.into_iter().rev() {
-                    cmds.push((ind + 1, mode, p));
+                for p in ps.iter().rev() {
+                    cmds.push(Cmd::Doc(ind + 1, mode, p));
                 }
             }
             Doc::Dedent(ps) => {
                 let de = ind.saturating_sub(1);
-                for p in ps.into_iter().rev() {
-                    cmds.push((de, mode, p));
+                for p in ps.iter().rev() {
+                    cmds.push(Cmd::Doc(de, mode, p));
                 }
             }
             Doc::Line | Doc::Softline | Doc::Hardline => {
@@ -112,9 +155,7 @@ pub(crate) fn print(
                 } else {
                     trim_trailing_blanks(&mut out);
                     out.push('\n');
-                    let pad = unit.repeat(ind);
-                    out.push_str(&pad);
-                    pos = pad.width();
+                    pos = push_indent(&mut out, unit, ind);
                 }
             }
             Doc::Literalline => {
@@ -125,94 +166,90 @@ pub(crate) fn print(
             }
             Doc::RawExpr { flat, broken } => {
                 if mode == Mode::Flat || broken.len() <= 1 {
-                    pos += flat.width();
-                    out.push_str(&flat);
+                    pos += flat.visual_width(unit.tab_width());
+                    out.push_str(flat);
                 } else {
-                    let pad = unit.repeat(ind);
-                    let mut lines = broken.into_iter();
+                    let mut lines = broken.iter();
                     if let Some(first) = lines.next() {
-                        pos += first.width();
-                        out.push_str(&first);
+                        pos += first.visual_width(unit.tab_width());
+                        out.push_str(first);
                     }
                     for line in lines {
                         trim_trailing_blanks(&mut out);
                         out.push('\n');
-                        out.push_str(&pad);
-                        out.push_str(&line);
-                        pos = pad.width() + line.width();
+                        let pad_width = push_indent(&mut out, unit, ind);
+                        out.push_str(line);
+                        pos = pad_width + line.visual_width(unit.tab_width());
                     }
                 }
             }
             Doc::BreakParent => {} // consumed by propagate_breaks; prints nothing
             Doc::Group(ps) => {
-                let flat = fits(width as isize - pos as isize, &cmds, &ps);
+                let flat = fits(signed_width(width) - signed_width(pos), &cmds, ps, unit);
                 let m = if flat { Mode::Flat } else { Mode::Break };
-                for p in ps.into_iter().rev() {
-                    cmds.push((ind, m, p));
+                for p in ps.iter().rev() {
+                    cmds.push(Cmd::Doc(ind, m, p));
                 }
             }
             Doc::ForcedGroup(ps) => {
                 // Already known to break — never measured.
-                for p in ps.into_iter().rev() {
-                    cmds.push((ind, Mode::Break, p));
+                for p in ps.iter().rev() {
+                    cmds.push(Cmd::Doc(ind, Mode::Break, p));
                 }
             }
-            Doc::Fill(mut ps) => {
-                if ps.is_empty() {
-                    continue;
-                }
-                let content = ps[0].clone();
-                // Fill measures locally (a content item / a content–sep–content
-                // pair), NOT the whole rest of the document — otherwise a large
-                // sibling after the fill (an element) would make every word
-                // "not fit" and break the prose one word per line.
-                let content_fits = fits(
-                    width as isize - pos as isize,
-                    &[],
-                    std::slice::from_ref(&content),
-                );
-                if ps.len() == 1 {
-                    let m = if content_fits {
-                        Mode::Flat
-                    } else {
-                        Mode::Break
-                    };
-                    cmds.push((ind, m, content));
-                    continue;
-                }
-                let ws = ps[1].clone();
-                if ps.len() == 2 {
-                    let m = if content_fits {
-                        Mode::Flat
-                    } else {
-                        Mode::Break
-                    };
-                    cmds.push((ind, m, ws));
-                    cmds.push((ind, m, content));
-                    continue;
-                }
-                let rest = Doc::Fill(ps.split_off(2));
-                let second = match &rest {
-                    Doc::Fill(rp) => rp[0].clone(),
-                    _ => unreachable!(),
-                };
-                let pair = vec![content.clone(), ws.clone(), second];
-                let pair_fits = fits(width as isize - pos as isize, &[], &pair);
-                cmds.push((ind, mode, rest));
-                if pair_fits {
-                    cmds.push((ind, Mode::Flat, ws));
-                    cmds.push((ind, Mode::Flat, content));
-                } else if content_fits {
-                    cmds.push((ind, Mode::Break, ws));
-                    cmds.push((ind, Mode::Flat, content));
-                } else {
-                    cmds.push((ind, Mode::Break, ws));
-                    cmds.push((ind, Mode::Break, content));
-                }
+            Doc::Fill(ps) => {
+                cmds.push(Cmd::Fill(ind, mode, ps));
             }
         }
     }
     out
+}
+
+/// One greedy `Fill` step: decide the mode of the first content item (and, if
+/// present, its following separator) from a local fit test, push them, and push
+/// the tail slice back as a `Fill` continuation. `pos` is the current column;
+/// this never mutates it (it only enqueues commands).
+fn print_fill<'a>(
+    ind: usize,
+    mode: Mode,
+    ps: &'a [Doc],
+    width: usize,
+    pos: usize,
+    unit: IndentUnit,
+    cmds: &mut Vec<Cmd<'a>>,
+) {
+    if ps.is_empty() {
+        return;
+    }
+    // Fill measures locally (a content item / a content–sep–content pair), NOT
+    // the whole rest of the document — otherwise a large sibling after the fill
+    // (an element) would make every word "not fit" and break the prose one word
+    // per line.
+    let remaining = signed_width(width) - signed_width(pos);
+    let content_fits = fits(remaining, &[], &ps[..1], unit);
+    if ps.len() <= 2 {
+        let m = if content_fits { Mode::Flat } else { Mode::Break };
+        for p in ps.iter().rev() {
+            cmds.push(Cmd::Doc(ind, m, p));
+        }
+        return;
+    }
+    // The content–separator–content triple is contiguous, so it can be measured
+    // in place.
+    let pair_fits = fits(remaining, &[], &ps[..3], unit);
+    cmds.push(Cmd::Fill(ind, mode, &ps[2..]));
+    let content = &ps[0];
+    let ws = &ps[1];
+    if pair_fits {
+        cmds.push(Cmd::Doc(ind, Mode::Flat, ws));
+        cmds.push(Cmd::Doc(ind, Mode::Flat, content));
+    } else if content_fits {
+        cmds.push(Cmd::Doc(ind, Mode::Break, ws));
+        cmds.push(Cmd::Doc(ind, Mode::Flat, content));
+    } else {
+        cmds.push(Cmd::Doc(ind, Mode::Break, ws));
+        cmds.push(Cmd::Doc(ind, Mode::Break, content));
+    }
 }
 
 /// Whether `next` (rendered flat) followed by the rest of the command stack fits
@@ -220,8 +257,11 @@ pub(crate) fn print(
 /// of prettier's `doc.js` `fits`: a soft `line` defers a pending space that is
 /// only charged when a following string is emitted (so a trailing `line` costs
 /// nothing), and a hard/break line ends the measurement successfully.
-fn fits(mut remaining: isize, rest_stack: &[(usize, Mode, Doc)], next: &[Doc]) -> bool {
-    let mut local: Vec<(Mode, Doc)> = next.iter().rev().map(|d| (Mode::Flat, d.clone())).collect();
+fn fits(mut remaining: isize, rest_stack: &[Cmd], next: &[Doc], unit: IndentUnit) -> bool {
+    // Measurement never mutates the tree, so the whole walk borrows: cloning a
+    // `Doc` here would deep-copy the entire measured subtree (and every entry
+    // pulled off `rest_stack`) on every group, which dominated `print`.
+    let mut local: Vec<(Mode, &Doc)> = next.iter().rev().map(|d| (Mode::Flat, d)).collect();
     let mut rest_idx = rest_stack.len();
     let mut has_pending_space = false;
 
@@ -229,15 +269,23 @@ fn fits(mut remaining: isize, rest_stack: &[(usize, Mode, Doc)], next: &[Doc]) -
         if remaining < 0 {
             return false;
         }
-        let (mode, d) = match local.pop() {
-            Some(x) => x,
-            None => {
-                if rest_idx == 0 {
-                    return true;
+        let (mode, d) = if let Some(x) = local.pop() {
+            x
+        } else {
+            if rest_idx == 0 {
+                return true;
+            }
+            rest_idx -= 1;
+            match &rest_stack[rest_idx] {
+                Cmd::Doc(_, m, dd) => (*m, *dd),
+                Cmd::Fill(_, m, ps) => {
+                    // A pending fill measures like its items in the fill's own
+                    // mode (front first, so push in reverse).
+                    for p in ps.iter().rev() {
+                        local.push((*m, p));
+                    }
+                    continue;
                 }
-                rest_idx -= 1;
-                let (_, m, dd) = &rest_stack[rest_idx];
-                (*m, dd.clone())
             }
         };
         match d {
@@ -247,19 +295,35 @@ fn fits(mut remaining: isize, rest_stack: &[(usize, Mode, Doc)], next: &[Doc]) -
                         remaining -= 1;
                         has_pending_space = false;
                     }
-                    remaining -= s.width() as isize;
+                    remaining -= signed_width(s.visual_width(unit.tab_width()));
                 }
             }
-            // A pre-formatted interpolation is measured by its flat width: the
-            // fill decides whether to keep it inline (flat) or break it based on
-            // whether that flat form fits at the current column.
-            Doc::RawExpr { flat, .. } => {
+            // A pre-formatted interpolation. In `Flat` mode it is measured by
+            // its flat width. In `Break` mode, a *breakable* one (`broken` has
+            // 2+ lines) behaves like a prettier group with an internal line: it
+            // charges only up to its first break (`broken[0]`) and then the
+            // break ends the measurement — so an interpolation earlier in the
+            // value stays flat whenever this later one can break to absorb the
+            // overflow. (`fits` measures the rest with the modes the commands
+            // were pushed in; the value's interpolation groups sit in `Break`
+            // mode when the attribute's open tag has wrapped.)
+            Doc::RawExpr { flat, broken } => {
+                if mode == Mode::Break && broken.len() > 1 {
+                    let head = &broken[0];
+                    if !head.is_empty() {
+                        if has_pending_space {
+                            remaining -= 1;
+                        }
+                        remaining -= signed_width(head.visual_width(unit.tab_width()));
+                    }
+                    return remaining >= 0;
+                }
                 if !flat.is_empty() {
                     if has_pending_space {
                         remaining -= 1;
                         has_pending_space = false;
                     }
-                    remaining -= flat.width() as isize;
+                    remaining -= signed_width(flat.visual_width(unit.tab_width()));
                 }
             }
             Doc::Concat(ps)
@@ -267,14 +331,14 @@ fn fits(mut remaining: isize, rest_stack: &[(usize, Mode, Doc)], next: &[Doc]) -
             | Doc::Dedent(ps)
             | Doc::Group(ps)
             | Doc::Fill(ps) => {
-                for p in ps.into_iter().rev() {
+                for p in ps.iter().rev() {
                     local.push((mode, p));
                 }
             }
             Doc::ForcedGroup(ps) => {
                 // A forced-break group: its contents render in break mode, so its
                 // first line break ends the (successful) measurement.
-                for p in ps.into_iter().rev() {
+                for p in ps.iter().rev() {
                     local.push((Mode::Break, p));
                 }
             }
@@ -301,6 +365,15 @@ fn fits(mut remaining: isize, rest_stack: &[(usize, Mode, Doc)], next: &[Doc]) -
     }
 }
 
+/// Append `level` copies of `unit` without materialising an intermediate
+/// `String` (this runs on every emitted line break).
+fn push_indent(out: &mut String, unit: IndentUnit, level: usize) -> usize {
+    for _ in 0..level {
+        out.push_str(unit.as_str());
+    }
+    unit.columns() * level
+}
+
 fn trim_trailing_blanks(out: &mut String) {
     let trimmed = out.trim_end_matches([' ', '\t']).len();
     out.truncate(trimmed);
@@ -312,7 +385,7 @@ fn trim_trailing_blanks(out: &mut String) {
 /// group. Run once on a Doc tree before [`print`] so groups that must break are
 /// converted to [`Doc::ForcedGroup`] (and never measured with `fits`).
 #[allow(dead_code)] // only called from tests in this module
-pub(crate) fn propagate_breaks(doc: Doc) -> Doc {
+pub fn propagate_breaks(doc: Doc) -> Doc {
     fn go(doc: Doc) -> (Doc, bool) {
         fn map_children(ps: Vec<Doc>) -> (Vec<Doc>, bool) {
             let mut forces = false;
@@ -327,11 +400,14 @@ pub(crate) fn propagate_breaks(doc: Doc) -> Doc {
             (out, forces)
         }
         match doc {
-            Doc::Text(_) | Doc::Line | Doc::Softline => (doc, false),
+            Doc::Text(_) | Doc::Line | Doc::Softline | Doc::RawExpr { .. } => (doc, false),
             // A RawExpr has a flat form, so it never forces the enclosing group
             // to break (the fill/group decides per-position).
-            Doc::RawExpr { .. } => (doc, false),
-            Doc::Hardline | Doc::Literalline | Doc::BreakParent => (doc, true),
+            Doc::Hardline | Doc::Literalline => (doc, true),
+            // Consumed here: once the enclosing groups are forced, a surviving
+            // sentinel would reach `fits` through the rest stack and wrongly veto
+            // a LATER sibling's group, which prettier's `fits` never does.
+            Doc::BreakParent => (Doc::Text(String::new()), true),
             Doc::Concat(ps) => {
                 let (ps, f) = map_children(ps);
                 (Doc::Concat(ps), f)
@@ -351,11 +427,7 @@ pub(crate) fn propagate_breaks(doc: Doc) -> Doc {
             Doc::Group(ps) => {
                 let (ps, f) = map_children(ps);
                 // A broken group still forces its own ancestors to break.
-                if f {
-                    (Doc::ForcedGroup(ps), true)
-                } else {
-                    (Doc::Group(ps), false)
-                }
+                if f { (Doc::ForcedGroup(ps), true) } else { (Doc::Group(ps), false) }
             }
             Doc::ForcedGroup(ps) => {
                 let (ps, _) = map_children(ps);
@@ -371,7 +443,7 @@ mod tests {
     use super::*;
 
     fn p(doc: Doc, width: usize) -> String {
-        print(doc, width, "  ", 0, 0)
+        print(&doc, width, IndentUnit::new("  ", 2), 0, 0)
     }
 
     #[test]
@@ -391,10 +463,7 @@ mod tests {
         // enclosing group fits flat.
         let doc = Doc::Group(vec![
             Doc::Text("x: ".into()),
-            Doc::RawExpr {
-                flat: "{a + b}".into(),
-                broken: vec!["{a +".into(), "  b}".into()],
-            },
+            Doc::RawExpr { flat: "{a + b}".into(), broken: vec!["{a +".into(), "  b}".into()] },
         ]);
         assert_eq!(p(doc, 80), "x: {a + b}");
     }
@@ -408,18 +477,54 @@ mod tests {
             Doc::Line,
             Doc::RawExpr {
                 flat: "{averylongidentifier + anotherlongidentifier}".into(),
-                broken: vec![
-                    "{averylongidentifier +".into(),
-                    "  anotherlongidentifier}".into(),
-                ],
+                broken: vec!["{averylongidentifier +".into(), "  anotherlongidentifier}".into()],
             },
         ]));
         // width 20 forces the fill's Line to break before the wide RawExpr, then
         // the RawExpr itself prints broken with its continuation at indent 0.
         assert_eq!(
-            print(doc, 20, "  ", 0, 0),
+            print(&doc, 20, IndentUnit::new("  ", 2), 0, 0),
             "lead\n{averylongidentifier +\n  anotherlongidentifier}"
         );
+    }
+
+    // Two interpolation groups L and T, adjacent; T is either breakable or not.
+    // Locks the whole-value attribute model's break-point rule: whether the
+    // LEADING interpolation stays flat depends on whether the TRAILING one can
+    // break — because `fits`, measuring the trailing group in the inherited
+    // Break mode, charges a *breakable* RawExpr only up to its first line
+    // (`broken[0]`) and then short-circuits, but a *non-breakable* one
+    // (`broken.len() == 1`) by its full flat width.
+    fn two_interps(t_breakable: bool) -> Doc {
+        let l = Doc::Group(vec![Doc::RawExpr {
+            flat: "{a1}".into(),
+            broken: vec!["{a1".into(), "z}".into()],
+        }]);
+        let t = Doc::Group(vec![Doc::RawExpr {
+            flat: "{bbbbbb}".into(),
+            broken: if t_breakable {
+                vec!["{bb".into(), "bbb}".into()]
+            } else {
+                vec!["{bbbbbb}".into()]
+            },
+        }]);
+        Doc::Concat(vec![l, Doc::Text(" ".into()), t])
+    }
+
+    #[test]
+    fn fits_break_mode_short_circuits_a_breakable_trailing_raw_expr() {
+        // width 8 = `{a1}`(4) + ` `(1) + T's first broken line `{bb`(3). Because
+        // T is breakable, L's `fits` reaches T's break and succeeds, so L stays
+        // flat and T breaks on its own (it does not fit flat at its column).
+        assert_eq!(p(two_interps(true), 8), "{a1} {bb\nbbb}");
+    }
+
+    #[test]
+    fn fits_flat_measures_an_unbreakable_trailing_raw_expr_full_width() {
+        // Same width 8, but T is unbreakable (`broken.len() == 1`), so `fits`
+        // charges its FULL flat width (`{bbbbbb}` = 8). L can no longer fit up to
+        // a later break, so L breaks and T prints flat on the continuation line.
+        assert_eq!(p(two_interps(false), 8), "{a1\nz} {bbbbbb}");
     }
 
     #[test]
@@ -460,11 +565,7 @@ mod tests {
     fn hardline_propagates_break_to_all_ancestor_groups() {
         let doc = propagate_breaks(Doc::Group(vec![
             Doc::Text("o(".into()),
-            Doc::Group(vec![
-                Doc::Text("i".into()),
-                Doc::Hardline,
-                Doc::Text("j".into()),
-            ]),
+            Doc::Group(vec![Doc::Text("i".into()), Doc::Hardline, Doc::Text("j".into())]),
             Doc::Text(")".into()),
         ]));
         // Inner hardline forces both groups to break (outer can't be flat).

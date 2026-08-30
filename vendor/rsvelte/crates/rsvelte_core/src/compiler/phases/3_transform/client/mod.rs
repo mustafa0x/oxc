@@ -6,18 +6,31 @@
 //! `svelte/packages/svelte/src/compiler/phases/3-transform/client/`.
 
 pub(crate) use super::shared::ast_rewrite;
+use std::borrow::Cow;
 use std::fmt::Write as _;
+mod assign_dev_ast;
 mod ast_state_transform;
-mod class_body_ast;
+mod async_derived_dev;
+mod await_reactivity_loss_ast;
 mod class_transforms;
 mod console_dev_ast;
+mod console_wrap;
+mod dead_comments;
+mod declaration_split;
 mod derived_by_ast;
 mod destructure_transforms;
 mod effect_rune_ast;
-mod expression_utils;
+pub(crate) mod expression_utils;
 mod formatting;
+mod inspect_rune_ast;
+mod inspect_trace_ast;
+mod instance_dev_tail_ast;
 mod legacy_state_member_mutate_ast;
 mod local_assign_ast;
+mod module_derived_ast;
+mod module_destructure_ast;
+mod module_dev_tail_ast;
+mod module_state_runes_ast;
 mod private_class_assign_ast;
 mod private_field_assign_ast;
 mod private_member_mutate_root_ast;
@@ -26,6 +39,7 @@ mod private_read_wrap_ast;
 mod private_v_suffix_ast;
 mod prop_assign_ast;
 mod prop_member_mutate_ast;
+mod prop_mutation_validation_ast;
 mod prop_source_reads_ast;
 mod props_transforms;
 mod reactive_transforms;
@@ -33,10 +47,13 @@ mod reactive_update_ast;
 mod read_only_props_ast;
 mod rest_prop_member_access_ast;
 mod rune_transforms;
+mod sanitized_props;
+mod scan_index;
 mod scope_analysis;
-mod state;
+pub(crate) mod source_anchor;
 mod state_assigns_combined_ast;
 mod state_call_ast;
+mod state_eager_ast;
 mod state_member_mutate_ast;
 mod state_pipeline_ast;
 mod state_raw_frozen_ast;
@@ -53,11 +70,9 @@ mod strict_equals_ast;
 mod strip_rune_generics_ast;
 mod tag_class_field_ast;
 mod tag_declarator_ast;
-pub mod transform_client;
 pub mod transform_template;
 pub mod types;
 pub mod utils;
-mod visitor;
 pub mod visitors;
 
 // Re-export all extracted module functions so they remain accessible by their original names.
@@ -73,6 +88,7 @@ use store_transforms::*;
 
 // Explicit re-exports for functions used outside the client module.
 pub(crate) use class_transforms::transform_class_fields_client;
+use class_transforms::transform_module_class_fields_client;
 pub(crate) use expression_utils::find_matching_paren;
 pub(crate) use formatting::normalize_js_with_oxc;
 
@@ -80,6 +96,13 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::LazyLock;
 
+use crate::compiler::phases::phase1_parse::parser::is_js_whitespace;
+use crate::compiler::phases::phase3_transform::shared::js_scan::{
+    after_keyword, after_keywords, code_bytes, contains_identifier, find_code, find_rune_code,
+    is_ident_byte, skip_opaque,
+};
+use crate::compiler::phases::phase3_transform::shared::rune_shadow;
+use compact_str::CompactString;
 use memchr::memmem;
 // rustc_hash is used by submodules via their own imports
 
@@ -92,13 +115,14 @@ use super::js_ast::{
     nodes::{
         JsBlockStatement, JsExportDefault, JsExportDefaultDeclaration, JsExpr,
         JsFunctionDeclaration, JsImportDeclaration, JsImportSpecifier, JsObjectMember, JsPattern,
-        JsProgram, JsPropertyKey, JsStatement, JsVariableKind,
+        JsProgram, JsPropertyKey, JsStatement, JsVariableKind, RawMappedSpan,
     },
 };
 use crate::ast::template::Root;
 use crate::compiler::CompileOptions;
 use crate::compiler::phases::phase2_analyze::ComponentAnalysis;
 use crate::compiler::phases::phase2_analyze::scope::{BindingKind, DeclarationKind};
+use crate::compiler::phases::phase2_analyze::types::{CopiedSourceChunk, ScriptProjection};
 
 // Import new visitor system types
 use types::{ComponentClientTransformState, ComponentContext, TransformOptions, TransformResult};
@@ -119,7 +143,8 @@ pub(super) static REGEX_STATE_DERIVED_VAR: LazyLock<Regex> = LazyLock::new(|| {
     // (`x[key]`) and writes (`x = next`) are never rewritten through
     // `$.get`/`$.set`, so consumers see the raw source object instead of
     // the value (see baseballyama/rsvelte#143).
-    Regex::new(r"(let|const|var)\s+(\w+)(?:\s*:[^=\n]*)?\s*=\s*\$(?:state(?:\.raw|\.frozen)?|derived(?:\.by)?)(?:<[^(]*>)?\s*\(").unwrap()
+    // `$` is a JS identifier character, so names like `delay$` must be captured too.
+    Regex::new(r"(let|const|var)\s+([\w$]+)(?:\s*:[^=\n]*)?\s*=\s*\$(?:state(?:\.raw|\.frozen)?|derived(?:\.by)?)(?:<[^(]*>)?\s*\(").unwrap()
 });
 
 // Regex for sanitizing identifier names - replaces invalid identifier characters
@@ -133,6 +158,11 @@ pub(super) static REGEX_INVALID_IDENTIFIER_CHARS: LazyLock<Regex> =
 // $derived destructuring patterns in the same component.
 // This is reset at the start of each component transformation.
 thread_local! {
+    /// Set when any prenormalize transform changed the text, so a file touched
+    /// by two of them is counted once rather than twice.
+    #[cfg(feature = "measure-pa-split")]
+    pub(super) static PN_FILE_TOUCHED: Cell<bool> = const { Cell::new(false) };
+
     pub(super) static SCRIPT_ARRAY_COUNTER: Cell<usize> = const { Cell::new(0) };
     // Counter for looking up which $$array variable to use when processing nested patterns
     // This must stay in sync with SCRIPT_ARRAY_COUNTER
@@ -148,6 +178,31 @@ thread_local! {
     // $.safe_get() handles this by returning undefined if not yet initialized.
     // Reference: declarations.js line 26
     pub(super) static VAR_STATE_VARS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
+
+struct AstStateCounterSnapshot {
+    script_array: usize,
+    array_lookup: usize,
+    state_tmp: usize,
+    derived_tmp: usize,
+}
+
+impl AstStateCounterSnapshot {
+    fn capture() -> Self {
+        Self {
+            script_array: SCRIPT_ARRAY_COUNTER.with(Cell::get),
+            array_lookup: ARRAY_LOOKUP_COUNTER.with(Cell::get),
+            state_tmp: STATE_TMP_COUNTER.with(Cell::get),
+            derived_tmp: DERIVED_TMP_COUNTER.with(Cell::get),
+        }
+    }
+
+    fn restore(&self) {
+        SCRIPT_ARRAY_COUNTER.with(|counter| counter.set(self.script_array));
+        ARRAY_LOOKUP_COUNTER.with(|counter| counter.set(self.array_lookup));
+        STATE_TMP_COUNTER.with(|counter| counter.set(self.state_tmp));
+        DERIVED_TMP_COUNTER.with(|counter| counter.set(self.derived_tmp));
+    }
 }
 
 // Thread-local cache for dynamically-constructed regex patterns to avoid recompilation.
@@ -175,23 +230,6 @@ pub(super) fn get_or_compile_regex(pattern: &str) -> Option<std::sync::Arc<Regex
     })
 }
 
-/// Transform a component analysis into client-side JavaScript.
-///
-/// # Arguments
-///
-/// * `analysis` - The component analysis from Phase 2 (includes pre-extracted script content)
-/// * `ast` - The parsed AST from Phase 1 (to avoid re-parsing)
-/// * `_source` - The original source code (for backward compatibility)
-/// * `options` - Compile options
-pub fn transform_client(
-    analysis: &ComponentAnalysis,
-    ast: &Root,
-    source: &str,
-    options: &CompileOptions,
-) -> Result<CodegenResult, TransformError> {
-    transform_client_with_visitors(analysis, ast, source, options)
-}
-
 /// Transform a module (.svelte.js/.svelte.ts) into client-side JavaScript.
 ///
 /// Unlike `transform_client`, this does NOT generate a component function wrapper.
@@ -204,8 +242,6 @@ pub fn transform_client_module(
     source: &str,
     options: &CompileOptions,
 ) -> Result<String, TransformError> {
-    use super::js_ast::codegen::generate;
-
     let mut body: Vec<JsStatement> = Vec::new();
 
     // Leading comment: /* filename generated by Svelte vX */
@@ -214,42 +250,67 @@ pub fn transform_client_module(
         .as_ref()
         .and_then(|f| f.rsplit('/').next().or_else(|| f.rsplit('\\').next()))
         .unwrap_or("input.svelte.js");
-    body.push(JsStatement::Raw(
-        format!(
-            "/* {} generated by Svelte v{} */",
-            basename,
-            option_env!("SVELTE_VERSION").unwrap_or("VERSION")
-        )
-        .into(),
-    ));
+    let header = format!(
+        "/* {} generated by Svelte v{} */",
+        basename,
+        option_env!("SVELTE_VERSION").unwrap_or("VERSION")
+    );
 
     // import * as $ from 'svelte/internal/client'
-    body.push(JsStatement::Import(
-        super::js_ast::nodes::JsImportDeclaration {
-            specifiers: vec![super::js_ast::nodes::JsImportSpecifier::Namespace(
-                "$".into(),
-            )],
-            source: "svelte/internal/client".into(),
-        },
-    ));
+    body.push(JsStatement::Import(super::js_ast::nodes::JsImportDeclaration {
+        specifiers: vec![super::js_ast::nodes::JsImportSpecifier::Namespace("$".into())],
+        source: "svelte/internal/client".into(),
+    }));
 
     // Add tracing flag import if needed
     if analysis.tracing {
-        body.push(JsStatement::Import(
-            super::js_ast::nodes::JsImportDeclaration {
-                specifiers: vec![],
-                source: "svelte/internal/flags/tracing".into(),
-            },
-        ));
+        body.push(JsStatement::Import(super::js_ast::nodes::JsImportDeclaration {
+            specifiers: vec![],
+            source: "svelte/internal/flags/tracing".into(),
+        }));
     }
 
-    // Transform the module source (rune replacements, class fields, etc.)
-    let class_transformed = transform_class_fields_client(source);
-    let transformed = transform_module_script_runes(&class_transformed, analysis, options.dev);
+    // `$inspect.trace()`'s default label carries `locate_node(fn)`, a position
+    // in the source the user wrote, so the rune is lowered before any other
+    // rewrite moves its enclosing function.
+    let trace_lowered = inspect_trace_ast::transform_module_inspect_trace(
+        source,
+        options.dev,
+        analysis.filename.ends_with(".ts"),
+        options.filename.as_deref(),
+    );
+    let source = trace_lowered.as_deref().unwrap_or(source);
 
-    // Transform destructured assignments where LHS contains state variables (client only).
-    // e.g., `[a, b] = array;` where `a` and `b` are $state() variables becomes:
-    //   ((array) => { var $$array = $.to_array(array, 2); $.set(a, $$array[0], true); $.set(b, $$array[1], true); })(array);
+    // Drop the comments upstream's synthesized accessors swallow before any
+    // rewrite, so the scan still sees the source's own class bodies.
+    let dead_comments_stripped =
+        dead_comments::strip_dead_comments(source, dead_comments::Rules::ACCESSORS);
+    let source = dead_comments_stripped.as_deref().unwrap_or(source);
+
+    // Every lowering below decides what a rune call is from this text, so the
+    // grouping parens around one have to be gone before the first of them runs.
+    let paren_stripped = super::shared::rune_parens::strip_rune_parens(source);
+    let source = paren_stripped.as_deref().unwrap_or(source);
+
+    // Transform the module source (rune replacements, class fields, etc.)
+    let class_transformed = transform_module_class_fields_client(source);
+
+    // Transform destructured assignments whose LHS contains state variables into
+    // IIFE / sequence form (mirrors upstream `visit_assignment_expression` in
+    // `shared/assignments.js`), e.g.
+    //   `({ issues: raw = [], result } = rhs)` becomes
+    //   `(($$value) => { $.set(raw, $.fallback($$value.issues, () => [], true), true);
+    //                    $.set(result, $$value.result, true); })(rhs)`.
+    // This MUST run on the RAW (pre-read-wrap) source — the same ordering the
+    // instance-script pipeline uses (`transform_instance_script_for_visitors`)
+    // — because it decomposes the destructure pattern into individual `$.set`
+    // targets before `transform_module_script_runes` wraps state *reads* in
+    // `$.get(...)`. Running it afterwards would see the pattern's LHS
+    // identifiers already wrapped (`$.get(raw) = []`), which is invalid.
+    // Handles object / array / rest patterns robustly; the previous
+    // line-based `[a, b] = …` handler only matched array destructures at the
+    // start of a line and left object patterns (and mid-line array patterns)
+    // untransformed. See issue #1438.
     let reactive_state_vars: Vec<String> = analysis
         .root
         .bindings
@@ -263,32 +324,129 @@ pub fn transform_client_module(
         })
         .map(|b| b.name.clone())
         .collect();
-    let transformed = transform_destructured_state_assignments(&transformed, &reactive_state_vars);
+    let class_transformed = if reactive_state_vars.is_empty() {
+        class_transformed
+    } else {
+        // Reset the per-compile `$$array` counter (as the instance-script path
+        // does) so `$.to_array(...)` temp names start at `$$array` and are
+        // deterministic across compiles that reuse this thread.
+        SCRIPT_ARRAY_COUNTER.with(|c| c.set(0));
+        destructure_transforms::transform_destructure_assignments(
+            &class_transformed,
+            &reactive_state_vars,
+            &[],
+        )
+    };
 
-    // The transformed source includes everything (imports + body).
-    // We need to split imports from body to avoid duplicate svelte import.
-    let (script_imports, script_rest) = extract_imports(&transformed);
+    let has_effect_rune =
+        class_transformed.contains("$effect") || class_transformed.contains("$inspect");
+    let transformed =
+        transform_module_script_runes(&class_transformed, source, analysis, options.dev, true);
 
-    // Add non-svelte imports
-    for import_line in &script_imports {
-        let trimmed = import_line.trim();
-        // Skip svelte internal imports since we already added them
-        if memmem::find(trimmed.as_bytes(), b"svelte/internal/").is_none() {
-            body.push(JsStatement::Raw(trimmed.into()));
-        }
-    }
-
-    // Add the rest of the module body
+    // Upstream `client_module` concatenates the generated `$` import with the
+    // module body untouched, so an `import` keeps its place among the other
+    // statements — hoisting it would change module evaluation order.
     {
-        let rest_trimmed = script_rest.trim();
+        let rest_trimmed = transformed.trim();
         if !rest_trimmed.is_empty() {
-            body.push(JsStatement::Raw(rest_trimmed.into()));
+            body.push(if has_effect_rune {
+                JsStatement::RawEffect(rest_trimmed.into())
+            } else {
+                JsStatement::Raw(rest_trimmed.into())
+            });
         }
     }
 
-    let program = super::js_ast::nodes::JsProgram { body };
+    print_module_program(body, &header)
+}
+
+/// Print a `.svelte.(js|ts)` module body the way upstream's `client_module` /
+/// `server_module` do: a builder-made `Program` with no `loc`, which parks
+/// esrap's comment cursor past the end so only comments inside a located nested
+/// body survive.
+/// Stands in for upstream's `b.empty` while a module's text is still parsed as
+/// JavaScript: `const t = ;;` is what upstream prints and what no parser reads.
+pub(crate) const MODULE_INSPECT_HOLE: &str = "$$inspect_empty";
+
+/// Expand [`MODULE_INSPECT_HOLE`] back to the `;` esrap prints for `b.empty`.
+/// Code positions only — a module may hold the same text in a string literal.
+fn expand_module_inspect_holes(code: String) -> String {
+    if memmem::find(code.as_bytes(), MODULE_INSPECT_HOLE.as_bytes()).is_none() {
+        return code;
+    }
+    let mut out = String::with_capacity(code.len());
+    let mut rest = code.as_str();
+    while let Some(pos) = find_code(rest.as_bytes(), MODULE_INSPECT_HOLE.as_bytes()) {
+        out.push_str(&rest[..pos]);
+        out.push(';');
+        rest = &rest[pos + MODULE_INSPECT_HOLE.len()..];
+    }
+    out.push_str(rest);
+    out
+}
+
+pub(crate) fn print_module_program(
+    body: Vec<JsStatement>,
+    header: &str,
+) -> Result<String, TransformError> {
+    use super::js_ast::codegen::generate;
+
+    let program = super::js_ast::nodes::JsProgram { body, component_brace_span: None };
     let arena = super::js_ast::arena::JsArena::new();
-    generate(&program, &arena).map_err(TransformError::CodeGen)
+    let alloc = oxc_allocator::Allocator::default();
+    if let Some(code) =
+        super::js_ast::to_oxc::program_to_oxc(&program, &arena, &alloc).map(|converted| {
+            let print_opts = rsvelte_esrap::PrintOptions::default().with_unlocated_program(true);
+            match &converted.comment_source {
+                Some(cs) => {
+                    rsvelte_esrap::print_split(
+                        &converted.program,
+                        cs,
+                        converted.loc_base,
+                        None,
+                        &converted.loc_map,
+                        &converted.brace_mappings,
+                        &print_opts,
+                    )
+                    .code
+                }
+                None => rsvelte_esrap::print_with(&converted.program, "", &print_opts),
+            }
+        })
+    {
+        return Ok(expand_module_inspect_holes(format!(
+            "{header}\n{}",
+            rehome_derived_jsdoc(&code)
+        )));
+    }
+    generate(&program, &arena)
+        .map(|code| {
+            expand_module_inspect_holes(format!("{header}\n{}", rehome_derived_jsdoc(&code)))
+        })
+        .map_err(TransformError::CodeGen)
+}
+
+/// Expand a destructured `$state` / `$state.raw` / `$state.snapshot` declarator
+/// in a module script, for the server path only: it lowers those calls to their
+/// bare initializer before the shared module transform runs, so the rune is gone
+/// by the time [`transform_module_script_runes`] could act on it.
+pub(crate) fn expand_module_rune_destructuring_for_server(
+    source: &str,
+    analysis: &ComponentAnalysis,
+) -> Option<String> {
+    let is_ts = analysis.filename.ends_with(".ts") || analysis.filename.ends_with(".svelte.ts");
+    module_destructure_ast::transform_module_rune_destructuring_ast(
+        source,
+        is_ts,
+        &module_destructure_ast::ModuleDestructureConfig {
+            state_vars: &[],
+            non_reactive_vars: &[],
+            proxy_vars: &[],
+            dev: false,
+            server: true,
+            state_only: true,
+        },
+    )
 }
 
 /// Transform module source code for module compilation (shared between client and server).
@@ -297,24 +455,22 @@ pub(crate) fn transform_module_source_for_module(
     source: &str,
     analysis: &ComponentAnalysis,
     dev: bool,
+    server: bool,
+    preserve_inspect: bool,
 ) -> String {
-    let class_transformed = transform_class_fields_client(source);
-    transform_module_script_runes(&class_transformed, analysis, dev)
+    let class_transformed = transform_module_class_fields_client(source);
+    transform_module_script_runes_with_target(
+        &class_transformed,
+        source,
+        analysis,
+        dev,
+        server,
+        true,
+        preserve_inspect,
+    )
 }
 
-/// Extract imports from a string, returning (imports, rest).
-/// This is a convenience wrapper for use from the server module.
-pub(crate) fn extract_imports_str(script: &str) -> (Vec<String>, Option<String>) {
-    let (imports, rest) = extract_imports(script);
-    let rest_trimmed = rest.trim();
-    if rest_trimmed.is_empty() {
-        (imports, None)
-    } else {
-        (imports, Some(rest_trimmed.to_string()))
-    }
-}
-
-/// Transform using the visitor-based system.
+/// Transform a component analysis into client-side JavaScript.
 ///
 /// This function implements the visitor pattern that mirrors the official Svelte compiler.
 /// It uses `ComponentContext`, `ComponentClientTransformState`, and the fragment visitor.
@@ -333,16 +489,19 @@ pub(crate) fn extract_imports_str(script: &str) -> (Vec<String>, Option<String>)
 /// Corresponds to `client_component()` in
 /// `svelte/packages/svelte/src/compiler/phases/3-transform/client/transform-client.js`
 ///
-/// `#[inline(never)]` keeps this large function out of `transform_client`'s
-/// inlined frame: the function is called once per component (not in a hot
-/// loop) and inlining it bloats binary size without any per-component
-/// throughput gain.
+/// `#[inline(never)]` keeps this large function out of its caller's inlined
+/// frame: it runs once per component (not in a hot loop) and inlining it
+/// bloats binary size without any per-component throughput gain.
 #[inline(never)]
-fn transform_client_with_visitors(
+pub(crate) fn transform_client(
     analysis: &ComponentAnalysis,
     ast: &Root,
     source: &str,
     options: &CompileOptions,
+    retained_scripts: Option<&crate::ast::oxc_program::RetainedScripts<'_>>,
+    mut program_sink: Option<
+        &mut dyn FnMut(&super::js_ast::JsProgram, &super::js_ast::arena::JsArena),
+    >,
 ) -> Result<CodegenResult, TransformError> {
     use crate::compiler::phases::phase3_transform::client::visitors::fragment::fragment;
 
@@ -360,6 +519,7 @@ fn transform_client_with_visitors(
         preserve_comments: options.preserve_comments,
         experimental_async: options.experimental.r#async,
         hmr: options.hmr,
+        source: source.into(),
     });
 
     // Create the component client transform state
@@ -376,17 +536,10 @@ fn transform_client_with_visitors(
     // The actual visiting is done via ComponentContext::visit_node which dispatches
     // based on node type - the visit function pointer is not actually used
     let mut context = ComponentContext::new(state, |_, _, _| TransformResult::None);
-
-    // Set up state transformers ($.get, $.set wrappers for $state variables)
-    // This must be called before processing the template so that state variable
-    // references in event handlers get properly transformed
-    use crate::compiler::phases::phase3_transform::client::visitors::shared::declarations::add_state_transformers;
-    add_state_transformers(&mut context);
+    context.enable_sourcemap = options.enable_sourcemap;
 
     // Visit the program to set up transforms for props, store subscriptions, etc.
-    // This handles legacy mode props ($.prop() getters) and store subscriptions
-    // NOTE: visit_program calls add_state_transformers again internally, so any
-    // transform removals must happen AFTER this call.
+    // This handles state, legacy props, and store subscriptions.
     use crate::compiler::phases::phase3_transform::client::visitors::program::visit_program;
     let _vp_start = super::profile::timer_start();
     visit_program(&mut context);
@@ -427,34 +580,156 @@ fn transform_client_with_visitors(
             Vec::new()
         };
 
+    // Module-scope `var rest_excludes = new Set([...])` hoists lifted out of the
+    // instance script's `$.rest_props($$props, [...])` calls. Emitted as real
+    // statements at module-body assembly (below) rather than spliced into the
+    // final printed output.
+    let mut rest_excludes_hoists: Vec<(String, String)> = Vec::new();
+    let mut ast_islands = Vec::new();
+
     // Transform the instance script once with the real reactive_import_names.
     // This also determines how many $$array names it consumes (for template generation)
     // and is used for blocker_map computation and the final output.
-    let pre_transformed_script = if let Some(instance_script) = &analysis.instance_script_content {
-        let raw = &instance_script.raw;
+    let mut instance_script_imports = Vec::new();
+    let mut pre_transformed_script = if let Some(instance_script) =
+        &analysis.instance_script_content
+    {
+        // Drop comments swallowed by upstream's unlocated rune accessors and
+        // reactive-destructure IIFE bodies. The splice moves every later offset,
+        // so the retained parse and the TypeScript projection built against the
+        // untouched text are dropped with it.
+        let destructure_iife_targets: Vec<String> = context
+            .state
+            .transform
+            .iter()
+            .filter(|(_, transform)| transform.assign.is_some())
+            .map(|(name, _)| name.clone())
+            .collect();
+        let dead_comment_rules =
+            dead_comments::Rules::component(analysis.runes, &destructure_iife_targets);
+        let dead_comments_stripped = match retained_scripts
+            .and_then(|scripts| scripts.instance.as_ref())
+            .filter(|retained| {
+                !retained.panicked()
+                    && retained.diagnostics().is_empty()
+                    && retained.program().source_text == instance_script.raw
+            }) {
+            Some(retained) => dead_comments::strip_dead_comments_from_program(
+                &instance_script.raw,
+                retained.program(),
+                dead_comment_rules,
+            ),
+            None => dead_comments::strip_dead_comments(&instance_script.raw, dead_comment_rules),
+        };
+        // Every lowering below decides what a rune call is from this text, so the
+        // grouping parens around one have to be gone before the first of them runs.
+        let paren_stripped = super::shared::rune_parens::strip_rune_parens(
+            dead_comments_stripped.as_deref().unwrap_or(&instance_script.raw),
+        );
+        // In runes mode this is a user binding, and upstream renames it before
+        // generation so compiler-built `$$props` uses remain untouched.
+        let sanitized_props_renamed = analysis
+            .runes
+            .then(|| {
+                sanitized_props::rename_dollar_props(
+                    paren_stripped
+                        .as_deref()
+                        .or(dead_comments_stripped.as_deref())
+                        .unwrap_or(&instance_script.raw),
+                )
+            })
+            .flatten();
+        let instance_raw = sanitized_props_renamed
+            .as_deref()
+            .or(paren_stripped.as_deref())
+            .or(dead_comments_stripped.as_deref())
+            .unwrap_or(&instance_script.raw);
+        let retained_instance =
+            retained_scripts.and_then(|scripts| scripts.instance.as_ref()).filter(|_| {
+                dead_comments_stripped.is_none()
+                    && paren_stripped.is_none()
+                    && sanitized_props_renamed.is_none()
+            });
+        let needs_projection = analysis.runes
+            && retained_instance.is_some()
+            && instance_script.source_projection.is_some();
+        // A comment copied out of a TypeScript-only declaration is first
+        // flushed when upstream enters the located component block. Its
+        // printer then revisits the first generated location and flushes that
+        // first comment once more; later erased comments have already advanced
+        // the cursor and are printed only once. Preserve the exact copied
+        // comment here so the text fallback can reproduce that two-step cursor
+        // behaviour without guessing from comment contents or script mode.
+        let repeated_projection_comment = instance_script
+            .source_projection
+            .as_ref()
+            .filter(|projection| !projection.reemitted_comment_outputs.is_empty())
+            .and_then(|projection| projection.reemitted_comment_outputs.first())
+            .and_then(|range| instance_script.raw.get(range.start as usize..range.end as usize))
+            .map(str::to_owned);
+        let can_borrow_projection = needs_projection
+            && memmem::find(instance_raw.as_bytes(), b"import").is_none()
+            && !instance_raw.as_bytes().contains(&b'\r');
+        let (imports, script_body, body_chunks) = if can_borrow_projection {
+            (
+                Vec::new(),
+                instance_raw.strip_suffix('\n').unwrap_or(instance_raw).to_string(),
+                Vec::new(),
+            )
+        } else if needs_projection {
+            extract_imports_with_projection(instance_raw)
+        } else {
+            let (imports, script_body) = extract_imports(instance_raw);
+            (imports, script_body, Vec::new())
+        };
+        let composed_body_projection = (needs_projection && !can_borrow_projection).then(|| {
+            compose_script_projection(
+                instance_script.source_projection.as_ref().unwrap(),
+                &body_chunks,
+                script_body.len(),
+            )
+        });
+        let body_projection = if can_borrow_projection {
+            instance_script.source_projection.as_ref()
+        } else {
+            composed_body_projection.as_ref()
+        };
+        instance_script_imports = attach_import_origins(
+            imports,
+            retained_scripts.and_then(|scripts| scripts.instance.as_ref()),
+            instance_script.start,
+            analysis.is_typescript,
+            options.enable_sourcemap,
+        );
+        let split_top_level_declarations =
+            instance_has_top_level_multi_declarator(ast, instance_raw);
         let _script_start = super::profile::timer_start();
-        let transformed = transform_instance_script_for_visitors(
-            raw,
+        let _parent_scope = super::profile::ParentScope::new();
+        let mut transformed = transform_instance_script_for_visitors(
+            &script_body,
             analysis,
             options.dev,
             &reactive_import_names,
+            split_top_level_declarations,
+            retained_instance,
+            body_projection,
         );
+        if let Some(comment) = repeated_projection_comment
+            && let Some(start) = transformed.find(&comment)
+        {
+            transformed.insert_str(start + comment.len(), &format!("\n{comment}"));
+        }
+        rest_excludes_hoists = extract_rest_excludes_hoists(&mut transformed);
         super::profile::record_script_text(super::profile::timer_elapsed(_script_start));
+        super::profile::record_parent_site(false);
         // Transfer the script's $$array counter to the context state so that the template
         // visitor continues numbering from where the script left off.
         let script_array_count = SCRIPT_ARRAY_COUNTER.with(|c| c.get());
-        context
-            .state
-            .destructure_array_counter
-            .set(script_array_count);
+        context.state.destructure_array_counter.set(script_array_count);
         // Also seed the memoizer's conflicts set with names already used by the script,
         // so that generate_array_name() (which uses the memoizer) won't reuse them.
         for i in 0..script_array_count {
-            let name = if i == 0 {
-                "$$array".to_string()
-            } else {
-                format!("$$array_{}", i)
-            };
+            let name = if i == 0 { "$$array".to_string() } else { format!("$$array_{}", i) };
             context.state.memoizer.add_conflict(&name);
         }
         Some(transformed)
@@ -493,11 +768,7 @@ fn transform_client_with_visitors(
                 && props_pos > await_pos
             {
                 let idx = if blocker_map.is_empty() {
-                    async_result
-                        .output
-                        .matches("() =>")
-                        .count()
-                        .saturating_sub(1)
+                    async_result.output.matches("() =>").count().saturating_sub(1)
                 } else {
                     *blocker_map.values().max().unwrap_or(&0)
                 };
@@ -625,18 +896,15 @@ fn transform_client_with_visitors(
         let is_source_prop =
             is_prop_store && store_binding.is_some_and(|b| utils::is_prop_source(b, analysis));
 
-        // Check if the store is a derived or state variable - if so, wrap with $.get()
-        // e.g., $.get(store) instead of store
+        // Resolve the store variable through the same read transform that upstream's
+        // `build_getter` uses. A state binding only has that transform when it is an
+        // actual state source; in runes mode an unreassigned `$state(writable(...))`
+        // is lowered to a plain value and must remain bare here.
         // LegacyReactive bindings (from `$: z = expr`) are also state variables
         // that need $.get() wrapping.
-        let is_derived_or_state = store_binding.is_some_and(|b| {
-            matches!(
-                b.kind,
-                BindingKind::State
-                    | BindingKind::RawState
-                    | BindingKind::Derived
-                    | BindingKind::LegacyReactive
-            )
+        let store_reference_has_getter = store_binding.is_some_and(|b| {
+            utils::is_state_source(b, analysis)
+                || matches!(b.kind, BindingKind::Derived | BindingKind::LegacyReactive)
         });
 
         // Check if the store is a reactive import (mutated instance import in legacy mode)
@@ -645,7 +913,7 @@ fn transform_client_with_visitors(
         // Generate: const $store = () => $.store_get(store, '$store', $$stores);
         // or: const $store = () => $.store_get(store(), '$store', $$stores); for source prop stores
         // or: const $store = () => $.store_get($$props.store, '$store', $$stores); for non-source prop stores
-        // or: const $store = () => $.store_get($.get(store), '$store', $$stores); for derived/state stores
+        // or: const $store = () => $.store_get($.get(store), '$store', $$stores); for reactive store references
         // or: const $store = () => $.store_get($$_import_store(), '$store', $$stores); for reactive imports
         let store_access = if is_source_prop {
             b::call(&context.arena, b::id(store_name), vec![])
@@ -671,12 +939,8 @@ fn transform_client_with_visitors(
                 b::member_path(&context.arena, &format!("$$props.{}", store_name))
             }
         } else if is_reactive_import {
-            b::call(
-                &context.arena,
-                b::id(format!("$$_import_{}", store_name)),
-                vec![],
-            )
-        } else if is_derived_or_state {
+            b::call(&context.arena, b::id(format!("$$_import_{}", store_name)), vec![])
+        } else if store_reference_has_getter {
             b::call(
                 &context.arena,
                 b::member_path(&context.arena, "$.get"),
@@ -728,43 +992,13 @@ fn transform_client_with_visitors(
                 Some(b::id_pattern("$$stores")),
                 Some(b::id_pattern("$$cleanup")),
             ]),
-            Some(b::call(
-                &context.arena,
-                b::member_path(&context.arena, "$.setup_stores"),
-                vec![],
-            )),
+            Some(b::call(&context.arena, b::member_path(&context.arena, "$.setup_stores"), vec![])),
         ));
     }
 
-    // Detect reactive statements ($:) in the instance script
-    // Since analysis.reactive_statements is not populated yet, we scan the script directly.
-    // A `$:` is reactive only at the TOP LEVEL of the instance script (brace depth 0);
-    // a `$:` inside a function/block body is a plain labeled statement (upstream only
-    // treats top-level `$:` as reactive). We approximate nesting with a brace counter.
-    let has_reactive_statements = if let Some(ref content) = analysis.instance_script_content {
-        let mut depth: i32 = 0;
-        let mut found = false;
-        for line in content.raw.lines() {
-            let trimmed = line.trim();
-            if depth <= 0
-                && trimmed.starts_with("$:")
-                && (trimmed.len() == 2 || !trimmed.chars().nth(2).unwrap_or(' ').is_alphanumeric())
-            {
-                found = true;
-                break;
-            }
-            for c in line.chars() {
-                match c {
-                    '{' => depth += 1,
-                    '}' => depth -= 1,
-                    _ => {}
-                }
-            }
-        }
-        found
-    } else {
-        false
-    };
+    // Phase 2 records only top-level legacy `$:` statements, without text
+    // heuristics that confuse braces in comments or strings.
+    let has_reactive_statements = !analysis.legacy_reactive_statements.is_empty();
 
     // Determine if we need context injection ($.push/$.pop)
     // Reference: transform-client.js lines 280-306, 366-370
@@ -863,6 +1097,39 @@ fn transform_client_with_visitors(
     // Pre-allocate for typical component body size
     let mut component_body: Vec<JsStatement> = Vec::new();
 
+    // Add the componentApi: 4 new.target check / the dev `$.check_target` guard.
+    // Reference: transform-client.js lines 559-574. Upstream unshifts this AFTER
+    // the `$$slots` / `$$sanitized_props` / `$$restProps` unshifts, so it lands
+    // ahead of all of them — only `props_id` (unshifted last) precedes it.
+    if options.compatibility.component_api == crate::compiler::ComponentApi::V4 {
+        // if (new.target) return $$_createClassComponent({ component: ComponentName, ...$$anchor });
+        component_body.push(JsStatement::If(super::js_ast::nodes::JsIfStatement {
+            test: context.arena.alloc_expr(b::id("new.target")),
+            consequent: context.arena.alloc_stmt(JsStatement::Return(
+                super::js_ast::nodes::JsReturnStatement {
+                    argument: Some(context.arena.alloc_expr(b::call(
+                        &context.arena,
+                        b::id("$$_createClassComponent"),
+                        vec![b::object(vec![
+                            b::prop(&context.arena, "component", b::id(&analysis.name)),
+                            b::spread(&context.arena, b::id("$$anchor")),
+                        ])],
+                    ))),
+                },
+            )),
+            alternate: None,
+        }));
+    } else if options.dev {
+        component_body.push(b::stmt(
+            &context.arena,
+            b::call(
+                &context.arena,
+                b::member_path(&context.arena, "$.check_target"),
+                vec![b::id("new.target")],
+            ),
+        ));
+    }
+
     // Add legacy $$sanitized_props / $$restProps / $$slots declarations at the top.
     // These must come BEFORE $.push().
     // Reference: transform-client.js lines 458-497. Upstream `unshift`s in the
@@ -936,37 +1203,6 @@ fn transform_client_with_visitors(
         }
     }
 
-    // Add componentApi: 4 new.target check at the very start
-    // Reference: transform-client.js lines 569-582
-    if options.compatibility.component_api == crate::compiler::ComponentApi::V4 {
-        // if (new.target) return $$_createClassComponent({ component: ComponentName, ...$$anchor });
-        component_body.push(JsStatement::If(super::js_ast::nodes::JsIfStatement {
-            test: context.arena.alloc_expr(b::id("new.target")),
-            consequent: context.arena.alloc_stmt(JsStatement::Return(
-                super::js_ast::nodes::JsReturnStatement {
-                    argument: Some(context.arena.alloc_expr(b::call(
-                        &context.arena,
-                        b::id("$$_createClassComponent"),
-                        vec![b::object(vec![
-                            b::prop(&context.arena, "component", b::id(&analysis.name)),
-                            b::spread(&context.arena, b::id("$$anchor")),
-                        ])],
-                    ))),
-                },
-            )),
-            alternate: None,
-        }));
-    } else if options.dev {
-        component_body.push(b::stmt(
-            &context.arena,
-            b::call(
-                &context.arena,
-                b::member_path(&context.arena, "$.check_target"),
-                vec![b::id("new.target")],
-            ),
-        ));
-    }
-
     // Add $.push at the start if injecting context
     if should_inject_context {
         let mut push_args = vec![
@@ -978,13 +1214,13 @@ fn transform_client_with_visitors(
         }
         component_body.push(b::stmt(
             &context.arena,
-            b::call(
-                &context.arena,
-                b::member_path(&context.arena, "$.push"),
-                push_args,
-            ),
+            b::call(&context.arena, b::member_path(&context.arena, "$.push"), push_args),
         ));
     }
+
+    // Everything unshifted upstream lands above this point, so it anchors the
+    // `$$ownership_validator` insertion below without restating those conditions.
+    let preamble_end = component_body.len();
 
     // Add store setup (getters and setup_stores) right after $.push
     // Reference: transform-client.js line 379
@@ -999,7 +1235,7 @@ fn transform_client_with_visitors(
             if matches!(binding.kind, BindingKind::LegacyReactive) {
                 let args = if analysis.immutable {
                     vec![
-                        b::id("undefined"),
+                        b::undefined(&context.arena),
                         b::literal(super::js_ast::nodes::JsLiteral::Boolean(true)),
                     ]
                 } else {
@@ -1036,18 +1272,11 @@ fn transform_client_with_visitors(
     // of assembly — see below. Upstream unshifts it last so it becomes the
     // first line of the component, before `$.push`.)
 
-    // Add CSS styles injection if needed
-    if analysis.css.has_css && analysis.inject_styles {
-        // $.append_styles($$anchor, $$css)
-        component_body.push(b::stmt(
-            &context.arena,
-            b::call(
-                &context.arena,
-                b::member_path(&context.arena, "$.append_styles"),
-                vec![b::id("$$anchor"), b::id("$$css")],
-            ),
-        ));
-    }
+    // `$.append_styles` is unshifted upstream (transform-client.js lines
+    // 412-421) *after* the `$$ownership_validator` unshift (lines 379-383),
+    // so it lands closer to the front. See the insertion below, anchored at
+    // `preamble_end` alongside `$$ownership_validator`, which reproduces
+    // that call order instead of pushing here out of position.
 
     // Add instance-level snippets
     component_body.extend(instance_level_snippets);
@@ -1056,7 +1285,12 @@ fn transform_client_with_visitors(
     // This includes $state, $derived, $effect, $props transformations
     // Reuse the pre_transformed_script from above (already has reactive_import_names).
     if let Some(ref content) = analysis.instance_script_content {
-        let mut transformed_script = pre_transformed_script.clone().unwrap_or_default();
+        let mut transformed_script = pre_transformed_script.take().unwrap_or_default();
+        let has_effect_rune = content.raw.contains("$effect") || content.raw.contains("$inspect");
+        let props_comments = props_declaration_comments(&content.raw);
+        let props_comment_anchor = props_comments
+            .last()
+            .map(|(offset, comment)| content.start + *offset + comment.len() as u32);
 
         // Post-process reactive imports: replace $.get(X)/$.mutate(X,...) with $$_import_X()
         for name in &reactive_import_names {
@@ -1092,11 +1326,7 @@ fn transform_client_with_visitors(
 
         // If the text-based transform added ownership validation, set the flag
         // so that the $$ownership_validator declaration is emitted.
-        if memmem::find(
-            transformed_script.as_bytes(),
-            b"$$ownership_validator.mutation",
-        )
-        .is_some()
+        if memmem::find(transformed_script.as_bytes(), b"$$ownership_validator.mutation").is_some()
         {
             context.state.needs_mutation_validation.set(true);
         }
@@ -1109,8 +1339,24 @@ fn transform_client_with_visitors(
         // content is always emitted at the function body level.
         let script_indent = 1usize;
         let trimmed = transformed_script.trim();
-        let script_source_offset = content.start;
+        // `content.start` is the byte right after `<script>`, which resolves to a
+        // column past the end of that line; anchor the chunk at its first token.
+        let script_source_offset = source
+            .get(content.start as usize..content.end as usize)
+            .map_or(content.start, |text| {
+                content.start + (text.len() - text.trim_start().len()) as u32
+            });
         if !trimmed.is_empty() {
+            for (offset, comment) in &props_comments {
+                if !transformed_script.contains(comment.as_str()) {
+                    component_body.push(JsStatement::RawMapped {
+                        code: comment.clone(),
+                        source_offset: content.start + *offset,
+                        comment_anchor: None,
+                        copied_spans: Vec::new(),
+                    });
+                }
+            }
             // Apply async body transformation if experimental.async is enabled
             // This splits the instance script at the first top-level `await`
             if options.experimental.r#async {
@@ -1121,10 +1367,16 @@ fn transform_client_with_visitors(
                 ) {
                     let cleaned_output = strip_async_noop_placeholders(async_result.output.trim());
                     let normalized = normalize_js_with_oxc(cleaned_output.trim(), script_indent);
-                    component_body.push(JsStatement::RawMapped {
-                        code: normalized.into(),
-                        source_offset: script_source_offset,
-                    });
+                    component_body.push(script_raw_statement(
+                        normalized,
+                        script_source_offset,
+                        has_effect_rune,
+                        &content.raw,
+                        content.start,
+                        content.source_projection.as_ref(),
+                        props_comment_anchor,
+                        options.enable_sourcemap,
+                    ));
                     // Store the blocker_map for use during template generation
                     if !async_result.blocker_map.is_empty() {
                         *context.state.blocker_map.borrow_mut() = async_result.blocker_map;
@@ -1134,10 +1386,16 @@ fn transform_client_with_visitors(
                     let cleaned = strip_async_noop_placeholders(trimmed);
                     if !cleaned.trim().is_empty() {
                         let normalized = normalize_js_with_oxc(cleaned.trim(), script_indent);
-                        component_body.push(JsStatement::RawMapped {
-                            code: normalized.into(),
-                            source_offset: script_source_offset,
-                        });
+                        component_body.push(script_raw_statement(
+                            normalized,
+                            script_source_offset,
+                            has_effect_rune,
+                            &content.raw,
+                            content.start,
+                            content.source_projection.as_ref(),
+                            props_comment_anchor,
+                            options.enable_sourcemap,
+                        ));
                     }
                 }
             } else {
@@ -1150,10 +1408,43 @@ fn transform_client_with_visitors(
                     // the official Svelte compiler's esrap output (consistent spacing,
                     // semicolons, etc.)
                     let normalized = normalize_js_with_oxc(trimmed, script_indent);
-                    component_body.push(JsStatement::RawMapped {
-                        code: normalized.into(),
-                        source_offset: script_source_offset,
-                    });
+                    let retained = retained_scripts
+                        .and_then(|scripts| scripts.instance.as_ref())
+                        .filter(|retained| {
+                            !analysis.is_typescript
+                                && content.source_projection.is_none()
+                                && retained.source() == content.raw
+                                && retained.program().comments.is_empty()
+                        })
+                        .and_then(|retained| {
+                            retained_instance_statement_indices(retained, &content.raw, &normalized)
+                                .map(|statement_indices| (retained, statement_indices))
+                        });
+                    if let Some((retained, statement_indices)) = retained {
+                        let index = ast_islands.len();
+                        ast_islands.push(super::js_ast::to_oxc::AstIsland {
+                            program: retained,
+                            source_offset: content.start,
+                            statement_indices,
+                        });
+                        component_body.push(JsStatement::RetainedAst {
+                            index,
+                            fallback: normalized.into(),
+                            source_offset: script_source_offset,
+                            has_effect_rune,
+                        });
+                    } else {
+                        component_body.push(script_raw_statement(
+                            normalized,
+                            script_source_offset,
+                            has_effect_rune,
+                            &content.raw,
+                            content.start,
+                            content.source_projection.as_ref(),
+                            props_comment_anchor,
+                            options.enable_sourcemap,
+                        ));
+                    }
                 }
             }
         }
@@ -1196,7 +1487,35 @@ fn transform_client_with_visitors(
             let binding = binding_by_name.get(name.as_str()).copied();
 
             if let Some(binding) = binding {
+                // Upstream reads the binding through `build_getter`, which is the
+                // identity when the binding has no read transform. A `$state` that
+                // is never reassigned is lowered to a plain `const`, so it has
+                // none — and then the `state` arm below is never reached, because
+                // the identifier branch has already returned.
+                let read_is_signal = match binding.kind {
+                    BindingKind::State | BindingKind::RawState => {
+                        !analysis.immutable || binding.reassigned || analysis.accessors
+                    }
+                    _ => true,
+                };
                 let is_identifier_expr = true; // build_getter returns identifier for simple refs
+                let returned_early = !read_is_signal
+                    && (matches!(
+                        binding.declaration_kind,
+                        crate::compiler::phases::phase2_analyze::scope::DeclarationKind::Let
+                            | crate::compiler::phases::phase2_analyze::scope::DeclarationKind::Var
+                    ) || !options.dev);
+                let read_expr = || {
+                    if read_is_signal {
+                        b::call(
+                            &context.arena,
+                            b::member_path(&context.arena, "$.get"),
+                            vec![b::id(name)],
+                        )
+                    } else {
+                        b::id(name)
+                    }
+                };
 
                 if is_identifier_expr {
                     if matches!(
@@ -1208,11 +1527,9 @@ fn transform_client_with_visitors(
                         exports_members.push(b::getter(
                             &context.arena,
                             alias,
-                            vec![JsStatement::Return(
-                                super::js_ast::nodes::JsReturnStatement {
-                                    argument: Some(context.arena.alloc_expr(b::id(name))),
-                                },
-                            )],
+                            vec![JsStatement::Return(super::js_ast::nodes::JsReturnStatement {
+                                argument: Some(context.arena.alloc_expr(b::id(name))),
+                            })],
                         ));
                         exports_members.push(b::setter(
                             &context.arena,
@@ -1235,11 +1552,9 @@ fn transform_client_with_visitors(
                         exports_members.push(b::getter(
                             &context.arena,
                             alias,
-                            vec![JsStatement::Return(
-                                super::js_ast::nodes::JsReturnStatement {
-                                    argument: Some(context.arena.alloc_expr(b::id(name))),
-                                },
-                            )],
+                            vec![JsStatement::Return(super::js_ast::nodes::JsReturnStatement {
+                                argument: Some(context.arena.alloc_expr(b::id(name))),
+                            })],
                         ));
                     }
                 }
@@ -1290,7 +1605,7 @@ fn transform_client_with_visitors(
                             ));
                         }
                     }
-                    BindingKind::State => {
+                    BindingKind::State if !returned_early => {
                         // Remove previously added members for this alias
                         while exports_members.last().is_some_and(|m| match m {
                             JsObjectMember::Property(p) => match &p.key {
@@ -1304,15 +1619,9 @@ fn transform_client_with_visitors(
                         exports_members.push(b::getter(
                             &context.arena,
                             alias,
-                            vec![JsStatement::Return(
-                                super::js_ast::nodes::JsReturnStatement {
-                                    argument: Some(context.arena.alloc_expr(b::call(
-                                        &context.arena,
-                                        b::member_path(&context.arena, "$.get"),
-                                        vec![b::id(name)],
-                                    ))),
-                                },
-                            )],
+                            vec![JsStatement::Return(super::js_ast::nodes::JsReturnStatement {
+                                argument: Some(context.arena.alloc_expr(read_expr())),
+                            })],
                         ));
                         exports_members.push(b::setter(
                             &context.arena,
@@ -1335,7 +1644,7 @@ fn transform_client_with_visitors(
                             )],
                         ));
                     }
-                    BindingKind::RawState => {
+                    BindingKind::RawState if !returned_early => {
                         // Remove previously added members for this alias
                         while exports_members.last().is_some_and(|m| match m {
                             JsObjectMember::Property(p) => match &p.key {
@@ -1349,15 +1658,9 @@ fn transform_client_with_visitors(
                         exports_members.push(b::getter(
                             &context.arena,
                             alias,
-                            vec![JsStatement::Return(
-                                super::js_ast::nodes::JsReturnStatement {
-                                    argument: Some(context.arena.alloc_expr(b::call(
-                                        &context.arena,
-                                        b::member_path(&context.arena, "$.get"),
-                                        vec![b::id(name)],
-                                    ))),
-                                },
-                            )],
+                            vec![JsStatement::Return(super::js_ast::nodes::JsReturnStatement {
+                                argument: Some(context.arena.alloc_expr(read_expr())),
+                            })],
                         ));
                         exports_members.push(b::setter(
                             &context.arena,
@@ -1387,15 +1690,13 @@ fn transform_client_with_visitors(
                         exports_members.push(b::getter(
                             &context.arena,
                             alias,
-                            vec![JsStatement::Return(
-                                super::js_ast::nodes::JsReturnStatement {
-                                    argument: Some(context.arena.alloc_expr(b::call(
-                                        &context.arena,
-                                        b::member_path(&context.arena, "$.get"),
-                                        vec![b::id(name)],
-                                    ))),
-                                },
-                            )],
+                            vec![JsStatement::Return(super::js_ast::nodes::JsReturnStatement {
+                                argument: Some(context.arena.alloc_expr(b::call(
+                                    &context.arena,
+                                    b::member_path(&context.arena, "$.get"),
+                                    vec![b::id(name)],
+                                ))),
+                            })],
                         ));
                     }
                     _ => {}
@@ -1423,15 +1724,13 @@ fn transform_client_with_visitors(
                     exports_members.push(b::getter(
                         &context.arena,
                         alias,
-                        vec![JsStatement::Return(
-                            super::js_ast::nodes::JsReturnStatement {
-                                argument: Some(context.arena.alloc_expr(b::call(
-                                    &context.arena,
-                                    b::id(name),
-                                    vec![],
-                                ))),
-                            },
-                        )],
+                        vec![JsStatement::Return(super::js_ast::nodes::JsReturnStatement {
+                            argument: Some(context.arena.alloc_expr(b::call(
+                                &context.arena,
+                                b::id(name),
+                                vec![],
+                            ))),
+                        })],
                     ));
                     let setter_body = vec![
                         b::stmt(
@@ -1450,8 +1749,32 @@ fn transform_client_with_visitors(
                     // In runes mode with an initial value, turn `set foo($$value)`
                     // into `set foo($$value = <initial>)`.
                     // Reference: transform-client.js lines 315-323
-                    if analysis.runes && binding.initial.is_some() {
-                        let initial = binding.initial.clone().unwrap();
+                    if analysis.runes
+                        && binding.initial.is_some()
+                        && let Some(initial) = binding
+                            .initial_span
+                            .and_then(|(s, e)| source.get(s as usize..e as usize))
+                            // The slice is raw source, so a type argument or an
+                            // annotation NESTED in the default is still in it —
+                            // upstream prints a node the TS erasure already
+                            // walked.
+                            .map(|text| {
+                                super::server::helpers::strip_ts_from_derived_inner(
+                                    text,
+                                    analysis.is_typescript,
+                                )
+                            })
+                            .or_else(|| {
+                                // `initial` is the literal's raw text only for the
+                                // shapes `extract_literal_string_typed` handles;
+                                // for the rest it is a JSON dump of the node, so
+                                // it can stand in only when a span is missing AND
+                                // the node was a literal.
+                                (binding.initial_node_type.as_deref() == Some("Literal"))
+                                    .then(|| binding.initial.clone())
+                                    .flatten()
+                            })
+                    {
                         exports_members.push(b::setter_with_default(
                             &context.arena,
                             alias,
@@ -1498,14 +1821,15 @@ fn transform_client_with_visitors(
                 ),
             ));
         } else if options.dev {
-            exports_members.push(b::spread(
-                &context.arena,
-                b::call(
+            // Upstream `unshift`s this one (transform-client.js:345) while the
+            // componentApi: 4 members above are pushed, so it leads the object.
+            exports_members.insert(
+                0,
+                b::spread(
                     &context.arena,
-                    b::member_path(&context.arena, "$.legacy_api"),
-                    vec![],
+                    b::call(&context.arena, b::member_path(&context.arena, "$.legacy_api"), vec![]),
                 ),
-            ));
+            );
         }
 
         if !exports_members.is_empty() {
@@ -1530,11 +1854,7 @@ fn transform_client_with_visitors(
         };
         component_body.push(b::stmt(
             &context.arena,
-            b::call(
-                &context.arena,
-                b::member_path(&context.arena, "$.init"),
-                init_args,
-            ),
+            b::call(&context.arena, b::member_path(&context.arena, "$.init"), init_args),
         ));
     }
 
@@ -1556,17 +1876,30 @@ fn transform_client_with_visitors(
                 vec![b::id("$$props")],
             )),
         );
-        // Insert after $.push (and $.check_target if present)
-        // In the official compiler, this is unshifted before push is unshifted,
-        // so it ends up right after push
-        let mut insert_pos = 0;
-        if options.dev && options.compatibility.component_api != crate::compiler::ComponentApi::V4 {
-            insert_pos += 1; // skip $.check_target(new.target)
-        }
-        if should_inject_context {
-            insert_pos += 1; // skip $.push(...)
-        }
-        component_body.insert(insert_pos, ownership_decl);
+        // Upstream unshifts this before `$.push` is unshifted, so it ends up
+        // directly after the preamble.
+        component_body.insert(preamble_end, ownership_decl);
+    }
+
+    // Add $.append_styles($$anchor, $$css) if needed
+    // Reference: transform-client.js lines 412-421
+    // Upstream unshifts this at the *same* front position as
+    // `$$ownership_validator` above, but its unshift call happens after
+    // (line 412 vs line 379), so it ends up ahead of `$$ownership_validator`
+    // once both land at `preamble_end` — inserting here, after the
+    // ownership-validator insert, reproduces that call order exactly.
+    if analysis.css.has_css && analysis.inject_styles {
+        component_body.insert(
+            preamble_end,
+            b::stmt(
+                &context.arena,
+                b::call(
+                    &context.arena,
+                    b::member_path(&context.arena, "$.append_styles"),
+                    vec![b::id("$$anchor"), b::id("$$css")],
+                ),
+            ),
+        );
     }
 
     // Bind static exports to props so that people can access them with bind:x
@@ -1578,10 +1911,7 @@ fn transform_client_with_visitors(
             // Apply the read transform if one exists (e.g., $.get() for state variables)
             let getter_expr = if let Some(transform) = context.state.transform.get(&export.name) {
                 if let Some(read_fn) = transform.read {
-                    read_fn(
-                        &context.arena,
-                        JsExpr::Identifier(export.name.clone().into()),
-                    )
+                    read_fn(&context.arena, JsExpr::Identifier(export.name.clone().into()))
                 } else {
                     b::id(&export.name)
                 }
@@ -1616,24 +1946,18 @@ fn transform_client_with_visitors(
                 ));
             } else {
                 // return $.pop($$exports)
-                component_body.push(JsStatement::Return(
-                    super::js_ast::nodes::JsReturnStatement {
-                        argument: Some(context.arena.alloc_expr(b::call(
-                            &context.arena,
-                            b::member_path(&context.arena, "$.pop"),
-                            vec![b::id("$$exports")],
-                        ))),
-                    },
-                ));
+                component_body.push(JsStatement::Return(super::js_ast::nodes::JsReturnStatement {
+                    argument: Some(context.arena.alloc_expr(b::call(
+                        &context.arena,
+                        b::member_path(&context.arena, "$.pop"),
+                        vec![b::id("$$exports")],
+                    ))),
+                }));
             }
         } else {
             component_body.push(b::stmt(
                 &context.arena,
-                b::call(
-                    &context.arena,
-                    b::member_path(&context.arena, "$.pop"),
-                    vec![],
-                ),
+                b::call(&context.arena, b::member_path(&context.arena, "$.pop"), vec![]),
             ));
         }
     }
@@ -1641,18 +1965,14 @@ fn transform_client_with_visitors(
     // Add $$cleanup() at the very end if store subscriptions exist
     // Reference: transform-client.js lines 448-454
     if needs_store_cleanup {
-        component_body.push(b::stmt(
-            &context.arena,
-            b::call(&context.arena, b::id("$$cleanup"), vec![]),
-        ));
+        component_body
+            .push(b::stmt(&context.arena, b::call(&context.arena, b::id("$$cleanup"), vec![])));
 
         if needs_exports {
             // return $$pop;
-            component_body.push(JsStatement::Return(
-                super::js_ast::nodes::JsReturnStatement {
-                    argument: Some(context.arena.alloc_expr(b::id("$$pop"))),
-                },
-            ));
+            component_body.push(JsStatement::Return(super::js_ast::nodes::JsReturnStatement {
+                argument: Some(context.arena.alloc_expr(b::id("$$pop"))),
+            }));
         }
     }
 
@@ -1666,21 +1986,14 @@ fn transform_client_with_visitors(
             b::const_decl(
                 &context.arena,
                 props_id_name,
-                b::call(
-                    &context.arena,
-                    b::member_path(&context.arena, "$.props_id"),
-                    vec![],
-                ),
+                b::call(&context.arena, b::member_path(&context.arena, "$.props_id"), vec![]),
             ),
         );
     }
 
     // Build component function parameters
     let params = if should_inject_props {
-        vec![
-            JsPattern::Identifier("$$anchor".into()),
-            JsPattern::Identifier("$$props".into()),
-        ]
+        vec![JsPattern::Identifier("$$anchor".into()), JsPattern::Identifier("$$props".into())]
     } else {
         vec![JsPattern::Identifier("$$anchor".into())]
     };
@@ -1689,9 +2002,7 @@ fn transform_client_with_visitors(
     let component_fn = JsFunctionDeclaration {
         id: Some(analysis.name.clone().into()),
         params: params.into(),
-        body: JsBlockStatement {
-            body: component_body,
-        },
+        body: JsBlockStatement::with_body(component_body),
         is_async: false,
         is_generator: false,
     };
@@ -1745,10 +2056,8 @@ fn transform_client_with_visitors(
 
     // In dev mode, add ComponentName[$.FILENAME] = 'filename.svelte'
     // Reference: transform-client.js line 544-551
-    if options.dev
-        && let Some(ref filename) = options.filename
-    {
-        let fname = filename.replace('\\', "/");
+    if options.dev {
+        let fname = options.filename_or_unknown().replace('\\', "/");
         let relative_filename = if let Some(ref root_dir) = options.root_dir {
             let rd = root_dir.replace('\\', "/");
             if fname.starts_with(&rd) {
@@ -1776,42 +2085,99 @@ fn transform_client_with_visitors(
     // Process module script content - extract imports separately from other content
     // This is needed because module_level_snippets must come after imports but before exports
     // Reference: transform-client.js line 513: body = [...imports, ...state.module_level_snippets, ...body];
-    let module_script_non_imports: Option<String> = if let Some(ref module_content) =
-        analysis.module_script_content
-    {
-        // Strip TypeScript syntax before processing
-        let raw =
-            crate::compiler::phases::phase2_analyze::types::strip_typescript(&module_content.raw);
-        let (module_imports, rest) = extract_imports(&raw);
-        // Add module script imports first (from module.body in official compiler)
-        for import_line in module_imports {
-            let cleaned = cleanup_import_line(&import_line);
-            if cleaned.is_empty() {
-                continue;
-            }
-            let trimmed = cleaned.trim();
-            // Ensure import statements end with semicolons, matching esrap behavior.
-            let with_semi = if !trimmed.ends_with(';') {
-                format!("{};", trimmed)
+    let module_script_non_imports: Option<(String, Option<String>)> =
+        if let Some(ref module_content) = analysis.module_script_content {
+            // `$inspect.trace()`'s default label is located in the original
+            // component, so lower it before TypeScript stripping, comment
+            // removal, import extraction, or any other rewrite moves the
+            // enclosing function. The AST pass parses only the script body;
+            // its prefix supplies the whole-file line and column base.
+            let trace_lowered = if options.dev {
+                source
+                    .get(..module_content.start as usize)
+                    .zip(source.get(module_content.start as usize..module_content.end as usize))
+                    .and_then(|(prefix, module_source)| {
+                        inspect_trace_ast::transform_module_inspect_trace_with_prefix(
+                            module_source,
+                            true,
+                            analysis.is_typescript,
+                            options.filename.as_deref(),
+                            prefix,
+                        )
+                    })
             } else {
-                trimmed.to_string()
+                None
             };
-            body.push(JsStatement::Raw(with_semi.into()));
-        }
-        let rest_trimmed = rest.trim();
-        // A module `<script module>` whose only non-import content is comments
-        // (and whitespace) carries no statements. Upstream parses it into an
-        // empty Program and esrap emits nothing — the dangling comments are
-        // dropped (they have no node to anchor to). Mirror that: emit nothing,
-        // rather than hoisting the bare comments to module top level.
-        if rest_trimmed.is_empty() || is_js_comments_and_whitespace_only(rest_trimmed) {
-            None
+            // Strip TypeScript syntax before processing
+            let raw = crate::compiler::phases::phase2_analyze::types::strip_typescript(
+                trace_lowered.as_deref().unwrap_or(&module_content.raw),
+            );
+            // Phase 2 preserves comments from erased TypeScript declarations for
+            // instance scripts, whose located component block lets esrap print
+            // them. A module script is inserted into a synthetic, unlocated
+            // Program, so those comments are dead upstream. Remove them by their
+            // recorded output ranges before a preceding class/body can revive the
+            // cursor and make the origin of the comments indistinguishable.
+            let raw = if trace_lowered.is_none() {
+                strip_module_reemitted_ts_comments(&raw, module_content.source_projection.as_ref())
+                    .unwrap_or(raw)
+            } else {
+                raw
+            };
+            // Then the comments the accessors swallow, while the class the scan
+            // keys on is still in its source shape — the rune transforms below
+            // rewrite it before `strip_module_toplevel_comments` runs.
+            let raw = analysis
+                .runes
+                .then(|| dead_comments::strip_dead_comments(&raw, dead_comments::Rules::ACCESSORS))
+                .flatten()
+                .unwrap_or(raw);
+            // Every lowering below decides what a rune call is from this text, so
+            // the grouping parens around one have to be gone before the first runs.
+            let raw = super::shared::rune_parens::strip_rune_parens(&raw).unwrap_or(raw);
+            let (module_imports, rest) = extract_imports(&raw);
+            let module_imports = attach_import_origins(
+                module_imports,
+                retained_scripts.and_then(|scripts| scripts.module.as_ref()),
+                module_content.start,
+                analysis.is_typescript,
+                options.enable_sourcemap,
+            );
+            let retained_comment_stripped = if !analysis.is_typescript {
+                retained_scripts
+                    .and_then(|scripts| scripts.module.as_ref())
+                    .filter(|retained| retained.program().source_text == raw)
+                    .map(|retained| {
+                        let stripped = strip_module_toplevel_comments_from_program(
+                            &raw,
+                            retained.program(),
+                            analysis.runes,
+                        );
+                        extract_imports(&stripped).1.trim().to_string()
+                    })
+            } else {
+                None
+            };
+            // Add module script imports first (from module.body in official compiler)
+            for import in module_imports {
+                if let Some(statement) = mapped_import_statement(import, options.enable_sourcemap) {
+                    body.push(statement);
+                }
+            }
+            let rest_trimmed = rest.trim();
+            // A module `<script module>` whose only non-import content is comments
+            // (and whitespace) carries no statements. Upstream parses it into an
+            // empty Program and esrap emits nothing — the dangling comments are
+            // dropped (they have no node to anchor to). Mirror that: emit nothing,
+            // rather than hoisting the bare comments to module top level.
+            if rest_trimmed.is_empty() || is_js_comments_and_whitespace_only(rest_trimmed) {
+                None
+            } else {
+                Some((rest_trimmed.to_string(), retained_comment_stripped))
+            }
         } else {
-            Some(rest_trimmed.to_string())
-        }
-    } else {
-        None
-    };
+            None
+        };
 
     // Add svelte/internal/client import (namespace import as $)
     // In the official compiler (transform-client.js line 154, 506), this is the first
@@ -1824,23 +2190,11 @@ fn transform_client_with_visitors(
 
     // Extract and add imports from instance script
     // These are in state.hoisted after import * as $ (from analysis.instance_body.hoisted)
-    if let Some(ref instance_content) = analysis.instance_script_content {
-        let (script_imports, _) = extract_imports(&instance_content.raw);
-        for import_line in script_imports {
-            let cleaned = cleanup_import_line(&import_line);
-            if cleaned.is_empty() {
-                continue;
+    if analysis.instance_script_content.is_some() {
+        for import in instance_script_imports {
+            if let Some(statement) = mapped_import_statement(import, options.enable_sourcemap) {
+                body.push(statement);
             }
-            let trimmed = cleaned.trim();
-            // Ensure import statements end with semicolons, matching esrap behavior.
-            // User code may omit semicolons (ASI), but the Svelte compiler's esrap
-            // printer always adds them.
-            let with_semi = if !trimmed.ends_with(';') {
-                format!("{};", trimmed)
-            } else {
-                trimmed.to_string()
-            };
-            body.push(JsStatement::Raw(with_semi.into()));
         }
     }
 
@@ -1856,10 +2210,63 @@ fn transform_client_with_visitors(
     // This comes after module_level_snippets so that `export { foo }` can reference `const foo`
     // Transform class fields first (before rune transforms strip the rune names)
     // Then transform remaining rune calls ($state, $derived, etc.) in module-level script
-    if let Some(non_imports) = module_script_non_imports {
-        let class_transformed = transform_class_fields_client(&non_imports);
-        let transformed = transform_module_script_runes(&class_transformed, analysis, options.dev);
-        body.push(JsStatement::Raw(transformed.into()));
+    if let Some((non_imports, retained_comment_stripped)) = module_script_non_imports {
+        let class_transformed = transform_module_class_fields_client(&non_imports);
+        let has_effect_rune =
+            class_transformed.contains("$effect") || class_transformed.contains("$inspect");
+        let transformed = transform_module_script_runes(
+            &class_transformed,
+            &non_imports,
+            analysis,
+            options.dev,
+            false,
+        );
+        // Drop module-level comments esrap's no-`loc` top-level Program omits
+        // (leading JSDoc before a kept `export const`, per-field JSDoc that
+        // `strip_typescript` re-emits from a removed `export type`/`interface`).
+        let transformed = if transformed == non_imports {
+            retained_comment_stripped
+                .unwrap_or_else(|| strip_module_toplevel_comments(&transformed, analysis.runes))
+        } else {
+            strip_module_toplevel_comments(&transformed, analysis.runes)
+        };
+        let retained = retained_scripts
+            .and_then(|scripts| scripts.module.as_ref())
+            .filter(|retained| {
+                !analysis.is_typescript
+                    && analysis.module_script_content.as_ref().is_some_and(|content| {
+                        content.source_projection.is_none() && retained.source() == content.raw
+                    })
+                    && retained.program().comments.is_empty()
+            })
+            .and_then(|retained| {
+                analysis.module_script_content.as_ref().and_then(|content| {
+                    retained_instance_statement_indices(
+                        retained,
+                        &content.raw,
+                        &normalize_js_with_oxc(&transformed, 1),
+                    )
+                    .map(|statement_indices| (retained, content.start, statement_indices))
+                })
+            });
+        body.push(if let Some((retained, source_offset, statement_indices)) = retained {
+            let index = ast_islands.len();
+            ast_islands.push(super::js_ast::to_oxc::AstIsland {
+                program: retained,
+                source_offset,
+                statement_indices,
+            });
+            JsStatement::RetainedAst {
+                index,
+                fallback: transformed.into(),
+                source_offset,
+                has_effect_rune,
+            }
+        } else if has_effect_rune {
+            JsStatement::RawEffect(transformed.into())
+        } else {
+            JsStatement::Raw(transformed.into())
+        });
     }
 
     // Add hoisted statements (template declarations, etc.)
@@ -1871,7 +2278,6 @@ fn transform_client_with_visitors(
         // Render the actual scoped CSS code.
         // Injected styles are minified unless in dev mode, matching upstream's
         // `minify: analysis.inject_styles && !options.dev` (3-transform/css/index.js:36).
-        let is_custom_element = analysis.custom_element.is_some();
         let mut css_code = String::new();
         let css_render_result = if !options.dev {
             super::css::render_stylesheet_minified(analysis, ast.css.as_deref(), source, options)
@@ -1880,14 +2286,10 @@ fn transform_client_with_visitors(
         };
         if let Ok(css_output) = css_render_result {
             css_code = css_output.code;
-            // In dev mode, embed the CSS source map as a data URI in the CSS code.
-            // This matches the official Svelte compiler behavior (css/index.js):
-            //   css.code += `\n/*# sourceMappingURL=${css.map.toUrl()} */`;
-            // IMPORTANT: Only for css="injected" mode, NOT for custom elements.
-            // Custom elements embed CSS in $$css.code without sourcemaps.
-            // Reference: css/index.js line 68: `if (dev && options.css === 'injected' && css.code)`
+            // `if (dev && analysis.inject_styles && css.code)` (`css/index.js`),
+            // which a custom element satisfies too — its `$$css.code` carries
+            // the map like any other injected stylesheet.
             if options.dev
-                && !is_custom_element
                 && !css_code.is_empty()
                 && let Some(mut css_map_json) = css_output.map
             {
@@ -1938,20 +2340,26 @@ fn transform_client_with_visitors(
         //   if (import.meta.hot) {
         //     Component = $.hmr(Component);
         //     import.meta.hot.accept((module) => {
+        //       $.cleanup_styles('<hash>');   // only when the component has CSS
         //       Component[$.HMR].update(module.default);
         //     });
         //   }
+        // The `cleanup_styles` call removes the previous version's injected
+        // stylesheet, so rules do not accumulate across hot updates.
+        let cleanup_styles = if analysis.css.hash.is_empty() {
+            String::new()
+        } else {
+            format!("\t\t$.cleanup_styles('{}');\n", analysis.css.hash)
+        };
         body.push(JsStatement::Raw(
             format!(
-                "if (import.meta.hot) {{\n\t{} = $.hmr({});\n\n\timport.meta.hot.accept((module) => {{\n\t\t{}[$.HMR].update(module.default);\n\t}});\n}}",
-                analysis.name, analysis.name, analysis.name
+                "if (import.meta.hot) {{\n\t{name} = $.hmr({name});\n\n\timport.meta.hot.accept((module) => {{\n{cleanup_styles}\t\t{name}[$.HMR].update(module.default);\n\t}});\n}}",
+                name = analysis.name,
             ).into(),
         ));
 
         // export default Component;
-        body.push(JsStatement::Raw(
-            format!("export default {};", analysis.name).into(),
-        ));
+        body.push(JsStatement::Raw(format!("export default {};", analysis.name).into()));
     } else {
         body.push(JsStatement::ExportDefault(JsExportDefault {
             declaration: JsExportDefaultDeclaration::Function(component_fn),
@@ -2026,14 +2434,11 @@ fn transform_client_with_visitors(
         {
             for (name, prop_def) in &ce_props {
                 let binding = analysis.root.bindings.iter().find(|b| &b.name == name);
-                let key = binding
-                    .and_then(|b| b.prop_alias.clone())
-                    .unwrap_or_else(|| name.clone());
+                let key =
+                    binding.and_then(|b| b.prop_alias.clone()).unwrap_or_else(|| name.clone());
 
-                let mut prop_type = prop_def
-                    .get("type")
-                    .and_then(|t| t.as_str())
-                    .map(|s| s.to_string());
+                let mut prop_type =
+                    prop_def.get("type").and_then(|t| t.as_str()).map(|s| s.to_string());
                 // If no explicit type and the binding's initial value is a boolean
                 // literal, infer type: 'Boolean' (transform-client.js lines 600-607)
                 if prop_type.is_none()
@@ -2048,11 +2453,7 @@ fn transform_client_with_visitors(
                 if let Some(attribute) = prop_def.get("attribute").and_then(|a| a.as_str()) {
                     value_props.push(b::prop(&context.arena, "attribute", b::string(attribute)));
                 }
-                if prop_def
-                    .get("reflect")
-                    .and_then(|r| r.as_bool())
-                    .unwrap_or(false)
-                {
+                if prop_def.get("reflect").and_then(|r| r.as_bool()).unwrap_or(false) {
                     value_props.push(b::prop(&context.arena, "reflect", b::true_literal()));
                 }
                 if let Some(t) = &prop_type {
@@ -2069,10 +2470,7 @@ fn transform_client_with_visitors(
             {
                 continue;
             }
-            let key = binding
-                .prop_alias
-                .clone()
-                .unwrap_or_else(|| binding.name.clone());
+            let key = binding.prop_alias.clone().unwrap_or_else(|| binding.name.clone());
             // Upstream checks `if (ce_props[key]) continue;` — i.e. the original
             // option-object keys, not the emitted (aliased) keys.
             if ce_props.iter().any(|(name, _)| name == &key) {
@@ -2083,13 +2481,8 @@ fn transform_client_with_visitors(
         let props_str = b::object(props_entries);
 
         // Build slots array
-        let slots_str = b::array(
-            analysis
-                .slot_names
-                .keys()
-                .map(|name| b::string(name.clone()))
-                .collect(),
-        );
+        let slots_str =
+            b::array(analysis.slot_names.keys().map(|name| b::string(name.clone())).collect());
 
         // Build accessors array
         let accessors_str = b::array(
@@ -2109,11 +2502,7 @@ fn transform_client_with_visitors(
         } else if shadow_mode == "none" {
             None
         } else {
-            Some(b::object(vec![b::prop(
-                &context.arena,
-                "mode",
-                b::string(shadow_mode),
-            )]))
+            Some(b::object(vec![b::prop(&context.arena, "mode", b::string(shadow_mode))]))
         };
 
         // $.create_custom_element(Component, props, slots, accessors, shadowRootInit, extend)
@@ -2136,68 +2525,163 @@ fn transform_client_with_visitors(
 
         // If tag name is provided, call customElements.define
         if let Some(ref tag) = ce.tag {
-            body.push(b::stmt(
+            let define = b::stmt(
                 &context.arena,
                 b::call(
                     &context.arena,
                     b::member_path(&context.arena, "customElements.define"),
                     vec![b::string(tag.clone()), create_ce],
                 ),
-            ));
+            );
+            if options.hmr {
+                // `customElements.define` throws on an already-defined name, so a
+                // second hot update of the same module would otherwise abort.
+                body.push(b::if_stmt(
+                    &context.arena,
+                    b::binary_str(
+                        &context.arena,
+                        "==",
+                        b::call(
+                            &context.arena,
+                            b::member_path(&context.arena, "customElements.get"),
+                            vec![b::string(tag.clone())],
+                        ),
+                        b::null(),
+                    ),
+                    define,
+                    None,
+                ));
+            } else {
+                body.push(define);
+            }
         } else {
             body.push(b::stmt(&context.arena, create_ce));
         }
     }
 
+    // Insert module-scope `var rest_excludes = new Set([...])` hoists lifted from
+    // the instance script's `$.rest_props(...)` calls: immediately before the first
+    // template-factory declaration, or before `export default` when none exists.
+    if !rest_excludes_hoists.is_empty() {
+        let insert_idx = body
+            .iter()
+            .position(|s| is_client_template_factory(&context.arena, s))
+            .or_else(|| body.iter().position(is_export_default_stmt))
+            .unwrap_or(body.len());
+        for (offset, (id, init)) in rest_excludes_hoists.iter().enumerate() {
+            body.insert(
+                insert_idx + offset,
+                JsStatement::Raw(format!("var {} = {};", id, init).into()),
+            );
+        }
+    }
+
     // Create the program
-    let program = JsProgram { body };
+    let program = JsProgram {
+        body,
+        component_brace_span: ast.instance.as_deref().and_then(|script| {
+            (script.start < script.end)
+                .then(|| (analysis.name.clone().into(), script.start, script.end))
+        }),
+    };
+    if let Some(sink) = &mut program_sink {
+        sink(&program, &context.arena);
+    }
 
     // Generate JavaScript code from the program, optionally with source map data
     super::profile::record_assembly_after_fragment(super::profile::timer_elapsed(_assembly_start));
     let _codegen_start = super::profile::timer_start();
 
-    // Direct-AST codegen via to_oxc + esrap — the DEFAULT client codegen path.
-    // The string codegen (`generate` / `generate_with_sourcemap`) is the fallback
-    // for the ~6% of components where to_oxc bails (a comment-bearing chunk, which
-    // keeps the comments verbatim, or an unsupported node). `RSVELTE_CLIENT_NO_OXC`
-    // forces the legacy string path (escape hatch). Span-stamping (`Spanned` /
-    // `RawMapped` → original-source offsets) feeds esrap `print_with_map` for the
-    // sourcemap branch.
-    if std::env::var_os("RSVELTE_CLIENT_NO_OXC").is_none() {
+    // Scriptless components use the faster handwritten printer. Scripts need
+    // OXC/esrap for official formatting and coordinate-aware comment placement.
+    if *CLIENT_USE_OXC || ast.instance.is_some() || ast.module.is_some() {
         let converted = CLIENT_TO_OXC_ALLOCATOR.with(|cell| {
             let mut alloc = cell.borrow_mut();
             alloc.reset();
-            super::js_ast::to_oxc::program_to_oxc(&program, &context.arena, &alloc).map(
-                |oxc_prog| {
-                    // Keep `;` empty statements: the parsed-`Raw` `;;` are real
-                    // EmptyStatement nodes the official compiler output preserves.
-                    let print_opts = rsvelte_esrap::PrintOptions {
-                        keep_empty_statements: true,
-                        ..Default::default()
-                    };
-                    if options.enable_sourcemap {
-                        let pm = rsvelte_esrap::print_with_map_opts(&oxc_prog, source, &print_opts);
-                        (pm.code, esrap_mappings_to_source_mappings(&pm.mappings))
-                    } else {
-                        (
-                            rsvelte_esrap::print_with(&oxc_prog, "", &print_opts),
-                            Vec::new(),
-                        )
-                    }
-                },
+            super::js_ast::to_oxc::program_to_oxc_with_islands(
+                &program,
+                &context.arena,
+                &alloc,
+                &ast_islands,
             )
+            .map(|converted| {
+                let print_opts =
+                    rsvelte_esrap::PrintOptions::default().with_unlocated_program(true);
+                let oxc_prog = &converted.program;
+                match &converted.comment_source {
+                    // The program carries comments, so it prints in the
+                    // unified comment coordinate space `to_oxc` built.
+                    Some(comment_source) => {
+                        let map_source = options.enable_sourcemap.then_some(source);
+                        let _t = super::profile::timer_start();
+                        let pm = rsvelte_esrap::print_split(
+                            oxc_prog,
+                            comment_source,
+                            converted.loc_base,
+                            map_source,
+                            &converted.loc_map,
+                            &converted.brace_mappings,
+                            &print_opts,
+                        );
+                        super::profile::record_esrap_client_split(super::profile::timer_elapsed(
+                            _t,
+                        ));
+                        (pm.code, esrap_mappings_to_source_mappings(&pm.mappings))
+                    }
+                    None if options.enable_sourcemap => {
+                        let _t = super::profile::timer_start();
+                        let pm = rsvelte_esrap::print_with_map(oxc_prog, source, &print_opts);
+                        super::profile::record_esrap_client_map(super::profile::timer_elapsed(_t));
+                        (pm.code, esrap_mappings_to_source_mappings(&pm.mappings))
+                    }
+                    None => {
+                        let _t = super::profile::timer_start();
+                        let code = rsvelte_esrap::print_with(oxc_prog, "", &print_opts);
+                        super::profile::record_esrap_client_plain(super::profile::timer_elapsed(
+                            _t,
+                        ));
+                        (code, Vec::new())
+                    }
+                }
+            })
         });
         if let Some((code, mappings)) = converted {
             super::profile::record_codegen(super::profile::timer_elapsed(_codegen_start));
-            return Ok(CodegenResult {
-                code: hoist_rest_excludes(&code),
-                mappings,
-            });
-        } else if std::env::var_os("RSVELTE_CLIENT_TO_OXC_DEBUG").is_some() {
-            eprintln!(
-                "CLIENT_TO_OXC_FALLBACK {}",
+            let code = rehome_derived_jsdoc(&code);
+            let code = if let Some(script) = analysis.instance_script_content.as_ref() {
+                super::shared::async_body::restore_async_derived_ignore_comments(&script.raw, code)
+            } else {
+                code
+            };
+            let code = if let Some(script) = analysis.module_script_content.as_ref() {
+                super::shared::async_body::strip_module_async_derived_ignore_comments(
+                    &script.raw,
+                    code,
+                )
+            } else {
+                code
+            };
+            let mut mappings = mappings;
+            let code = if let Some(script) = analysis.module_script_content.as_ref() {
+                super::shared::module_tail_comment::rehome(
+                    code,
+                    &script.raw,
+                    &analysis.name,
+                    &mut mappings,
+                )
+            } else {
+                code
+            };
+            return Ok(CodegenResult { code, mappings });
+        } else if *CLIENT_TO_OXC_DEBUG {
+            // Corpus workers share one stderr and a multi-part write interleaves,
+            // gluing records together; emit the whole line in one call.
+            let line = format!(
+                "CLIENT_TO_OXC_FALLBACK {} {}\n",
+                super::js_ast::to_oxc::take_fallback_reason(),
                 options.filename.as_deref().unwrap_or("?")
             );
+            let _ = std::io::Write::write_all(&mut std::io::stderr().lock(), line.as_bytes());
         }
     }
 
@@ -2205,7 +2689,14 @@ fn transform_client_with_visitors(
         let r = generate_with_sourcemap(&program, source, &context.arena)
             .map_err(TransformError::CodeGen)
             .map(|mut result| {
-                result.code = hoist_rest_excludes(&result.code);
+                if let Some(script) = analysis.module_script_content.as_ref() {
+                    result.code = super::shared::module_tail_comment::rehome(
+                        result.code,
+                        &script.raw,
+                        &analysis.name,
+                        &mut result.mappings,
+                    );
+                }
                 result
             });
         super::profile::record_codegen(super::profile::timer_elapsed(_codegen_start));
@@ -2213,34 +2704,116 @@ fn transform_client_with_visitors(
     } else {
         let code = generate(&program, &context.arena).map_err(TransformError::CodeGen)?;
         super::profile::record_codegen(super::profile::timer_elapsed(_codegen_start));
-        Ok(CodegenResult {
-            code: hoist_rest_excludes(&code),
-            mappings: vec![],
-        })
+        let code = rehome_derived_jsdoc(&code);
+        let code = if let Some(script) = analysis.instance_script_content.as_ref() {
+            super::shared::async_body::restore_async_derived_ignore_comments(&script.raw, code)
+        } else {
+            code
+        };
+        let code = if let Some(script) = analysis.module_script_content.as_ref() {
+            super::shared::async_body::strip_module_async_derived_ignore_comments(&script.raw, code)
+        } else {
+            code
+        };
+        let code = if let Some(script) = analysis.module_script_content.as_ref() {
+            super::shared::module_tail_comment::rehome(code, &script.raw, &analysis.name, &mut [])
+        } else {
+            code
+        };
+        Ok(CodegenResult { code, mappings: vec![] })
     }
 }
 
-/// Convert esrap's line-indexed source-map segments
-/// (`Vec<Vec<[gen_col, src_idx, src_line, src_col]>>`) into the flat
-/// [`SourceMapping`] list the downstream VLQ encoder (`encode_vlq_mappings`)
-/// consumes. The outer index is the 0-based generated line.
-fn esrap_mappings_to_source_mappings(
-    mappings: &[Vec<rsvelte_esrap::command::Segment>],
-) -> Vec<SourceMapping> {
-    let mut out = Vec::new();
-    for (gen_line, segs) in mappings.iter().enumerate() {
-        for seg in segs {
-            out.push(SourceMapping {
-                gen_line: gen_line as u32,
-                gen_col: seg[0] as u32,
-                source: seg[1] as u32,
-                orig_line: seg[2] as u32,
-                orig_col: seg[3] as u32,
-                name: None,
-            });
+fn rehome_derived_jsdoc(code: &str) -> String {
+    let code = rehome_tag_derived_line_comments(code);
+    let mut result = String::with_capacity(code.len());
+    let mut rest = code.as_str();
+    const PREFIX: &str = "$.derived(() => /**";
+
+    while let Some(start) = rest.find(PREFIX) {
+        result.push_str(&rest[..start]);
+        let comment_start = start + "$.derived(() => ".len();
+        let Some(comment_end) = rest[comment_start + 3..].find("*/") else {
+            result.push_str(&rest[start..]);
+            return result;
+        };
+        let comment_end = comment_start + 3 + comment_end + 2;
+        let expression = rest[comment_end..].trim_start();
+        if expression.is_empty() {
+            result.push_str(&rest[start..]);
+            return result;
         }
+        let line_start = rest[..start].rfind('\n').map_or(0, |index| index + 1);
+        let line = &rest[line_start..start];
+        let indent = &line[..line.len() - line.trim_start_matches([' ', '\t']).len()];
+        result.push_str("$.derived((");
+        result.push_str(&rest[comment_start..comment_end]);
+        result.push('\n');
+        result.push_str(indent);
+        result.push_str(") => ");
+        rest = expression;
     }
-    out
+    result.push_str(rest);
+    result
+}
+
+fn rehome_tag_derived_line_comments(code: &str) -> String {
+    let mut result = String::with_capacity(code.len());
+    let mut rest = code;
+    const PREFIX: &str = "$.tag(\n";
+    const DERIVED: &str = "$.derived(() => ";
+
+    while let Some(start) = rest.find(PREFIX) {
+        let comment_start = start + PREFIX.len();
+        let indent_end = rest[comment_start..]
+            .find(|c: char| !matches!(c, ' ' | '\t'))
+            .map_or(rest.len(), |index| comment_start + index);
+        let indent = &rest[comment_start..indent_end];
+        let Some(comment_end_relative) = rest[indent_end..].find('\n') else {
+            result.push_str(&rest[..start + PREFIX.len()]);
+            rest = &rest[start + PREFIX.len()..];
+            continue;
+        };
+        let comment_end = indent_end + comment_end_relative;
+        let after_comment = comment_end + 1;
+
+        if !rest[indent_end..].starts_with("//")
+            || !rest[after_comment..].starts_with(indent)
+            || !rest[after_comment + indent.len()..].starts_with(DERIVED)
+        {
+            result.push_str(&rest[..start + PREFIX.len()]);
+            rest = &rest[start + PREFIX.len()..];
+            continue;
+        }
+
+        result.push_str(&rest[..indent_end]);
+        result.push_str("$.derived((");
+        result.push_str(&rest[indent_end..comment_end]);
+        result.push('\n');
+        result.push_str(indent);
+        result.push_str(") => ");
+        rest = &rest[after_comment + indent.len() + DERIVED.len()..];
+    }
+    result.push_str(rest);
+    result
+}
+
+/// Convert esrap's flat, generated-order mapping list into the
+/// [`SourceMapping`] list the downstream VLQ encoder (`encode_vlq_mappings`)
+/// consumes.
+fn esrap_mappings_to_source_mappings(mappings: &[rsvelte_esrap::Mapping]) -> Vec<SourceMapping> {
+    mappings
+        .iter()
+        .map(|m| SourceMapping {
+            gen_line: m.gen_line,
+            gen_col: m.gen_column,
+            // esrap only ever maps a single source.
+            source: 0,
+            orig_line: m.source_line,
+            orig_col: m.source_column,
+            name: None,
+        })
+        .collect()
 }
 
 // Thread-local OXC allocator for the client `to_oxc` direct-AST print path.
@@ -2252,38 +2825,48 @@ thread_local! {
         std::cell::RefCell::new(oxc_allocator::Allocator::default());
 }
 
-/// Hoist `$.rest_props($$props, [...])` inline exclude arrays to module-scope
-/// `var rest_excludes_N = new Set([...])` declarations and replace the inline
-/// arrays with identifier references. Mirrors Svelte 5.56.0 #18252.
+static CLIENT_USE_OXC: LazyLock<bool> =
+    LazyLock::new(|| std::env::var_os("RSVELTE_CLIENT_TO_OXC").is_some());
+static CLIENT_TO_OXC_DEBUG: LazyLock<bool> =
+    LazyLock::new(|| std::env::var_os("RSVELTE_CLIENT_TO_OXC_DEBUG").is_some());
+
+fn is_ascii_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'$'
+}
+
+/// Rewrite `$.rest_props($$props, [<array>])` occurrences in the instance-script
+/// text to `$.rest_props($$props, <id>)`, returning the module-scope hoists as
+/// `(<id>, "new Set([<array>])")` pairs to emit as `var <id> = new Set([...]);`.
 ///
-/// Operates as a post-process pass on the generated source because the
-/// `transform_props_destructuring` text helper emits its `$.rest_props(...)`
-/// shape lazily inside the AST visitor, so the existing AST-level
-/// `state.hoisted` channel is not available at that emission site. Legacy
-/// `$.legacy_rest_props($$sanitized_props, [...])` calls are intentionally
-/// left untouched — that runtime mutates the exclude list in its
-/// `deleteProperty` trap and so cannot share a hoisted Set across instances
-/// (matches the upstream commit's explicit carve-out).
-fn hoist_rest_excludes(code: &str) -> String {
+/// The `transform_props_destructuring` text helper emits the `$.rest_props(...)`
+/// call inline, so the exclude array is lifted here — before codegen — and the
+/// module-scope `var <id> = new Set([...])` declaration is inserted as a real
+/// statement (see the insertion in `transform_client`) rather than
+/// spliced into the final printed output. Mirrors Svelte 5.56.0 #18252. Legacy
+/// `$.legacy_rest_props($$sanitized_props, [...])` calls are intentionally left
+/// untouched — that runtime mutates the exclude list in its `deleteProperty` trap
+/// and so cannot share a hoisted Set across instances (the upstream carve-out).
+/// #18252. Legacy `$.legacy_rest_props(...)` is intentionally untouched (its
+/// runtime mutates the exclude list per instance and cannot share a hoisted Set).
+fn extract_rest_excludes_hoists(code: &mut String) -> Vec<(String, String)> {
     let needle = "$.rest_props($$props, [";
     if !code.contains(needle) {
-        return code.to_string();
+        return Vec::new();
     }
 
-    let bytes = code.as_bytes();
-    let mut hoists: Vec<String> = Vec::new();
+    let mut hoists: Vec<(String, String)> = Vec::new();
     let mut replacements: Vec<(usize, usize, String)> = Vec::new();
     let mut search_start = 0usize;
     let mut counter: usize = 0;
-    // Pre-seed conflicts with any existing `rest_excludes` identifier in the
-    // source so we don't collide with user code or future emission sites.
+    // Pre-seed conflicts with any existing `rest_excludes` identifier so we don't
+    // collide with user code or a second emission site.
     let mut taken: rustc_hash::FxHashSet<String> = rustc_hash::FxHashSet::default();
     {
+        let bytes = code.as_bytes();
         let mut i = 0usize;
         while let Some(pos) = code[i..].find("rest_excludes") {
             let abs = i + pos;
             let after = abs + "rest_excludes".len();
-            // Capture optional `_N` suffix.
             let mut end = after;
             if end < bytes.len() && bytes[end] == b'_' {
                 end += 1;
@@ -2291,8 +2874,7 @@ fn hoist_rest_excludes(code: &str) -> String {
                     end += 1;
                 }
             }
-            // Only collect when preceded by a non-identifier boundary.
-            let prev_ok = abs == 0 || !is_ident_char(bytes[abs - 1]);
+            let prev_ok = abs == 0 || !is_ascii_ident_byte(bytes[abs - 1]);
             if prev_ok {
                 taken.insert(code[abs..end].to_string());
             }
@@ -2307,15 +2889,14 @@ fn hoist_rest_excludes(code: &str) -> String {
             break;
         };
         let array_close = array_open + 1 + array_close_rel;
-        // Ensure the very next char after ']' is ')' so we know the array is
-        // the second argument and there are no further parts.
-        if bytes.get(array_close + 1).copied() != Some(b')') {
+        // The array must be the whole second argument: what follows `]` is either
+        // the end of the call or the comma before the dev-only name argument.
+        if !matches!(code.as_bytes().get(array_close + 1).copied(), Some(b')') | Some(b',')) {
             search_start = array_close + 1;
             continue;
         }
-        let array_text = &code[array_open..=array_close]; // includes [ ... ]
+        let array_text = code[array_open..=array_close].to_string(); // includes [ ... ]
 
-        // Allocate a unique `rest_excludes[_N]` name.
         let id = loop {
             let candidate = if counter == 0 {
                 "rest_excludes".to_string()
@@ -2329,104 +2910,482 @@ fn hoist_rest_excludes(code: &str) -> String {
             }
         };
 
-        hoists.push(format!("var {} = new Set({});", id, array_text));
-        // Replace the inline `[...]` with the identifier inside the call.
+        hoists.push((id.clone(), format!("new Set({})", array_text)));
         replacements.push((array_open, array_close + 1, id));
-        search_start = array_close + 2; // skip past `])`
+        search_start = array_close + 1; // skip past `]`
     }
 
-    if hoists.is_empty() {
-        return code.to_string();
-    }
-
-    // Apply replacements right-to-left to preserve indices.
-    let mut out = code.to_string();
+    // Apply replacements right-to-left to preserve byte offsets.
     for (start, end, id) in replacements.into_iter().rev() {
-        out.replace_range(start..end, &id);
+        code.replace_range(start..end, &id);
     }
 
-    // Inject hoists at module scope, just before the first non-import line.
-    // Upstream lays them out as: imports, then a blank line, then each `var`
-    // on its own line followed by a blank line, then the component function.
-    let injection_point = find_module_scope_injection_point(&out);
-    let mut injection = String::new();
-    for h in &hoists {
-        injection.push_str(h);
-        injection.push_str("\n\n");
+    hoists
+}
+
+/// True when a module-scope statement is a client template-factory declaration —
+/// a `var X = $.from_html(...)` / `$.from_svg(...)` / `$.from_mathml(...)` /
+/// `$.from_tree(...)` / `$.with_script(...)`. The `rest_excludes` hoist is
+/// inserted immediately before the first such statement so it lands right after
+/// the imports / module-script preamble, matching upstream's `state.hoisted`
+/// ordering. In dev the factory is wrapped in `$.add_locations(...)`, so the
+/// match looks through that wrapper to the factory call it carries.
+fn is_client_template_factory(arena: &super::js_ast::JsArena, stmt: &JsStatement) -> bool {
+    fn callee_name<'a>(
+        arena: &'a super::js_ast::JsArena,
+        expr: &'a JsExpr,
+    ) -> Option<(&'a str, &'a super::js_ast::nodes::JsCallExpression)> {
+        let JsExpr::Call(call) = expr else {
+            return None;
+        };
+        let JsExpr::Member(m) = arena.get_expr(call.callee) else {
+            return None;
+        };
+        if !matches!(arena.get_expr(m.object), JsExpr::Identifier(o) if o == "$") {
+            return None;
+        }
+        match &m.property {
+            super::js_ast::nodes::JsMemberProperty::Identifier(p) => Some((p.as_str(), call)),
+            _ => None,
+        }
     }
-    out.insert_str(injection_point, &injection);
-    out
+    fn callee_is_factory(arena: &super::js_ast::JsArena, expr: &JsExpr) -> bool {
+        let Some((name, call)) = callee_name(arena, expr) else {
+            return false;
+        };
+        match name {
+            "from_html" | "from_svg" | "from_mathml" | "from_tree" | "with_script" => true,
+            "add_locations" => call.arguments.first().is_some_and(|a| callee_is_factory(arena, a)),
+            _ => false,
+        }
+    }
+    match stmt {
+        JsStatement::VariableDeclaration(vd) => vd
+            .declarations
+            .first()
+            .and_then(|d| d.init)
+            .is_some_and(|id| callee_is_factory(arena, arena.get_expr(id))),
+        JsStatement::Raw(s) => stmt_text_has_factory(s),
+        JsStatement::RawMapped { code, .. } | JsStatement::RawMappedEffect { code, .. } => {
+            stmt_text_has_factory(code)
+        }
+        _ => false,
+    }
 }
 
-fn is_ident_char(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_' || b == b'$'
-}
-
-/// Find the byte offset at which to inject module-scope hoists. The hoisted
-/// `var rest_excludes = new Set(...)` declarations belong inside the
-/// `state.hoisted` region of the assembled module — after any
-/// custom-element IIFE and module-script preamble, but immediately before the
-/// first `$.from_html` / `$.from_svg` / `$.from_mathml` / `$.from_tree`
-/// template factory declaration so the layout matches upstream's
-/// `state.hoisted.push(...)` ordering.
-///
-/// Search order:
-/// 1. First `var <id> = $.from_html(` / `$.from_svg(` / `$.from_mathml(` /
-///    `$.from_tree(` line at module scope (start of line indentation), insert
-///    before it.
-/// 2. Fall back to start of the line containing the first `export default`.
-/// 3. Final fallback: end of source.
-fn find_module_scope_injection_point(code: &str) -> usize {
-    const FACTORY_NEEDLES: &[&str] = &[
+fn stmt_text_has_factory(s: &str) -> bool {
+    const NEEDLES: &[&str] = &[
         "= $.from_html(",
         "= $.from_svg(",
         "= $.from_mathml(",
         "= $.from_tree(",
-        // `<script>`-bearing templates wrap the factory: `var root =
-        // $.with_script($.from_html(...))`. The inner `= $.from_html(` is preceded
-        // by `(` not `= `, so match the outer `$.with_script(` declaration too —
-        // otherwise the `rest_excludes` hoist lands AFTER this first template
-        // instead of above all of them (upstream emits it right after imports).
         "= $.with_script(",
+        "= $.add_locations(",
     ];
-
-    let mut best: Option<usize> = None;
-    for needle in FACTORY_NEEDLES {
-        if let Some(pos) = code.find(needle)
-            && let Some(line_start) = line_start_of(code, pos)
-            && best.is_none_or(|b| line_start < b)
-        {
-            best = Some(line_start);
-        }
-    }
-    if let Some(p) = best {
-        return p;
-    }
-
-    if let Some(pos) = code.find("\nexport default ") {
-        return pos + 1;
-    }
-    if code.starts_with("export default ") {
-        return 0;
-    }
-    code.len()
+    NEEDLES.iter().any(|n| s.contains(n))
 }
 
-fn line_start_of(code: &str, pos: usize) -> Option<usize> {
-    let bytes = code.as_bytes();
-    if pos > bytes.len() {
-        return None;
+/// True when a module-scope statement is the `export default` component. Used as
+/// the fall-through insertion anchor for the `rest_excludes` hoist when no
+/// template factory exists.
+fn is_export_default_stmt(stmt: &JsStatement) -> bool {
+    match stmt {
+        JsStatement::ExportDefault(_) => true,
+        JsStatement::Raw(s) | JsStatement::RawEffect(s) => {
+            s.trim_start().starts_with("export default ")
+        }
+        _ => false,
     }
-    let mut i = pos;
-    while i > 0 && bytes[i - 1] != b'\n' {
-        i -= 1;
+}
+
+fn script_raw_statement(
+    code: String,
+    source_offset: u32,
+    has_effect_rune: bool,
+    original: &str,
+    original_offset: u32,
+    projection: Option<&ScriptProjection>,
+    comment_anchor: Option<u32>,
+    enable_sourcemap: bool,
+) -> JsStatement {
+    let copied_spans = if enable_sourcemap {
+        copied_spans_for_normalized_code(&code, original, original_offset, projection)
+    } else {
+        Vec::new()
+    };
+    if has_effect_rune {
+        JsStatement::RawMappedEffect {
+            code: code.into(),
+            source_offset,
+            comment_anchor,
+            effect_spans: original
+                .match_indices("$effect")
+                .map(|(start, _)| {
+                    let tail = &original[start..];
+                    let pre = tail.starts_with("$effect.pre");
+                    let len = if pre { 11 } else { 7 };
+                    (pre, original_offset + start as u32, original_offset + start as u32 + len)
+                })
+                .collect(),
+            copied_spans,
+        }
+    } else {
+        JsStatement::RawMapped { copied_spans, code: code.into(), source_offset, comment_anchor }
     }
-    Some(i)
+}
+
+/// Comments inside the `$props()` declaration survive upstream's lowering even
+/// though the declaration itself is removed from the component body.
+fn props_declaration_comments(raw: &str) -> Vec<(u32, CompactString)> {
+    let Some(props) = raw.find("$props()") else {
+        return Vec::new();
+    };
+    let Some(start) = raw[..props].rfind("let") else {
+        return Vec::new();
+    };
+    let end = raw[props..].find(';').map_or(raw.len(), |end| props + end + 1);
+    crate::compiler::phases::phase3_transform::server::transform_script::extract_comments_from_snippet_with_pos(&raw[start..end])
+        .into_iter()
+        .map(|(offset, comment)| ((start + offset) as u32, comment.into()))
+        .collect()
+}
+
+/// Shortest run a resync candidate must start to beat the nearest-byte rule.
+const MIN_RESYNC_RUN: usize = 4;
+/// Longest run compared when scoring a resync candidate — a cap, so scoring the
+/// window stays linear in the window rather than in the rest of the script.
+const MAX_RESYNC_RUN: usize = 64;
+
+fn common_run(left: &[u8], right: &[u8]) -> usize {
+    left.iter().zip(right).take(MAX_RESYNC_RUN).take_while(|(a, b)| a == b).count()
+}
+
+/// Align normalized raw output with the stripped script, then project every
+/// unchanged byte back through TypeScript erasure to its component offset.
+/// Formatting may add whitespace or a semicolon, so unmatched bytes are left
+/// unmapped instead of guessing through a compiler-generated rewrite.
+fn copied_spans_for_normalized_code(
+    code: &str,
+    stripped: &str,
+    original_offset: u32,
+    projection: Option<&ScriptProjection>,
+) -> Vec<RawMappedSpan> {
+    // Without TypeScript erasure the stripped script *is* the source slice, so
+    // every byte projects back at its own offset: the per-byte table would hold
+    // `Some(original_offset + i)` at every `i` and the split loop below could
+    // never break a run, which is the whole cost of the general path — and this
+    // path now runs for every script, not only a TypeScript one.
+    let source_at_output = projection.map(|projection| {
+        let mut table: Vec<Option<u32>> = vec![None; stripped.len() + 1];
+        for chunk in &projection.copied_chunks {
+            let len =
+                (chunk.output.end - chunk.output.start).min(chunk.source.end - chunk.source.start);
+            for offset in 0..=len {
+                let output = (chunk.output.start + offset) as usize;
+                if output < table.len() {
+                    table[output] = Some(original_offset + chunk.source.start + offset);
+                }
+            }
+        }
+        table
+    });
+
+    let mut spans = Vec::new();
+    let mut output = 0usize;
+    let mut input = 0usize;
+    while output < code.len() && input < stripped.len() {
+        let output_byte = code.as_bytes()[output];
+        let input_byte = stripped.as_bytes()[input];
+        if output_byte == input_byte {
+            let start_output = output;
+            let start_input = input;
+            while output < code.len()
+                && input < stripped.len()
+                && code.as_bytes()[output] == stripped.as_bytes()[input]
+            {
+                output += 1;
+                input += 1;
+            }
+            let Some(source_at_output) = source_at_output.as_deref() else {
+                spans.push(RawMappedSpan {
+                    code: start_output as u32..output as u32,
+                    source: (original_offset + start_input as u32)
+                        ..(original_offset + input as u32),
+                    erased_comment_before_export_prop: false,
+                });
+                continue;
+            };
+            let mut run_start = start_output;
+            for code_offset in start_output..=output {
+                let raw_offset = start_input + code_offset - start_output;
+                let mapped = source_at_output.get(raw_offset).copied().flatten();
+                let previous = if code_offset > run_start {
+                    source_at_output.get(raw_offset.saturating_sub(1)).copied().flatten()
+                } else {
+                    mapped
+                };
+                if code_offset == output
+                    || mapped.is_none()
+                    || previous.is_none_or(|p| mapped != Some(p + 1))
+                {
+                    if code_offset > run_start
+                        && let (Some(source_start), Some(source_end)) = (
+                            source_at_output[start_input + run_start - start_output],
+                            source_at_output[start_input + code_offset - 1 - start_output]
+                                .map(|value| value + 1),
+                        )
+                    {
+                        spans.push(RawMappedSpan {
+                            code: run_start as u32..code_offset as u32,
+                            source: source_start..source_end,
+                            erased_comment_before_export_prop: false,
+                        });
+                    }
+                    run_start = code_offset;
+                }
+            }
+            continue;
+        }
+        if output_byte.is_ascii_whitespace() {
+            output += 1;
+            continue;
+        }
+        if input_byte.is_ascii_whitespace() {
+            input += 1;
+            continue;
+        }
+        // A generated change (for example `count++` -> `$.update(count)`) must
+        // not desynchronise the rest of the script. Resume at the nearest exact
+        // byte within a small window; otherwise leave one generated byte bare.
+        const RESYNC_WINDOW: usize = 256;
+        const NEAR_RESYNC_WINDOW: usize = 32;
+        let code_tail = &code.as_bytes()[output..];
+        let input_tail = &stripped.as_bytes()[input..];
+        let next_input =
+            input_tail.iter().take(RESYNC_WINDOW).position(|&byte| byte == output_byte);
+        let next_output = code_tail.iter().take(RESYNC_WINDOW).position(|&byte| byte == input_byte);
+        let (skip_input, skip_output) = match (next_input, next_output) {
+            (Some(left), Some(right)) if left <= right => (left, 0),
+            (Some(left), None) => (left, 0),
+            (_, Some(right)) => (0, right),
+            (None, None) => (0, 1),
+        };
+        // A single equal byte is a weak anchor: `export let x = …` →
+        // `let x = $.prop(…)` re-anchors on the `e` of `let` and misattributes
+        // every token after it. When it buys less than a token's worth of
+        // agreement, take the nearest candidate that does.
+        if common_run(&code_tail[skip_output..], &input_tail[skip_input..]) < MIN_RESYNC_RUN {
+            let mut best: Option<(usize, usize, usize)> = None;
+            let mut consider = |run: usize, skip_input: usize, skip_output: usize| {
+                if run >= MIN_RESYNC_RUN
+                    && best.is_none_or(|(best_run, input, output)| {
+                        let skipped = skip_input + skip_output;
+                        skipped < input + output || (skipped == input + output && run > best_run)
+                    })
+                {
+                    best = Some((run, skip_input, skip_output));
+                }
+            };
+            for (skip, &byte) in input_tail.iter().take(NEAR_RESYNC_WINDOW).enumerate() {
+                if byte == output_byte {
+                    consider(common_run(code_tail, &input_tail[skip..]), skip, 0);
+                }
+            }
+            for (skip, &byte) in code_tail.iter().take(NEAR_RESYNC_WINDOW).enumerate() {
+                if byte == input_byte {
+                    consider(common_run(&code_tail[skip..], input_tail), 0, skip);
+                }
+            }
+            if let Some((_, skip_input, skip_output)) = best {
+                input += skip_input;
+                output += skip_output;
+                continue;
+            }
+        }
+        // A lowering can replace a member callee with a shorter generated
+        // identifier (`$state.raw(` -> `$.state(`). The bytes before the
+        // member suffix still form a copied run, but its generated endpoint
+        // belongs to the end of the whole source callee, as in upstream's
+        // `b.id('$.state', init.callee.loc)`. Preserve that non-linear boundary
+        // as a zero-width marker; `RestoreRawMappedSpans` consumes it when it
+        // restores the generated identifier's end span, while the ordinary
+        // copied run beginning at the same byte continues to map the delimiter.
+        if skip_input > 0
+            && skip_output == 0
+            && output > 0
+            && code.as_bytes()[output - 1].is_ascii_alphanumeric()
+            && matches!(code.as_bytes().get(output), Some(b'('))
+            && matches!(stripped.as_bytes().get(input), Some(b'.'))
+            && input_tail.get(..skip_input).is_some_and(|suffix| {
+                suffix[1..]
+                    .iter()
+                    .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_' || *byte == b'$')
+            })
+        {
+            let source = source_at_output
+                .as_deref()
+                .and_then(|table| table.get(input + skip_input).copied().flatten())
+                .unwrap_or(original_offset + (input + skip_input) as u32);
+            spans.push(RawMappedSpan {
+                code: output as u32..output as u32,
+                source: source..source,
+                erased_comment_before_export_prop: false,
+            });
+        }
+        input += skip_input;
+        output += skip_output;
+    }
+    if let Some(projection) = projection {
+        for comment in &projection.erased_leading_comments_before_export_props {
+            let comment = (original_offset + comment.start)..(original_offset + comment.end);
+            if let Some(span) = spans
+                .iter_mut()
+                .find(|span| span.source.start <= comment.start && comment.end <= span.source.end)
+            {
+                span.erased_comment_before_export_prop = true;
+            }
+        }
+    }
+    spans
+}
+
+/// Select the source statements that survive instance-import hoisting.
+///
+/// `extract_imports` owns the legacy-compatible line handling, so the AST path
+/// proves equivalence by normalizing the exact non-import statement slices to
+/// the already-settled script text. Any disagreement keeps `RawMapped`.
+fn retained_instance_statement_indices(
+    retained: &crate::ast::oxc_program::RetainedProgram<'_>,
+    source: &str,
+    normalized_script: &str,
+) -> Option<Vec<usize>> {
+    use oxc_span::GetSpan;
+
+    let mut indices = Vec::new();
+    let mut body = String::new();
+    for (index, statement) in retained.program().body.iter().enumerate() {
+        if matches!(statement, oxc_ast::ast::Statement::ImportDeclaration(_)) {
+            continue;
+        }
+        let span = statement.span();
+        let slice = source.get(span.start as usize..span.end as usize)?;
+        if !body.is_empty() {
+            body.push('\n');
+        }
+        body.push_str(slice);
+        indices.push(index);
+    }
+
+    (!indices.is_empty() && normalize_js_with_oxc(&body, 1) == normalized_script).then_some(indices)
 }
 
 // ============================================================================
 // Script Transformation Functions
 // ============================================================================
+
+#[derive(Debug)]
+struct ExtractedImport {
+    text: String,
+    origin: Option<ImportOrigin>,
+}
+
+#[derive(Debug)]
+struct ImportOrigin {
+    source_offset: u32,
+    source: String,
+}
+
+/// Pair extracted import text with the declaration span retained by phase 1.
+///
+/// TypeScript stripping can remove a whole type-only import, and the legacy
+/// extractor can split several imports packed onto one line, so the two lists
+/// cannot be joined by index. Compare each emitted declaration with the next
+/// retained declaration after applying the same TypeScript erasure and import
+/// cleanup. The comparison proves identity; the retained span is the source-map
+/// position and no generated-output/source search is needed later.
+fn attach_import_origins(
+    imports: Vec<String>,
+    retained: Option<&crate::ast::oxc_program::RetainedProgram<'_>>,
+    script_offset: u32,
+    is_typescript: bool,
+    enable_sourcemap: bool,
+) -> Vec<ExtractedImport> {
+    use oxc_span::GetSpan;
+
+    if !enable_sourcemap {
+        return imports.into_iter().map(|text| ExtractedImport { text, origin: None }).collect();
+    }
+
+    let candidates = retained.map(|retained| {
+        retained
+            .program()
+            .body
+            .iter()
+            .filter(|statement| matches!(statement, oxc_ast::ast::Statement::ImportDeclaration(_)))
+            .map(|statement| {
+                let span = statement.span();
+                let source = &retained.source()[span.start as usize..span.end as usize];
+                let comparable = if is_typescript {
+                    crate::compiler::phases::phase2_analyze::types::strip_typescript(source)
+                } else {
+                    source.to_string()
+                };
+                (span.start, source, cleaned_import_code(&comparable))
+            })
+            .collect::<Vec<_>>()
+    });
+    let mut next_candidate = 0usize;
+
+    imports
+        .into_iter()
+        .map(|text| {
+            let expected = cleaned_import_code(&text);
+            let origin = candidates.as_ref().and_then(|candidates| {
+                candidates[next_candidate..]
+                    .iter()
+                    .position(|(_, _, comparable)| comparable == &expected)
+                    .map(|relative| {
+                        let index = next_candidate + relative;
+                        next_candidate = index + 1;
+                        let (start, source, _) = &candidates[index];
+                        ImportOrigin {
+                            source_offset: script_offset + *start,
+                            source: (*source).to_string(),
+                        }
+                    })
+            });
+            ExtractedImport { text, origin }
+        })
+        .collect()
+}
+
+fn cleaned_import_code(import: &str) -> String {
+    let cleaned = cleanup_import_line(import);
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() || trimmed.ends_with(';') {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed};")
+    }
+}
+
+fn mapped_import_statement(import: ExtractedImport, enable_sourcemap: bool) -> Option<JsStatement> {
+    let code = cleaned_import_code(&import.text);
+    if code.is_empty() {
+        return None;
+    }
+    let Some(origin) = import.origin.filter(|_| enable_sourcemap) else {
+        return Some(JsStatement::Raw(code.into()));
+    };
+    let copied_spans =
+        copied_spans_for_normalized_code(&code, &origin.source, origin.source_offset, None);
+    Some(JsStatement::RawMapped {
+        code: code.into(),
+        source_offset: origin.source_offset,
+        comment_anchor: None,
+        copied_spans,
+    })
+}
 
 /// Extract import statements from script content.
 /// Returns (imports, rest_of_script).
@@ -2438,6 +3397,71 @@ fn line_start_of(code: &str, pos: usize) -> Option<usize> {
 ///   bar,
 /// } from './module';
 /// ```
+/// Drop module-`<script>`-level comments that the official compiler's esrap
+/// output omits.
+///
+/// The client program's top-level `Program` node is synthetic (no `loc`), so
+/// esrap's comment cursor is already parked past the end when the module body is
+/// printed — a leading JSDoc before a surviving `export const`, and the per-field
+/// JSDoc that `strip_typescript` re-emits when it removes an `export type` /
+/// `interface` body, are both dropped. (That re-emission is correct for the
+/// instance script, whose statements keep their `loc` inside the component block,
+/// but wrong for the module.) A later `body()` over a located block revives the
+/// cursor, so `dead_comments` walks the same events with the kill seeded at the
+/// program. Leftover blank lines are absorbed by downstream normalization. Returns
+/// the input unchanged on a parse failure or when there is nothing to drop.
+pub(crate) fn strip_module_toplevel_comments(src: &str, runes: bool) -> String {
+    #[cfg(test)]
+    MODULE_COMMENT_REPARSES.with(|count| count.set(count.get() + 1));
+    dead_comments::strip_dead_comments(src, dead_comments::Rules::module_script(runes))
+        .unwrap_or_else(|| src.to_string())
+}
+
+#[cfg(test)]
+thread_local! {
+    static MODULE_COMMENT_REPARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static AST_STATE_REPARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static AST_STATE_RETAINED_USES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn strip_module_toplevel_comments_from_program(
+    src: &str,
+    program: &oxc_ast::ast::Program<'_>,
+    runes: bool,
+) -> String {
+    dead_comments::strip_dead_comments_from_program(
+        src,
+        program,
+        dead_comments::Rules::module_script(runes),
+    )
+    .unwrap_or_else(|| src.to_string())
+}
+
+fn strip_module_reemitted_ts_comments(
+    src: &str,
+    projection: Option<&crate::compiler::phases::phase2_analyze::types::ScriptProjection>,
+) -> Option<String> {
+    let projection = projection?;
+    if projection.output_len != src.len() as u32 || projection.reemitted_comment_outputs.is_empty()
+    {
+        return None;
+    }
+
+    let mut out = String::with_capacity(src.len());
+    let mut pos = 0usize;
+    for range in &projection.reemitted_comment_outputs {
+        let start = range.start as usize;
+        let end = range.end as usize;
+        if start < pos || end < start || end > src.len() {
+            return None;
+        }
+        out.push_str(&src[pos..start]);
+        pos = end;
+    }
+    out.push_str(&src[pos..]);
+    Some(out)
+}
+
 /// True when `src` contains only line/block comments and whitespace — i.e. no
 /// JS statements. Used to detect a comment-only module `<script module>` body,
 /// which upstream parses to an empty Program and prints as nothing. The scan
@@ -2592,24 +3616,31 @@ pub(crate) fn extract_imports(script: &str) -> (Vec<String>, String) {
     let mut imports = Vec::new();
     let mut rest = Vec::new();
     let mut current_import: Option<Vec<String>> = None;
+    let mut carry = ImportCarry::default();
     let mut scan = ScanState::default();
+    let mut line_start = 0usize;
 
-    for line in script.lines() {
-        // Only treat a line as import-eligible when it begins in pure-code state
-        // (not inside a multi-line template literal / block comment).
+    for physical_line in script.split_inclusive('\n') {
+        let line = strip_line_terminator(physical_line);
+        let line_end = line_start + physical_line.len();
+        line_start = line_end;
         let line_starts_in_code = scan.in_code();
+        let line_starts_in_block_comment = scan.in_block_comment;
         scan.advance(line);
+        // Only consult the next lines when they start in plain code: inside a
+        // block comment or a template literal their bytes are not code.
+        let following = if scan.in_code() { &script[line_end..] } else { "" };
         let scan = line_starts_in_code; // shadow for the decision below
         if let Some(ref mut import_lines) = current_import {
-            // We're inside a multi-line import. The closing line may carry
-            // trailing statements after the import terminator; split them off.
             let trimmed = line.trim();
-            let closes = trimmed.contains(';')
-                || trimmed.ends_with('\'')
-                || trimmed.ends_with('"')
-                || trimmed.ends_with('`');
-            if closes {
-                if let Some(end) = import_statement_end(trimmed)
+            let scanned = scan_import_line(trimmed, line_starts_in_block_comment, carry);
+            let attributes_follow =
+                scanned.ends_at_specifier(trimmed.len()) && starts_import_attributes(following);
+            carry = scanned.carry;
+            carry.expect_attributes |= attributes_follow;
+            if scanned.closes(trimmed.len()) && !attributes_follow {
+                carry = ImportCarry::default();
+                if let Some(end) = scanned.end()
                     && end < trimmed.len()
                     && !trimmed[end..].trim().is_empty()
                 {
@@ -2634,12 +3665,15 @@ pub(crate) fn extract_imports(script: &str) -> (Vec<String>, String) {
             let trimmed = line.trim();
             if scan && (trimmed.starts_with("import ") || trimmed.starts_with("import{")) {
                 // Check if this import is complete on one line
-                if trimmed.contains(';')
-                    || is_complete_side_effect_import(trimmed)
+                let scanned = scan_import_line(trimmed, false, ImportCarry::default());
+                let ends_at_specifier = is_complete_side_effect_import(trimmed)
                     || (memmem::find(trimmed.as_bytes(), b" from ").is_some()
-                        && (trimmed.ends_with('\'')
-                            || trimmed.ends_with('"')
-                            || trimmed.ends_with('`')))
+                        && scanned.last_string_end == Some(trimmed.len()));
+                let attributes_follow = ends_at_specifier && starts_import_attributes(following);
+                if !attributes_follow
+                    && (scanned.semicolon.is_some()
+                        || scanned.attributes_end.is_some()
+                        || ends_at_specifier)
                 {
                     // The line begins with a *complete* import statement but may
                     // carry additional imports and/or statements on the same
@@ -2655,6 +3689,8 @@ pub(crate) fn extract_imports(script: &str) -> (Vec<String>, String) {
                 } else {
                     // Multi-line import starts here
                     current_import = Some(vec![line.to_string()]);
+                    carry = scanned.carry;
+                    carry.expect_attributes |= attributes_follow;
                 }
             } else {
                 rest.push(line.to_string());
@@ -2670,6 +3706,207 @@ pub(crate) fn extract_imports(script: &str) -> (Vec<String>, String) {
     (imports, rest.join("\n"))
 }
 
+struct ExtractedSourcePart {
+    text: String,
+    source: std::ops::Range<u32>,
+}
+
+fn extract_imports_with_projection(script: &str) -> (Vec<String>, String, Vec<CopiedSourceChunk>) {
+    let mut imports = Vec::new();
+    let mut rest: Vec<ExtractedSourcePart> = Vec::new();
+    let mut current_import: Option<Vec<String>> = None;
+    let mut carry = ImportCarry::default();
+    let mut scan = ScanState::default();
+    let mut line_start = 0usize;
+
+    for physical_line in script.split_inclusive('\n') {
+        let line = strip_line_terminator(physical_line);
+        let line_starts_in_code = scan.in_code();
+        let line_starts_in_block_comment = scan.in_block_comment;
+        scan.advance(line);
+        let following =
+            if scan.in_code() { &script[line_start + physical_line.len()..] } else { "" };
+        let scan = line_starts_in_code;
+        if let Some(ref mut import_lines) = current_import {
+            let trimmed = line.trim();
+            let scanned = scan_import_line(trimmed, line_starts_in_block_comment, carry);
+            let attributes_follow =
+                scanned.ends_at_specifier(trimmed.len()) && starts_import_attributes(following);
+            carry = scanned.carry;
+            carry.expect_attributes |= attributes_follow;
+            if scanned.closes(trimmed.len()) && !attributes_follow {
+                carry = ImportCarry::default();
+                if let Some(end) = scanned.end()
+                    && end < trimmed.len()
+                    && !trimmed[end..].trim().is_empty()
+                {
+                    import_lines.push(trimmed[..end].to_string());
+                    imports.push(import_lines.join("\n"));
+                    current_import = None;
+                    let trimmed_start = line.len() - line.trim_start().len();
+                    let remainder_source_start = trimmed_start + end;
+                    let (remainder, remainder_offset) =
+                        peel_leading_imports_ref(&trimmed[end..], &mut imports);
+                    if !remainder.trim().is_empty() {
+                        rest.push(ExtractedSourcePart {
+                            text: remainder.to_string(),
+                            source: (line_start + remainder_source_start + remainder_offset) as u32
+                                ..(line_start
+                                    + remainder_source_start
+                                    + remainder_offset
+                                    + remainder.len()) as u32,
+                        });
+                    }
+                } else {
+                    import_lines.push(line.to_string());
+                    imports.push(import_lines.join("\n"));
+                    current_import = None;
+                }
+            } else {
+                import_lines.push(line.to_string());
+            }
+        } else {
+            let trimmed = line.trim();
+            if scan && (trimmed.starts_with("import ") || trimmed.starts_with("import{")) {
+                let scanned = scan_import_line(trimmed, false, ImportCarry::default());
+                let ends_at_specifier = is_complete_side_effect_import(trimmed)
+                    || (memmem::find(trimmed.as_bytes(), b" from ").is_some()
+                        && scanned.last_string_end == Some(trimmed.len()));
+                let attributes_follow = ends_at_specifier && starts_import_attributes(following);
+                if !attributes_follow
+                    && (scanned.semicolon.is_some()
+                        || scanned.attributes_end.is_some()
+                        || ends_at_specifier)
+                {
+                    let trimmed_start = line.len() - line.trim_start().len();
+                    let (remainder, remainder_offset) =
+                        peel_leading_imports_ref(trimmed, &mut imports);
+                    if !remainder.trim().is_empty() {
+                        rest.push(ExtractedSourcePart {
+                            text: remainder.to_string(),
+                            source: (line_start + trimmed_start + remainder_offset) as u32
+                                ..(line_start + trimmed_start + remainder_offset + remainder.len())
+                                    as u32,
+                        });
+                    }
+                } else {
+                    current_import = Some(vec![line.to_string()]);
+                    carry = scanned.carry;
+                    carry.expect_attributes |= attributes_follow;
+                }
+            } else {
+                rest.push(ExtractedSourcePart {
+                    text: line.to_string(),
+                    source: line_start as u32..(line_start + line.len()) as u32,
+                });
+            }
+        }
+        line_start += physical_line.len();
+    }
+
+    if let Some(import_lines) = current_import {
+        imports.push(import_lines.join("\n"));
+    }
+
+    let mut output = String::new();
+    let mut copied_chunks = Vec::with_capacity(rest.len().saturating_mul(2));
+    for (index, part) in rest.iter().enumerate() {
+        if index != 0 {
+            let output_start = output.len() as u32;
+            output.push('\n');
+            let previous = &rest[index - 1];
+            if previous.source.end + 1 == part.source.start
+                && script.as_bytes().get(previous.source.end as usize) == Some(&b'\n')
+            {
+                push_projection_chunk(
+                    &mut copied_chunks,
+                    previous.source.end..part.source.start,
+                    output_start..output.len() as u32,
+                );
+            }
+        }
+
+        let output_start = output.len() as u32;
+        output.push_str(&part.text);
+        push_projection_chunk(
+            &mut copied_chunks,
+            part.source.clone(),
+            output_start..output.len() as u32,
+        );
+    }
+
+    (imports, output, copied_chunks)
+}
+
+fn push_projection_chunk(
+    chunks: &mut Vec<CopiedSourceChunk>,
+    source: std::ops::Range<u32>,
+    output: std::ops::Range<u32>,
+) {
+    if source.is_empty() {
+        return;
+    }
+    debug_assert_eq!(source.end - source.start, output.end - output.start);
+    if let Some(previous) = chunks.last_mut()
+        && previous.source.end == source.start
+        && previous.output.end == output.start
+    {
+        previous.source.end = source.end;
+        previous.output.end = output.end;
+    } else {
+        chunks.push(CopiedSourceChunk { source, output });
+    }
+}
+
+fn compose_script_projection(
+    source_projection: &ScriptProjection,
+    raw_to_body: &[CopiedSourceChunk],
+    body_len: usize,
+) -> ScriptProjection {
+    let mut copied_chunks = Vec::new();
+    let mut source_index = 0usize;
+    for body_chunk in raw_to_body {
+        while source_index < source_projection.copied_chunks.len()
+            && source_projection.copied_chunks[source_index].output.end <= body_chunk.source.start
+        {
+            source_index += 1;
+        }
+
+        for source_chunk in &source_projection.copied_chunks[source_index..] {
+            if source_chunk.output.start >= body_chunk.source.end {
+                break;
+            }
+            let intersection_start = source_chunk.output.start.max(body_chunk.source.start);
+            let intersection_end = source_chunk.output.end.min(body_chunk.source.end);
+            if intersection_start >= intersection_end {
+                continue;
+            }
+            let source_start =
+                source_chunk.source.start + intersection_start - source_chunk.output.start;
+            let output_start =
+                body_chunk.output.start + intersection_start - body_chunk.source.start;
+            push_projection_chunk(
+                &mut copied_chunks,
+                source_start..source_start + intersection_end - intersection_start,
+                output_start..output_start + intersection_end - intersection_start,
+            );
+        }
+    }
+
+    ScriptProjection {
+        copied_chunks,
+        // Re-emitted comments are consumed only from ScriptContent's original
+        // projection. Erased-comment attachment remains source-relative and is
+        // still needed when the retained body contains the following prop.
+        reemitted_comment_outputs: Vec::new(),
+        erased_leading_comments_before_export_props: source_projection
+            .erased_leading_comments_before_export_props
+            .clone(),
+        source_len: source_projection.source_len,
+        output_len: body_len as u32,
+    }
+}
+
 /// Check whether `trimmed` is a complete *side-effect* import statement —
 /// `import "module"` or `import 'module'` with no `from` clause and no
 /// terminating semicolon. ASI in real JavaScript allows this form to stand
@@ -2680,39 +3917,187 @@ pub(crate) fn extract_imports(script: &str) -> (Vec<String>, String) {
 /// then a single string literal (single or double quoted), then optional
 /// whitespace until end-of-line. Anything else (bindings, `from`, trailing
 /// content, dynamic `import(...)` calls) returns `false`.
-/// Find the byte index at which the leading import statement in `s` ends.
+#[derive(Default)]
+struct ImportLineScan {
+    /// Just past the first `;` that is code.
+    semicolon: Option<usize>,
+    /// Just past the last string or template literal that is code.
+    last_string_end: Option<usize>,
+    /// Just past the `}` that closes an import-attributes clause.
+    attributes_end: Option<usize>,
+    /// Brace nesting and clause state to carry to the statement's next line.
+    carry: ImportCarry,
+}
+
+/// What an unfinished `import` statement carries from one line to the next.
+#[derive(Default, Clone, Copy)]
+struct ImportCarry {
+    /// Brace nesting depth reached so far within the statement.
+    depth: u32,
+    /// An import-attributes clause is open.
+    in_attributes: bool,
+    /// The next `{` opens the attributes clause even though its `with` keyword
+    /// was read on an earlier line.
+    expect_attributes: bool,
+}
+
+impl ImportLineScan {
+    /// Where the statement ends: the `;` if there is one, else the attributes
+    /// clause's `}`, else — ASI — the last completed string literal, which is
+    /// the module specifier.
+    fn end(&self) -> Option<usize> {
+        self.semicolon.or(self.attributes_end).or(self.last_string_end)
+    }
+
+    /// True when the statement would end — by ASI — at the module specifier that
+    /// finishes this line, so whether it really ends there depends on what
+    /// follows on the next line.
+    fn ends_at_specifier(&self, line_len: usize) -> bool {
+        self.semicolon.is_none()
+            && self.attributes_end.is_none()
+            && self.carry.depth == 0
+            && self.last_string_end == Some(line_len)
+    }
+
+    fn closes(&self, line_len: usize) -> bool {
+        self.semicolon.is_some()
+            || self.attributes_end.is_some()
+            || self.ends_at_specifier(line_len)
+    }
+}
+
+/// Scan one line of an `import` statement for its terminator.
 ///
-/// String literals (single/double quotes and template backticks) are skipped
-/// honouring backslash escapes, so a `;` inside a module specifier is ignored.
-/// If a top-level `;` is found it terminates the statement (index just past it).
-/// Otherwise — ASI — the statement ends just past the last completed top-level
-/// string literal (the module specifier). Returns `None` if neither is present.
-fn import_statement_end(s: &str) -> Option<usize> {
+/// A `;` or a closing quote inside a comment is text, and reading it as the
+/// terminator cut the statement mid-specifier-list (#2601).
+/// `in_block_comment` carries that state across the preceding lines, and `carry`
+/// the brace nesting, so a `"…"` ending a line inside a specifier list or an
+/// import-attributes clause is not read as the module specifier.
+fn scan_import_line(s: &str, in_block_comment: bool, carry: ImportCarry) -> ImportLineScan {
     let bytes = s.as_bytes();
+    let mut out = ImportLineScan { carry, ..ImportLineScan::default() };
     let mut i = 0usize;
-    let mut last_string_end: Option<usize> = None;
-    while i < bytes.len() {
-        match bytes[i] {
-            b';' => return Some(i + 1),
-            q @ (b'\'' | b'"' | b'`') => {
-                i += 1;
-                while i < bytes.len() {
-                    if bytes[i] == b'\\' && i + 1 < bytes.len() {
-                        i += 2;
-                        continue;
-                    }
-                    if bytes[i] == q {
-                        i += 1;
-                        break;
-                    }
-                    i += 1;
-                }
-                last_string_end = Some(i);
-            }
-            _ => i += 1,
+    if in_block_comment {
+        match memmem::find(bytes, b"*/") {
+            Some(at) => i = at + 2,
+            None => return out,
         }
     }
-    last_string_end
+    let mut prev: Option<u8> = None;
+    while i < bytes.len() {
+        let quoted = matches!(bytes[i], b'\'' | b'"' | b'`');
+        if let Some((next, is_comment)) = skip_opaque(bytes, i, prev) {
+            if quoted {
+                out.last_string_end = Some(next);
+            }
+            if !is_comment {
+                prev = Some(b'x');
+            }
+            i = next;
+            continue;
+        }
+        match bytes[i] {
+            b';' => {
+                out.semicolon = Some(i + 1);
+                return out;
+            }
+            b'{' => {
+                if out.carry.depth == 0
+                    && (out.carry.expect_attributes
+                        || token_before_is_import_attributes_keyword(bytes, i))
+                {
+                    out.carry.in_attributes = true;
+                    out.carry.expect_attributes = false;
+                }
+                out.carry.depth += 1;
+            }
+            b'}' => {
+                out.carry.depth = out.carry.depth.saturating_sub(1);
+                if out.carry.depth == 0 && out.carry.in_attributes {
+                    out.carry.in_attributes = false;
+                    out.attributes_end = Some(i + 1);
+                }
+            }
+            _ => {}
+        }
+        if !bytes[i].is_ascii_whitespace() {
+            prev = Some(bytes[i]);
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Is the token immediately before `i` an import-attributes keyword?
+///
+/// Called on a `{`, so anything else there — a specifier list's brace, or a
+/// `with` that is the tail of a longer identifier — must answer `false`. A
+/// comment before the brace ends on a byte that cannot be part of an
+/// identifier, so it yields an empty run rather than a false match.
+fn token_before_is_import_attributes_keyword(bytes: &[u8], at: usize) -> bool {
+    let mut end = at;
+    while end > 0 && bytes[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    let mut start = end;
+    while start > 0 && is_ident_byte(bytes[start - 1]) {
+        start -= 1;
+    }
+    matches!(&bytes[start..end], b"with" | b"assert")
+}
+
+/// Does `s` begin — after whitespace and comments — with an import-attributes
+/// clause that continues an `import` statement?
+///
+/// The clause carries no `[no LineTerminator here]` restriction, so it may start
+/// on any later line. Acorn-typescript also accepts the deprecated `assert`
+/// spelling after a line terminator (#3198). Requiring the following `{` keeps
+/// an `assert(...)` call or an unrelated identifier from extending the import.
+fn starts_import_attributes(s: &str) -> bool {
+    let keyword = skip_js_whitespace_and_comments(s, 0);
+    let Some(after_keyword) =
+        s[keyword..].strip_prefix("with").or_else(|| s[keyword..].strip_prefix("assert"))
+    else {
+        return false;
+    };
+    if after_keyword.as_bytes().first().is_some_and(|b| is_ident_byte(*b)) {
+        return false;
+    }
+    let brace = skip_js_whitespace_and_comments(s, s.len() - after_keyword.len());
+    s.as_bytes().get(brace) == Some(&b'{')
+}
+
+/// Byte index of the first significant character in `s` at or after `from`.
+fn skip_js_whitespace_and_comments(s: &str, from: usize) -> usize {
+    let mut i = from;
+    loop {
+        let trimmed = s[i..].trim_start_matches(is_js_whitespace);
+        i = s.len() - trimmed.len();
+        if !(trimmed.starts_with("//") || trimmed.starts_with("/*")) {
+            return i;
+        }
+        match skip_opaque(s.as_bytes(), i, None) {
+            Some((next, true)) => i = next,
+            _ => return i,
+        }
+    }
+}
+
+/// Find the byte index at which the leading import statement in `s` ends.
+///
+/// Callers pass a slice that starts at a statement boundary, so no comment can
+/// already be open.
+fn import_statement_end(s: &str) -> Option<usize> {
+    scan_import_line(s, false, ImportCarry::default()).end()
+}
+
+/// One line of `split_inclusive('\n')` without its line terminator, so the two
+/// `extract_imports` ports see exactly what `str::lines` would give them.
+fn strip_line_terminator(physical_line: &str) -> &str {
+    match physical_line.strip_suffix('\n') {
+        Some(without_lf) => without_lf.strip_suffix('\r').unwrap_or(without_lf),
+        None => physical_line,
+    }
 }
 
 /// Peel every complete leading `import` statement off `s`, pushing each onto
@@ -2723,16 +4108,23 @@ fn import_statement_end(s: &str) -> Option<usize> {
 /// the first non-import token or an *incomplete* import (one that continues on a
 /// following line) and returns it so the caller can route it.
 fn peel_leading_imports(s: &str, imports: &mut Vec<String>) -> String {
-    let mut cur = s.trim_start();
+    peel_leading_imports_ref(s, imports).0.to_string()
+}
+
+fn peel_leading_imports_ref<'a>(s: &'a str, imports: &mut Vec<String>) -> (&'a str, usize) {
+    let mut offset = s.len() - s.trim_start().len();
+    let mut cur = &s[offset..];
     while cur.starts_with("import ") || cur.starts_with("import{") {
         let Some(end) = import_statement_end(cur) else {
             break;
         };
         let (import_part, remainder) = cur.split_at(end);
         imports.push(import_part.trim().to_string());
-        cur = remainder.trim_start();
+        let whitespace = remainder.len() - remainder.trim_start().len();
+        offset += end + whitespace;
+        cur = &s[offset..];
     }
-    cur.to_string()
+    (cur, offset)
 }
 
 fn is_complete_side_effect_import(trimmed: &str) -> bool {
@@ -2776,6 +4168,31 @@ fn is_complete_side_effect_import(trimmed: &str) -> bool {
     after_import[i..].trim().is_empty()
 }
 
+/// True when `text` is a `let`/`const`/`var` declaration whose whole initializer
+/// is `$props.id()` — or an already-lowered `$.props_id()`. The component body
+/// always gets a hoisted `const` for it, so the source's own declaration has to
+/// go or the scope declares the name twice, which no JS parser accepts.
+///
+/// Compared over the statement's **code**: `code_bytes` steps over comments and
+/// string bodies, so trivia anywhere in the declaration cannot defeat the match
+/// and an `=` inside a string cannot be mistaken for the assignment. The
+/// text-level version this replaced was defeated by a comment on either side of
+/// the call and by a line break before it (#3346).
+fn is_props_id_declaration(text: &str) -> bool {
+    let code: Vec<u8> = code_bytes(text.as_bytes()).map(|(_, b)| b).collect();
+    let Ok(code) = std::str::from_utf8(&code) else {
+        return false;
+    };
+    let code = code.trim();
+    let head = code.strip_prefix("export ").unwrap_or(code);
+    if !(head.starts_with("let ") || head.starts_with("const ") || head.starts_with("var ")) {
+        return false;
+    }
+    code.find('=')
+        .map(|eq| code[eq + 1..].trim().trim_end_matches(';').trim())
+        .is_some_and(|rhs| rhs == "$props.id()" || rhs == "$.props_id()")
+}
+
 /// True when `trimmed` begins an `export { ... }` specifier statement,
 /// tolerating any whitespace between `export` and `{` — including none, since
 /// `export{a}` is valid JavaScript (M-021). Guards against matching longer
@@ -2792,6 +4209,30 @@ fn starts_export_specifier(trimmed: &str) -> bool {
     }
 }
 
+/// Everything after a leading `let|const|var <name> = $props.id();` declaration,
+/// or `None` when `trimmed` does not open one. The declaration is dropped here
+/// because the component body emits it as a hoisted `const`.
+///
+/// The initializer is a closed literal, so the declaration's end is read rather
+/// than inferred — nothing here has to answer where a general statement ends.
+fn props_id_declaration_tail(trimmed: &str) -> Option<&str> {
+    let head = trimmed.strip_prefix("export ").unwrap_or(trimmed);
+    if !(head.starts_with("let ") || head.starts_with("const ") || head.starts_with("var ")) {
+        return None;
+    }
+    let eq = trimmed.find('=')?;
+    let rhs = trimmed[eq + 1..].trim_start();
+    let mut rest = rhs.strip_prefix("$props.id()").or_else(|| rhs.strip_prefix("$.props_id()"))?;
+    // Empty statements belong to the declaration's line, not to the tail.
+    loop {
+        rest = rest.trim_start();
+        match rest.strip_prefix(';') {
+            Some(after) => rest = after,
+            None => return Some(rest),
+        }
+    }
+}
+
 /// Clean up an import statement after TypeScript stripping.
 /// Removes empty specifier slots (trailing commas, double commas) that result from
 /// type-only specifier removal. Normalizes `import { A,  , C,  } from 'x'` to
@@ -2805,11 +4246,8 @@ fn cleanup_import_line(import: &str) -> String {
     // that. String literals (the module specifier) are respected.
     let import = props_transforms::strip_js_comments(import);
     // Normalize whitespace (join multi-line imports into a single line)
-    let single_line = import
-        .lines()
-        .map(|l| l.trim())
-        .collect::<Vec<_>>()
-        .join(" ");
+    let mut single_line = import.lines().map(|l| l.trim()).collect::<Vec<_>>().join(" ");
+    normalize_import_assert_keyword(&mut single_line);
 
     // Find the { ... } block
     if let Some(open) = single_line.find('{')
@@ -2821,11 +4259,8 @@ fn cleanup_import_line(import: &str) -> String {
         let after = &single_line[close..]; // "} from '...'"
 
         // Parse specifiers, filter out empty ones
-        let specs: Vec<&str> = specs_str
-            .split(',')
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-            .collect();
+        let specs: Vec<&str> =
+            specs_str.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
 
         if specs.is_empty() {
             // All specifiers were removed - check if there's a default import before the {
@@ -2847,6 +4282,44 @@ fn cleanup_import_line(import: &str) -> String {
     }
 
     single_line
+}
+
+/// Esrap prints the deprecated `assert` import-attributes spelling as `with`.
+/// The client string pipeline must mirror that normalization without touching
+/// the same bytes in a module specifier or an attribute value.
+fn normalize_import_assert_keyword(import: &mut String) {
+    let assert_start = {
+        let bytes = import.as_bytes();
+        let mut i = 0usize;
+        let mut previous = None;
+        let mut found = None;
+        while i < bytes.len() {
+            if let Some((next, _)) = skip_opaque(bytes, i, previous) {
+                previous = Some(b'x');
+                i = next;
+                continue;
+            }
+            if bytes[i..].starts_with(b"assert")
+                && (i == 0 || !is_ident_byte(bytes[i - 1]))
+                && bytes.get(i + "assert".len()).is_none_or(|byte| !is_ident_byte(*byte))
+            {
+                let brace = skip_js_whitespace_and_comments(import, i + "assert".len());
+                if bytes.get(brace) == Some(&b'{') {
+                    found = Some(i);
+                    break;
+                }
+            }
+            if !bytes[i].is_ascii_whitespace() {
+                previous = Some(bytes[i]);
+            }
+            i += 1;
+        }
+        found
+    };
+
+    if let Some(start) = assert_start {
+        import.replace_range(start..start + "assert".len(), "with");
+    }
 }
 
 /// Extract variable names from top-level (non-nested) declarations that are NOT
@@ -2883,6 +4356,11 @@ fn cleanup_import_line(import: &str) -> String {
 /// holds iff `<kw> N = $state(` occurs for some keyword. The keyword is matched as
 /// a raw substring (no left word boundary), mirroring the original `contains`.
 fn collect_local_state_decls(script: &str) -> rustc_hash::FxHashSet<&str> {
+    // The only insert requires this exact suffix, so its absence settles the answer
+    // without the three keyword scans below.
+    if memmem::find(script.as_bytes(), b" = $state(").is_none() {
+        return rustc_hash::FxHashSet::default();
+    }
     let mut set: rustc_hash::FxHashSet<&str> = rustc_hash::FxHashSet::default();
     for kw in ["let ", "const ", "var "] {
         let mut from = 0;
@@ -2902,6 +4380,12 @@ fn collect_local_state_decls(script: &str) -> rustc_hash::FxHashSet<&str> {
 }
 
 fn extract_shadowed_state_names(script: &str) -> rustc_hash::FxHashSet<String> {
+    if memmem::find(script.as_bytes(), b"$state").is_none()
+        && memmem::find(script.as_bytes(), b"$derived").is_none()
+    {
+        return rustc_hash::FxHashSet::default();
+    }
+
     let mut top_level_non_state: rustc_hash::FxHashSet<String> = rustc_hash::FxHashSet::default();
     let mut inner_state: rustc_hash::FxHashSet<String> = rustc_hash::FxHashSet::default();
     let mut brace_depth: i32 = 0;
@@ -2912,14 +4396,7 @@ fn extract_shadowed_state_names(script: &str) -> rustc_hash::FxHashSet<String> {
         // Check if this line is at the top level BEFORE counting braces in this line
         let line_starts_at_top = brace_depth == 0;
 
-        // Track brace depth (simple heuristic - doesn't handle strings/comments)
-        for ch in trimmed.chars() {
-            match ch {
-                '{' => brace_depth += 1,
-                '}' => brace_depth -= 1,
-                _ => {}
-            }
-        }
+        advance_brace_depth_lexical(trimmed, &mut brace_depth);
 
         // Check if this is a let/const/var declaration
         let has_decl = trimmed.starts_with("let ")
@@ -2974,10 +4451,167 @@ fn extract_shadowed_state_names(script: &str) -> rustc_hash::FxHashSet<String> {
     }
 
     // Return the intersection: names that appear in BOTH sets
-    top_level_non_state
-        .intersection(&inner_state)
-        .cloned()
-        .collect()
+    top_level_non_state.intersection(&inner_state).cloned().collect()
+}
+
+fn advance_brace_depth_lexical(line: &str, depth: &mut i32) {
+    let bytes = line.as_bytes();
+    let mut prev = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        if let Some((next, is_comment)) = skip_opaque(bytes, i, prev) {
+            if !is_comment {
+                prev = Some(b'x');
+            }
+            i = next;
+            continue;
+        }
+        match bytes[i] {
+            b'{' => *depth += 1,
+            b'}' => *depth -= 1,
+            c if !c.is_ascii_whitespace() => prev = Some(c),
+            _ => {}
+        }
+        i += 1;
+    }
+}
+/// Every identifier in `script` that is written to, found in one pass.
+///
+/// Replaces asking `is_variable_reassigned_in_text` once per variable, which
+/// walked the whole script per variable. Both routes run the same
+/// per-occurrence predicate, so the answers agree by construction.
+fn index_reassigned_vars(script: &str) -> rustc_hash::FxHashSet<&str> {
+    let bytes = script.as_bytes();
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$';
+    let mut found: rustc_hash::FxHashSet<&str> = rustc_hash::FxHashSet::default();
+    let mut i = 0;
+    while i < bytes.len() {
+        if !is_ident(bytes[i]) || (i > 0 && is_ident(bytes[i - 1])) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && is_ident(bytes[i]) {
+            i += 1;
+        }
+        let name = &script[start..i];
+        if !found.contains(name) && is_reassignment_at(script, start, i - start) {
+            found.insert(name);
+        }
+    }
+    found
+}
+
+/// Every identifier declared as `const <name> = $state(` (or `.raw(` /
+/// `.frozen(`), found in one pass.
+///
+/// Matches the three `contains` calls it replaces byte for byte, including
+/// their indifference to what precedes `const`: the caller's pattern was a
+/// plain substring, so `aconst x = $state(` satisfied it and still does.
+fn index_const_state_decls(script: &str) -> rustc_hash::FxHashSet<&str> {
+    let bytes = script.as_bytes();
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$';
+    let mut found: rustc_hash::FxHashSet<&str> = rustc_hash::FxHashSet::default();
+    for suffix in [" = $state(", " = $state.raw(", " = $state.frozen("] {
+        let mut from = 0;
+        while let Some(rel) = memmem::find(&bytes[from..], suffix.as_bytes()) {
+            let at = from + rel;
+            let mut name_start = at;
+            while name_start > 0 && is_ident(bytes[name_start - 1]) {
+                name_start -= 1;
+            }
+            if name_start < at && name_start >= 6 && &script[name_start - 6..name_start] == "const "
+            {
+                found.insert(&script[name_start..at]);
+            }
+            from = at + 1;
+        }
+    }
+    found
+}
+
+/// Whether the identifier occupying `abs_pos .. abs_pos + var_len` is written
+/// to rather than merely read.
+///
+/// Split out so the per-variable scan and the one-pass index below apply the
+/// same predicate: an index that answered a slightly different question would
+/// change the output, and the difference would be invisible in the counters.
+fn is_reassignment_at(script: &str, abs_pos: usize, var_len: usize) -> bool {
+    let bytes = script.as_bytes();
+    let after_pos = abs_pos + var_len;
+    // Check if this is a reassignment (not member mutation)
+    // Look at what comes after the variable name (skip whitespace)
+    let mut j = after_pos;
+    while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+        j += 1;
+    }
+
+    if j < bytes.len() {
+        let next_char = bytes[j];
+        // Check for assignment operators: =, +=, -=, *=, /=, %=, etc.
+        // But NOT == or => or =>{
+        if next_char == b'=' {
+            // Make sure it's not == or =>
+            if j + 1 < bytes.len() && bytes[j + 1] != b'=' && bytes[j + 1] != b'>' {
+                // Check that before the var, there's no `.` (which would mean member access)
+                if abs_pos == 0 || bytes[abs_pos - 1] != b'.' {
+                    // This is `x = ...` which is a declaration or reassignment.
+                    // Check if it's the declaration itself (let x = $state(...))
+                    // by looking backwards for `let `, `const `, or `var `
+                    let before_text = &script[..abs_pos];
+                    let trimmed_before = before_text.trim_end();
+                    if trimmed_before.ends_with("let")
+                        || trimmed_before.ends_with("const")
+                        || trimmed_before.ends_with("var")
+                    {
+                        // This is the declaration, not a reassignment
+                    } else {
+                        return true;
+                    }
+                }
+            }
+        } else if (next_char == b'+'
+            || next_char == b'-'
+            || next_char == b'*'
+            || next_char == b'/'
+            || next_char == b'%'
+            || next_char == b'&'
+            || next_char == b'|'
+            || next_char == b'^')
+            && j + 1 < bytes.len()
+            && bytes[j + 1] == b'='
+        {
+            // Compound assignment: +=, -=, *=, /=, %=, &=, |=, ^=
+            if abs_pos == 0 || bytes[abs_pos - 1] != b'.' {
+                return true;
+            }
+        } else if next_char == b'+' && j + 1 < bytes.len() && bytes[j + 1] == b'+' {
+            // x++ postfix increment
+            if abs_pos == 0 || bytes[abs_pos - 1] != b'.' {
+                return true;
+            }
+        } else if next_char == b'-' && j + 1 < bytes.len() && bytes[j + 1] == b'-' {
+            // x-- postfix decrement
+            if abs_pos == 0 || bytes[abs_pos - 1] != b'.' {
+                return true;
+            }
+        }
+    }
+
+    // Also check for prefix ++/-- before the variable
+    if abs_pos >= 2 {
+        let mut k = abs_pos - 1;
+        while k > 0 && bytes[k].is_ascii_whitespace() {
+            k -= 1;
+        }
+        if k > 0 && bytes[k] == b'+' && bytes[k - 1] == b'+' {
+            return true;
+        }
+        if k > 0 && bytes[k] == b'-' && bytes[k - 1] == b'-' {
+            return true;
+        }
+    }
+    false
 }
 
 /// Extract local reactive variable names from script content.
@@ -3016,79 +4650,8 @@ pub(super) fn is_variable_reassigned_in_text(script: &str, var_name: &str) -> bo
                 !next.is_ascii_alphanumeric() && next != b'_' && next != b'$'
             };
 
-            if before_ok && after_ok {
-                // Check if this is a reassignment (not member mutation)
-                // Look at what comes after the variable name (skip whitespace)
-                let mut j = after_pos;
-                while j < bytes.len() && bytes[j].is_ascii_whitespace() {
-                    j += 1;
-                }
-
-                if j < bytes.len() {
-                    let next_char = bytes[j];
-                    // Check for assignment operators: =, +=, -=, *=, /=, %=, etc.
-                    // But NOT == or => or =>{
-                    if next_char == b'=' {
-                        // Make sure it's not == or =>
-                        if j + 1 < bytes.len() && bytes[j + 1] != b'=' && bytes[j + 1] != b'>' {
-                            // Check that before the var, there's no `.` (which would mean member access)
-                            if abs_pos == 0 || bytes[abs_pos - 1] != b'.' {
-                                // This is `x = ...` which is a declaration or reassignment.
-                                // Check if it's the declaration itself (let x = $state(...))
-                                // by looking backwards for `let `, `const `, or `var `
-                                let before_text = &script[..abs_pos];
-                                let trimmed_before = before_text.trim_end();
-                                if trimmed_before.ends_with("let")
-                                    || trimmed_before.ends_with("const")
-                                    || trimmed_before.ends_with("var")
-                                {
-                                    // This is the declaration, not a reassignment
-                                } else {
-                                    return true;
-                                }
-                            }
-                        }
-                    } else if (next_char == b'+'
-                        || next_char == b'-'
-                        || next_char == b'*'
-                        || next_char == b'/'
-                        || next_char == b'%'
-                        || next_char == b'&'
-                        || next_char == b'|'
-                        || next_char == b'^')
-                        && j + 1 < bytes.len()
-                        && bytes[j + 1] == b'='
-                    {
-                        // Compound assignment: +=, -=, *=, /=, %=, &=, |=, ^=
-                        if abs_pos == 0 || bytes[abs_pos - 1] != b'.' {
-                            return true;
-                        }
-                    } else if next_char == b'+' && j + 1 < bytes.len() && bytes[j + 1] == b'+' {
-                        // x++ postfix increment
-                        if abs_pos == 0 || bytes[abs_pos - 1] != b'.' {
-                            return true;
-                        }
-                    } else if next_char == b'-' && j + 1 < bytes.len() && bytes[j + 1] == b'-' {
-                        // x-- postfix decrement
-                        if abs_pos == 0 || bytes[abs_pos - 1] != b'.' {
-                            return true;
-                        }
-                    }
-                }
-
-                // Also check for prefix ++/-- before the variable
-                if abs_pos >= 2 {
-                    let mut k = abs_pos - 1;
-                    while k > 0 && bytes[k].is_ascii_whitespace() {
-                        k -= 1;
-                    }
-                    if k > 0 && bytes[k] == b'+' && bytes[k - 1] == b'+' {
-                        return true;
-                    }
-                    if k > 0 && bytes[k] == b'-' && bytes[k - 1] == b'-' {
-                        return true;
-                    }
-                }
+            if before_ok && after_ok && is_reassignment_at(script, abs_pos, var_len) {
+                return true;
             }
 
             i = abs_pos + 1;
@@ -3101,6 +4664,13 @@ pub(super) fn is_variable_reassigned_in_text(script: &str, var_name: &str) -> bo
 }
 
 pub(super) fn extract_local_reactive_vars(script: &str) -> Vec<(String, bool, bool)> {
+    if memmem::find(script.as_bytes(), b"$state").is_none()
+        && memmem::find(script.as_bytes(), b"$derived").is_none()
+    {
+        return Vec::new();
+    }
+
+    super::profile::record_st_collect_scan(script.len() as u64);
     let mut vars = Vec::new();
 
     // Pattern: (let|const|var) varname = $state(...) or (let|const|var) varname = $derived(...)
@@ -3209,6 +4779,11 @@ fn is_inside_function_with_param(script: &str, pos: usize, param_name: &str) -> 
 /// These variables will be transformed to $.proxy() and should NOT have $.get() wrapping
 /// when accessing their properties.
 fn extract_proxy_vars(script: &str) -> Vec<String> {
+    // Nothing is pushed without a `$state(` on the line, so no token means no result.
+    if memmem::find(script.as_bytes(), b"$state(").is_none() {
+        return Vec::new();
+    }
+    super::profile::record_st_collect_scan(script.len() as u64);
     let mut proxy_vars = Vec::new();
 
     for line in script.lines() {
@@ -3266,10 +4841,49 @@ fn is_non_proxy_node_type(nt: &str) -> bool {
 
 pub(crate) fn transform_module_script_runes(
     script: &str,
+    pre_class_script: &str,
     analysis: &ComponentAnalysis,
     dev: bool,
+    module_entry: bool,
+) -> String {
+    transform_module_script_runes_with_target(
+        script,
+        pre_class_script,
+        analysis,
+        dev,
+        false,
+        module_entry,
+        false,
+    )
+}
+
+/// `pre_class_script` is the script before the class-field lowering — the dev
+/// `$.tag` label needs the name the user wrote, which the lowering erases.
+/// Whether this module declares a rune-spelled name at all — the cheap
+/// precondition for [`rune_shadow::RuneShadows`]: with no such declaration no
+/// call can resolve to one, so nothing needs a scope pass.
+fn module_binds_rune_name(analysis: &ComponentAnalysis) -> bool {
+    analysis.root.bindings.iter().any(|b| rune_shadow::is_rune_name(&b.name))
+}
+
+fn transform_module_script_runes_with_target(
+    script: &str,
+    pre_class_script: &str,
+    analysis: &ComponentAnalysis,
+    dev: bool,
+    server: bool,
+    // `compileModule` only: a component's `<script module>` is printed by the
+    // component pipeline, whose text survives to the output as written.
+    module_entry: bool,
+    // Server compileModule dev output lowers `$inspect` after this shared AST
+    // transform so comments on its arguments retain their final positions.
+    preserve_inspect: bool,
 ) -> String {
     let mut result = script.to_string();
+    let mut shadows = rune_shadow::RuneShadows::new(
+        module_binds_rune_name(analysis),
+        analysis.filename.ends_with(".ts") || analysis.filename.ends_with(".svelte.ts"),
+    );
 
     // Strip TypeScript generic parameters from $state<...>() and $derived<...>() calls.
     // These are type-only annotations that have no runtime meaning.
@@ -3282,8 +4896,8 @@ pub(crate) fn transform_module_script_runes(
     // CallExpressions and asks "is the callee `$state`/`$derived` with type
     // arguments?". Falls back to the original `result` when the source isn't
     // TS (generics aren't legal) or fails to parse.
+    let is_ts = analysis.filename.ends_with(".ts") || analysis.filename.ends_with(".svelte.ts");
     {
-        let is_ts = analysis.filename.ends_with(".ts") || analysis.filename.ends_with(".svelte.ts");
         if let Some(rewritten) =
             strip_rune_generics_ast::strip_rune_generic_params_ast(&result, is_ts)
         {
@@ -3291,26 +4905,41 @@ pub(crate) fn transform_module_script_runes(
         }
     }
 
-    // In non-dev mode, remove $inspect.trace(...) statements from module scripts.
-    // Mirrors the same logic in rune_transforms.rs for instance scripts.
+    // Instrument the source await before `$derived` lowering moves it into an
+    // async-derived thunk. The tail pass recognises the generated outer await.
+    if dev {
+        let is_ts = analysis.filename.ends_with(".ts") || analysis.filename.ends_with(".svelte.ts");
+        if let Some(rewritten) = module_dev_tail_ast::transform_module_awaits_ast(
+            &result,
+            is_ts,
+            analysis.runes,
+            Some(analysis),
+        ) {
+            result = rewritten;
+        }
+    }
+
+    // The AST lowering above answers for a `.svelte.(js|ts)` module's *client*
+    // output; every other target still reaches this function with the rune
+    // intact, so the non-dev removal stays. `find_code` rather than a plain
+    // byte search: the same bytes inside a string literal are not the rune.
     if !dev {
-        while let Some(pos) = memmem::find(result.as_bytes(), b"$inspect.trace(") {
+        while let Some(pos) = find_rune_code(result.as_bytes(), b"$inspect.trace(") {
             let trace_start = pos + b"$inspect.trace(".len();
-            if let Some(content_end) = find_matching_paren(&result[trace_start..]) {
-                let mut end = trace_start + content_end + 1;
-                while end < result.len()
-                    && matches!(result.as_bytes()[end], b';' | b' ' | b'\t' | b'\n' | b'\r')
-                {
-                    end += 1;
-                }
-                let mut start = pos;
-                while start > 0 && matches!(result.as_bytes()[start - 1], b' ' | b'\t') {
-                    start -= 1;
-                }
-                result = format!("{}{}", &result[..start], &result[end..]);
-            } else {
+            let Some(content_end) = find_matching_paren(&result[trace_start..]) else {
                 break;
+            };
+            let mut end = trace_start + content_end + 1;
+            while end < result.len()
+                && matches!(result.as_bytes()[end], b';' | b' ' | b'\t' | b'\n' | b'\r')
+            {
+                end += 1;
             }
+            let mut start = pos;
+            while start > 0 && matches!(result.as_bytes()[start - 1], b' ' | b'\t') {
+                start -= 1;
+            }
+            result = format!("{}{}", &result[..start], &result[end..]);
         }
     }
 
@@ -3318,8 +4947,8 @@ pub(crate) fn transform_module_script_runes(
     // module scripts. Mirrors CallExpression.js `transform_inspect_rune`: `if (!dev)
     // return b.empty`. The component-instance path handles this in rune_transforms.rs;
     // module scripts use this dedicated loop.
-    if !dev {
-        while let Some(pos) = memmem::find(result.as_bytes(), b"$inspect(") {
+    if !dev && !preserve_inspect {
+        while let Some(pos) = find_rune_code(result.as_bytes(), b"$inspect(") {
             let inspect_start = pos + b"$inspect(".len();
             if let Some(content_end) = find_matching_paren(&result[inspect_start..]) {
                 let after_call = &result[inspect_start + content_end + 1..];
@@ -3335,20 +4964,34 @@ pub(crate) fn transform_module_script_runes(
                 } else {
                     inspect_start + content_end + 1 - pos
                 };
-                // Remove leading whitespace on the same line
-                let mut start = pos;
-                while start > 0 && matches!(result.as_bytes()[start - 1], b' ' | b'\t') {
-                    start -= 1;
+                // In an operand slot upstream's `EmptyStatement` prints as a bare
+                // `;`, which no parser accepts; keep the slot filled with the
+                // value `$inspect` evaluates to, rather than deleting the line
+                // and leaving the initializer dangling
+                // (`upstream_issues/3213-svelte-inspect-in-a-value-position.md`).
+                if rune_transforms::operand_expected_before(&result[..pos]) {
+                    result =
+                        format!("{}undefined{}", &result[..pos], &result[pos + total_call_len..]);
+                    continue;
                 }
-                // Consume optional trailing semicolon then newline
+                // Statement position: upstream substitutes an `EmptyStatement`
+                // for the call and keeps the statement's own `;`, which esrap
+                // prints as `;;` where the call stood — at whatever nesting it
+                // had. Deleting the line instead loses both.
                 let mut end = pos + total_call_len;
                 while end < result.len() && result.as_bytes()[end] == b';' {
                     end += 1;
                 }
-                if end < result.len() && result.as_bytes()[end] == b'\n' {
-                    end += 1;
-                }
-                result = format!("{}{}", &result[..start], &result[end..]);
+                result = if module_entry {
+                    // `compileModule` re-parses this text before printing and a
+                    // re-parse drops an `EmptyStatement`, so there the hole
+                    // travels as a sentinel esrap prints as a statement. Its
+                    // `;` is for the next iteration's position test, which
+                    // reads an identifier as an operand slot.
+                    format!("{}{MODULE_INSPECT_HOLE};{}", &result[..pos], &result[end..])
+                } else {
+                    format!("{};;{}", &result[..pos], &result[end..])
+                };
             } else {
                 break;
             }
@@ -3358,23 +5001,24 @@ pub(crate) fn transform_module_script_runes(
     // Extract local reactive variable names from the module script
     // These are variables declared with $state() or $derived() inside functions
     let module_state_vars_with_const = extract_local_reactive_vars(&result);
-    let module_state_vars: Vec<String> = module_state_vars_with_const
-        .iter()
-        .map(|(name, _, _)| name.clone())
-        .collect();
+    let module_state_vars: Vec<String> =
+        module_state_vars_with_const.iter().map(|(name, _, _)| name.clone()).collect();
 
     // Extract non-reactive module state vars: $state() variables that are NOT reassigned.
     // In runes mode (immutable=true), non-reassigned $state vars don't need $.state() or $.get().
-    // They only get $.proxy() for objects/arrays. This mirrors the instance-level is_state_source logic.
-    let mut module_non_reactive_vars: Vec<String> = if analysis.immutable {
+    // They only get $.proxy() for objects/arrays. This mirrors the official compiler's
+    // `is_state_source` (`3-transform/client/utils.js`), which gates purely on
+    // `binding.reassigned` — it is applied at every scope during the visitor traversal, not
+    // just the module's top-level scope. `Binding::reassigned` already reflects the true
+    // reassignment analysis (not just "declared with `const`"), so this check covers both
+    // top-level and function-local `let`/`const` `$state`/`$state.raw` locals alike (#2082).
+    let module_non_reactive_vars: Vec<String> = if analysis.immutable {
         analysis
             .root
             .bindings
             .iter()
             .filter(|b| {
-                // Module-level bindings are at scope 0
-                b.scope_index == 0
-                    && matches!(b.kind, BindingKind::State | BindingKind::RawState)
+                matches!(b.kind, BindingKind::State | BindingKind::RawState)
                     && !b.reassigned
                     && !analysis.accessors
             })
@@ -3384,17 +5028,20 @@ pub(crate) fn transform_module_script_runes(
         Vec::new()
     };
 
-    // Also include `const` $state variables from any scope as non-reactive.
-    // `const` variables can never be reassigned, so they don't need $.state()/$.get() wrapping.
-    // This is especially important for module files where $state is used inside functions.
-    // NOTE: Only $state vars (is_state=true) qualify. $derived vars always need $.get() wrapping.
-    if analysis.immutable {
-        for (name, is_const, is_state) in &module_state_vars_with_const {
-            if *is_const && *is_state && !module_non_reactive_vars.contains(name) {
-                module_non_reactive_vars.push(name.clone());
-            }
-        }
-    }
+    // `bindings` is flat across every scope, so same-named `$state` locals in
+    // sibling functions collapse into one entry; such a name cannot classify
+    // declarations, reads or writes by itself and must be resolved per binding.
+    let ambiguous_state_names: Vec<String> = module_non_reactive_vars
+        .iter()
+        .filter(|name| {
+            analysis.root.bindings.iter().any(|b| {
+                matches!(b.kind, BindingKind::State | BindingKind::RawState)
+                    && b.reassigned
+                    && &b.name == *name
+            })
+        })
+        .cloned()
+        .collect();
 
     // Extract module proxy vars for non-reactive vars
     let module_proxy_vars = extract_proxy_vars(script);
@@ -3424,10 +5071,7 @@ pub(crate) fn transform_module_script_runes(
                         | BindingKind::StoreSub
                 )
                 && (b.initial_is_function
-                    || b.initial_node_type
-                        .as_deref()
-                        .map(is_non_proxy_node_type)
-                        .unwrap_or(false)
+                    || b.initial_node_type.as_deref().map(is_non_proxy_node_type).unwrap_or(false)
                     || (b.initial_node_type.as_deref() == Some("Identifier")
                         && b.initial_identifier_name.as_deref() == Some("undefined")))
         })
@@ -3436,78 +5080,77 @@ pub(crate) fn transform_module_script_runes(
 
     // Reactive module state vars = those that need $.get()/$.set()
     // (i.e. all module state vars except non-reactive ones)
-    let reactive_module_state_vars: Vec<String> = module_state_vars
+    let mut reactive_module_state_vars: Vec<String> = module_state_vars
         .iter()
         .filter(|v| !module_non_reactive_vars.contains(v))
         .cloned()
         .collect();
-
-    // Transform $state.snapshot(x) to $.snapshot(x).
-    // Module scripts don't need dev-mode handling for state_snapshot_uncloneable.
-    //
-    // AST-based rewrite via `state_snapshot_ast::transform_state_snapshot_ast`.
-    // The text version was `String::replace("$state.snapshot(", "$.snapshot(")`
-    // — rewrites byte patterns regardless of lexical context, so anything inside
-    // a string / template literal got (incorrectly) rewritten too. The AST
-    // visitor descends only into expression positions and can't make that
-    // mistake.
-    {
-        let is_ts = analysis.filename.ends_with(".ts") || analysis.filename.ends_with(".svelte.ts");
-        if let Some(rewritten) = state_snapshot_ast::transform_state_snapshot_ast(&result, is_ts) {
-            result = rewritten;
+    for binding in &analysis.root.bindings {
+        if matches!(binding.kind, BindingKind::Derived)
+            && !reactive_module_state_vars.contains(&binding.name)
+        {
+            reactive_module_state_vars.push(binding.name.clone());
         }
     }
 
-    // Transform $state.raw(x) / $state.frozen(x).
-    // Like $state(), whether we wrap in $.state() depends on whether the variable
-    // is reassigned.  $state.raw/$state.frozen never use $.proxy(), just the raw value
-    // when non-reactive, or $.state(value) when reassigned.
-    //
-    // AST-based rewrite via `state_raw_frozen_ast::transform_state_raw_frozen_ast`.
-    // The text predecessor scanned for `$state.raw(` / `$state.frozen(`, walked
-    // backwards via `extract_var_name_before_rune` to discover the declarator's
-    // identifier, then rewrote in place. That walked-back search was fragile
-    // (any byte pattern matching `$state.raw(` inside a string would trigger it).
-    // The AST visitor knows about strings / templates / regexes and reads the
-    // binding name from the `BindingPattern` directly.
+    // Expand a destructured rune declarator before the call lowering below sees
+    // it: `let { a } = $state(1)` is one `tmp` plus one declarator per bound
+    // leaf, not a pattern around the lowered call.
     {
         let is_ts = analysis.filename.ends_with(".ts") || analysis.filename.ends_with(".svelte.ts");
-        if let Some(rewritten) = state_raw_frozen_ast::transform_state_raw_frozen_ast(
+        if let Some(rewritten) = module_destructure_ast::transform_module_rune_destructuring_ast(
             &result,
-            &module_non_reactive_vars,
             is_ts,
+            &module_destructure_ast::ModuleDestructureConfig {
+                state_vars: &reactive_module_state_vars,
+                non_reactive_vars: &module_non_reactive_vars,
+                proxy_vars: &module_proxy_vars,
+                dev,
+                server,
+                state_only: false,
+            },
         ) {
             result = rewritten;
         }
     }
 
-    // Transform $state(x) - handling both reassigned and non-reassigned cases.
-    // Non-reassigned vars get $.proxy() only, reassigned vars get $.state($.proxy()).
-    //
-    // AST-based rewrite via `state_call_ast::transform_state_call_ast`. The
-    // text predecessor scanned for `$state(`, found the close-paren via a
-    // custom brace tracker, walked backwards via `extract_var_name_before_rune`
-    // to discover the binding name, then dispatched on the reactive /
-    // needs-proxy / empty axes. The OXC parser knows about all of the
-    // lexical concerns (strings, templates, regexes, comments) and the
-    // `BindingPattern` gives us the name directly. After the AST helper
-    // runs, the legacy text loop below sees no remaining `$state(` and
-    // exits immediately — idempotent fallback for parse failures.
+    // Lower the module script's `$state*` runes in a single batched parse:
+    //   * `$state.snapshot(x)` → `$.snapshot(x)`
+    //   * `$state.raw(x)` / `$state.frozen(x)` → `$.state(x)` or raw value
+    //   * bare `$state(x)`   → `$.state(...)` / `$.proxy(...)` / raw value
+    // These three rewrites target lexically disjoint syntax, so one parse feeds
+    // all three collectors instead of re-parsing the whole module script per
+    // rune. Module scripts don't need dev-mode `state_snapshot_uncloneable`
+    // handling. The AST visitors descend only into expression positions, so —
+    // unlike the text predecessors — none of them can be tripped by the same
+    // bytes inside a string / template / regex literal. On a parse failure the
+    // batch is a no-op and the legacy `$state(` text loop below runs as a
+    // fallback (and, on success, sees no remaining `$state(` and exits).
     {
         let is_ts = analysis.filename.ends_with(".ts") || analysis.filename.ends_with(".svelte.ts");
-        if let Some(rewritten) = state_call_ast::transform_state_call_ast(
+        if let Some(rewritten) = module_state_runes_ast::transform_module_state_runes_ast(
             &result,
             &module_non_reactive_vars,
+            &ambiguous_state_names,
             &module_non_proxy_vars,
             is_ts,
         ) {
             result = rewritten;
         }
     }
-    while let Some(pos) = memmem::find(result.as_bytes(), b"$state(") {
+    // `find_code`, not `memmem::find`: the AST batch above leaves a `$state(`
+    // that sits in a string / template / regex / comment untouched, and this
+    // fallback would otherwise rewrite that text as if it were a call (#2988).
+    let mut state_from = 0usize;
+    while let Some(rel) = find_rune_code(&result.as_bytes()[state_from..], b"$state(") {
+        let pos = state_from + rel;
         // Make sure this is not $state.something
         if pos + 7 < result.len() && result.as_bytes()[pos + 6] != b'(' {
             break;
+        }
+        if shadows.is_bound(&result, pos) {
+            state_from = pos + 1;
+            continue;
         }
 
         let var_name = extract_var_name_before_rune(&result[..pos]);
@@ -3590,26 +5233,64 @@ pub(crate) fn transform_module_script_runes(
     // expression positions and can't make that mistake.
     {
         let is_ts = analysis.filename.ends_with(".ts") || analysis.filename.ends_with(".svelte.ts");
-        if let Some(rewritten) = derived_by_ast::transform_derived_by_ast(&result, is_ts) {
+        if let Some(rewritten) =
+            derived_by_ast::transform_derived_by_ast(&result, is_ts, shadows.enabled())
+        {
             result = rewritten;
         }
     }
 
     // Transform $derived() to $.derived(() => expr) or $.async_derived() for async
     // Need to wrap state variable references inside the expression with $.get()
-    while let Some(pos) = memmem::find(result.as_bytes(), b"$derived(") {
+    let module_async_derived_locations = dev.then(|| {
+        let script_content = analysis.module_script_content.as_ref();
+        let (script_start, original_script) = script_content.map_or((0, script), |content| {
+            (
+                content.start,
+                analysis.source.get(content.start as usize..content.end as usize).unwrap_or(script),
+            )
+        });
+        async_derived_dev::collect(
+            &analysis.source,
+            script_start,
+            original_script,
+            analysis.filename.as_str(),
+            analysis.is_typescript,
+            analysis.runes,
+        )
+    });
+    if let Some(rewritten) = module_derived_ast::transform_module_derived_destructuring_ast(
+        &result,
+        is_ts,
+        &reactive_module_state_vars,
+        &module_non_reactive_vars,
+        &module_proxy_vars,
+        dev,
+        server,
+        module_async_derived_locations.as_ref(),
+    ) {
+        result = rewritten;
+    }
+    // `find_code`, not `memmem::find`: a `$derived(` inside a string / template
+    // / regex / comment is text. Matching it either rewrote the literal (#2988)
+    // or aborted the loop on its unbalanced parens, leaving the real rune call
+    // unlowered and the module referencing a global `$derived` (#2987).
+    let mut derived_from = 0usize;
+    while let Some(rel) = find_rune_code(&result.as_bytes()[derived_from..], b"$derived(") {
+        let pos = derived_from + rel;
         if result[..pos].ends_with('$') {
             // Already transformed to $.derived() - skip
             break;
+        }
+        if shadows.is_bound(&result, pos) {
+            derived_from = pos + 1;
+            continue;
         }
         let derived_start = pos + 9; // after "$derived("
         if let Some(content_end) = find_matching_paren(&result[derived_start..]) {
             let content = &result[derived_start..derived_start + content_end];
             // Strip trailing comma from $derived(expr,) - valid in function call but not in () => (expr,)
-            let content = content
-                .trim_end()
-                .strip_suffix(',')
-                .map_or(content, |stripped| stripped);
+            let content = content.trim_end().strip_suffix(',').map_or(content, |stripped| stripped);
             // Wrap state variables inside the expression with $.get()
             let wrapped_content = wrap_state_vars_in_expr(
                 content,
@@ -3628,21 +5309,30 @@ pub(crate) fn transform_module_script_runes(
                 let inner_expr = strip_top_level_await_from_expr(&saved_content);
                 let inner_has_nested_await = contains_direct_await_in_expression(&inner_expr);
 
+                let var_name = extract_var_name_before_rune(&result[..pos]);
+                let dev_tail = async_derived_dev::dev_args(
+                    module_async_derived_locations.as_ref(),
+                    &var_name,
+                    &var_name,
+                );
                 let new_derived = if inner_has_nested_await {
                     let is_object = saved_content.trim().starts_with('{');
                     if is_object {
-                        format!("await $.async_derived(async () => ({}))", saved_content)
+                        format!(
+                            "await $.async_derived(async () => ({}){})",
+                            saved_content, dev_tail
+                        )
                     } else {
-                        format!("await $.async_derived(async () => {})", saved_content)
+                        format!("await $.async_derived(async () => {}{})", saved_content, dev_tail)
                     }
                 } else {
                     let inner_trimmed = inner_expr.trim();
                     let inner_is_object = inner_trimmed.starts_with('{');
                     if inner_is_object {
-                        format!("await $.async_derived(() => ({}))", inner_expr)
+                        format!("await $.async_derived(() => ({}){})", inner_expr, dev_tail)
                     } else {
                         let thunk_arg = unthunk_string(&inner_expr);
-                        format!("await $.async_derived({})", thunk_arg)
+                        format!("await $.async_derived({}{})", thunk_arg, dev_tail)
                     }
                 };
                 result = format!(
@@ -3675,7 +5365,7 @@ pub(crate) fn transform_module_script_runes(
     // if any declaration (let/const/var) for the variable exists in the text.
     // In module scripts, declarations and assignments coexist, so we need to
     // process non-declaration lines separately.
-    if !reactive_module_state_vars.is_empty() {
+    if !reactive_module_state_vars.is_empty() || !ambiguous_state_names.is_empty() {
         // Collect no-proxy vars (these should NOT get proxy flag in $.set())
         // The official Svelte compiler skips the proxy flag for derived, raw_state,
         // prop, bindable_prop, and store_sub bindings (AssignmentExpression.js L136-141).
@@ -3685,6 +5375,14 @@ pub(crate) fn transform_module_script_runes(
             .filter(|(_, _, is_state)| !is_state) // is_state=false means $derived
             .map(|(name, _, _)| name.clone())
             .collect();
+        for binding in &analysis.root.bindings {
+            if binding.scope_index != analysis.root.instance_scope_index
+                && matches!(binding.kind, BindingKind::Derived)
+                && !derived_vars.contains(&binding.name)
+            {
+                derived_vars.push(binding.name.clone());
+            }
+        }
         // Also add $state.raw vars from bindings — they never use the proxy flag.
         for (name, &binding_idx) in &analysis.root.scope.declarations {
             if let Some(b) = analysis.root.bindings.get(binding_idx)
@@ -3712,213 +5410,83 @@ pub(crate) fn transform_module_script_runes(
         // READ wraps in a single parse + SemanticBuilder. Replaces
         // the previous sequential `state_assigns_combined_ast` +
         // `wrap_state_vars_in_expr` which each did their own parse.
+        // Ambiguous names must reach the visitor, which resolves each reference
+        // to its own binding instead of trusting the name-keyed classification.
+        let mut pipeline_state_vars = reactive_module_state_vars.clone();
+        pipeline_state_vars.extend(
+            ambiguous_state_names.iter().filter(|name| module_state_vars.contains(name)).cloned(),
+        );
+        let pipeline_non_reactive_vars: Vec<String> = module_non_reactive_vars
+            .iter()
+            .filter(|name| !ambiguous_state_names.contains(name))
+            .cloned()
+            .collect();
+
         result = state_pipeline_ast::transform_state_pipeline_ast(
             &result,
-            &reactive_module_state_vars,
+            &pipeline_state_vars,
             &derived_vars,
             analysis.runes,
             &[],
-            &module_non_reactive_vars,
+            &pipeline_non_reactive_vars,
         )
         .unwrap_or(result);
     }
 
-    // Transform $effect.root(), $effect.pre(), $effect.tracking(), $effect()
-    // These rune calls can appear in module scripts (e.g., inside class constructors).
-    //
-    // AST-based rewrite via `effect_rune_ast::apply_effect_rune_transforms_ast`:
-    // OXC parses the module script, the visitor matches `CallExpression`s whose
-    // callee is `$effect` (bare) or `$effect.<member>`, and swaps the callee for
-    // the runtime equivalent (`$.user_effect`, `$.user_pre_effect`, etc.). The
-    // text-based predecessor blindly rewrote byte patterns regardless of lexical
-    // context, so `let s = "$effect("` would be (incorrectly) rewritten — the
-    // AST visitor descends into none of those positions.
+    // Lower the module script's `$effect` runes and, in dev mode, its
+    // `===`/`!==` → `$.strict_equals(...)`, `console.METHOD(...)` →
+    // `...$.log_if_contains_state(...)` wraps, `$.state`/`$.derived`/
+    // `$.proxy` declarator `$.tag(...)` wraps, and `await X` →
+    // `(await $.track_reactivity_loss(X))()` — all in a single batched
+    // parse. These passes target lexically disjoint syntax (call callees /
+    // binary operators / console calls / declarator inits / awaits), so one
+    // parse feeds every collector instead of re-parsing the whole module
+    // script per pass. The AST visitors descend only into expression
+    // positions, so — unlike the text predecessors — none can be tripped by
+    // the same bytes inside a string / template / regex literal. `dev` gates
+    // the dev-only collectors exactly as the sequential call sites did.
     {
         let is_ts = analysis.filename.ends_with(".ts") || analysis.filename.ends_with(".svelte.ts");
-        if let Some(rewritten) = effect_rune_ast::apply_effect_rune_transforms_ast(&result, is_ts) {
+        // `compileModule` only: a component's `<script module>` reaches here with
+        // an already-processed `pre_class_script`, so its positions are not the
+        // source's (#3543).
+        let trace_thunks = if dev && !server && module_entry {
+            inspect_rune_ast::collect_trace_thunks(pre_class_script, is_ts, &analysis.filename)
+        } else {
+            Vec::new()
+        };
+        if let Some(rewritten) = module_dev_tail_ast::transform_module_dev_tail_ast(
+            &result,
+            dev,
+            is_ts,
+            analysis.runes,
+            Some(analysis),
+            &trace_thunks,
+        ) {
             result = rewritten;
         }
     }
 
-    // In dev mode, transform === to $.strict_equals() and !== to !$.strict_equals()
-    // This matches the BinaryExpression visitor from the official Svelte compiler.
-    //
-    // AST-based rewrite via `strict_equals_ast::transform_strict_equals_module_ast`:
-    // OXC parses the module script, the visitor walks every BinaryExpression with
-    // operator `===` / `!==`, and replacements are spliced right-to-left. Replaces
-    // the legacy `transform_strict_equals` text scanner — the text version's
-    // string-literal heuristics (count quotes) were fragile under escaped quotes,
-    // regex literals, line comments, and template-literal interpolation. The AST
-    // path can't make those mistakes because OXC's parser knows the lexical
-    // categories. Falls back to the legacy text version on parse failure (which
-    // shouldn't happen for module scripts that get this far in the pipeline).
+    // In dev mode, wrap class-field `$.state()`/`$.derived()`/`$.proxy()`
+    // declarations with `$.tag()`/`$.tag_proxy()` (class `#field = ...` and
+    // `this.field` / `this.#field` assignments, with an originally-public
+    // label heuristic via paired setter detection), then a text fallback
+    // for any remaining non-declarator shapes (a no-op in practice after
+    // the AST passes for valid inputs). The declarator-level tag pass runs
+    // in the batch above; these two cover the class-field / residual cases
+    // that batch's `tag_declarator` collector intentionally skips.
     if dev {
-        let is_ts = analysis.filename.ends_with(".ts") || analysis.filename.ends_with(".svelte.ts");
-        match strict_equals_ast::transform_strict_equals_module_ast(&result, is_ts) {
-            Some(rewritten) => result = rewritten,
-            None => {
-                // None means either no operators to rewrite or a parse
-                // failure; both leave `result` correct as-is. The legacy
-                // text-based pass is no longer wired in; it stays in
-                // `rune_transforms.rs` for the rolling Phase A migration.
-            }
-        }
-    }
-
-    // In dev mode, wrap console.METHOD() calls with $.log_if_contains_state
-    // to detect when state proxies are logged directly.
-    // Reference: CallExpression.js in the official Svelte compiler.
-    //
-    // AST-based rewrite via `console_dev_ast::transform_console_calls_dev_ast`.
-    // The text predecessor used `is_inside_string_literal` (quote counting)
-    // to skip strings, fragile under escaped quotes / regex literals /
-    // template-literal interpolation. The AST visitor descends only into
-    // call positions so it can't make that class of mistake.
-    if dev {
-        let is_ts = analysis.filename.ends_with(".ts") || analysis.filename.ends_with(".svelte.ts");
-        if let Some(rewritten) = console_dev_ast::transform_console_calls_dev_ast(&result, is_ts) {
-            result = rewritten;
-        }
-    }
-
-    // In dev mode, wrap $.state(), $.derived(), and $.proxy() declarations with $.tag()/$.tag_proxy()
-    // This tags signals with their variable names for better debugging with $inspect.trace().
-    //
-    // Three passes, chained idempotently (the text version's
-    // already-tagged guard skips both AST emissions cleanly):
-    // 1. `tag_declarator_ast` — `let/const/var X = $.state(...)` declarators
-    // 2. `tag_class_field_ast` — class `#field = ...` declarations and
-    //    `this.field` / `this.#field` assignments (with originally-public
-    //    label heuristic via paired setter detection)
-    // 3. `wrap_state_derived_with_tag` text fallback for any remaining
-    //    non-declarator shapes (no-op in practice after the two AST
-    //    passes for valid inputs).
-    if dev {
-        let is_ts = analysis.filename.ends_with(".ts") || analysis.filename.ends_with(".svelte.ts");
         if let Some(rewritten) =
-            tag_declarator_ast::wrap_state_derived_with_tag_declarators_ast(&result, is_ts)
-        {
-            result = rewritten;
-        }
-        if let Some(rewritten) =
-            tag_class_field_ast::wrap_state_derived_with_tag_class_fields_ast(&result)
+            tag_class_field_ast::wrap_state_derived_with_tag_class_fields_ast_from(
+                &result,
+                pre_class_script,
+            )
         {
             result = rewritten;
         }
         result = wrap_state_derived_with_tag(&result);
     }
 
-    result
-}
-
-/// Transform destructured array assignments where the LHS contains state variables.
-///
-/// Converts `[a, b] = expr;` where `a` or `b` are reactive state variables into:
-/// ```js
-/// ((array) => {
-///     var $$array = $.to_array(array, 2);
-///     $.set(a, $$array[0], true);
-///     $.set(b, $$array[1], true);
-/// })(expr);
-/// ```
-///
-/// Non-state variables in the pattern are assigned normally: `c = $$array[N];`
-fn transform_destructured_state_assignments(
-    script: &str,
-    reactive_state_vars: &[String],
-) -> String {
-    if reactive_state_vars.is_empty() {
-        return script.to_string();
-    }
-
-    let mut result = String::new();
-    for line in script.lines() {
-        let trimmed = line.trim();
-        // Look for lines like `[a, b] = expr;` or `[a, b] = expr`
-        if trimmed.starts_with('[') {
-            // Find the matching `]`
-            let mut depth = 0;
-            let mut bracket_end = None;
-            for (i, c) in trimmed.char_indices() {
-                match c {
-                    '[' => depth += 1,
-                    ']' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            bracket_end = Some(i);
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            if let Some(bracket_end) = bracket_end {
-                let pattern = &trimmed[..bracket_end + 1]; // e.g., "[a, b]"
-                let after_pattern = trimmed[bracket_end + 1..].trim();
-                // Must be followed by `= expr` or `= expr;`
-                if let Some(rhs) = after_pattern.strip_prefix('=') {
-                    let rhs = rhs.trim().trim_end_matches(';').trim();
-                    let inner = &pattern[1..pattern.len() - 1]; // strip [ ]
-                    let parts: Vec<&str> = inner.split(',').map(|s| s.trim()).collect();
-                    // By the time this runs, the rune pipeline has already wrapped
-                    // state reads, so an LHS target `a` appears as `$.get(a)`.
-                    // Unwrap that to recover the underlying state-var name.
-                    let unwrap_get = |p: &str| -> String {
-                        p.strip_prefix("$.get(")
-                            .and_then(|s| s.strip_suffix(')'))
-                            .map(|s| s.trim().to_string())
-                            .unwrap_or_else(|| p.to_string())
-                    };
-                    // Check if any parts are reactive state vars
-                    let has_state_var = parts
-                        .iter()
-                        .any(|p| reactive_state_vars.iter().any(|v| *v == unwrap_get(p)));
-                    if has_state_var {
-                        // Build the IIFE
-                        let indent: String =
-                            line.chars().take_while(|c| c.is_whitespace()).collect();
-                        let inner_indent = format!("{}\t", indent);
-                        let n = parts.len();
-                        let mut body_lines = Vec::new();
-                        body_lines.push(format!(
-                            "{}var $$array = $.to_array(array, {});",
-                            inner_indent, n
-                        ));
-                        body_lines.push(String::new()); // blank line after var
-                        for (idx, part) in parts.iter().enumerate() {
-                            let name = unwrap_get(part);
-                            if reactive_state_vars.contains(&name) {
-                                body_lines.push(format!(
-                                    "{}$.set({}, $$array[{}], true);",
-                                    inner_indent, name, idx
-                                ));
-                            } else {
-                                body_lines
-                                    .push(format!("{}{} = $$array[{}];", inner_indent, part, idx));
-                            }
-                        }
-                        let _ = writeln!(
-                            result,
-                            "{}((array) => {{\n{}\n{}}})({});",
-                            indent,
-                            body_lines.join("\n"),
-                            indent,
-                            rhs
-                        );
-                        // Add blank line after the IIFE
-                        result.push('\n');
-                        continue;
-                    }
-                }
-            }
-        }
-        result.push_str(line);
-        result.push('\n');
-    }
-    // Remove trailing newline to match original
-    if result.ends_with('\n') && !script.ends_with('\n') {
-        result.pop();
-    }
     result
 }
 
@@ -3936,7 +5504,22 @@ pub(crate) fn transform_instance_script_for_visitors_pub(
     dev: bool,
     reactive_import_names: &[String],
 ) -> String {
-    transform_instance_script_for_visitors(script, analysis, dev, reactive_import_names)
+    // Timed like the main call site, so the script-text bucket stays the parent
+    // of its five stage timers rather than missing this entry point's share.
+    let _script_start = super::profile::timer_start();
+    let _parent_scope = super::profile::ParentScope::new();
+    let out = transform_instance_script_for_visitors(
+        script,
+        analysis,
+        dev,
+        reactive_import_names,
+        might_have_comma_separated_declaration(script),
+        None,
+        None,
+    );
+    super::profile::record_script_text(super::profile::timer_elapsed(_script_start));
+    super::profile::record_parent_site(true);
+    out
 }
 
 /// True when a legacy-mode script contains a `$`-token that the fragile
@@ -3960,30 +5543,705 @@ fn legacy_script_has_dollar_token(script: &str) -> bool {
     false
 }
 
+/// `else` as a keyword, not as the prefix of `elsewhere`.
+fn starts_with_else_keyword(line: &str) -> bool {
+    line.strip_prefix("else").is_some_and(|rest| {
+        rest.is_empty() || !rest.starts_with(|c: char| c.is_alphanumeric() || c == '_' || c == '$')
+    })
+}
+
+/// A top-level `$:` label, which is what the legacy pipeline rewrites.
+fn is_legacy_reactive_label(statement: &oxc_ast::ast::Statement<'_>) -> bool {
+    matches!(
+        statement,
+        oxc_ast::ast::Statement::LabeledStatement(labeled) if labeled.label.name == "$"
+    )
+}
+
+/// Makes an AST statement boundary visible to the legacy per-line pipeline.
+///
+/// The pipeline treats each physical line as one statement, and it reads a line
+/// as `\n`-delimited text. So two top-level statements reach it as one whenever
+/// they share a line — and also when the only thing between them is a CR or a
+/// U+2028 / U+2029, which end a line in ECMAScript but not in `str::lines`. We
+/// use the parser's top-level statement spans rather than scanning for
+/// semicolons, whose grammar is precisely what this path must not infer.
+fn separate_same_line_top_level_statements<'a>(
+    script: &'a str,
+    is_typescript: bool,
+) -> Cow<'a, str> {
+    use oxc_allocator::Allocator;
+    use oxc_parser::Parser;
+    use oxc_span::{GetSpan as _, SourceType};
+
+    let has_export = script.contains("export let ") || script.contains("export var ");
+    let has_label = memmem::find(script.as_bytes(), b"$:").is_some();
+    // A semicolon at the start of a physical line belongs to the statement
+    // before it in the parser span, while everything after it belongs to the
+    // next statement. The line-oriented pipeline cannot express that boundary
+    // unless we make it a physical one. Without the cut, a store name shadowed
+    // by an arrow parameter in the first statement suppresses real store writes
+    // in the second one (for example `derived(..., ($point4) => ...)` followed
+    // by `;(point3).set = () => { $point4 = ... }`).
+    let has_leading_semicolon = script.lines().any(|line| line.trim_start().starts_with(';'));
+    if !has_export && !has_label && !has_leading_semicolon {
+        return Cow::Borrowed(script);
+    }
+
+    let allocator = Allocator::default();
+    let source_type = if is_typescript { SourceType::ts() } else { SourceType::mjs() };
+    let parsed = Parser::new(&allocator, script, source_type).parse();
+    if parsed.panicked || !parsed.diagnostics.is_empty() {
+        return Cow::Borrowed(script);
+    }
+
+    let mut cuts = Vec::new();
+    for pair in parsed.program.body.windows(2) {
+        let previous = pair[0].span();
+        let next = pair[1].span();
+        let previous_text = &script[previous.start as usize..previous.end as usize];
+        let gap = &script[previous.end as usize..next.start as usize];
+        let export_declaration = previous_text.trim_start().starts_with("export let ")
+            || previous_text.trim_start().starts_with("export var ");
+        let previous_end = previous.end as usize;
+        let leading_semicolon = previous_end.checked_sub(1).is_some_and(|semicolon| {
+            script.as_bytes().get(semicolon) == Some(&b';')
+                && script[..semicolon]
+                    .rsplit_once('\n')
+                    .is_some_and(|(_, before)| before.trim().is_empty())
+        });
+        if (export_declaration
+            || is_legacy_reactive_label(&pair[0])
+            || is_legacy_reactive_label(&pair[1])
+            || leading_semicolon)
+            && !gap.contains('\n')
+            && gap.chars().all(char::is_whitespace)
+        {
+            cuts.push((previous.end as usize, next.start as usize));
+        }
+    }
+
+    if cuts.is_empty() {
+        return Cow::Borrowed(script);
+    }
+
+    let mut separated = String::with_capacity(script.len() + cuts.len());
+    let mut cursor = 0;
+    for (end, next_start) in cuts {
+        separated.push_str(&script[cursor..end]);
+        separated.push('\n');
+        cursor = next_start;
+    }
+    separated.push_str(&script[cursor..]);
+    Cow::Owned(separated)
+}
+
+/// Move a legacy `$:` label's colon up against its `$`.
+///
+/// JavaScript allows whitespace and comments between a label and its colon, but
+/// every downstream stage of this pipeline locates a reactive statement by the
+/// literal two bytes `$:`, so `$ : x = 1` reaches none of them and is emitted as
+/// an inert labelled statement. The parser decides what is a label; swapping the
+/// gap with the colon rather than deleting it keeps both byte length and line
+/// count, so nothing that indexes into this text moves.
+fn close_reactive_label_gaps<'a>(script: &'a str, is_typescript: bool) -> Cow<'a, str> {
+    use oxc_allocator::Allocator;
+    use oxc_ast::ast::Statement;
+    use oxc_parser::Parser;
+    use oxc_span::SourceType;
+
+    // A gapped label is a `$` followed by whitespace or a comment. Non-ASCII is
+    // a candidate because JavaScript's whitespace reaches past it (NBSP, U+2028,
+    // U+FEFF); every other successor byte — `:`, an identifier character, `{`,
+    // `.`, `(` — rules the `$` out without a parse.
+    let bytes = script.as_bytes();
+    let gap_candidate = bytes.iter().enumerate().any(|(i, &b)| {
+        b == b'$'
+            && bytes
+                .get(i + 1)
+                .is_some_and(|&n| n.is_ascii_whitespace() || n == b'\x0b' || n == b'/' || n >= 0x80)
+    });
+    if !gap_candidate {
+        return Cow::Borrowed(script);
+    }
+
+    let allocator = Allocator::default();
+    let source_type = if is_typescript { SourceType::ts() } else { SourceType::mjs() };
+    let parsed = Parser::new(&allocator, script, source_type).parse();
+    if parsed.panicked || !parsed.diagnostics.is_empty() {
+        return Cow::Borrowed(script);
+    }
+
+    // Only a top-level label is a reactive statement upstream
+    // (`2-analyze/visitors/LabeledStatement.js`), so a nested one is left alone.
+    let mut gaps: Vec<(usize, usize)> = Vec::new();
+    for statement in &parsed.program.body {
+        let Statement::LabeledStatement(labeled) = statement else {
+            continue;
+        };
+        if labeled.label.name != "$" {
+            continue;
+        }
+        let gap_start = labeled.label.span.end as usize;
+        if let Some(colon) = label_colon_offset(script, gap_start)
+            && colon > gap_start
+        {
+            gaps.push((gap_start, colon));
+        }
+    }
+
+    if gaps.is_empty() {
+        return Cow::Borrowed(script);
+    }
+
+    let mut out = String::with_capacity(script.len());
+    let mut cursor = 0;
+    for (gap_start, colon) in gaps {
+        out.push_str(&script[cursor..gap_start]);
+        out.push(':');
+        out.push_str(&script[gap_start..colon]);
+        cursor = colon + 1;
+    }
+    out.push_str(&script[cursor..]);
+    Cow::Owned(out)
+}
+
+/// Offset of the `:` that follows a label name at `from`, skipping the
+/// whitespace and comments the grammar allows in between.
+fn label_colon_offset(script: &str, from: usize) -> Option<usize> {
+    let bytes = script.as_bytes();
+    let mut i = from;
+    while i < bytes.len() {
+        match bytes[i] {
+            b':' => return Some(i),
+            b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                i = script[i..].find('\n').map_or(script.len(), |nl| i + nl + 1);
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                i = script[i + 2..].find("*/").map_or(script.len(), |end| i + 2 + end + 2);
+            }
+            _ => {
+                let c = script[i..].chars().next()?;
+                // JavaScript's whitespace is `White_Space` plus U+FEFF.
+                if !c.is_whitespace() && c != '\u{feff}' {
+                    return None;
+                }
+                i += c.len_utf8();
+            }
+        }
+    }
+    None
+}
+
+fn might_have_comma_separated_declaration(script: &str) -> bool {
+    let bytes = script.as_bytes();
+    if memmem::find(bytes, b", ").is_none()
+        && memmem::find(bytes, b",\n").is_none()
+        && memmem::find(bytes, b",\t").is_none()
+    {
+        return false;
+    }
+
+    script.lines().any(|line| {
+        let trimmed = line.trim_start();
+        let declaration = trimmed.strip_prefix("export ").map(str::trim_start).unwrap_or(trimmed);
+        declaration.starts_with("const ")
+            || declaration.starts_with("let ")
+            || declaration.starts_with("var ")
+    })
+}
+
+fn instance_has_top_level_multi_declarator(ast: &Root, script: &str) -> bool {
+    use crate::ast::typed_expr::JsNode;
+
+    let Some(instance) = ast.instance.as_ref() else {
+        return false;
+    };
+    let program = instance.content.as_node();
+    let JsNode::Program { body, .. } = program.as_ref() else {
+        return might_have_comma_separated_declaration(script);
+    };
+
+    ast.arena.get_js_children(*body).iter().any(|statement| {
+        let declaration = match statement {
+            JsNode::VariableDeclaration { declarations, .. } => Some(*declarations),
+            JsNode::ExportNamedDeclaration { declaration: Some(declaration), .. } => {
+                match ast.arena.get_js_node(*declaration) {
+                    JsNode::VariableDeclaration { declarations, .. } => Some(*declarations),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        declaration.is_some_and(|declarations| ast.arena.get_js_children(declarations).len() > 1)
+    })
+}
+
+/// A pass's answer read as "did it rewrite?". A borrowed result is the very
+/// text the pass was handed, so the chain keeps the string it already owns
+/// instead of taking a copy of it.
+#[inline]
+fn rewritten(out: Cow<'_, str>) -> Option<String> {
+    match out {
+        Cow::Borrowed(_) => None,
+        Cow::Owned(text) => Some(text),
+    }
+}
+
+/// Run one stage of the per-statement transform chain, so the split between a
+/// stage that rewrote and one that handed its input through stays measurable.
+#[inline]
+fn stage<'a>(
+    name: &'static str,
+    input: Cow<'a, str>,
+    f: impl FnOnce(Cow<'a, str>) -> Cow<'a, str>,
+) -> Cow<'a, str> {
+    #[cfg(feature = "measure-stmt-chain")]
+    {
+        let before = input.as_ptr();
+        let out = f(input);
+        crate::measure_stmt_chain::record(name, before, &out);
+        out
+    }
+    #[cfg(not(feature = "measure-stmt-chain"))]
+    {
+        let _ = name;
+        f(input)
+    }
+}
+
+/// [`stage`] plus the `process_accumulated` split's own timer and work counter.
+#[inline]
+fn pa_stage<'a>(
+    idx: usize,
+    name: &'static str,
+    input: Cow<'a, str>,
+    f: impl FnOnce(Cow<'a, str>) -> Cow<'a, str>,
+) -> Cow<'a, str> {
+    #[cfg(feature = "measure-pa-split")]
+    {
+        let bytes = input.len() as u64;
+        let start = super::profile::timer_start();
+        let out = stage(name, input, f);
+        super::profile::record_pa(idx, super::profile::timer_elapsed(start), bytes);
+        out
+    }
+    #[cfg(not(feature = "measure-pa-split"))]
+    {
+        let _ = idx;
+        stage(name, input, f)
+    }
+}
+
+/// Whether the statement accumulated so far ends in a brace-less control-flow
+/// header, materialising the joined text only when the last line cannot settle it.
+fn accumulated_ends_with_control_header(accumulated: &[&str], last: &str) -> bool {
+    if let Some(verdict) = expression_utils::braceless_control_header_from_last_line(last) {
+        super::profile::record_st_ctrl_header(0);
+        return verdict;
+    }
+    let mut acc = accumulated[..accumulated.len() - 1].join("\n");
+    if !acc.is_empty() {
+        acc.push('\n');
+    }
+    acc.push_str(last);
+    super::profile::record_st_ctrl_header(acc.len() as u64);
+    expression_utils::ends_with_braceless_control_header(&acc)
+}
+
+thread_local! {
+    static STMT_BOUNDARY_ALLOCATOR: RefCell<oxc_allocator::Allocator> =
+        RefCell::new(oxc_allocator::Allocator::default());
+}
+
+/// Per line of `script`, whether the accumulated statement ends there, given
+/// the top-level statement spans and the comment spans — both already in
+/// `script`'s own byte coordinates.
+///
+/// True on a line that ends a top-level statement, and also on a line no
+/// statement covers — a comment or blank between statements. The scanner this
+/// replaces flushes those too (their depths are balanced), and the stages
+/// downstream read the first line of what they are handed, so folding a leading
+/// comment into the next statement stops `export let` from being recognised.
+fn statement_end_lines_from_spans(
+    script: &str,
+    stmt_spans: impl Iterator<Item = (u32, u32)>,
+    comment_spans: impl Iterator<Item = (u32, u32)>,
+) -> Vec<bool> {
+    let mut line_starts: Vec<u32> = vec![0];
+    for (i, b) in script.bytes().enumerate() {
+        if b == b'\n' {
+            line_starts.push(i as u32 + 1);
+        }
+    }
+    let line_of = |byte: u32| match line_starts.binary_search(&byte) {
+        Ok(i) => i,
+        Err(i) => i - 1,
+    };
+    let line_count = line_starts.len();
+    let mut covered = vec![false; line_count];
+    let mut flush = vec![false; line_count];
+    // Lines where a block comment is still open at end of line. The text
+    // pipeline cannot cut there — half a comment is not a statement — and
+    // neither could the scanner, whose depth tracker stays inside the comment.
+    let mut comment_open = vec![false; line_count];
+
+    // `end` is exclusive, so a span's last byte is one before it; a span ending
+    // exactly at a newline would otherwise be attributed to the following line.
+    let lines_of =
+        |start: u32, end: u32| (line_of(start), line_of(end.saturating_sub(1)).min(line_count - 1));
+
+    for (start, end) in stmt_spans {
+        let (first, last) = lines_of(start, end);
+        for c in covered.iter_mut().take(last + 1).skip(first) {
+            *c = true;
+        }
+        flush[last] = true;
+    }
+    for (start, end) in comment_spans {
+        let (first, last) = lines_of(start, end);
+        // A comment inside a statement is not a cut point — the scanner this
+        // replaces cannot stop there either, its depths being unbalanced — so
+        // only a comment that stands between statements ends a unit.
+        if !covered[last] {
+            flush[last] = true;
+        }
+        for open in comment_open.iter_mut().take(last).skip(first) {
+            *open = true;
+        }
+        for c in covered.iter_mut().take(last + 1).skip(first) {
+            *c = true;
+        }
+    }
+    for (l, f) in flush.iter_mut().enumerate() {
+        if !covered[l] {
+            *f = true;
+        }
+        if comment_open[l] {
+            *f = false;
+        }
+    }
+    flush
+}
+
+/// The same spans, for a `script` that TypeScript stripping rewrote, placed
+/// through the projection that records which source bytes survived into it.
+///
+/// Only the first and last byte of each span are mapped, never the whole span:
+/// `let a: number = 1;` loses `: number`, so no annotated statement is one
+/// contiguous copied run, while its two endpoints almost always are — and the
+/// endpoints are all a line boundary needs.
+///
+/// A span whose endpoints both fail to map is a construct stripping deleted
+/// outright (`interface Foo {}`), so it is skipped rather than treated as a
+/// failure: bailing on it would give up on every file that declares a type.
+/// One endpoint mapping without the other is not interpretable, so that bails.
+fn statement_end_lines_via_projection(
+    script: &str,
+    program: &oxc_ast::ast::Program<'_>,
+    projection: &ScriptProjection,
+) -> Option<Vec<bool>> {
+    use oxc_span::GetSpan as _;
+
+    let place = |start: u32, end: u32| -> Option<Option<(u32, u32)>> {
+        if end <= start {
+            return Some(None);
+        }
+        let first = projection.output_range_for_source(start..start + 1);
+        let last = projection.output_range_for_source(end - 1..end);
+        match (first, last) {
+            (Some(first), Some(last)) => Some(Some((first.start, last.end))),
+            (None, None) => Some(None),
+            _ => None,
+        }
+    };
+
+    let mut stmt_spans: Vec<(u32, u32)> = Vec::with_capacity(program.body.len());
+    for stmt in &program.body {
+        let span = stmt.span();
+        if let Some(mapped) = place(span.start, span.end)? {
+            stmt_spans.push(mapped);
+        }
+    }
+    let mut comment_spans: Vec<(u32, u32)> = Vec::with_capacity(program.comments.len());
+    for comment in &program.comments {
+        if let Some(mapped) = place(comment.span.start, comment.span.end)? {
+            comment_spans.push(mapped);
+        }
+    }
+    // Every statement vanishing means the projection placed nothing, which is
+    // not an answer about `script` -- fall back rather than report "no
+    // statement covers any line", which reads as "flush everywhere".
+    if stmt_spans.is_empty() && comment_spans.is_empty() {
+        return None;
+    }
+    let limit = script.len() as u32;
+    if stmt_spans.iter().chain(comment_spans.iter()).any(|&(s, e)| e > limit || s > e) {
+        return None;
+    }
+    Some(statement_end_lines_from_spans(script, stmt_spans.into_iter(), comment_spans.into_iter()))
+}
+
+/// The spans, in `script` coordinates, that `retained` already holds — when
+/// `script` is a verbatim, uniquely-locatable region of the text it parsed and
+/// no statement straddles that region's edge.
+fn statement_end_lines_from_retained(
+    script: &str,
+    retained: &crate::ast::oxc_program::RetainedProgram<'_>,
+    is_typescript: bool,
+    projection: Option<&ScriptProjection>,
+) -> Option<Vec<bool>> {
+    use oxc_span::GetSpan as _;
+
+    if retained.panicked() || !retained.diagnostics().is_empty() {
+        super::profile::record_st_boundary_bail(super::profile::BOUNDARY_BAIL_DIAGNOSTICS);
+        return None;
+    }
+    let core = script.trim();
+    let source = retained.source();
+    let mut matches = source.match_indices(core);
+    let text_differs = match (is_typescript, projection.is_some()) {
+        (true, true) => super::profile::BOUNDARY_BAIL_TEXT_DIFFERS_TS,
+        (true, false) => super::profile::BOUNDARY_BAIL_TS_NO_PROJECTION,
+        (false, _) => super::profile::BOUNDARY_BAIL_TEXT_DIFFERS_JS,
+    };
+    // The text is not verbatim. Stripping is what rewrote it, and the
+    // projection records which bytes survived, so the spans can still be
+    // placed -- without it there is nothing left to try.
+    let fall_back_to_projection = || match projection {
+        Some(projection) => {
+            match statement_end_lines_via_projection(script, retained.program(), projection) {
+                Some(ends) => Some(ends),
+                None => {
+                    super::profile::record_st_boundary_bail(
+                        super::profile::BOUNDARY_BAIL_PROJECTION_FAILED,
+                    );
+                    None
+                }
+            }
+        }
+        None => {
+            super::profile::record_st_boundary_bail(text_differs);
+            None
+        }
+    };
+    let Some((core_start, _)) = matches.next() else {
+        return fall_back_to_projection();
+    };
+    if matches.next().is_some() {
+        return fall_back_to_projection();
+    }
+    let core_end = (core_start + core.len()) as u32;
+    let core_start = core_start as u32;
+    // Where `core` sits inside `script`, so a span lands on the same line the
+    // caller's line split produced.
+    let lead = (script.len() - script.trim_start().len()) as u32;
+    let rebase = |start: u32, end: u32| (start - core_start + lead, end - core_start + lead);
+
+    let program = retained.program();
+    let in_core = |start: u32, end: u32| start >= core_start && end <= core_end;
+    // A span crossing the edge would have been cut by the text that produced
+    // `script`, so it says nothing about `script`'s boundaries — and dropping
+    // it silently would leave the lines it covers looking uncovered.
+    let straddles =
+        |start: u32, end: u32| end > core_start && start < core_end && !in_core(start, end);
+    if program.body.iter().any(|stmt| straddles(stmt.span().start, stmt.span().end))
+        || program.comments.iter().any(|comment| straddles(comment.span.start, comment.span.end))
+    {
+        super::profile::record_st_boundary_bail(super::profile::BOUNDARY_BAIL_STRADDLE);
+        return None;
+    }
+    // `core` is matched as text, so a region that merely *looks* like the script
+    // — inside a template literal, say — would match too, and would hold no
+    // statements at all, which the caller would read as "every line flushes".
+    // Something has to begin exactly where it begins.
+    if !program.body.iter().any(|stmt| stmt.span().start == core_start)
+        && !program.comments.iter().any(|comment| comment.span.start == core_start)
+    {
+        super::profile::record_st_boundary_bail(super::profile::BOUNDARY_BAIL_UNANCHORED);
+        return None;
+    }
+    Some(statement_end_lines_from_spans(
+        script,
+        program
+            .body
+            .iter()
+            .map(|stmt| (stmt.span().start, stmt.span().end))
+            .filter(|&(s, e)| in_core(s, e))
+            .map(|(s, e)| rebase(s, e)),
+        program
+            .comments
+            .iter()
+            .map(|c| (c.span.start, c.span.end))
+            .filter(|&(s, e)| in_core(s, e))
+            .map(|(s, e)| rebase(s, e)),
+    ))
+}
+
+/// `None` when the text does not parse. That is not a defect: this runs on a
+/// script that is part-way through the text pipeline, so the caller keeps its
+/// scanning heuristics as the fallback.
+fn top_level_statement_end_lines(
+    script: &str,
+    retained: Option<&crate::ast::oxc_program::RetainedProgram<'_>>,
+    is_typescript: bool,
+    projection: Option<&ScriptProjection>,
+) -> Option<Vec<bool>> {
+    use oxc_span::GetSpan as _;
+
+    if script.trim().is_empty() {
+        return None;
+    }
+
+    let reused = match retained {
+        Some(retained) => {
+            statement_end_lines_from_retained(script, retained, is_typescript, projection)
+        }
+        None => {
+            super::profile::record_st_boundary_bail(super::profile::BOUNDARY_BAIL_NO_RETAINED);
+            None
+        }
+    };
+    if let Some(ends) = reused.as_ref()
+        && !super::profile::boundary_oracle_enabled()
+    {
+        super::profile::record_st_boundary_retained();
+        return Some(ends.clone());
+    }
+
+    // A separate arena from `ast_state_transform`'s: that one resets on entry,
+    // and both would then be live in the same call.
+    let fresh = STMT_BOUNDARY_ALLOCATOR.with(|cell| {
+        const MAX_RETAINED_BYTES: usize = 16 * 1024 * 1024;
+        let mut alloc = cell.borrow_mut();
+        alloc.reset();
+
+        let _pt = super::profile::timer_start();
+        let parsed = oxc_parser::Parser::new(&alloc, script, oxc_span::SourceType::mjs()).parse();
+        super::profile::record_direct_parse(super::profile::timer_elapsed(_pt), script.len());
+
+        let ends = if parsed.panicked || !parsed.diagnostics.is_empty() {
+            None
+        } else {
+            Some(statement_end_lines_from_spans(
+                script,
+                parsed.program.body.iter().map(|stmt| (stmt.span().start, stmt.span().end)),
+                parsed.program.comments.iter().map(|c| (c.span.start, c.span.end)),
+            ))
+        };
+
+        drop(parsed);
+        if alloc.capacity() > MAX_RETAINED_BYTES {
+            *alloc = oxc_allocator::Allocator::default();
+        }
+        ends
+    });
+
+    if super::profile::boundary_oracle_enabled()
+        && let Some(reused) = reused
+    {
+        super::profile::record_boundary_oracle(fresh.as_ref() == Some(&reused));
+        super::profile::record_st_boundary_retained();
+        return Some(reused);
+    }
+    fresh
+}
+
+fn has_snapshot_ignore_before(output: &str) -> bool {
+    for line in output.lines().rev() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if memmem::find(trimmed.as_bytes(), b"svelte-ignore").is_some()
+            && memmem::find(trimmed.as_bytes(), b"state_snapshot_uncloneable").is_some()
+        {
+            return true;
+        }
+        if trimmed.starts_with("//") || (trimmed.starts_with("/*") && trimmed.ends_with("*/")) {
+            continue;
+        }
+        break;
+    }
+    false
+}
+
+/// Remove standalone `svelte-ignore` trivia immediately preceding a rebuilt
+/// legacy reactive statement. Analysis still sees the comment in the source;
+/// upstream then replaces the labeled statement with a synthesized effect, so
+/// the comment has no surviving node to attach to and is not printed.
+fn drop_trailing_svelte_ignore(output: &mut String) {
+    loop {
+        let end = output.trim_end().len();
+        if end == 0 {
+            output.clear();
+            return;
+        }
+
+        let line_start = output[..end].rfind('\n').map_or(0, |newline| newline + 1);
+        let line = &output[line_start..end];
+        let comment_start = if line.trim_start().starts_with("//") {
+            line_start + line.len() - line.trim_start().len()
+        } else if output[..end].ends_with("*/") {
+            let Some(comment_start) = output[..end].rfind("/*") else {
+                return;
+            };
+            let comment_line_start =
+                output[..comment_start].rfind('\n').map_or(0, |newline| newline + 1);
+            if !output[comment_line_start..comment_start].trim().is_empty() {
+                return;
+            }
+            comment_start
+        } else {
+            return;
+        };
+
+        if !output[comment_start..end].contains("svelte-ignore") {
+            return;
+        }
+
+        let remove_start = output[..comment_start].rfind('\n').map_or(0, |newline| newline + 1);
+        output.truncate(remove_start);
+    }
+}
+
 fn transform_instance_script_for_visitors(
     script: &str,
     analysis: &ComponentAnalysis,
     dev: bool,
     reactive_import_names: &[String],
+    split_top_level_declarations: bool,
+    retained_program: Option<&crate::ast::oxc_program::RetainedProgram<'_>>,
+    source_projection: Option<&ScriptProjection>,
 ) -> String {
+    super::profile::record_st_entry();
+    let _entry_guard = super::profile::EntryGuard::new();
     if script.is_empty() {
         return String::new();
     }
+    let separated_script = separate_same_line_top_level_statements(script, analysis.is_typescript);
+    // A cut moves every byte after it, so the spans and the projection that were
+    // built for the caller's text no longer describe this one.
+    let separated = matches!(separated_script, Cow::Owned(_));
+    let retained_program = retained_program.filter(|_| !separated);
+    let source_projection = source_projection.filter(|_| !separated);
+    let normalized_labels = if analysis.runes {
+        Cow::Borrowed(separated_script.as_ref())
+    } else {
+        close_reactive_label_gaps(separated_script.as_ref(), analysis.is_typescript)
+    };
+    let labels_changed = matches!(normalized_labels, Cow::Owned(_));
+    let retained_program = retained_program.filter(|_| !labels_changed);
+    let source_projection = source_projection.filter(|_| !labels_changed);
+    let script = normalized_labels.as_ref();
+    let original_script = script;
 
-    // Fast path: if the script has no runes ($state, $derived, $effect, $props),
-    // no store subscriptions ($xxx), no reactive statements ($:), and no exports,
-    // the text-based transform pipeline has nothing to do. Just return the script
-    // with imports stripped.
-    // Fast path: if the script has no runes, stores, reactive statements, exports,
-    // or comma-separated declarations, the text-based transform pipeline has nothing to do.
+    // Instance imports are removed by the caller before this pipeline.
     let has_dollar = script.contains('$');
-    let has_export = memmem::find(script.as_bytes(), b"export ").is_some();
-    let has_comma_decl = memmem::find(script.as_bytes(), b", ").is_some()
-        || memmem::find(script.as_bytes(), b",\n").is_some()
-        || memmem::find(script.as_bytes(), b",\t").is_some();
+    let has_export = contains_identifier(script, "export");
+    let has_comma_decl = split_top_level_declarations;
     if !has_dollar
         && !has_export
-        && !has_comma_decl
         && analysis.root.bindings.iter().all(|b| {
             !matches!(
                 b.kind,
@@ -3998,10 +6256,15 @@ fn transform_instance_script_for_visitors(
             )
         })
     {
-        // No transforms needed - just strip imports and return the rest
-        let (_imports, rest) = extract_imports(script);
-        return rest.to_string();
+        return if has_comma_decl {
+            declaration_split::split_top_level_multi_declarators(script, analysis.is_typescript)
+                .unwrap_or_else(|| script.to_string())
+        } else {
+            script.to_string()
+        };
     }
+
+    let _stage = super::profile::timer_start();
 
     // Reset the $$array counters for this component
     // This ensures unique names across multiple $derived destructuring patterns
@@ -4021,49 +6284,87 @@ fn transform_instance_script_for_visitors(
     // template-literal `${...}` interpolations do not count). Scripts without
     // such tokens keep their comments, matching upstream (esrap prints them
     // as leading trivia).
+    // Upstream rebuilds every `$:` statement as a synthesized
+    // `legacy_pre_effect(...)` call, so its comments have nothing left to
+    // attach to. Everything else in the script keeps them.
+    // Span-validity gate for the text->AST migration: Phase 2's spans survive
+    // into the line loop exactly when prenormalize leaves the text untouched.
+    #[cfg(feature = "measure-pa-split")]
+    let pn_entry_text: &str = script;
+    super::profile::record_pn(super::profile::PN_FILES);
+
     let script: std::borrow::Cow<str> = if analysis.runes || !legacy_script_has_dollar_token(script)
     {
         std::borrow::Cow::Borrowed(script)
     } else {
-        std::borrow::Cow::Owned(strip_js_single_line_comments(script))
+        super::profile::record_pn(super::profile::PN_INV_COMMENTS);
+        let out = rehome_reactive_statement_comments(script);
+        #[cfg(feature = "measure-pa-split")]
+        if out != script {
+            super::profile::record_pn(super::profile::PN_CHG_COMMENTS);
+            PN_FILE_TOUCHED.with(|c| c.set(true));
+        }
+        std::borrow::Cow::Owned(out)
     };
 
+    // The dev-mode `$.tag` label needs the spelling the user wrote: the lowering
+    // below turns a public `x = $state()` into the same `#x` + accessor pair a
+    // hand-written private field produces, and the two are then indistinguishable.
+    let pre_class_script: String = if dev { script.to_string() } else { String::new() };
+
     // Transform class fields only if the script contains class definitions with runes
-    let script: std::borrow::Cow<str> = if memmem::find(script.as_bytes(), b"class ").is_some()
+    let script: std::borrow::Cow<str> = if contains_identifier(&script, "class")
         && (memmem::find(script.as_bytes(), b"$state").is_some()
             || memmem::find(script.as_bytes(), b"$derived").is_some())
     {
-        std::borrow::Cow::Owned(transform_class_fields_client(&script))
+        super::profile::record_pn(super::profile::PN_INV_CLASS);
+        let out = transform_class_fields_client(&script);
+        #[cfg(feature = "measure-pa-split")]
+        if out != *script {
+            super::profile::record_pn(super::profile::PN_CHG_CLASS);
+            PN_FILE_TOUCHED.with(|c| c.set(true));
+        }
+        std::borrow::Cow::Owned(out)
     } else {
         script
     };
 
     // Split comma-separated variable declarations only if needed
-    let script: std::borrow::Cow<str> = if memmem::find(script.as_bytes(), b", ").is_some()
-        || memmem::find(script.as_bytes(), b",\n").is_some()
-        || memmem::find(script.as_bytes(), b",\t").is_some()
+    let class_transform_can_add_declarations = contains_identifier(&script, "class")
+        && (memmem::find(script.as_bytes(), b"$state").is_some()
+            || memmem::find(script.as_bytes(), b"$derived").is_some());
+    let split = if split_top_level_declarations
+        || (class_transform_can_add_declarations && might_have_comma_separated_declaration(&script))
     {
-        std::borrow::Cow::Owned(crate::compiler::phases::phase3_transform::server::transform_script::split_comma_separated_declarations(&script))
+        super::profile::record_pn(super::profile::PN_INV_DECL_SPLIT);
+        declaration_split::split_top_level_multi_declarators(&script, analysis.is_typescript)
     } else {
-        script
+        None
+    };
+    let script: std::borrow::Cow<str> = match split {
+        Some(out) => {
+            super::profile::record_pn(super::profile::PN_CHG_DECL_SPLIT);
+            #[cfg(feature = "measure-pa-split")]
+            PN_FILE_TOUCHED.with(|c| c.set(true));
+            std::borrow::Cow::Owned(out)
+        }
+        None => script,
     };
 
-    // Extract imports from script (they will be hoisted separately)
-    let (_script_imports, script_rest_raw) = extract_imports(&script);
+    let script_rest = script.into_owned();
 
-    // Strip unnecessary parentheses from arrow function expression bodies in the
-    // ORIGINAL source text, before any transforms run. The official Svelte compiler
-    // uses AST-based printing (esrap) which strips redundant parens automatically.
-    // Our text-based transform preserves source parens, so we strip them here.
-    // This must happen BEFORE transforms to avoid stripping parens from generated code
-    // patterns like `() => ($.deep_read_state(...))` in $.legacy_pre_effect.
-    let script_rest = if memmem::find(script_rest_raw.as_bytes(), b"=> (").is_some()
-        || memmem::find(script_rest_raw.as_bytes(), b"=>(").is_some()
+    #[cfg(feature = "measure-pa-split")]
     {
-        strip_unnecessary_arrow_body_parens(&script_rest_raw)
-    } else {
-        script_rest_raw
-    };
+        if script_rest != pn_entry_text {
+            super::profile::record_pn(super::profile::PN_TEXT_CHANGED);
+        }
+        if PN_FILE_TOUCHED.with(|c| c.replace(false)) {
+            super::profile::record_pn(super::profile::PN_ANY_CHANGED);
+        }
+    }
+
+    super::profile::record_st_prenormalize(super::profile::timer_elapsed(_stage));
+    let _stage = super::profile::timer_start();
 
     // Collect state variables from analysis for $.get() wrapping
     // LegacyReactive bindings (from `$: x = expr`) also need $.get()/$.set() transforms
@@ -4075,7 +6376,7 @@ fn transform_instance_script_for_visitors(
     // transform this is actually OK - the inner function's $state variable references DO
     // need $.get()/$.set() wrapping, and outer-scope declaration LHS references are
     // automatically skipped by transform_state_in_expr. The AST-based template transform
-    // is corrected separately (see transform_client_with_visitors where shadowed names
+    // is corrected separately (see transform_client where shadowed names
     // are removed from context.state.transform).
     // Use the root scope's declarations map to determine which names are reactive.
     // The declarations map uses or_insert during scope merging, so outer-scope bindings
@@ -4106,6 +6407,9 @@ fn transform_instance_script_for_visitors(
     // Pre-filter state_vars to only include variables that actually appear in the script.
     // This avoids O(M*N) scanning in downstream transforms for variables that can't match.
     // Uses O(text_len) identifier extraction instead of O(N*text_len) substring search.
+    if !state_vars.is_empty() && !script_rest.is_empty() {
+        super::profile::record_st_collect_scan(script_rest.len() as u64);
+    }
     utils::text_retain_matching_identifiers(&script_rest, &mut state_vars);
 
     // Ensure reactive import names are included in state_vars for $.get()/$.mutate() wrapping.
@@ -4159,16 +6463,55 @@ fn transform_instance_script_for_visitors(
     // if there's a top-level `const multiplier = () => { let multiplier = $state(2); ... }`,
     // the inner `multiplier` should NOT cause the outer `multiplier` to be wrapped with $.get().
     let local_reactive_vars = extract_local_reactive_vars(&script_rest);
-    let top_level_binding_names: rustc_hash::FxHashSet<&str> = analysis
-        .root
-        .bindings
-        .iter()
-        .map(|b| b.name.as_str())
-        .collect();
+    let top_level_binding_names: rustc_hash::FxHashSet<&str> =
+        analysis.root.bindings.iter().map(|b| b.name.as_str()).collect();
     let mut shadowed_local_reactive_vars: Vec<String> = Vec::new();
     // Collect non-reactive shadowed vars to add to non_reactive_state_vars later
     // (non_reactive_state_vars is declared after this loop).
     let mut non_reactive_shadowed_vars: Vec<String> = Vec::new();
+    // A `const $state(...)` binding is normally non-reactive in runes mode (it can
+    // never be locally reassigned, so `is_state_source` is false). But analysis
+    // marks an *exported* binding as `reassigned` (upstream `ExportSpecifier`:
+    // `binding.reassigned = true`), and `accessors` mode likewise forces a source
+    // — in either case the binding IS a state source and must keep its
+    // `$.state(...)` wrapper, so it must not be treated as non-reactive here.
+    let is_reassigned_or_accessor_state = |name: &str| -> bool {
+        analysis.accessors
+            || analysis
+                .root
+                .scope
+                .declarations
+                .get(name)
+                .and_then(|&idx| analysis.root.bindings.get(idx))
+                .is_some_and(|b| b.reassigned)
+    };
+    // One pass each, shared by both loops below. Asking per variable walked
+    // the whole script once per variable, which is where this stage's cost
+    // grew faster than the script did.
+    // Every read of either index happens while iterating `local_reactive_vars`, so
+    // an empty list makes both whole-script passes unobservable.
+    let (const_state_decls, reassigned_in_text) = if local_reactive_vars.is_empty() {
+        Default::default()
+    } else {
+        super::profile::record_st_collect_scan(script_rest.len() as u64);
+        super::profile::record_st_collect_scan(script_rest.len() as u64);
+        (index_const_state_decls(&script_rest), index_reassigned_vars(&script_rest))
+    };
+    if super::profile::index_oracle_enabled() {
+        for (var, ..) in &local_reactive_vars {
+            super::profile::record_index_oracle(
+                reassigned_in_text.contains(var.as_str())
+                    == is_variable_reassigned_in_text(&script_rest, var),
+            );
+            let pattern = format!("const {}", var);
+            super::profile::record_index_oracle(
+                const_state_decls.contains(var.as_str())
+                    == (script_rest.contains(&format!("{} = $state(", pattern))
+                        || script_rest.contains(&format!("{} = $state.raw(", pattern))
+                        || script_rest.contains(&format!("{} = $state.frozen(", pattern))),
+            );
+        }
+    }
     for (var, is_const, is_state) in &local_reactive_vars {
         // Skip top-level bindings - they are already handled by the analysis-based
         // state_vars and non_reactive_state_vars collections above. The text-based
@@ -4180,7 +6523,10 @@ fn transform_instance_script_for_visitors(
             // If it is non-reactive, we should add it to non_reactive_state_vars so the
             // rune transform strips $state() to just the argument, and the AST-based
             // scope-aware transform will handle shadowing correctly.
-            let is_non_reactive_shadowed = analysis.immutable && *is_state && *is_const;
+            let is_non_reactive_shadowed = analysis.immutable
+                && *is_state
+                && *is_const
+                && !is_reassigned_or_accessor_state(var);
             if is_non_reactive_shadowed {
                 non_reactive_shadowed_vars.push(var.clone());
                 // Don't add to shadowed_local_reactive_vars - the AST-based transform
@@ -4201,14 +6547,11 @@ fn transform_instance_script_for_visitors(
         // $derived vars are never non-reactive (they always need $.get()).
         let is_non_reactive = if analysis.immutable && *is_state {
             if *is_const {
-                let state_pattern = format!("const {}", var);
-                script_rest.contains(&format!("{} = $state(", state_pattern))
-                    || script_rest.contains(&format!("{} = $state.raw(", state_pattern))
-                    || script_rest.contains(&format!("{} = $state.frozen(", state_pattern))
+                !is_reassigned_or_accessor_state(var) && const_state_decls.contains(var.as_str())
             } else {
                 // let/var $state: check if the variable is actually reassigned in the script.
                 // Member mutations (x.foo = ...) do NOT count as reassignment.
-                !is_variable_reassigned_in_text(&script_rest, var)
+                !reassigned_in_text.contains(var.as_str())
             }
         } else {
             false
@@ -4223,12 +6566,18 @@ fn transform_instance_script_for_visitors(
     // These are converted to $.proxy() and don't need $.get() wrapping for property access
     let proxy_vars = extract_proxy_vars(&script_rest);
 
-    // Collect rest_prop variable names (from `let props = $props()`)
+    // Collect rest_prop variable names (from `let props = $props()`). Legacy
+    // analysis also declares synthetic `$$props` and `$$restProps` bindings with
+    // this kind for dependency tracking; they are the backing objects, not
+    // destructured rest bindings, and must never be rewritten to `$$props`.
     let rest_prop_vars: Vec<String> = analysis
         .root
         .bindings
         .iter()
-        .filter(|b| matches!(b.kind, BindingKind::RestProp))
+        .filter(|b| {
+            matches!(b.kind, BindingKind::RestProp)
+                && b.declaration_kind != DeclarationKind::Synthetic
+        })
         .map(|b| b.name.clone())
         .collect();
 
@@ -4278,13 +6627,10 @@ fn transform_instance_script_for_visitors(
             if *is_state {
                 let is_not_reassigned = if *is_const {
                     // const vars are never reassigned
-                    let state_pattern = format!("const {}", var);
-                    script_rest.contains(&format!("{} = $state(", state_pattern))
-                        || script_rest.contains(&format!("{} = $state.raw(", state_pattern))
-                        || script_rest.contains(&format!("{} = $state.frozen(", state_pattern))
+                    const_state_decls.contains(var.as_str())
                 } else {
                     // let/var: check text for actual reassignment
-                    !is_variable_reassigned_in_text(&script_rest, var)
+                    !reassigned_in_text.contains(var.as_str())
                 };
                 if is_not_reassigned && !non_reactive_state_vars.contains(var) {
                     non_reactive_state_vars.push(var.clone());
@@ -4356,14 +6702,14 @@ fn transform_instance_script_for_visitors(
 
     // Check for legacy mode (export let or export { x })
     // Also detect `export { x }` patterns which create BindableProp bindings
-    let has_legacy_export_let = script_rest.lines().any(|line| {
-        let trimmed = line.trim();
-        trimmed.starts_with("export let ") || trimmed.starts_with("export let\t")
-    }) || analysis
-        .root
-        .bindings
-        .iter()
-        .any(|b| matches!(b.kind, BindingKind::BindableProp));
+    // The per-line walk can only succeed where the substring exists.
+    let has_legacy_export_let =
+        (memmem::find(script_rest.as_bytes(), b"export").is_some() && {
+            super::profile::record_st_collect_scan(script_rest.len() as u64);
+            script_rest
+                .lines()
+                .any(|line| after_keywords(line.trim(), &["export", "let"]).is_some())
+        }) || analysis.root.bindings.iter().any(|b| matches!(b.kind, BindingKind::BindableProp));
 
     // Collect exported names from analysis (needed for prop filtering below)
     let exported_names: Vec<String> = analysis.exports.iter().map(|e| e.name.clone()).collect();
@@ -4529,16 +6875,29 @@ fn transform_instance_script_for_visitors(
         Vec::new()
     };
 
+    // Name-only projections of `legacy_state_vars`, used once per top-level
+    // statement by the per-statement loop below and invariant across it.
+    let legacy_state_var_names: Vec<String> =
+        legacy_state_vars.iter().map(|(name, _, _)| name.clone()).collect();
+    let legacy_var_state_var_names: Vec<String> = legacy_state_vars
+        .iter()
+        .filter(|(_, _, kind)| *kind == DeclarationKind::Var)
+        .map(|(name, _, _)| name.clone())
+        .collect();
+
     // Collect prop variable info for ownership mutation validation (dev mode only).
     // Maps prop variable name to its prop alias (the public prop name).
-    let prop_mutation_vars: Vec<(String, String)> = if dev && analysis.runes {
+    let prop_mutation_vars: Vec<(String, Option<String>)> = if dev {
         analysis
             .root
             .bindings
             .iter()
             .filter(|b| matches!(b.kind, BindingKind::Prop | BindingKind::BindableProp))
             .map(|b| {
-                let alias = b.prop_alias.as_deref().unwrap_or(&b.name).to_string();
+                // Upstream only ever assigns `prop_alias` from a `$props()` destructuring key,
+                // so legacy `export let` props report a `null` alias.
+                let alias =
+                    analysis.runes.then(|| b.prop_alias.as_deref().unwrap_or(&b.name).to_string());
                 (b.name.clone(), alias)
             })
             .collect()
@@ -4617,11 +6976,7 @@ fn transform_instance_script_for_visitors(
                 per_name.insert(b.name.clone(), (false, 0));
                 continue;
             }
-            let ok = b
-                .initial_node_type
-                .as_deref()
-                .map(is_non_proxy_node_type)
-                .unwrap_or(false);
+            let ok = b.initial_node_type.as_deref().map(is_non_proxy_node_type).unwrap_or(false);
             let entry = per_name.entry(b.name.clone()).or_insert((true, 0));
             if !ok {
                 entry.0 = false;
@@ -4682,11 +7037,7 @@ fn transform_instance_script_for_visitors(
                         | BindingKind::StoreSub
                 )
                 && b.import_source.is_none()
-                && (b
-                    .initial_node_type
-                    .as_deref()
-                    .map(is_non_proxy_node_type)
-                    .unwrap_or(false)
+                && (b.initial_node_type.as_deref().map(is_non_proxy_node_type).unwrap_or(false)
                     || (b.initial_node_type.as_deref() == Some("Identifier")
                         && b.initial_identifier_name.as_deref() == Some("undefined")))
             {
@@ -4776,10 +7127,7 @@ fn transform_instance_script_for_visitors(
             let is_top_level = b.scope_index == 0 || b.scope_index == instance_scope_for_proxy;
             if is_top_level
                 && matches!(b.kind, BindingKind::Prop | BindingKind::BindableProp)
-                && b.initial_node_type
-                    .as_deref()
-                    .map(is_non_proxy_node_type)
-                    .unwrap_or(false)
+                && b.initial_node_type.as_deref().map(is_non_proxy_node_type).unwrap_or(false)
             {
                 v.push(b.name.clone());
             }
@@ -4793,7 +7141,7 @@ fn transform_instance_script_for_visitors(
     // After collection, these are topologically sorted by dependencies before emission.
     let mut pending_reactive_statements: Vec<(Vec<String>, Vec<String>, String)> = Vec::new();
     // Source-ordinal counter for top-level `$:` statements, aligning each with its
-    // Phase-2 `reactive_statement_dependencies` entry.
+    // Phase-2 typed metadata entry.
     let mut reactive_stmt_ordinal: usize = 0;
 
     // Track if we're inside a multi-line export block
@@ -4829,37 +7177,38 @@ fn transform_instance_script_for_visitors(
         if accumulated.is_empty() {
             return;
         }
+        // Timed from here so the loop's own line scanning is what remains.
+        let _stmt_start = super::profile::timer_start();
+        let _guard = super::profile::ProcessAccumulatedGuard(_stmt_start);
 
         // Join all accumulated lines into a single statement
-        let statement = accumulated.join("\n");
-        let first_line_trimmed = accumulated[0].trim();
+        // The split's work counter is accumulated lines here, not bytes -- the
+        // byte count is not known until the join has already run.
+        let (statement, first_line_trimmed) = {
+            let _pa = super::profile::pa_guard(super::profile::PA_JOIN, accumulated.len() as u64);
+            (accumulated.join("\n"), accumulated[0].trim())
+        };
 
         // Handle $: reactive statements in legacy (non-runes) mode
         // Transform `$: c = a + b;` to `$.legacy_pre_effect(() => (...deps), () => { c(a() + b()); })`
         if !analysis.runes && first_line_trimmed.starts_with("$:") {
-            // Extract assignment targets and dependencies from the raw statement
-            // for topological sorting (matching official compiler's order_reactive_statements)
-            let (assigned_vars, dep_vars) = extract_reactive_statement_deps(
-                &statement,
-                state_vars,
-                prop_assignment_transform_vars,
-                store_sub_vars,
-            );
-
-            let var_state_vars: Vec<String> = legacy_state_vars
-                .iter()
-                .filter(|(_, _, kind)| *kind == DeclarationKind::Var)
-                .map(|(n, _, _)| n.clone())
-                .collect();
-            // AST-derived ordered dependency names for THIS top-level `$:` statement
-            // (Phase 2, source-ordinal aligned). Both phases count top-level `$:`
-            // in source order, so the ordinal stays in sync.
-            let dep_names: &[String] = analysis
-                .reactive_statement_dependencies
-                .get(*reactive_ordinal)
-                .map(|v| v.as_slice())
-                .unwrap_or(&[]);
+            let _reactive_start = super::profile::timer_start();
+            let _reactive_guard = super::profile::ReactiveStmtGuard(_reactive_start);
+            drop_trailing_svelte_ignore(result);
+            // AST-derived assignment and dependency names for THIS top-level
+            // `$:` statement (Phase 2, source-ordinal aligned). Both sides of
+            // the topology graph must come from the same traversal: the old
+            // assignment text scan could not see a nested destructuring target
+            // such as `$: if (x) { ;[[mode]] = config }`, so a statement that
+            // depended on `mode` could be emitted before its assigner.
+            let metadata = analysis.legacy_reactive_statements.get(*reactive_ordinal);
+            let dep_names: &[String] = metadata.map(|m| m.dependencies.as_slice()).unwrap_or(&[]);
+            let assigned_vars = metadata.map(|m| m.assignments.clone()).unwrap_or_default();
             *reactive_ordinal += 1;
+            let _rs_deps_start = super::profile::timer_start();
+            let dep_vars = dep_names.to_vec();
+            super::profile::record_rs_deps(super::profile::timer_elapsed(_rs_deps_start));
+            let _rs_body_start = super::profile::timer_start();
             let transformed = transform_reactive_statement(
                 &statement,
                 state_vars,
@@ -4868,10 +7217,13 @@ fn transform_instance_script_for_visitors(
                 prop_assignment_transform_vars,
                 store_sub_vars,
                 import_names,
-                &var_state_vars,
+                &legacy_var_state_var_names,
                 dep_names,
                 analysis,
+                &prop_invalidate_bodies,
             );
+            super::profile::record_rs_body(super::profile::timer_elapsed(_rs_body_start));
+            let _rs_assign_start = super::profile::timer_start();
             // Also apply state assignment transformations to the reactive statement body
             // This handles cases like: `$: selected ? component = Sub : component = banana`
             // where state variables are assigned inside conditional expressions.
@@ -4885,6 +7237,7 @@ fn transform_instance_script_for_visitors(
                 &non_proxy_vars,
             )
             .unwrap_or(transformed);
+            super::profile::record_rs_assigns(super::profile::timer_elapsed(_rs_assign_start));
             // Collect reactive statements to append at end (matching official compiler behavior
             // which appends all reactive statements after the rest of instance body code)
             let mut reactive_code = transformed;
@@ -4899,46 +7252,48 @@ fn transform_instance_script_for_visitors(
         // export let`), so we also check the statement text after stripping
         // any leading block comments.
         let effective_export_kw_line = {
-            let mut s = first_line_trimmed;
+            let _pa = super::profile::pa_guard(
+                super::profile::PA_EXPORT_KW_PROBE,
+                statement.len() as u64,
+            );
+            // The keyword and the declaration it exports need not share a
+            // physical line, so this reads the joined statement.
+            let mut s: &str = statement.trim();
             while s.starts_with("/*") {
                 if let Some(end) = s.find("*/") {
                     s = s[end + 2..].trim_start();
                 } else {
-                    // Unclosed block comment — scan across accumulated lines
-                    let full = statement.as_str();
-                    let mut t: &str = full.trim();
-                    while t.starts_with("/*") {
-                        if let Some(e) = t.find("*/") {
-                            t = t[e + 2..].trim_start();
-                        } else {
-                            t = "";
-                            break;
-                        }
-                    }
-                    s = t;
+                    s = "";
                     break;
                 }
             }
             s
         };
-        if has_legacy_export_let
-            && (effective_export_kw_line.starts_with("export let ")
-                || effective_export_kw_line.starts_with("export var "))
-        {
+        let export_prop_declarator_at =
+            after_keywords(effective_export_kw_line, &["export", "let"])
+                .or_else(|| after_keywords(effective_export_kw_line, &["export", "var"]));
+        if has_legacy_export_let && let Some(declarator_at) = export_prop_declarator_at {
+            let _pa =
+                super::profile::pa_guard(super::profile::PA_EXPORT_LET, statement.len() as u64);
             // Check if this is a destructured export let pattern
-            let after_export_let = effective_export_kw_line[11..].trim();
+            let after_export_let = effective_export_kw_line[declarator_at..].trim();
             if after_export_let.starts_with('{') || after_export_let.starts_with('[') {
+                let _pa_sub = super::profile::pa_guard(
+                    super::profile::PA_EL_DESTRUCTURED,
+                    statement.len() as u64,
+                );
                 // Destructured export let: flatten using extract_paths pattern
                 if let Some(flattened) = transform_destructured_export_let(&statement, analysis) {
                     let flattened = if analysis.runes {
-                        flattened // AST transform handles state var wrapping
+                        Cow::Owned(flattened) // AST transform handles state var wrapping
                     } else {
-                        wrap_state_vars_in_expr(
+                        rewritten(wrap_state_vars_in_expr(
                             &flattened,
                             state_vars,
                             non_reactive_state_vars,
                             proxy_vars,
-                        )
+                        ))
+                        .map_or(Cow::Owned(flattened), Cow::Owned)
                     };
                     result.push_str(&flattened);
                     result.push('\n');
@@ -4946,49 +7301,73 @@ fn transform_instance_script_for_visitors(
                 }
             }
             // Use the full statement for multi-line export declarations
-            let transformed = transform_export_let(&statement, analysis);
+            let transformed = {
+                let _pa_sub = super::profile::pa_guard(
+                    super::profile::PA_EL_TRANSFORM,
+                    statement.len() as u64,
+                );
+                transform_export_let(&statement, analysis)
+            };
             // After converting to $.prop(), apply prop read wrapping to the DEFAULT VALUE
             // inside $.prop() calls. wrap_prop_source_reads skips lines containing $.prop(),
             // so we need to apply it only to the interior of the default value expression.
             // This handles cases like: export let click_1 = () => { logs.push('click_1'); }
             // where `logs` is a prop and should become `logs()` inside the default value.
-            let transformed = if !prop_assignment_transform_vars.is_empty() {
-                apply_prop_reads_in_prop_default_values(
-                    &transformed,
-                    prop_assignment_transform_vars,
-                )
-            } else {
-                transformed
+            let transformed = {
+                let _pa_sub = super::profile::pa_guard(
+                    super::profile::PA_EL_PROP_READS,
+                    transformed.len() as u64,
+                );
+                if !prop_assignment_transform_vars.is_empty() {
+                    apply_prop_reads_in_prop_default_values(
+                        &transformed,
+                        prop_assignment_transform_vars,
+                    )
+                } else {
+                    transformed
+                }
             };
             // Apply state variable assignment transforms ($.set) to the full export let statement.
             // This handles cases where state variables are assigned inside nested callbacks
             // within the default value expression, e.g.:
             //   export let promise = new Promise((resolve) => { setTimeout(() => { answer = 42; }, 0); })
             // The `answer = 42` inside the callback needs to become `$.set(answer, 42)`.
-            let transformed = if analysis.runes {
-                transformed // AST transform handles state var wrapping
-            } else {
-                // Combined pipeline: assigns + reads in one parse.
-                let _ = proxy_vars;
-                state_pipeline_ast::transform_state_pipeline_ast(
-                    &transformed,
-                    state_vars,
-                    raw_state_vars,
-                    analysis.runes,
-                    &non_proxy_vars,
-                    non_reactive_state_vars,
-                )
-                .unwrap_or(transformed)
+            let transformed = {
+                let _pa_sub = super::profile::pa_guard(
+                    super::profile::PA_EL_STATE_PIPELINE,
+                    transformed.len() as u64,
+                );
+                if analysis.runes {
+                    transformed // AST transform handles state var wrapping
+                } else {
+                    // Combined pipeline: assigns + reads in one parse.
+                    let _ = proxy_vars;
+                    state_pipeline_ast::transform_state_pipeline_ast(
+                        &transformed,
+                        state_vars,
+                        raw_state_vars,
+                        analysis.runes,
+                        &non_proxy_vars,
+                        non_reactive_state_vars,
+                    )
+                    .unwrap_or(transformed)
+                }
             };
             // Apply store subscription transformations to the default value expression
             // (e.g. `export let value = $page.params` becomes `$.prop(..., () => $page().params)`).
             // Only transform when the default value is wrapped in an arrow function — when
             // the default is a bare store identifier (e.g. `$foo`), it's passed as a getter
             // reference and must stay untransformed.
-            let transformed = if !store_sub_vars.is_empty() && !analysis.runes {
-                apply_store_reads_in_prop_default_values(&transformed, store_sub_vars)
-            } else {
-                transformed
+            let transformed = {
+                let _pa_sub = super::profile::pa_guard(
+                    super::profile::PA_EL_STORE_READS,
+                    transformed.len() as u64,
+                );
+                if !store_sub_vars.is_empty() && !analysis.runes {
+                    apply_store_reads_in_prop_default_values(&transformed, store_sub_vars)
+                } else {
+                    transformed
+                }
             };
             result.push_str(&transformed);
             result.push('\n');
@@ -5000,23 +7379,31 @@ fn transform_instance_script_for_visitors(
         // not ES module export syntax. `export { a, b as c }` statements are only
         // used by the analysis phase to mark bindings as BindableProp/exports.
         // The actual declarations (let a, let b) remain and get transformed to $.prop() calls.
-        if starts_export_specifier(first_line_trimmed) {
-            return;
-        }
-
-        // Handle `let` declarations that contain variables exported via `export { ... }`.
-        // When we have `let a, b, c, d;` and `export { a, c }`, the variables `a` and `c`
-        // are marked as BindableProp and need to become `$.prop()` calls.
-        // We need to split the multi-declarator `let` statement and transform each declarator.
-        if !analysis.runes
-            && has_legacy_export_let
-            && (first_line_trimmed.starts_with("let ") || first_line_trimmed.starts_with("var "))
         {
-            // Check if any of the declarators are BindableProp
-            if let Some(transformed) = transform_let_with_reexported_props(&statement, analysis) {
-                result.push_str(&transformed);
-                result.push('\n');
+            let _pa = super::profile::pa_guard(
+                super::profile::PA_EXPORT_SPECIFIER,
+                statement.len() as u64,
+            );
+            if starts_export_specifier(first_line_trimmed) {
                 return;
+            }
+
+            // Handle `let` declarations that contain variables exported via `export { ... }`.
+            // When we have `let a, b, c, d;` and `export { a, c }`, the variables `a` and `c`
+            // are marked as BindableProp and need to become `$.prop()` calls.
+            // We need to split the multi-declarator `let` statement and transform each declarator.
+            if !analysis.runes
+                && has_legacy_export_let
+                && (first_line_trimmed.starts_with("let ")
+                    || first_line_trimmed.starts_with("var "))
+            {
+                // Check if any of the declarators are BindableProp
+                if let Some(transformed) = transform_let_with_reexported_props(&statement, analysis)
+                {
+                    result.push_str(&transformed);
+                    result.push('\n');
+                    return;
+                }
             }
         }
 
@@ -5024,42 +7411,56 @@ fn transform_instance_script_for_visitors(
         // In the compiled output, exports are exposed via $$exports object, not ES export syntax
         // Reference: The official compiler processes exports in ExportNamedDeclaration visitor
         // and outputs the declarations without the export keyword
-        let statement = if first_line_trimmed.starts_with("export function ")
-            || first_line_trimmed.starts_with("export const ")
-            || first_line_trimmed.starts_with("export class ")
-            || first_line_trimmed.starts_with("export var ")
-            || first_line_trimmed.starts_with("export async function ")
-        {
-            // Remove the "export " prefix from the first line
-            if let Some(pos) = memmem::find(statement.as_bytes(), b"export ") {
-                let mut s = String::with_capacity(statement.len() - 7);
-                s.push_str(&statement[..pos]);
-                s.push_str(&statement[pos + 7..]);
+        let statement = {
+            let _pa =
+                super::profile::pa_guard(super::profile::PA_EXPORT_STRIP, statement.len() as u64);
+            // The separator between `export` and what it declares is any run of
+            // JS whitespace, not the single ASCII space a literal needle bakes
+            // in (#3470); an unstripped `export` lands inside the component
+            // function, where no parser accepts it.
+            let head = statement.trim_start();
+            let head_at = statement.len() - head.len();
+            let exported = after_keyword(head, "export").filter(|&at| {
+                let rest = &head[at..];
+                ["function", "const", "class", "var"]
+                    .iter()
+                    .any(|kw| after_keyword(rest, kw).is_some())
+                    || after_keyword(rest, "async")
+                        .is_some_and(|a| after_keyword(&rest[a..], "function").is_some())
+            });
+            if let Some(at) = exported {
+                let mut s = String::with_capacity(statement.len() - at);
+                s.push_str(&statement[..head_at]);
+                s.push_str(&head[at..]);
                 s
             } else {
                 statement
             }
-        } else {
-            statement
         };
-        let _first_line_trimmed = first_line_trimmed
-            .strip_prefix("export ")
-            .unwrap_or(first_line_trimmed);
+        let _first_line_trimmed =
+            first_line_trimmed.strip_prefix("export ").unwrap_or(first_line_trimmed);
 
         // Transform runes ($state, $derived, $effect, $props)
-        let mut transformed = transform_client_runes_with_skip_and_state(
-            &statement,
-            non_reactive_state_vars,
-            state_vars,
-            non_reactive_state_vars,
-            prop_source_vars,
-            exported_names,
-            proxy_vars,
-            dev,
-            analysis,
-            store_sub_vars,
-            read_only_props,
-        );
+        let _runes_start = super::profile::timer_start();
+        let mut transformed = stage("runes", Cow::Borrowed(statement.as_str()), |t| {
+            rewritten(transform_client_runes_with_skip_and_state(
+                &t,
+                non_reactive_state_vars,
+                state_vars,
+                non_reactive_state_vars,
+                prop_source_vars,
+                exported_names,
+                proxy_vars,
+                dev,
+                analysis,
+                store_sub_vars,
+                read_only_props,
+                &pre_class_script,
+            ))
+            .map(Cow::Owned)
+            .unwrap_or(t)
+        });
+        super::profile::record_st_runes(super::profile::timer_elapsed(_runes_start));
 
         // In dev mode, if the previous output line carries a
         // `<!-- svelte-ignore state_snapshot_uncloneable -->` comment,
@@ -5071,59 +7472,52 @@ fn transform_instance_script_for_visitors(
         // callee — see the matching comment in
         // `rune_transforms::transform_client_runes_with_skip_and_state`
         // for the migration rationale.
-        if dev && memmem::find(transformed.as_bytes(), b"$state.snapshot(").is_some() {
-            let prev_has_ignore = {
-                let mut found = false;
-                for line in result.lines().rev() {
-                    let trimmed = line.trim();
-                    if trimmed.is_empty() {
-                        continue;
+        {
+            let _pa =
+                super::profile::pa_guard(super::profile::PA_SNAPSHOT_DEV, transformed.len() as u64);
+            if dev && memmem::find(transformed.as_bytes(), b"$state.snapshot(").is_some() {
+                let prev_has_ignore = has_snapshot_ignore_before(result);
+                if prev_has_ignore {
+                    let mut new_transformed = String::new();
+                    let mut remaining: &str = &transformed;
+                    while let Some(pos) = memmem::find(remaining.as_bytes(), b"$state.snapshot(") {
+                        new_transformed.push_str(&remaining[..pos]);
+                        let call_start = pos + "$state.snapshot(".len();
+                        if let Some(content_end) = find_matching_paren(&remaining[call_start..]) {
+                            let content = &remaining[call_start..call_start + content_end];
+                            let _ = write!(new_transformed, "$state.snapshot({}, true)", content);
+                            remaining = &remaining[call_start + content_end + 1..];
+                        } else {
+                            new_transformed.push_str("$state.snapshot(");
+                            remaining = &remaining[call_start..];
+                        }
                     }
-                    if memmem::find(trimmed.as_bytes(), b"svelte-ignore").is_some()
-                        && memmem::find(trimmed.as_bytes(), b"state_snapshot_uncloneable").is_some()
-                    {
-                        found = true;
-                    }
-                    break;
+                    new_transformed.push_str(remaining);
+                    transformed = Cow::Owned(new_transformed);
                 }
-                found
-            };
-            if prev_has_ignore {
-                let mut new_transformed = String::new();
-                let mut remaining = transformed.as_str();
-                while let Some(pos) = memmem::find(remaining.as_bytes(), b"$state.snapshot(") {
-                    new_transformed.push_str(&remaining[..pos]);
-                    let call_start = pos + "$state.snapshot(".len();
-                    if let Some(content_end) = find_matching_paren(&remaining[call_start..]) {
-                        let content = &remaining[call_start..call_start + content_end];
-                        let _ = write!(new_transformed, "$state.snapshot({}, true)", content);
-                        remaining = &remaining[call_start + content_end + 1..];
-                    } else {
-                        new_transformed.push_str("$state.snapshot(");
-                        remaining = &remaining[call_start..];
-                    }
-                }
-                new_transformed.push_str(remaining);
-                transformed = new_transformed;
             }
         }
 
         // Skip empty transformations (e.g., read-only $props() with no defaults)
         // In async mode, emit a placeholder so that async_body.rs generates
         // an empty thunk `() => {}` matching the official compiler
-        if transformed.trim().is_empty() {
-            if analysis.experimental_async {
-                // Extract variable names from the original statement for hoisting
-                // e.g., "const { name } = $props()" -> "name"
-                let orig = accumulated.join("\n");
-                let vars = extract_destructured_prop_names(&orig);
-                if vars.is_empty() {
-                    result.push_str("/* $$async_noop */;\n");
-                } else {
-                    let _ = writeln!(result, "/* $$async_noop:{} */;", vars.join(","));
+        {
+            let _pa =
+                super::profile::pa_guard(super::profile::PA_EMPTY_CHECK, transformed.len() as u64);
+            if transformed.trim().is_empty() {
+                if analysis.experimental_async {
+                    // Extract variable names from the original statement for hoisting
+                    // e.g., "const { name } = $props()" -> "name"
+                    let orig = accumulated.join("\n");
+                    let vars = extract_destructured_prop_names(&orig);
+                    if vars.is_empty() {
+                        result.push_str("/* $$async_noop */;\n");
+                    } else {
+                        let _ = writeln!(result, "/* $$async_noop:{} */;", vars.join(","));
+                    }
                 }
+                return;
             }
-            return;
         }
 
         // Transform destructure assignments targeting reactive variables into IIFE patterns.
@@ -5131,12 +7525,30 @@ fn transform_instance_script_for_visitors(
         // because it decomposes destructure patterns into individual assignments that those
         // transforms can then process.
         // Corresponds to visit_assignment_expression in shared/assignments.js.
-        // Skip if no state vars or store sub vars to destructure against
-        let transformed = if state_vars.is_empty() && store_sub_vars.is_empty() {
-            transformed
-        } else {
-            transform_destructure_assignments(&transformed, state_vars, store_sub_vars)
-        };
+        // Skip if there is no reactive target (state / store / prop) to destructure against
+        let transformed = pa_stage(
+            super::profile::PA_DESTRUCTURE_ASSIGNMENTS,
+            "destructure_assignments",
+            transformed,
+            |t| {
+                if state_vars.is_empty()
+                    && store_sub_vars.is_empty()
+                    && prop_assignment_transform_vars.is_empty()
+                {
+                    t
+                } else {
+                    rewritten(transform_destructure_assignments_with_props(
+                        &t,
+                        state_vars,
+                        non_reactive_state_vars,
+                        store_sub_vars,
+                        prop_assignment_transform_vars,
+                    ))
+                    .map(Cow::Owned)
+                    .unwrap_or(t)
+                }
+            },
+        );
 
         // Transform state variable assignments to $.set()
         // In runes mode, deferred to AST-based transform after main loop.
@@ -5144,122 +7556,190 @@ fn transform_instance_script_for_visitors(
             transformed
         } else {
             // Unified AST pass — see Site 1 comment for rationale.
-            let transformed = state_assigns_combined_ast::transform_state_assigns_ast(
-                &transformed,
-                state_vars,
-                raw_state_vars,
-                analysis.runes,
-                &non_proxy_vars,
+            let transformed =
+                pa_stage(super::profile::PA_STATE_ASSIGNS, "state_assigns", transformed, |t| {
+                    state_assigns_combined_ast::transform_state_assigns_ast(
+                        &t,
+                        state_vars,
+                        raw_state_vars,
+                        analysis.runes,
+                        &non_proxy_vars,
+                    )
+                    .map(Cow::Owned)
+                    .unwrap_or(t)
+                });
+            pa_stage(
+                super::profile::PA_STORE_UNSUB,
+                "store_unsub_for_state_sets",
+                transformed,
+                |t| {
+                    rewritten(wrap_store_unsub_for_state_sets(&t, state_vars, store_sub_vars))
+                        .map(Cow::Owned)
+                        .unwrap_or(t)
+                },
             )
-            .unwrap_or(transformed);
-            wrap_store_unsub_for_state_sets(&transformed, state_vars, store_sub_vars)
         };
 
         // Transform member mutations to $.mutate() calls (only in legacy/non-runes mode).
         // This handles patterns like `obj.self = obj` → `$.mutate(obj, obj.self = obj)`.
         // Must run AFTER transform_state_assignments (which handles direct assignments like `x = v`)
         // and BEFORE wrap_state_vars_in_expr (which will apply $.get() inside the $.mutate()).
-        let transformed = if !analysis.runes && !state_vars.is_empty() {
-            transform_member_mutations(
-                &transformed,
-                state_vars,
-                non_reactive_state_vars,
-                raw_state_vars,
-                &prop_invalidate_bodies,
-            )
-        } else {
-            transformed
-        };
+        let transformed =
+            pa_stage(super::profile::PA_MEMBER_MUTATIONS, "member_mutations", transformed, |t| {
+                if !analysis.runes && !state_vars.is_empty() {
+                    rewritten(transform_member_mutations(
+                        &t,
+                        state_vars,
+                        non_reactive_state_vars,
+                        raw_state_vars,
+                        &prop_invalidate_bodies,
+                    ))
+                    .map(Cow::Owned)
+                    .unwrap_or(t)
+                } else {
+                    t
+                }
+            });
 
         // Transform prop update expressions like `x++` to `$.update_prop(x)` FIRST,
         // before transform_prop_assignments runs (which would incorrectly turn `x++` into `x(x() + 1)`)
         // and before wrap_prop_source_reads (which would turn `count` → `count()`, causing `count()++`)
         // In runes mode, deferred to AST-based transform after main loop.
-        let transformed = if !prop_assignment_transform_vars.is_empty() && !analysis.runes {
-            transform_prop_update_expressions(&transformed, prop_assignment_transform_vars)
-        } else {
-            transformed
-        };
+        let transformed = pa_stage(
+            super::profile::PA_PROP_UPDATE_EXPRESSIONS,
+            "prop_update_expressions",
+            transformed,
+            |t| {
+                if !prop_assignment_transform_vars.is_empty() && !analysis.runes {
+                    rewritten(transform_prop_update_expressions(&t, prop_assignment_transform_vars))
+                        .map(Cow::Owned)
+                        .unwrap_or(t)
+                } else {
+                    t
+                }
+            },
+        );
 
         // Transform prop source variable reads to prop() calls BEFORE prop assignments.
         // This handles props used as function calls: `callback(args)` → `callback()(args)`.
         // Must come BEFORE transform_prop_assignments so that `callback = value` (assignment)
         // doesn't get incorrectly double-wrapped as `callback()(value)`.
         // In runes mode, deferred to AST-based transform after main loop.
-        let transformed = if !prop_assignment_transform_vars.is_empty() && !analysis.runes {
-            prop_source_reads_ast::wrap_prop_source_reads_ast(
-                &transformed,
-                prop_assignment_transform_vars,
-                &non_bindable_prop_vars,
-            )
-            .unwrap_or(transformed)
-        } else {
-            transformed
-        };
+        let transformed =
+            pa_stage(super::profile::PA_PROP_SOURCE_READS, "prop_source_reads", transformed, |t| {
+                if !prop_assignment_transform_vars.is_empty() && !analysis.runes {
+                    prop_source_reads_ast::wrap_prop_source_reads_ast(
+                        &t,
+                        prop_assignment_transform_vars,
+                        &non_bindable_prop_vars,
+                        prop_source_reads_ast::ParseGoal::Statements,
+                    )
+                    .map(Cow::Owned)
+                    .unwrap_or(t)
+                } else {
+                    t
+                }
+            });
 
         // Transform prop assignments to prop(prop() + value) syntax
         // This handles props declared with `export let` in legacy mode
         // Note: We use prop_assignment_transform_vars which excludes RestProp bindings
         // because rest_props use $.rest_props() which returns a plain object, not getter/setter
         // In runes mode, deferred to AST-based transform after main loop.
-        let transformed = if !analysis.runes {
-            transform_prop_assignments(
-                &transformed,
-                prop_assignment_transform_vars,
-                &non_bindable_prop_vars,
-                &prop_invalidate_bodies,
-            )
-        } else {
-            transformed
-        };
+        let transformed =
+            pa_stage(super::profile::PA_PROP_ASSIGNMENTS, "prop_assignments", transformed, |t| {
+                if !analysis.runes {
+                    rewritten(transform_prop_assignments(
+                        &t,
+                        prop_assignment_transform_vars,
+                        &non_bindable_prop_vars,
+                        &prop_invalidate_bodies,
+                    ))
+                    .map(Cow::Owned)
+                    .unwrap_or(t)
+                } else {
+                    t
+                }
+            });
 
         // Store transforms: skip entirely when there are no store subscriptions
         // In runes mode, deferred to AST-based transform after main loop.
-        let transformed = if !store_sub_vars.is_empty() && !analysis.runes {
-            // Filter out store_sub_vars that appear as function parameters in this statement.
-            let effective_store_sub_vars: Vec<String> = if store_sub_vars
-                .iter()
-                .any(|s| transformed.contains(s.as_str()))
+        let transformed = {
+            let _pa = super::profile::pa_guard(super::profile::PA_STORES, transformed.len() as u64);
+            if !store_sub_vars.is_empty()
+                && !analysis.runes
+                && store_sub_vars.iter().any(|store| transformed.contains(store.as_str()))
             {
-                store_sub_vars
-                    .iter()
-                    .filter(|s| !is_function_parameter_in_statement(&transformed, s))
-                    .cloned()
-                    .collect()
-            } else {
-                store_sub_vars.to_vec()
-            };
+                // Filter out store-sub spellings shadowed by any local binding in
+                // this top-level statement. The binding may be a function parameter,
+                // a local declaration, a destructuring leaf or a catch parameter.
+                // Template references can create the component StoreSub binding even
+                // when the same spelling resolves to a nested local in the script.
+                let mut filtered_store_sub_vars = Vec::new();
+                let may_declare_binding = transformed.contains("=>")
+                    || transformed.contains("function")
+                    || transformed.contains("let")
+                    || transformed.contains("const")
+                    || transformed.contains("var")
+                    || transformed.contains("catch");
+                let effective_store_sub_vars = if may_declare_binding {
+                    filtered_store_sub_vars.extend(
+                        store_sub_vars
+                            .iter()
+                            .filter(|s| {
+                                !is_function_parameter_in_statement(&transformed, s)
+                                    && !declares_binding_in_statement(&transformed, s)
+                            })
+                            .cloned(),
+                    );
+                    filtered_store_sub_vars.as_slice()
+                } else {
+                    store_sub_vars
+                };
 
-            let transformed = transform_store_sub_calls(&transformed, &effective_store_sub_vars);
-            let transformed = transform_store_assignments_client(
-                &transformed,
-                &effective_store_sub_vars,
-                prop_assignment_transform_vars,
-                state_vars,
-                non_reactive_state_vars,
-            );
-            transform_store_reads_client(&transformed, &effective_store_sub_vars)
-        } else {
-            transformed
+                let transformed = stage("store_sub_calls", transformed, |t| {
+                    Cow::Owned(transform_store_sub_calls(&t, effective_store_sub_vars))
+                });
+                let transformed = stage("store_assignments", transformed, |t| {
+                    Cow::Owned(transform_store_assignments_client(
+                        &t,
+                        effective_store_sub_vars,
+                        prop_assignment_transform_vars,
+                        state_vars,
+                        non_reactive_state_vars,
+                    ))
+                });
+                stage("store_reads", transformed, |t| {
+                    Cow::Owned(transform_store_reads_client(&t, effective_store_sub_vars))
+                })
+            } else {
+                transformed
+            }
         };
 
         // Expand legacy destructuring declarations with state variables into tmp-based
         // individual declarations BEFORE mutable_source wrapping.
         // e.g., `let { foo, bar } = expr` -> `let tmp = expr, foo = $.mutable_source(tmp.foo), bar = tmp.bar`
         // Reference: create_state_declarators in VariableDeclaration.js
-        let transformed = if !analysis.runes && !legacy_state_vars.is_empty() {
-            let state_var_names: Vec<String> = legacy_state_vars
-                .iter()
-                .map(|(name, _, _)| name.clone())
-                .collect();
-            transform_legacy_destructure_declarations(
-                &transformed,
-                &state_var_names,
-                analysis.immutable,
-            )
-        } else {
-            transformed
-        };
+        let transformed = pa_stage(
+            super::profile::PA_LEGACY_DESTRUCTURE_DECLARATIONS,
+            "legacy_destructure_declarations",
+            transformed,
+            |t| {
+                if !analysis.runes && !legacy_state_vars.is_empty() {
+                    rewritten(transform_legacy_destructure_declarations(
+                        &t,
+                        &legacy_state_var_names,
+                        analysis.immutable,
+                        dev,
+                    ))
+                    .map(Cow::Owned)
+                    .unwrap_or(t)
+                } else {
+                    t
+                }
+            },
+        );
 
         // Transform legacy state declarations to $.mutable_source() BEFORE wrapping reads.
         // This must come before wrap_state_vars_in_expr because multi-variable declarations
@@ -5268,68 +7748,95 @@ fn transform_instance_script_for_visitors(
         // By transforming declarations first, `let a, b;` becomes:
         //   `let a = $.mutable_source();\nlet b = $.mutable_source();`
         // and then wrap_state_vars_in_expr correctly skips them since each starts with `let `.
-        let transformed = if !analysis.runes && !legacy_state_vars.is_empty() {
-            transform_legacy_state_declarations(&transformed, legacy_state_vars, analysis.immutable)
-        } else {
-            transformed
-        };
+        let transformed = pa_stage(
+            super::profile::PA_LEGACY_STATE_DECLARATIONS,
+            "legacy_state_declarations",
+            transformed,
+            |t| {
+                if !analysis.runes && !legacy_state_vars.is_empty() {
+                    rewritten(transform_legacy_state_declarations(
+                        &t,
+                        legacy_state_vars,
+                        analysis.immutable,
+                        dev,
+                    ))
+                    .map(Cow::Owned)
+                    .unwrap_or(t)
+                } else {
+                    t
+                }
+            },
+        );
 
         // Wrap state variable reads in $.get() for ALL statements including declarations.
         // In runes mode, deferred to AST-based transform after main loop.
-        let transformed = if analysis.runes {
-            transformed
-        } else {
-            wrap_state_vars_in_expr(
-                &transformed,
-                state_vars,
-                non_reactive_state_vars,
-                proxy_vars,
-            )
-        };
+        let transformed =
+            pa_stage(super::profile::PA_STATE_READS, "state_reads", transformed, |t| {
+                if analysis.runes {
+                    t
+                } else {
+                    rewritten(wrap_state_vars_in_expr(
+                        &t,
+                        state_vars,
+                        non_reactive_state_vars,
+                        proxy_vars,
+                    ))
+                    .map(Cow::Owned)
+                    .unwrap_or(t)
+                }
+            });
 
         // Transform rest_prop member access to $$props (only in non-runes mode here;
         // in runes mode, deferred to AST-based transform after main loop)
-        let transformed = if !analysis.runes && !rest_prop_vars.is_empty() {
-            transform_rest_prop_member_access(&transformed, rest_prop_vars)
-        } else {
-            transformed
-        };
+        let transformed = pa_stage(
+            super::profile::PA_REST_PROP_MEMBER_ACCESS,
+            "rest_prop_member_access",
+            transformed,
+            |t| {
+                if !analysis.runes && !rest_prop_vars.is_empty() {
+                    Cow::Owned(transform_rest_prop_member_access(&t, rest_prop_vars))
+                } else {
+                    t
+                }
+            },
+        );
 
         // Transform read-only props to $$props.propName (only in non-runes mode here;
         // in runes mode, deferred to AST-based transform after main loop).
-        let transformed = if !analysis.runes && !read_only_props.is_empty() {
-            read_only_props_ast::transform_read_only_props_ast(&transformed, read_only_props)
-                .unwrap_or(transformed)
-        } else {
-            transformed
-        };
-
-        // Wrap prop member expression mutations with $$ownership_validator.mutation()
-        // Reference: validate_mutation() in shared/utils.js
-        let transformed = if !prop_mutation_vars.is_empty() {
-            wrap_prop_mutation_validation(&transformed, &prop_mutation_vars, &analysis.source)
-        } else {
-            transformed
-        };
+        let transformed =
+            pa_stage(super::profile::PA_READ_ONLY_PROPS, "read_only_props", transformed, |t| {
+                if !analysis.runes && !read_only_props.is_empty() {
+                    read_only_props_ast::transform_read_only_props_ast(&t, read_only_props)
+                        .map(Cow::Owned)
+                        .unwrap_or(t)
+                } else {
+                    t
+                }
+            });
 
         // In dev mode, wrap console.METHOD() calls with $.log_if_contains_state
         // to detect when state proxies are logged directly.
         // Reference: CallExpression.js in the official Svelte compiler.
         //
         // Try the AST-based rewrite first (same helper as the module-script
-        // path); fall back to the legacy text scanner if the statement
+        // path); fall back to the legacy text scanner only if the statement
         // fragment fails to parse standalone (rare — the parser is lenient
         // for any complete expression / statement). The AST path fixes the
         // quote-counting string-skip heuristic that the text version uses.
-        let transformed = if dev {
-            let is_ts =
-                analysis.filename.ends_with(".ts") || analysis.filename.ends_with(".svelte.ts");
-            console_dev_ast::transform_console_calls_dev_ast(&transformed, is_ts)
-                .unwrap_or_else(|| transform_console_calls_dev(&transformed))
-        } else {
-            transformed
-        };
+        let transformed =
+            pa_stage(super::profile::PA_CONSOLE_DEV, "console_dev", transformed, |t| {
+                if dev {
+                    let is_ts = analysis.filename.ends_with(".ts")
+                        || analysis.filename.ends_with(".svelte.ts");
+                    console_dev_ast::transform_console_calls_dev_fragment(&t, is_ts, Some(analysis))
+                        .map(Cow::Owned)
+                        .unwrap_or(t)
+                } else {
+                    t
+                }
+            });
 
+        let _pa = super::profile::pa_guard(super::profile::PA_EMIT, transformed.len() as u64);
         result.push_str(&transformed);
         result.push('\n');
     };
@@ -5347,12 +7854,37 @@ fn transform_instance_script_for_visitors(
     let mut depth_in_block_comment: bool = false;
     let mut depth_template_interp_stack: Vec<i32> = Vec::new();
 
-    // Pre-compute runes fast-path eligibility flags
-    let runes_fastpath_eligible = analysis.runes && !dev && prop_mutation_vars.is_empty();
+    // Pre-compute runes fast-path eligibility flags.
+    // `prop_mutation_vars` is not a factor: it feeds `wrap_prop_mutation_validation`,
+    // which runs over the whole result after this loop, never per statement.
+    let runes_fastpath_eligible = analysis.runes;
+
+    // Lines on which a top-level statement ends, according to a parser rather
+    // than to the depth/trailing-operator/lookahead heuristics below. `None`
+    // means the text did not parse, which is not a defect here — the script is
+    // mid-pipeline and may not be valid on its own — so the heuristics stay as
+    // the fallback.
+    // The projection maps into the script as it entered this function. When
+    // prenormalize rewrote the text, it maps somewhere that no longer exists,
+    // and unlike the verbatim path -- which re-finds its own text and so cannot
+    // be wrong about this -- nothing downstream would catch it.
+    let projection_still_applies = script_rest == original_script;
+    let stmt_end_lines = top_level_statement_end_lines(
+        &script_rest,
+        retained_program,
+        analysis.is_typescript,
+        source_projection.filter(|_| projection_still_applies),
+    );
+    super::profile::record_st_boundary_source(stmt_end_lines.is_some());
+
+    super::profile::record_st_collect_vars(super::profile::timer_elapsed(_stage));
+    let _stage = super::profile::timer_start();
+
+    super::profile::record_st_loop_lines(script_lines.len() as u64);
 
     while line_idx < script_lines.len() {
-        let line = script_lines[line_idx];
-        let trimmed = line.trim();
+        let mut line = script_lines[line_idx];
+        let mut trimmed = line.trim();
 
         // Skip empty lines (but preserve them if we're accumulating)
         if trimmed.is_empty() {
@@ -5395,19 +7927,34 @@ fn transform_instance_script_for_visitors(
         }
 
         // Skip $props.id() declarations - they will be added as const declarations
-        // in the component body. Match on the initializer being exactly
-        // `$props.id()` / `$.props_id()` (whitespace-tolerant) rather than the
-        // literal `= $props.id()` substring, so `let id=$props.id()` (no spaces)
-        // is also skipped instead of surviving alongside the generated const. H-060.
-        if at_statement_boundary
-            && (trimmed.starts_with("let ")
-                || trimmed.starts_with("const ")
-                || trimmed.starts_with("var "))
-            && trimmed
-                .find('=')
-                .map(|eq| trimmed[eq + 1..].trim().trim_end_matches(';').trim())
-                .is_some_and(|rhs| rhs == "$props.id()" || rhs == "$.props_id()")
-        {
+        // in the component body. An `export const` declarator is skipped too:
+        // upstream drops it in `VariableDeclaration` whichever way the declaration
+        // is reached, and the name still resolves — `$$exports` reads the hoisted
+        // `const`. Keeping it emitted `const x` twice in one scope, which is not
+        // parseable JS. H-060.
+        if at_statement_boundary && let Some(tail) = props_id_declaration_tail(trimmed) {
+            if tail.trim().is_empty() {
+                line_idx += 1;
+                continue;
+            }
+            // Another statement shares the line. Dropping the whole line drops
+            // that one too, and keeping it emits the hoisted `const` twice.
+            line = tail;
+            trimmed = tail.trim();
+        }
+
+        // A line comment at a statement boundary is complete trivia, never
+        // part of the statement that follows it. Keep it out of the
+        // per-statement AST rewrites: when a leading comment and a destructured
+        // declaration were parsed as one fragment, a rewrite of the
+        // initializer could re-emit the comment between the binding pattern
+        // and `=`, where `//` swallowed the initializer and produced invalid
+        // JavaScript. The comment must already be present in `result` for the
+        // reactive-statement ignore handling below, so emit it here instead of
+        // merely forcing an accumulator boundary.
+        if at_statement_boundary && trimmed.starts_with("//") {
+            result.push_str(line);
+            result.push('\n');
             line_idx += 1;
             continue;
         }
@@ -5415,26 +7962,36 @@ fn transform_instance_script_for_visitors(
         // Add line to accumulator (zero-copy borrow from script_lines)
         accumulated_lines.push(line);
 
-        // Incrementally update depth counters (only scans this new line, not the whole buffer)
-        update_expression_depths(
-            line,
-            &mut depth_paren,
-            &mut depth_bracket,
-            &mut depth_brace,
-            &mut depth_in_string,
-            &mut depth_in_block_comment,
-            &mut depth_template_interp_stack,
-        );
+        // The parser's answer when we have one. It settles all four heuristics
+        // below at once, so each of them is neutralised rather than consulted.
+        let complete_hint =
+            stmt_end_lines.as_ref().map(|ends| ends.get(line_idx).copied().unwrap_or(true));
+
+        // These counters feed `is_expression_incomplete` and nothing else, so
+        // the parser's answer makes the per-line character scan dead work.
+        if complete_hint.is_none() {
+            update_expression_depths(
+                line,
+                &mut depth_paren,
+                &mut depth_bracket,
+                &mut depth_brace,
+                &mut depth_in_string,
+                &mut depth_in_block_comment,
+                &mut depth_template_interp_stack,
+            );
+        }
 
         // Check if we have a complete statement (balanced braces/parens)
-        if !is_expression_incomplete(
-            depth_paren,
-            depth_bracket,
-            depth_brace,
-            &depth_in_string,
-            depth_in_block_comment,
-            &depth_template_interp_stack,
-        ) {
+        if complete_hint.unwrap_or_else(|| {
+            !is_expression_incomplete(
+                depth_paren,
+                depth_bracket,
+                depth_brace,
+                &depth_in_string,
+                depth_in_block_comment,
+                &depth_template_interp_stack,
+            )
+        }) {
             // Check for trailing comma in variable declarations (multi-declarator continuation)
             let first_trimmed_line = accumulated_lines[0].trim();
             let is_var_decl = first_trimmed_line.starts_with("let ")
@@ -5452,23 +8009,24 @@ fn transform_instance_script_for_visitors(
                 Some(pos) => trimmed[..pos].trim_end(),
                 None => trimmed,
             };
-            let trailing_comma = is_var_decl && trimmed.ends_with(',');
+            let trailing_comma = complete_hint.is_none() && is_var_decl && trimmed.ends_with(',');
 
             // Check if the current trimmed line ends with a binary/assignment operator,
             // indicating the expression continues on the next line.
             // e.g., `$: overflow_has_selected_tab =\n\thandle_overflow_has_selected_tab(...)`
             // Only check the most unambiguous operators to avoid false positives
             // (e.g., `*/` ending a JSDoc comment, or `}` ending a block).
-            let trailing_operator = {
+            let trailing_operator = complete_hint.is_none() && {
                 let t = trimmed.trim_end_matches(';');
                 (t.ends_with('=')
                     && !t.ends_with("==")
                     && !t.ends_with("!=")
                     && !t.ends_with("<=")
-                    && !t.ends_with(">=")
-                    && !t.ends_with("=>"))
+                    && !t.ends_with(">="))
                     || t.ends_with("&&")
                     || t.ends_with("||")
+                    // An arrow's body always follows, so `=>` never ends a statement.
+                    || t.ends_with("=>")
                     // Ternary `?` (and nullish `??`, a superset) continuation:
                     // a line ending with a bare `?` is always a dangling ternary
                     // operator whose consequent follows on the next line. This
@@ -5481,6 +8039,10 @@ fn transform_instance_script_for_visitors(
                     || t.ends_with('?')
                     // Binary `+` continuation: line ends with `+ ` (i.e., `+` not as part of `++`)
                     || (t.ends_with('+') && !t.ends_with("++"))
+                    // The exclusions above only keep a comparison out of the
+                    // assignment test; a line ending in one continues just the
+                    // same, its right operand being on the next line.
+                    || expression_utils::ends_with_binary_operator(t)
             };
 
             // A brace-less control-flow header (`$: if (cond)`, `else`, `for(...)`,
@@ -5488,16 +8050,11 @@ fn transform_instance_script_for_visitors(
             // complete statement — its body statement must be accumulated with it.
             // Otherwise `$: if (cond)\n\tstmt` splits `stmt` off as a separate
             // top-level statement, dropping the guard and the reactive wrapper.
-            let ends_with_control_header = {
-                let mut acc = accumulated_lines[..accumulated_lines.len() - 1].join("\n");
-                if !acc.is_empty() {
-                    acc.push('\n');
-                }
-                acc.push_str(trimmed);
-                expression_utils::ends_with_braceless_control_header(&acc)
-            };
-
-            if !trailing_comma && !trailing_operator && !ends_with_control_header {
+            if !trailing_comma
+                && !trailing_operator
+                && (complete_hint.is_some()
+                    || !accumulated_ends_with_control_header(&accumulated_lines, trimmed))
+            {
                 // Before processing, check if the next non-empty line starts with a
                 // continuation token (`.` for method chains, `?`, `:`, `&&`, `||`,
                 // `??` for ternary/logical continuation). Example:
@@ -5508,7 +8065,11 @@ fn transform_instance_script_for_visitors(
                 // The `cond` line by itself looks balanced, but the next line starts
                 // with `?`, so the expression continues.
                 let mut next_continues = false;
-                for future_line in script_lines.iter().skip(line_idx + 1) {
+                for future_line in script_lines
+                    .iter()
+                    .skip(line_idx + 1)
+                    .take(if complete_hint.is_some() { 0 } else { usize::MAX })
+                {
                     let future_trimmed = future_line.trim();
                     if future_trimmed.is_empty() {
                         continue;
@@ -5518,6 +8079,12 @@ fn transform_instance_script_for_visitors(
                         || future_trimmed.starts_with("&&")
                         || future_trimmed.starts_with("||")
                         || future_trimmed.starts_with("??")
+                        // No JavaScript statement may BEGIN with `else`, so a line
+                        // that does is always the tail of the `if` above it — even
+                        // when that `if` looked complete because its brace-less
+                        // consequent sat on the same line (`$: if (a) b = 1` /
+                        // newline / `else b = 2`).
+                        || starts_with_else_keyword(future_trimmed)
                     {
                         next_continues = true;
                     }
@@ -5525,6 +8092,23 @@ fn transform_instance_script_for_visitors(
                 }
 
                 if !next_continues {
+                    // The same rule as the per-line skip, applied once the whole
+                    // statement is in hand, so an initializer that sits on the
+                    // next line is dropped too. Both sites call the one predicate
+                    // rather than restating it — a second spelling of this test is
+                    // how #3346 got here.
+                    if is_props_id_declaration(&accumulated_lines.join("\n")) {
+                        accumulated_lines.clear();
+                        depth_paren = 0;
+                        depth_bracket = 0;
+                        depth_brace = 0;
+                        depth_in_string = None;
+                        depth_in_block_comment = false;
+                        depth_template_interp_stack.clear();
+                        line_idx += 1;
+                        continue;
+                    }
+
                     // Runes fast-path: skip process_accumulated entirely when no transforms apply
                     if runes_fastpath_eligible {
                         let statement = accumulated_lines.join("\n");
@@ -5535,8 +8119,13 @@ fn transform_instance_script_for_visitors(
                             || statement.contains('{'))
                             && statement.contains('=')
                             && (!state_vars.is_empty() || !store_sub_vars.is_empty());
+                        // The console wrap is the only per-statement stage that is
+                        // dev-only; every other one is gated on `!analysis.runes`.
+                        let needs_console =
+                            dev && memmem::find(statement.as_bytes(), b"console.").is_some();
 
-                        if !needs_rune && !needs_export && !needs_destructure {
+                        if !needs_rune && !needs_export && !needs_destructure && !needs_console {
+                            super::profile::record_st_fastpath_statement();
                             result.push_str(&statement);
                             result.push('\n');
                             accumulated_lines.clear();
@@ -5613,6 +8202,9 @@ fn transform_instance_script_for_visitors(
         );
     }
 
+    super::profile::record_st_line_loop(super::profile::timer_elapsed(_stage));
+    let _stage = super::profile::timer_start();
+
     // Append reactive statements at the end, mirroring the official Svelte compiler which
     // appends all $: reactive statements AFTER the rest of the instance body code.
     // See: svelte/packages/svelte/src/compiler/phases/3-transform/client/transform-client.js
@@ -5653,11 +8245,14 @@ fn transform_instance_script_for_visitors(
             && memmem::find(result.as_bytes(), b"$props").is_some();
         let has_host_calls = !store_sub_vars.iter().any(|v| v == "$host")
             && memmem::find(result.as_bytes(), b"$host").is_some();
-        // Dev-mode `===` / `!==` rewrite is now part of the AST pass
+        // Dev-mode equality rewrite is now part of the AST pass
         // (replaces `transform_strict_equals` from rune_transforms.rs).
-        let has_strict_equals = dev
-            && (memmem::find(result.as_bytes(), b"===").is_some()
-                || memmem::find(result.as_bytes(), b"!==").is_some());
+        let has_strict_equals = dev && strict_equals_ast::source_has_equality_op(&result);
+        // Dev-mode `await X` → `(await $.track_reactivity_loss(X))()` rewrite.
+        let has_await = dev && memmem::find(result.as_bytes(), b"await").is_some();
+        // Dev-mode `$inspect(...)` → `$.inspect(...)`; see the matching probe in
+        // `ast_state_transform`. This block already sits under `analysis.runes`.
+        let has_inspect = dev && inspect_rune_ast::source_has_inspect_rune(&result);
         let has_transforms = !state_vars.is_empty()
             || !prop_assignment_transform_vars.is_empty()
             || !store_sub_vars.is_empty()
@@ -5668,7 +8263,9 @@ fn transform_instance_script_for_visitors(
             || has_derived_calls
             || has_props_calls
             || has_host_calls
-            || has_strict_equals;
+            || has_strict_equals
+            || has_await
+            || has_inspect;
 
         if has_transforms {
             // Collect $derived / $derived.by binding names so AST assignment transforms
@@ -5699,6 +8296,23 @@ fn transform_instance_script_for_visitors(
                     None
                 })
                 .collect();
+            // Read off the ORIGINAL script: the AST pass below walks a
+            // post-rune-transform copy whose spans no longer map to the source
+            // `locate_node` measures against.
+            let async_derived_locations =
+                dev.then_some(analysis.instance_script_content.as_ref()).flatten().map(|script| {
+                    async_derived_dev::collect(
+                        &analysis.source,
+                        script.start,
+                        analysis
+                            .source
+                            .get(script.start as usize..script.end as usize)
+                            .unwrap_or_default(),
+                        analysis.filename.as_str(),
+                        analysis.is_typescript,
+                        analysis.runes,
+                    )
+                });
             let ast_config = ast_state_transform::AstTransformConfig {
                 state_vars: &state_vars,
                 non_reactive_vars: &non_reactive_state_vars,
@@ -5710,6 +8324,7 @@ fn transform_instance_script_for_visitors(
                 dev,
                 analysis_source: Some(&analysis.source),
                 filename: Some(analysis.filename.as_str()),
+                async_derived_locations: async_derived_locations.as_ref(),
                 prop_source_vars: &prop_source_vars,
                 prop_assignment_transform_vars: &prop_assignment_transform_vars,
                 non_bindable_prop_vars: &non_bindable_prop_vars,
@@ -5719,14 +8334,90 @@ fn transform_instance_script_for_visitors(
                 analysis: Some(analysis),
                 exported_names: &exported_names,
             };
-            if let Some(ast_result) =
+            let mut used_retained = false;
+            let ast_result = retained_program.and_then(|program| {
+                let retained_core = original_script.trim();
+                let result_core = result.trim();
+                if retained_core != result_core {
+                    return None;
+                }
+                let result_core_start = result.find(result_core).unwrap_or(0);
+                let result_core_end = result_core_start + result_core.len();
+                let prefix = &result[..result_core_start];
+                let suffix = &result[result_core_end..];
+
+                let transformed = if let Some(projection) = source_projection {
+                    let projection_core_start =
+                        original_script.len() - original_script.trim_start().len();
+                    let projection_core_end = projection_core_start + original_script.trim().len();
+                    let counters = AstStateCounterSnapshot::capture();
+                    match ast_state_transform::transform_state_vars_ast_projected_from_program(
+                        program.source(),
+                        program.program(),
+                        result_core,
+                        projection,
+                        projection_core_start..projection_core_end,
+                        &ast_config,
+                    ) {
+                        Ok(Some(transformed)) => Some(transformed),
+                        Ok(None) => {
+                            counters.restore();
+                            None
+                        }
+                        Err(()) => {
+                            counters.restore();
+                            return None;
+                        }
+                    }
+                } else {
+                    let mut retained_matches = program.source().match_indices(retained_core);
+                    let (retained_core_start, _) = retained_matches.next()?;
+                    if retained_matches.next().is_some() {
+                        return None;
+                    }
+                    let retained_core_end = retained_core_start + retained_core.len();
+                    ast_state_transform::transform_state_vars_ast_range_from_program(
+                        program.source(),
+                        program.program(),
+                        result_core,
+                        retained_core_start..retained_core_end,
+                        &ast_config,
+                    )
+                };
+
+                used_retained = true;
+                #[cfg(test)]
+                AST_STATE_RETAINED_USES.with(|count| count.set(count.get() + 1));
+                transformed.map(|transformed| {
+                    let mut output =
+                        String::with_capacity(prefix.len() + transformed.len() + suffix.len());
+                    output.push_str(prefix);
+                    output.push_str(&transformed);
+                    output.push_str(suffix);
+                    output
+                })
+            });
+            let ast_result = if used_retained {
+                ast_result
+            } else {
+                #[cfg(test)]
+                {
+                    AST_STATE_REPARSES.with(|count| count.set(count.get() + 1));
+                }
                 ast_state_transform::transform_state_vars_ast(&result, &ast_config)
-            {
+            };
+            if let Some(ast_result) = ast_result {
                 result = ast_result;
             }
             // Apply store_unsub wrapping after AST transform (searches for $.set patterns)
-            if !store_sub_vars.is_empty() {
-                result = wrap_store_unsub_for_state_sets(&result, &state_vars, &store_sub_vars);
+            if !store_sub_vars.is_empty()
+                && let Some(wrapped) = rewritten(wrap_store_unsub_for_state_sets(
+                    &result,
+                    &state_vars,
+                    &store_sub_vars,
+                ))
+            {
+                result = wrapped;
             }
             // The post-AST `wrap_state_derived_with_tag(&result)` pass that
             // used to tag AST-emitted `$.state(...)` / `$.derived(...)`
@@ -5744,6 +8435,9 @@ fn transform_instance_script_for_visitors(
         }
     }
 
+    super::profile::record_st_ast_transforms(super::profile::timer_elapsed(_stage));
+    let _stage = super::profile::timer_start();
+
     // Post-processing: transform shadowed local reactive vars within their enclosing function bodies.
     // These are state variables declared inside nested functions that share names with
     // top-level bindings. They're not in state_vars (to avoid incorrectly transforming
@@ -5753,272 +8447,42 @@ fn transform_instance_script_for_visitors(
         result = transform_shadowed_local_state_vars(&result, &shadowed_local_reactive_vars);
     }
 
+    // Must run after the runes AST pass: it matches the post-transform `prop()` getter
+    // form, which does not exist yet while the per-statement pipeline is still running.
+    // Reference: validate_mutation() in shared/utils.js
+    if !prop_mutation_vars.is_empty() {
+        result = prop_mutation_validation_ast::wrap_prop_mutation_validation_ast(
+            &result,
+            &prop_mutation_vars,
+            &analysis.source,
+        )
+        .unwrap_or_else(|| {
+            wrap_prop_mutation_validation(&result, &prop_mutation_vars, &analysis.source)
+        });
+    }
+
+    // Dev-mode equality / `await` instrumentation for legacy components. Upstream
+    // runs one visitor map over both modes; here the runes half rides inside the
+    // `analysis.runes` AST pass above, so legacy needs its own entry point. It goes
+    // last so the operands it copies are the settled, already-wrapped ones.
+    if dev
+        && !analysis.runes
+        && let Some(instrumented) =
+            instance_dev_tail_ast::transform_legacy_instance_dev_tail_ast(&result, Some(analysis))
+    {
+        result = instrumented;
+    }
+
+    if dev
+        && let Some(instrumented) =
+            instance_dev_tail_ast::transform_instance_dev_assign_tail(&result, analysis)
+    {
+        result = instrumented;
+    }
+
+    super::profile::record_st_post_passes(super::profile::timer_elapsed(_stage));
+
     result
-}
-
-/// Strip unnecessary parentheses from arrow function expression bodies.
-///
-/// Transforms `=> (expr)` to `=> expr` when `expr` is not an object literal `{...}`.
-/// This matches the official Svelte compiler behavior where esrap strips redundant parens.
-///
-/// All non-ASCII (multibyte UTF-8) content is preserved verbatim via range slicing —
-/// bytes are only used for ASCII pattern detection, never for character-by-character copying.
-fn strip_unnecessary_arrow_body_parens(code: &str) -> String {
-    let bytes = code.as_bytes();
-    let mut result = String::with_capacity(code.len());
-    let mut i = 0;
-
-    while i < bytes.len() {
-        // Skip string/template literals: their content must not be modified.
-        // Arrow patterns inside template literal raw segments are string values, not JS code.
-        // Use range slicing (&code[start..end]) so multibyte UTF-8 chars are copied intact.
-        if bytes[i] == b'\'' || bytes[i] == b'"' {
-            let quote = bytes[i];
-            let lit_start = i;
-            i += 1; // skip opening quote
-            while i < bytes.len() {
-                if bytes[i] == b'\\' {
-                    i += 2; // skip escaped char (always ASCII in escape sequences)
-                } else if bytes[i] == quote {
-                    i += 1; // include closing quote
-                    break;
-                } else {
-                    i += 1;
-                }
-            }
-            result.push_str(&code[lit_start..i]);
-            continue;
-        }
-        // Skip template literals completely (raw segments and ${} interpolations alike).
-        // Arrow patterns inside a template literal are raw string data — not JS code — so
-        // paren-stripping must not touch them.  ${} interpolations inside the template
-        // are not processed by this pass either; they receive the correct generated form
-        // from the upstream code-gen and do not need paren-stripping.
-        if bytes[i] == b'`' {
-            let lit_start = i;
-            i += 1; // skip opening backtick
-            let mut tpl_depth: u32 = 0; // nesting depth of ${} interpolations
-            while i < bytes.len() {
-                if bytes[i] == b'\\' {
-                    i += 2; // skip escaped char
-                    continue;
-                }
-                if bytes[i] == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'{' {
-                    tpl_depth += 1;
-                    i += 2;
-                    continue;
-                }
-                if bytes[i] == b'}' && tpl_depth > 0 {
-                    tpl_depth -= 1;
-                    i += 1;
-                    continue;
-                }
-                if bytes[i] == b'`' && tpl_depth == 0 {
-                    i += 1; // include closing backtick
-                    break;
-                }
-                i += 1;
-            }
-            result.push_str(&code[lit_start..i]);
-            continue;
-        }
-
-        // Look for "=> (" or "=>(" patterns (with or without space)
-        let (matched, paren_start, match_len) = if i + 4 <= bytes.len()
-            && bytes[i] == b'='
-            && bytes[i + 1] == b'>'
-            && bytes[i + 2] == b' '
-            && bytes[i + 3] == b'('
-        {
-            (true, i + 3, 4)
-        } else if i + 3 <= bytes.len()
-            && bytes[i] == b'='
-            && bytes[i + 1] == b'>'
-            && bytes[i + 2] == b'('
-        {
-            (true, i + 2, 3)
-        } else {
-            (false, 0, 0)
-        };
-
-        if matched {
-            let after_paren = paren_start + 1;
-            if after_paren < bytes.len() {
-                let first_char = bytes[after_paren];
-                // If the body starts with '{', it could be an object literal - keep parens
-                // Also keep parens if the paren is immediately followed by ')' (empty parens)
-                if first_char == b'{' || first_char == b')' {
-                    result.push_str(&code[i..i + match_len]);
-                    i += match_len;
-                    continue;
-                }
-
-                // Find the matching closing paren
-                if let Some(close_pos) = find_matching_paren_bytes(bytes, paren_start) {
-                    // Verify the expression is complete at the close paren:
-                    // After the `)`, the next non-whitespace should be something that
-                    // terminates the arrow body (`,`, `;`, `}`, `)`, newline, or EOF)
-                    let after_close = &code[close_pos + 1..];
-                    let next_char = after_close.chars().next();
-                    let is_end = match next_char {
-                        None => true,
-                        Some(c) => matches!(c, ',' | ';' | '}' | ')' | ']' | '\n' | '\r'),
-                    };
-                    // Check if the inner expression contains a top-level comma
-                    // (sequence expression). If so, keep the parens because they
-                    // are semantically required.
-                    let inner = &code[after_paren..close_pos];
-                    let has_top_level_comma = has_top_level_comma_in_expr(inner.as_bytes());
-                    if is_end && !has_top_level_comma {
-                        // Strip the parens: output "=> " + inner + skip the close paren
-                        result.push_str("=> ");
-                        result.push_str(inner);
-                        i = close_pos + 1;
-                        continue;
-                    }
-                }
-            }
-        }
-        // Copy one byte (always ASCII at this point: multibyte chars are handled by the
-        // string/template-literal branches above, and the pattern characters => ( are ASCII).
-        // However, to be safe against any non-ASCII byte reaching here, use a char-aware copy.
-        let ch_len = code[i..].chars().next().map_or(1, |c| c.len_utf8());
-        result.push_str(&code[i..i + ch_len]);
-        i += ch_len;
-    }
-    result
-}
-
-/// Check if an expression (as bytes) contains a top-level comma operator.
-/// Top-level means not nested inside any `()`, `[]`, `{}`, or string/template literal.
-fn has_top_level_comma_in_expr(bytes: &[u8]) -> bool {
-    let mut depth = 0;
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b',' if depth == 0 => return true,
-            b'(' | b'[' | b'{' => depth += 1,
-            b')' | b']' | b'}' if depth > 0 => {
-                depth -= 1;
-            }
-            b'\'' => {
-                i += 1;
-                while i < bytes.len() && bytes[i] != b'\'' {
-                    if bytes[i] == b'\\' {
-                        i += 1;
-                    }
-                    i += 1;
-                }
-            }
-            b'"' => {
-                i += 1;
-                while i < bytes.len() && bytes[i] != b'"' {
-                    if bytes[i] == b'\\' {
-                        i += 1;
-                    }
-                    i += 1;
-                }
-            }
-            b'`' => {
-                i += 1;
-                let mut tpl_depth = 0;
-                while i < bytes.len() {
-                    if bytes[i] == b'\\' {
-                        i += 2;
-                        continue;
-                    }
-                    if bytes[i] == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'{' {
-                        tpl_depth += 1;
-                        i += 2;
-                        continue;
-                    }
-                    if bytes[i] == b'}' && tpl_depth > 0 {
-                        tpl_depth -= 1;
-                        i += 1;
-                        continue;
-                    }
-                    if bytes[i] == b'`' && tpl_depth == 0 {
-                        break;
-                    }
-                    i += 1;
-                }
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    false
-}
-
-/// Find the matching closing parenthesis for an opening paren in a byte slice.
-/// Returns the byte index of the closing ')' or None if not found.
-/// Handles nested parens, brackets, braces, and string/template literals.
-fn find_matching_paren_bytes(bytes: &[u8], open_pos: usize) -> Option<usize> {
-    let mut depth = 1;
-    let mut i = open_pos + 1;
-    while i < bytes.len() && depth > 0 {
-        match bytes[i] {
-            b'(' | b'[' => depth += 1,
-            b')' | b']' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(i);
-                }
-            }
-            b'{' => depth += 1,
-            b'}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(i); // shouldn't happen for matching ()
-                }
-            }
-            b'\'' => {
-                i += 1;
-                while i < bytes.len() && bytes[i] != b'\'' {
-                    if bytes[i] == b'\\' {
-                        i += 1;
-                    }
-                    i += 1;
-                }
-            }
-            b'"' => {
-                i += 1;
-                while i < bytes.len() && bytes[i] != b'"' {
-                    if bytes[i] == b'\\' {
-                        i += 1;
-                    }
-                    i += 1;
-                }
-            }
-            b'`' => {
-                i += 1;
-                let mut tpl_depth = 0;
-                while i < bytes.len() {
-                    if bytes[i] == b'\\' {
-                        i += 2;
-                        continue;
-                    }
-                    if bytes[i] == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'{' {
-                        tpl_depth += 1;
-                        i += 2;
-                        continue;
-                    }
-                    if bytes[i] == b'}' && tpl_depth > 0 {
-                        tpl_depth -= 1;
-                        i += 1;
-                        continue;
-                    }
-                    if bytes[i] == b'`' && tpl_depth == 0 {
-                        break;
-                    }
-                    i += 1;
-                }
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    None
 }
 
 /// Transform shadowed local reactive variables within their enclosing function bodies.
@@ -6029,45 +8493,34 @@ fn find_matching_paren_bytes(bytes: &[u8], open_pos: usize) -> Option<usize> {
 /// `$.update()` transforms only within that scope.
 fn transform_shadowed_local_state_vars(script: &str, shadowed_vars: &[String]) -> String {
     let mut result = script.to_string();
+    // Every top-level rune binding lands in `shadowed_vars`, so probing the
+    // twelve declaration shapes with a `find` per variable ran
+    // O(shadowed_count × script_len) and dominated transform time on rune-heavy
+    // components. One indexing pass yields the same first-match offsets;
+    // it is refreshed whenever a transform rewrites `result`.
+    let mut decls = index_shadowed_decls(&result);
 
     for var in shadowed_vars {
-        // Find `let VAR = $.state(` or `let VAR = $.derived(` patterns
-        // in the already-transformed output
-        let state_patterns = [
-            format!("let {} = $.state(", var),
-            format!("let {} = $.derived(", var),
-            format!("var {} = $.state(", var),
-            format!("var {} = $.derived(", var),
-            format!("const {} = $.state(", var),
-            format!("const {} = $.derived(", var),
-            format!("let {} = $.state.raw(", var),
-            format!("let {} = $.derived.by(", var),
-            format!("var {} = $.state.raw(", var),
-            format!("var {} = $.derived.by(", var),
-            format!("const {} = $.state.raw(", var),
-            format!("const {} = $.derived.by(", var),
-        ];
+        // Shapes are probed in order and each one searches the *current*
+        // `result`, so the index is refreshed as soon as a rewrite lands.
+        for shape in 0..SHADOWED_DECL_SHAPE_COUNT {
+            let Some(decl_pos) = decls.get(var.as_str()).and_then(|found| found[shape]) else {
+                continue;
+            };
+            // Find the enclosing function body
+            let Some((func_start, func_end)) =
+                find_enclosing_function_body(&result, decl_pos as usize)
+            else {
+                continue;
+            };
+            let func_body = &result[func_start..func_end];
+            let is_state = shape % 2 == 0;
+            let transformed_body = apply_local_state_transforms(func_body, var, is_state);
 
-        for pattern in &state_patterns {
-            if let Some(decl_pos) = result.find(pattern.as_str()) {
-                // Find the enclosing function body
-                if let Some((func_start, func_end)) =
-                    find_enclosing_function_body(&result, decl_pos)
-                {
-                    let func_body = &result[func_start..func_end];
-                    let is_state = memmem::find(pattern.as_bytes(), b"$.state(").is_some()
-                        || memmem::find(pattern.as_bytes(), b"$.state.raw(").is_some();
-                    let transformed_body = apply_local_state_transforms(func_body, var, is_state);
-
-                    if transformed_body != func_body {
-                        result = format!(
-                            "{}{}{}",
-                            &result[..func_start],
-                            transformed_body,
-                            &result[func_end..]
-                        );
-                    }
-                }
+            if transformed_body != func_body {
+                result =
+                    format!("{}{}{}", &result[..func_start], transformed_body, &result[func_end..]);
+                decls = index_shadowed_decls(&result);
             }
         }
     }
@@ -6075,47 +8528,103 @@ fn transform_shadowed_local_state_vars(script: &str, shadowed_vars: &[String]) -
     result
 }
 
+/// The `$.…(` markers whose declarations [`transform_shadowed_local_state_vars`]
+/// rewrites, crossed with [`SHADOWED_DECL_KEYWORDS`] to form the twelve shapes.
+const SHADOWED_DECL_MARKERS: [&str; 4] =
+    ["$.state(", "$.derived(", "$.state.raw(", "$.derived.by("];
+
+const SHADOWED_DECL_KEYWORDS: [&str; 3] = ["let ", "var ", "const "];
+
+/// In dev the label wrap sits between the `=` and the rune call, so every
+/// declaration probe has to look through it.
+const SHADOWED_DECL_TAG_WRAPPERS: [&str; 2] = ["$.tag(", "$.tag_proxy("];
+
+const SHADOWED_DECL_SHAPE_COUNT: usize = SHADOWED_DECL_MARKERS.len() * SHADOWED_DECL_KEYWORDS.len();
+
+/// First offset of each `<kw> N = $.…(` declaration shape, keyed by `N`.
+///
+/// The twelve shapes are `let` / `var` / `const` crossed with
+/// [`SHADOWED_DECL_MARKERS`], optionally through a
+/// [`SHADOWED_DECL_TAG_WRAPPERS`] wrap. `N` is the space-delimited token before
+/// the `=` and the keyword is matched as a raw substring (no left word
+/// boundary).
+fn index_shadowed_decls(
+    script: &str,
+) -> rustc_hash::FxHashMap<String, [Option<u32>; SHADOWED_DECL_SHAPE_COUNT]> {
+    let mut map: rustc_hash::FxHashMap<String, [Option<u32>; SHADOWED_DECL_SHAPE_COUNT]> =
+        rustc_hash::FxHashMap::default();
+    for (marker_idx, marker) in SHADOWED_DECL_MARKERS.iter().enumerate() {
+        for pos in memmem::find_iter(script.as_bytes(), marker.as_bytes()) {
+            let mut before = &script[..pos];
+            for wrapper in SHADOWED_DECL_TAG_WRAPPERS {
+                if let Some(stripped) = before.strip_suffix(wrapper) {
+                    before = stripped;
+                    break;
+                }
+            }
+            let Some(before) = before.strip_suffix(" = ") else {
+                continue;
+            };
+            let Some(space) = before.rfind(' ') else {
+                continue;
+            };
+            let name_start = space + 1;
+            if name_start == before.len() {
+                continue;
+            }
+            let head = &script[..name_start];
+            let Some(keyword) = SHADOWED_DECL_KEYWORDS.iter().position(|kw| head.ends_with(kw))
+            else {
+                continue;
+            };
+            let shape = keyword * 2 + marker_idx % 2 + if marker_idx >= 2 { 6 } else { 0 };
+            let pattern_start = (name_start - SHADOWED_DECL_KEYWORDS[keyword].len()) as u32;
+            let entry = map
+                .entry(before[name_start..].to_string())
+                .or_insert([None; SHADOWED_DECL_SHAPE_COUNT]);
+            if entry[shape].is_none_or(|first| pattern_start < first) {
+                entry[shape] = Some(pattern_start);
+            }
+        }
+    }
+    map
+}
+
 /// Find the enclosing function body (from `{` to matching `}`) that contains `pos`.
 fn find_enclosing_function_body(script: &str, pos: usize) -> Option<(usize, usize)> {
-    let bytes = script.as_bytes();
+    use oxc_allocator::Allocator;
+    use oxc_ast::ast::FunctionBody;
+    use oxc_ast_visit::{Visit, walk};
+    use oxc_parser::Parser;
+    use oxc_span::SourceType;
 
-    // Scan backwards from pos to find the opening `{` of the enclosing function
-    let mut brace_depth = 0i32;
-    let mut func_open = None;
-    let mut i = pos;
-    while i > 0 {
-        i -= 1;
-        match bytes[i] {
-            b'}' => brace_depth += 1,
-            b'{' => {
-                if brace_depth == 0 {
-                    func_open = Some(i);
-                    break;
-                }
-                brace_depth -= 1;
+    struct BodyFinder {
+        pos: u32,
+        body: Option<(u32, u32)>,
+    }
+
+    impl<'a> Visit<'a> for BodyFinder {
+        fn visit_function_body(&mut self, body: &FunctionBody<'a>) {
+            if body.span.start < self.pos
+                && self.pos < body.span.end
+                && self
+                    .body
+                    .is_none_or(|(start, end)| body.span.end - body.span.start < end - start)
+            {
+                self.body = Some((body.span.start, body.span.end));
             }
-            _ => {}
+            walk::walk_function_body(self, body);
         }
     }
-    let func_start = func_open?;
 
-    // Find the matching closing `}` by scanning forward
-    let mut brace_depth = 0i32;
-    let mut func_end = None;
-    for (j, &byte) in bytes.iter().enumerate().take(script.len()).skip(func_start) {
-        match byte {
-            b'{' => brace_depth += 1,
-            b'}' => {
-                brace_depth -= 1;
-                if brace_depth == 0 {
-                    func_end = Some(j + 1);
-                    break;
-                }
-            }
-            _ => {}
-        }
+    let allocator = Allocator::default();
+    let parsed = Parser::new(&allocator, script, SourceType::mjs()).parse();
+    if parsed.panicked || !parsed.diagnostics.is_empty() {
+        return None;
     }
-    Some((func_start, func_end?))
+    let mut finder = BodyFinder { pos: pos as u32, body: None };
+    finder.visit_program(&parsed.program);
+    finder.body.map(|(start, end)| (start as usize, end as usize))
 }
 
 /// Apply `$.get()`, `$.set()`, `$.update()` transforms for a variable within a function body.
@@ -6126,24 +8635,16 @@ fn apply_local_state_transforms(func_body: &str, var_name: &str, is_state: bool)
     result = state_reads_ast::transform_state_reads_ast(&result, &[var_name.to_string()], &[])
         .unwrap_or(result);
 
-    // Apply $.update() for `var++`, `var--`, `++var`, `--var` patterns
-    // These must be applied BEFORE $.set() transforms since `x++` should become `$.update(x)`
-    // not `$.set(x, $.get(x)++, true)`
-    let update_patterns = [
-        (format!("{}++", var_name), format!("$.update({})", var_name)),
-        (
-            format!("{}--", var_name),
-            format!("$.update({}, -1)", var_name),
-        ),
-        (format!("++{}", var_name), format!("$.update({})", var_name)),
-        (
-            format!("--{}", var_name),
-            format!("$.update({}, -1)", var_name),
-        ),
-    ];
-
-    for (from, to) in &update_patterns {
-        result = replace_standalone_pattern(&result, from, to);
+    // Updates must precede sets, so `x++` becomes `$.update(x)` rather than
+    // a set around an update target. The AST pass keeps tokens in literals and
+    // comments out of this rewrite.
+    if let Some(transformed) = reactive_update_ast::transform_reactive_update_ast(
+        &result,
+        &[],
+        &[var_name.to_string()],
+        &[],
+    ) {
+        result = transformed;
     }
 
     // Apply $.set() for direct assignments (only for $state, not $derived)
@@ -6151,36 +8652,6 @@ fn apply_local_state_transforms(func_body: &str, var_name: &str, is_state: bool)
         result = apply_local_set_transforms(&result, var_name);
     }
 
-    result
-}
-
-/// Replace a pattern only when it appears as a standalone expression.
-fn replace_standalone_pattern(text: &str, from: &str, to: &str) -> String {
-    let mut result = String::new();
-    let mut search_from = 0;
-
-    while let Some(pos) = text[search_from..].find(from) {
-        let abs_pos = search_from + pos;
-        let before_ok = abs_pos == 0 || {
-            let b = text.as_bytes()[abs_pos - 1];
-            !b.is_ascii_alphanumeric() && b != b'_' && b != b'$' && b != b'.'
-        };
-        let after_pos = abs_pos + from.len();
-        let after_ok = after_pos >= text.len() || {
-            let b = text.as_bytes()[after_pos];
-            !b.is_ascii_alphanumeric() && b != b'_'
-        };
-
-        if before_ok && after_ok {
-            result.push_str(&text[search_from..abs_pos]);
-            result.push_str(to);
-            search_from = after_pos;
-        } else {
-            result.push_str(&text[search_from..abs_pos + 1]);
-            search_from = abs_pos + 1;
-        }
-    }
-    result.push_str(&text[search_from..]);
     result
 }
 
@@ -6192,11 +8663,7 @@ fn apply_local_set_transforms(func_body: &str, var_name: &str) -> String {
         let trimmed = line.trim();
 
         // Skip declaration lines
-        if trimmed.contains(&format!("let {} = $.state(", var_name))
-            || trimmed.contains(&format!("var {} = $.state(", var_name))
-            || trimmed.contains(&format!("let {} = $.derived(", var_name))
-            || trimmed.contains(&format!("var {} = $.derived(", var_name))
-        {
+        if declares_local_rune(trimmed, var_name) {
             lines.push(line.to_string());
             continue;
         }
@@ -6206,6 +8673,24 @@ fn apply_local_set_transforms(func_body: &str, var_name: &str) -> String {
     }
 
     lines.join("\n")
+}
+
+/// Whether `line` is `var_name`'s own signal declaration, with or without the
+/// dev label wrap around the rune call.
+fn declares_local_rune(line: &str, var_name: &str) -> bool {
+    ["let ", "var "].iter().any(|keyword| {
+        let head = format!("{keyword}{var_name} = ");
+        line.match_indices(head.as_str()).any(|(pos, _)| {
+            let mut rest = &line[pos + head.len()..];
+            for wrapper in SHADOWED_DECL_TAG_WRAPPERS {
+                if let Some(stripped) = rest.strip_prefix(wrapper) {
+                    rest = stripped;
+                    break;
+                }
+            }
+            rest.starts_with("$.state(") || rest.starts_with("$.derived(")
+        })
+    })
 }
 
 /// Transform `varName = expr` to `$.set(varName, expr, true)` in a line.
@@ -6240,13 +8725,7 @@ fn transform_local_assignment(line: &str, var_name: &str) -> String {
             let rhs = line[rhs_start..].trim_end_matches([';', ',']);
             let trailing = &line[rhs_start + rhs.len()..];
             let prefix = &line[..pos];
-            return format!(
-                "{}$.set({}, {}, true){}",
-                prefix,
-                var_name,
-                rhs.trim(),
-                trailing
-            );
+            return format!("{}$.set({}, {}, true){}", prefix, var_name, rhs.trim(), trailing);
         }
     }
 
@@ -6254,1158 +8733,4 @@ fn transform_local_assignment(line: &str, var_name: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_starts_export_specifier() {
-        // M-021: recognise `export { ... }` regardless of whitespace before `{`.
-        assert!(starts_export_specifier("export { a, b }"));
-        assert!(starts_export_specifier("export {a}"));
-        assert!(starts_export_specifier("export{a}"));
-        assert!(starts_export_specifier("export  {a}"));
-        assert!(starts_export_specifier("export\t{ a }"));
-        // Must not match other export forms or longer identifiers.
-        assert!(!starts_export_specifier("export default x"));
-        assert!(!starts_export_specifier("export function f() {}"));
-        assert!(!starts_export_specifier("export const x = 1"));
-        assert!(!starts_export_specifier("exporter({a})"));
-        assert!(!starts_export_specifier("let x = 1"));
-    }
-
-    // Tests for comma-separated variable declarations on client side.
-    // These verify that destructured patterns ($state, $derived, $props) produce
-    // comma-separated declarators in a single let/const/var statement, matching
-    // the official Svelte compiler output.
-
-    #[test]
-    fn test_client_comma_separated_state_destructuring() {
-        let input = r#"<script>
-  import { setup } from './utils.js';
-
-  let { num } = $state(setup());
-  let { num: num_frozen } = $state(setup());
-</script>
-
-<button on:click={() => { num++; num_frozen++; }}>{num} / {num_frozen}</button>
-"#;
-        let options = crate::compiler::CompileOptions {
-            generate: crate::compiler::GenerateMode::Client,
-            filename: Some("test/index.svelte".to_string()),
-            ..Default::default()
-        };
-        let result = crate::compiler::compile(input, options).unwrap();
-        println!("=== AMBIGUOUS SOURCE CLIENT OUTPUT ===");
-        println!("{}", result.js.code);
-        // The destructured $state should produce comma-separated declarations:
-        // let tmp = setup(), num = $.state($.proxy(tmp.num))
-        // NOT:
-        // let tmp = setup();
-        // let num = $.state($.proxy(tmp.num));
-        assert!(
-            result
-                .js
-                .code
-                .contains("let tmp = setup(), num = $.state($.proxy(tmp.num))"),
-            "Should have comma-separated declarations for destructured $state"
-        );
-    }
-
-    #[test]
-    fn test_comma_separated_let_declarations() {
-        let input = r#"<script>
-	let x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22, x23, x24, x25, x26, x27, x28, x29, x30, x31;
-</script>
-<A>foo</A>
-"#;
-        let options = crate::compiler::CompileOptions {
-            generate: crate::compiler::GenerateMode::Client,
-            filename: Some("test/index.svelte".to_string()),
-            ..Default::default()
-        };
-        let result = crate::compiler::compile(input, options).unwrap();
-        println!("=== COMMA-SEP LET OUTPUT ===");
-        println!("{}", result.js.code);
-        // The official Svelte compiler keeps them as separate let declarations
-        assert!(
-            result.js.code.contains("let x1;"),
-            "Should have separate let declarations: {}",
-            result.js.code,
-        );
-    }
-
-    #[test]
-    fn test_bitmask_overflow_2_export_lets() {
-        // 32 separate `export let` declarations - these produce separate $.prop() calls
-        let input = r#"<script>
-	export let x1;
-	export let x2;
-	export let x3;
-</script>
-<p>{x1 + x2 + x3}</p>
-"#;
-        let options = crate::compiler::CompileOptions {
-            generate: crate::compiler::GenerateMode::Client,
-            filename: Some("test/index.svelte".to_string()),
-            ..Default::default()
-        };
-        let result = crate::compiler::compile(input, options).unwrap();
-        println!("=== BITMASK OVERFLOW 2 OUTPUT ===");
-        println!("{}", result.js.code);
-    }
-
-    #[test]
-    fn test_props_destructuring_comma_separated() {
-        let input = r#"<script>
-let { foo = false, bar = true } = $props();
-</script>
-<p>{foo} {bar}</p>
-"#;
-        let options = crate::compiler::CompileOptions {
-            generate: crate::compiler::GenerateMode::Client,
-            filename: Some("test/index.svelte".to_string()),
-            ..Default::default()
-        };
-        let result = crate::compiler::compile(input, options).unwrap();
-        println!("=== PROPS DESTRUCTURING OUTPUT ===");
-        println!("{}", result.js.code);
-        // Should have comma-separated declarations (may be on one line or split across lines):
-        // let foo = $.prop($$props, 'foo', ...), bar = $.prop($$props, 'bar', ...);
-        // or:
-        // let foo = $.prop($$props, 'foo', ...),
-        //     bar = $.prop($$props, 'bar', ...);
-        assert!(
-            result.js.code.contains("foo = $.prop($$props, 'foo'")
-                && result.js.code.contains("bar = $.prop($$props, 'bar'"),
-            "Should have comma-separated prop declarations: {}",
-            result.js.code,
-        );
-    }
-
-    #[test]
-    fn test_assign_prop_to_prop() {
-        let input = r#"<script>
-	let z = 8;
-	let { a, b = a, c = b * b, d = z * b + c } = $props();
-</script>
-
-<p>{a}</p>
-<p>{b}</p>
-<p>{c}</p>
-<p>{d}</p>"#;
-        let options = crate::compiler::CompileOptions {
-            generate: crate::compiler::GenerateMode::Client,
-            filename: Some("Test/index.svelte".to_string()),
-            ..Default::default()
-        };
-        let result = crate::compiler::compile(input, options).unwrap();
-        println!("=== ASSIGN PROP TO PROP OUTPUT ===");
-        println!("{}", result.js.code);
-        // Expected: comma-separated prop declarations (may be on one line or split across lines):
-        // let b = $.prop(...), c = $.prop(...), d = $.prop(...);
-        // or:
-        // let b = $.prop(...),
-        //     c = $.prop(...),
-        //     d = $.prop(...);
-        assert!(
-            !result.js.code.contains("let b = $.prop") || result.js.code.contains("c = $.prop"),
-            "Should have comma-separated prop declarations: {}",
-            result.js.code,
-        );
-    }
-
-    #[test]
-    fn test_derived_destructured_iterator() {
-        let input = r#"<script>
-	let offset = $state(1);
-
-	function* count(offset) {
-		let i = offset;
-		while (true) yield i++;
-	}
-
-	let [a, b, c] = $derived(count(offset));
-</script>
-
-<button onclick={() => offset += 1}>increment</button>
-
-<p>a: {a}</p>
-<p>b: {b}</p>
-<p>c: {c}</p>
-"#;
-        let options = crate::compiler::CompileOptions {
-            generate: crate::compiler::GenerateMode::Client,
-            filename: Some("main/index.svelte".to_string()),
-            ..Default::default()
-        };
-        let result = crate::compiler::compile(input, options).unwrap();
-        println!("=== DERIVED DESTRUCTURED ITERATOR OUTPUT ===");
-        println!("{}", result.js.code);
-        // Expected: single let with comma-separated declarators (may be on one line or split across lines):
-        // let $$d = $.derived(...), $$array = $.derived(...), a = $.derived(...), ...;
-        // or:
-        // let $$d = $.derived(...),
-        //     $$array = $.derived(...),
-        //     a = $.derived(...), ...;
-        assert!(
-            result.js.code.contains("$$d = $.derived(")
-                && result.js.code.contains("$$array = $.derived("),
-            "Should have comma-separated derived destructuring declarations: {}",
-            result.js.code,
-        );
-    }
-
-    #[test]
-    fn test_bind_and_spread_precedence() {
-        let input = r#"<script>
-	let { value = $bindable(), ...properties } = $props();
-</script>
-
-<input bind:value {...properties} />
-"#;
-        let options = crate::compiler::CompileOptions {
-            generate: crate::compiler::GenerateMode::Client,
-            filename: Some("input/index.svelte".to_string()),
-            ..Default::default()
-        };
-        let result = crate::compiler::compile(input, options).unwrap();
-        println!("=== BIND AND SPREAD OUTPUT ===");
-        println!("{}", result.js.code);
-        // Expected: single let with comma-separated (may be on one line or split across lines):
-        // let value = $.prop($$props, 'value', 15), properties = $.rest_props($$props, [...]);
-        // or:
-        // let value = $.prop($$props, 'value', 15),
-        //     properties = $.rest_props($$props, [...]);
-        assert!(
-            result.js.code.contains("value = $.prop(")
-                && result.js.code.contains("properties = $.rest_props("),
-            "Should have comma-separated prop + rest_props declarations: {}",
-            result.js.code,
-        );
-    }
-
-    #[test]
-    fn test_destructure_state_from_props() {
-        let input = r#"<script>
-	let { data } = $props();
-	let { foo } = $state(data);
-</script>
-
-{foo}"#;
-        let options = crate::compiler::CompileOptions {
-            generate: crate::compiler::GenerateMode::Client,
-            filename: Some("Child/index.svelte".to_string()),
-            ..Default::default()
-        };
-        let result = crate::compiler::compile(input, options).unwrap();
-        println!("=== DESTRUCTURE STATE FROM PROPS OUTPUT ===");
-        println!("{}", result.js.code);
-        // Expected: let tmp = $$props.data, foo = $.proxy(tmp.foo);
-        assert!(
-            result
-                .js
-                .code
-                .contains("let tmp = $$props.data, foo = $.proxy(tmp.foo)"),
-            "Should have comma-separated let tmp/foo declarations: {}",
-            result.js.code,
-        );
-    }
-
-    #[test]
-    fn test_normalize_js_with_oxc() {
-        // Include a JSDoc comment (/** */) to force the OXC codegen path,
-        // since this test specifically validates OXC formatting behavior.
-        let input = "/** */\nlet count1=0;\nlet count2=0;\n\nfunction text1(){\n\treturn count1;\n}\n\nfunction text2(){\n\treturn count2;\n}";
-        let result = normalize_js_with_oxc(input, 1);
-        println!("OXC output:\n{}", result);
-        // Check basic formatting
-        assert!(
-            result.contains("let count1 = 0;"),
-            "Should have spaces around = : {}",
-            result
-        );
-        assert!(
-            result.contains("function text1() {"),
-            "Should have space before brace: {}",
-            result
-        );
-    }
-
-    #[test]
-    fn test_normalize_js_array_on_one_line() {
-        let input = "let props = $.rest_props($$props, ['$$slots', '$$events', '$$legacy']);";
-        let result = normalize_js_with_oxc(input, 1);
-        println!("OXC array output:\n{}", result);
-        assert!(
-            result.contains("['$$slots', '$$events', '$$legacy']"),
-            "Array should stay on one line: {}",
-            result
-        );
-    }
-
-    #[test]
-    fn test_normalize_js_arrow_expression_body() {
-        let input = "$.template_effect(() => $.set_text(text_3, $.get(item)));";
-        let result = normalize_js_with_oxc(input, 1);
-        println!("OXC arrow output:\n{}", result);
-        assert!(
-            result.contains("() => $.set_text(text_3, $.get(item))"),
-            "Arrow expression body should be preserved: {}",
-            result
-        );
-    }
-
-    #[test]
-    fn test_detect_indent_level() {
-        assert_eq!(detect_indent_level("\n\tlet x = 1;"), 1);
-        assert_eq!(detect_indent_level("\tlet x = 1;"), 1);
-        assert_eq!(detect_indent_level("let x = 1;"), 0);
-        assert_eq!(detect_indent_level("\n\n\t\tlet x = 1;"), 2);
-    }
-
-    #[test]
-    fn test_find_matching_paren() {
-        assert_eq!(find_matching_paren("abc)"), Some(3));
-        assert_eq!(find_matching_paren("(a))"), Some(3));
-        assert_eq!(find_matching_paren("((a)))"), Some(5));
-        assert_eq!(find_matching_paren("abc"), None);
-    }
-
-    // `test_derived_object_literal_wrapped_in_parens` was deleted along
-    // with the text-based `$derived(...)` rewrite — the paren wrap is
-    // now produced by `ast_state_transform::try_rewrite_derived_call_declarator`
-    // and is exercised by the runtime/snapshot fixtures that round-trip
-    // through the full compile pipeline.
-
-    #[test]
-    fn test_is_complete_side_effect_import() {
-        // Side-effect imports without `from`/`;` are complete on a single line.
-        assert!(is_complete_side_effect_import("import \"./Inner.svelte\""));
-        assert!(is_complete_side_effect_import("import './foo.js'"));
-        assert!(is_complete_side_effect_import(
-            "import  \"./Inner.svelte\"   "
-        ));
-        // Escaped quote inside string literal.
-        assert!(is_complete_side_effect_import("import \"./a\\\".svelte\""));
-
-        // Non-side-effect imports must NOT be detected here.
-        assert!(!is_complete_side_effect_import("import x from 'foo'"));
-        assert!(!is_complete_side_effect_import("import { x } from 'foo'"));
-        assert!(!is_complete_side_effect_import("import {"));
-        assert!(!is_complete_side_effect_import("import * as ns from 'foo'"));
-
-        // Anything trailing the closing quote also fails.
-        assert!(!is_complete_side_effect_import("import \"./foo\" extra"));
-
-        // Unclosed string literal is not complete.
-        assert!(!is_complete_side_effect_import("import \"./foo"));
-    }
-
-    #[test]
-    fn test_extract_imports_no_semicolon_side_effect() {
-        // Regression: `import "./Inner.svelte"` (no semicolon) followed by a
-        // `let count = 1;` declaration must split into a complete import and a
-        // separate body statement. Previously the line-by-line splitter merged
-        // both lines into the import block.
-        let script = "import \"./Inner.svelte\"\nlet count = 1;\n";
-        let (imports, rest) = extract_imports(script);
-        assert_eq!(imports, vec!["import \"./Inner.svelte\"".to_string()]);
-        assert_eq!(rest, "let count = 1;");
-    }
-
-    #[test]
-    fn test_transform_prop_reads_in_expr() {
-        // Test that prop reads are transformed to prop() calls
-        let prop_vars = vec!["a".to_string(), "b".to_string()];
-
-        // Simple expression
-        let result = transform_prop_reads_in_expr("a + b", &prop_vars);
-        println!("Input: 'a + b'");
-        println!("Result: '{}'", result);
-        assert_eq!(
-            result, "a() + b()",
-            "Should transform 'a + b' to 'a() + b()'"
-        );
-
-        // Function calls with prop names should still get the getter wrapper.
-        // `a()` in source means "call the prop getter, then call the result".
-        // So `a()` -> `a()()` is correct (getter + original call).
-        let result2 = transform_prop_reads_in_expr("a() + b()", &prop_vars);
-        println!("Input: 'a() + b()'");
-        println!("Result: '{}'", result2);
-        assert_eq!(
-            result2, "a()() + b()()",
-            "Should wrap prop name reads even when followed by ()"
-        );
-
-        // Multiplication
-        let prop_vars2 = vec!["c".to_string()];
-        let result3 = transform_prop_reads_in_expr("c * c", &prop_vars2);
-        println!("Input: 'c * c'");
-        println!("Result: '{}'", result3);
-        assert_eq!(
-            result3, "c() * c()",
-            "Should transform 'c * c' to 'c() * c()'"
-        );
-    }
-
-    #[test]
-    fn test_normalize_js_comma_separated_declarations() {
-        let input = "let tmp = setup(), num = $.state($.proxy(tmp.num));";
-        let result = normalize_js_with_oxc(input, 0);
-        println!("Comma-sep input:  {}", input);
-        println!("Comma-sep output: {}", result);
-        assert!(
-            result.contains("let tmp = setup(), num = $.state($.proxy(tmp.num));"),
-            "Comma-separated declarations should remain comma-separated: {}",
-            result,
-        );
-    }
-
-    #[test]
-    fn test_normalize_js_multi_let_declarations() {
-        let input = "let x1, x2, x3, x4, x5;";
-        let result = normalize_js_with_oxc(input, 0);
-        println!("Multi-let input:  {}", input);
-        println!("Multi-let output: {}", result);
-        assert!(
-            result.contains("let x1, x2, x3, x4, x5;"),
-            "Multi-variable let should remain comma-separated: {}",
-            result,
-        );
-    }
-}
-
-// `test_derived_object_literal_double_wrap` was deleted along with the
-// text-based `$derived(...)` rewrite — the paren wrap around object
-// literals is now produced by
-// `ast_state_transform::try_rewrite_derived_call_declarator` and is
-// exercised by the runtime/snapshot fixtures end-to-end.
-
-#[test]
-fn test_mutation_wrap_state_vars() {
-    // Test the mutation case: $.set(pending, pending.filter(...), true)
-    // The second `pending` should be wrapped with $.get()
-    let input = "$.set(pending, pending.filter((p) => p !== id), true)";
-    let state_vars = vec!["pending".to_string()];
-
-    let result = wrap_state_vars_in_expr(input, &state_vars, &[], &[]);
-
-    // The expected output is:
-    // $.set(pending, $.get(pending).filter((p) => p !== id), true)
-    // First `pending` after $.set( should NOT be wrapped (it's the target)
-    // Second `pending` should be wrapped with $.get()
-    assert!(
-        result.contains("$.get(pending).filter"),
-        "Second pending should be wrapped with $.get(): {}",
-        result
-    );
-    assert!(
-        result.starts_with("$.set(pending,"),
-        "First pending should NOT be wrapped: {}",
-        result
-    );
-}
-
-#[test]
-fn test_mutation_wrap_state_vars_in_context() {
-    // Test with nested function context - state vars inside arrow function body
-    // should still be wrapped even when inside if statement conditions.
-    // This tests the fix for is_shadowed_by_function_param incorrectly detecting
-    // variables inside if() conditions as shadowed parameters.
-    let input = r#"const togglePending = () => {
-    if ($.get(pending).includes(id)) {
-        $.set(pending, pending.filter((p) => p !== id), true);
-    } else {
-        $.set(pending, [...$.get(pending), id], true);
-    }
-};"#;
-    let state_vars = vec!["pending".to_string()];
-
-    let result = wrap_state_vars_in_expr(input, &state_vars, &[], &[]);
-
-    // Both $.set second args should have $.get(pending)
-    assert!(
-        result.contains("$.set(pending, $.get(pending).filter"),
-        "Second pending in filter should be wrapped with $.get(): {}",
-        result
-    );
-}
-
-// ===== Regression tests for bugs found during real-world build (2026-03-14) =====
-
-#[test]
-fn test_wrap_prop_source_reads_block_comment_before_property_key() {
-    // Bug: block comment `/* ... */` between `,` and property key `value` caused
-    // is_property_key check to fail, wrapping `value` as `value()` in object literal.
-    let prop_vars = vec!["value".to_string()];
-    let input = r#"{ key: 1, /* comment */ value: 2 }"#;
-    let result = prop_source_reads_ast::wrap_prop_source_reads_ast(input, &prop_vars, &[])
-        .unwrap_or_else(|| input.to_string());
-    assert!(
-        result.contains("value: 2"),
-        "value after block comment should NOT be wrapped as value(): {}",
-        result
-    );
-    assert!(
-        !result.contains("value(): 2"),
-        "value as property key should not be transformed: {}",
-        result
-    );
-}
-
-#[test]
-fn test_wrap_prop_source_reads_block_comment_multiline() {
-    let prop_vars = vec!["value".to_string()];
-    let input = "{ key: 1,\n\t/* multi\n\t   line\n\t   comment */\n\tvalue: 2 }";
-    let result = prop_source_reads_ast::wrap_prop_source_reads_ast(input, &prop_vars, &[])
-        .unwrap_or_else(|| input.to_string());
-    assert!(
-        result.contains("value: 2"),
-        "value after multiline block comment should NOT be wrapped: {}",
-        result
-    );
-}
-
-#[test]
-fn test_wrap_prop_source_reads_value_in_expression() {
-    // When `value` is used as an expression (not a property key), it SHOULD be wrapped
-    let prop_vars = vec!["value".to_string()];
-    let input = "let x = value + 1;";
-    let result = prop_source_reads_ast::wrap_prop_source_reads_ast(input, &prop_vars, &[])
-        .unwrap_or_else(|| input.to_string());
-    assert!(
-        result.contains("value() + 1"),
-        "value in expression should be wrapped as value(): {}",
-        result
-    );
-}
-
-#[test]
-fn test_wrap_prop_source_reads_skips_nullish_assign() {
-    // Bug: `value ??= 100` was incorrectly transforming `value` because
-    // is_on_left_side_of_assignment didn't detect ??=
-    let prop_vars = vec!["value".to_string()];
-    let input = "value ??= 100;";
-    let result = prop_source_reads_ast::wrap_prop_source_reads_ast(input, &prop_vars, &[])
-        .unwrap_or_else(|| input.to_string());
-    assert!(
-        !result.contains("value() ??= 100"),
-        "value on LHS of ??= should NOT be wrapped: {}",
-        result
-    );
-}
-
-#[test]
-fn test_is_on_left_side_of_assignment_nullish_assign() {
-    let chars: Vec<char> = "value ??= 100".chars().collect();
-    assert!(
-        is_on_left_side_of_assignment(&chars, 0, 5),
-        "value ??= should be detected as assignment"
-    );
-}
-
-#[test]
-fn test_is_on_left_side_of_assignment_logical_and_assign() {
-    let chars: Vec<char> = "value &&= true".chars().collect();
-    assert!(
-        is_on_left_side_of_assignment(&chars, 0, 5),
-        "value &&= should be detected as assignment"
-    );
-}
-
-#[test]
-fn test_is_on_left_side_of_assignment_logical_or_assign() {
-    let chars: Vec<char> = "value ||= false".chars().collect();
-    assert!(
-        is_on_left_side_of_assignment(&chars, 0, 5),
-        "value ||= should be detected as assignment"
-    );
-}
-
-#[test]
-fn test_is_on_left_side_of_assignment_modulo_assign() {
-    let chars: Vec<char> = "value %= 3".chars().collect();
-    assert!(
-        is_on_left_side_of_assignment(&chars, 0, 5),
-        "value %= should be detected as assignment"
-    );
-}
-
-#[test]
-fn test_is_on_left_side_of_assignment_simple_equals() {
-    let chars: Vec<char> = "value = 1".chars().collect();
-    assert!(
-        is_on_left_side_of_assignment(&chars, 0, 5),
-        "value = should be detected as assignment"
-    );
-}
-
-#[test]
-fn test_is_on_left_side_of_assignment_equality_not_assignment() {
-    let chars: Vec<char> = "value == 1".chars().collect();
-    assert!(
-        !is_on_left_side_of_assignment(&chars, 0, 5),
-        "value == should NOT be detected as assignment"
-    );
-}
-
-#[test]
-fn test_is_on_left_side_of_assignment_strict_equality_not_assignment() {
-    let chars: Vec<char> = "value === 1".chars().collect();
-    assert!(
-        !is_on_left_side_of_assignment(&chars, 0, 5),
-        "value === should NOT be detected as assignment"
-    );
-}
-
-#[test]
-fn test_split_nested_pattern_default_with_default() {
-    // Bug: `{ width: measuredWidth, height: measuredHeight } = { width: 0, height: 0 }`
-    // was passed entirely to process_nested_pattern_elements instead of splitting
-    let input = "{ width: measuredWidth, height: measuredHeight } = { width: 0, height: 0 }";
-    let (pattern, default_val) = split_nested_pattern_default(input);
-    assert_eq!(
-        pattern, "{ width: measuredWidth, height: measuredHeight }",
-        "Should extract just the pattern"
-    );
-    assert_eq!(
-        default_val,
-        Some("{ width: 0, height: 0 }"),
-        "Should extract the default value"
-    );
-}
-
-#[test]
-fn test_split_nested_pattern_default_no_default() {
-    let input = "{ width: measuredWidth, height: measuredHeight }";
-    let (pattern, default_val) = split_nested_pattern_default(input);
-    assert_eq!(pattern, input, "Should return the entire input as pattern");
-    assert_eq!(default_val, None, "Should have no default");
-}
-
-#[test]
-fn test_split_nested_pattern_default_array() {
-    let input = "[a, b] = [1, 2]";
-    let (pattern, default_val) = split_nested_pattern_default(input);
-    assert_eq!(pattern, "[a, b]", "Should extract array pattern");
-    assert_eq!(default_val, Some("[1, 2]"), "Should extract array default");
-}
-
-#[test]
-fn test_split_nested_pattern_default_nested_braces() {
-    // Nested braces inside the pattern should not confuse the splitting
-    let input = "{ a: { b: c } } = { a: { b: 1 } }";
-    let (pattern, default_val) = split_nested_pattern_default(input);
-    assert_eq!(pattern, "{ a: { b: c } }", "Should handle nested braces");
-    assert_eq!(default_val, Some("{ a: { b: 1 } }"));
-}
-
-#[test]
-fn test_split_nested_pattern_default_simple_identifier() {
-    // Non-pattern input (no { or [) should return as-is with no default
-    let input = "value";
-    let (pattern, default_val) = split_nested_pattern_default(input);
-    assert_eq!(pattern, "value");
-    assert_eq!(default_val, None);
-}
-
-#[test]
-fn test_transform_read_only_props_block_comment_before_key() {
-    // Similar to wrap_prop_source_reads: block comment before property key should be skipped
-    let read_only_props = vec![("value".to_string(), "value".to_string())];
-    let input = r#"{ key: 1, /* comment */ value: 2 }"#;
-    let result = read_only_props_ast::transform_read_only_props_ast(input, &read_only_props)
-        .unwrap_or_else(|| input.to_string());
-    assert!(
-        result.contains("value: 2"),
-        "value as property key after block comment should NOT be transformed: {}",
-        result
-    );
-    assert!(
-        !result.contains("$$props.value: 2"),
-        "Property key should not become $$props.value: {}",
-        result
-    );
-}
-
-#[test]
-fn test_transform_read_only_props_getter_setter() {
-    // getter/setter names should not be transformed
-    let read_only_props = vec![("value".to_string(), "value".to_string())];
-    let input = "{ get value() { return 1; } }";
-    let result = read_only_props_ast::transform_read_only_props_ast(input, &read_only_props)
-        .unwrap_or_else(|| input.to_string());
-    assert!(
-        result.contains("get value()"),
-        "getter name should not be transformed: {}",
-        result
-    );
-}
-
-#[test]
-fn test_transform_read_only_props_in_expression() {
-    // When used as an expression, should be transformed to $$props.propName
-    let read_only_props = vec![("value".to_string(), "value".to_string())];
-    let input = "let x = value + 1;";
-    let result = read_only_props_ast::transform_read_only_props_ast(input, &read_only_props)
-        .unwrap_or_else(|| input.to_string());
-    assert!(
-        result.contains("$$props.value"),
-        "value in expression should be transformed to $$props.value: {}",
-        result
-    );
-}
-
-#[test]
-fn test_derived_trailing_comma_no_syntax_error() {
-    // $derived(expr,) with trailing comma should produce valid JS
-    // The trailing comma is valid in function call syntax but NOT in () => (expr,)
-    let source = r#"<script>
-  const justifyClass = $derived(
-    {
-      center: 'justify-center',
-      left: 'justify-start',
-      right: 'justify-end',
-    }[position] ?? 'justify-center',
-  );
-</script>
-<p>{justifyClass}</p>"#;
-
-    let options = crate::compiler::CompileOptions {
-        dev: true,
-        generate: crate::compiler::GenerateMode::Client,
-        ..Default::default()
-    };
-    let result = crate::compiler::compile(source, options).expect("compile should succeed");
-    let code = &result.js.code;
-
-    // The output should NOT contain a trailing comma inside grouping parens () => (expr,)
-    // Check that $.derived(() => (...,)) pattern does NOT exist
-    assert!(
-        !code.contains("',\n  ))"),
-        "Should not have trailing comma in grouping expression: {}",
-        code
-    );
-    // Should contain a valid $.derived call
-    assert!(
-        code.contains("$.derived("),
-        "Should contain $.derived call: {}",
-        code
-    );
-}
-
-#[test]
-fn test_compile_with_multibyte_utf8_no_panic() {
-    // Source with Japanese characters that could cause byte index boundary issues
-    // when is_svelte_ignored_with_source slices source with saturating_sub(500)
-    let mut source = String::from("<script>\n");
-    // Add enough content with multi-byte characters to push past 500 bytes
-    for _ in 0..100 {
-        source.push_str("  // コメント: データタイプ\n");
-    }
-    source.push_str("  const x = $state(0);\n");
-    source.push_str("</script>\n<p>{x}</p>");
-
-    let options = crate::compiler::CompileOptions {
-        dev: true,
-        generate: crate::compiler::GenerateMode::Client,
-        ..Default::default()
-    };
-    // Should not panic with "byte index is not a char boundary"
-    let result = crate::compiler::compile(&source, options);
-    assert!(
-        result.is_ok(),
-        "compile should not panic on multi-byte UTF-8 source"
-    );
-}
-
-#[test]
-fn test_bindable_prop_setter_uses_function_call() {
-    // Bug: bind:value on a component with $bindable() props generated
-    // `set value($$value) { value = $$value; }` (plain assignment)
-    // instead of `set value($$value) { value($$value); }` (function call).
-    // This caused "TypeError: value is not a function" at runtime because
-    // $.prop() returns a getter/setter function, and the assignment overwrites it.
-    let source = r#"<script>
-  import Child from './Child.svelte';
-  let { value = $bindable() } = $props();
-</script>
-<Child bind:value />"#;
-
-    let options = crate::compiler::CompileOptions {
-        generate: crate::compiler::GenerateMode::Client,
-        ..Default::default()
-    };
-    let result = crate::compiler::compile(source, options).unwrap();
-    let code = &result.js.code;
-
-    // The setter should use function call syntax: value($$value)
-    assert!(
-        code.contains("value($$value)"),
-        "Setter for bindable prop should use function call value($$value), not assignment: {}",
-        code
-    );
-    // The setter should NOT use plain assignment: value = $$value
-    assert!(
-        !code.contains("value = $$value"),
-        "Setter should not use plain assignment for prop source: {}",
-        code
-    );
-}
-
-#[test]
-fn test_module_arrow_param_not_wrapped_when_shadowing_state() {
-    // Bug: In compileModule, when a function parameter has the same name as a
-    // $state() variable declared in a different function, the parameter references
-    // inside the arrow body were incorrectly wrapped with $.get().
-    // e.g., `(value) => JSON.stringify(value)` became
-    //        `(value) => JSON.stringify($.get(value))` — WRONG
-    // because `value` here is the arrow parameter, not the state variable.
-    let source = r#"
-export const defaultSerializer = () => ({
-  serialize: (value) => JSON.stringify(value),
-  deserialize: (value) => JSON.parse(value),
-});
-
-export function useStore() {
-  let value = $state('');
-  $effect(() => { console.log(value); });
-  return { get value() { return value; }, set value(v) { value = v; } };
-}
-"#;
-
-    let result = crate::compiler::compile_module(
-        source,
-        crate::compiler::ModuleCompileOptions {
-            dev: true,
-            filename: Some("test.svelte.js".to_string()),
-            ..Default::default()
-        },
-    )
-    .unwrap();
-    let code = &result.js.code;
-
-    // The arrow parameter `value` should NOT be wrapped with $.get()
-    assert!(
-        code.contains("(value) => JSON.stringify(value)"),
-        "Arrow param should not be wrapped with $.get(): {}",
-        code
-    );
-    assert!(
-        !code.contains("JSON.stringify($.get(value))"),
-        "Arrow body should not wrap shadowed param with $.get(): {}",
-        code
-    );
-    // But the state variable reads SHOULD be wrapped
-    assert!(
-        code.contains("$.get(value)"),
-        "State variable reads should still use $.get(): {}",
-        code
-    );
-    assert!(
-        code.contains("$.set(value,"),
-        "State variable writes should still use $.set(): {}",
-        code
-    );
-}
-
-#[test]
-fn test_module_nested_fn_call_in_arrow_body_shadow() {
-    // Verify that nested function calls inside arrow bodies don't break
-    // the shadowing detection: (x) => foo(bar(x))
-    let source = r#"
-export function useStore() {
-  let x = $state(0);
-  const transform = (x) => Math.abs(Math.floor(x));
-  return { get x() { return x; }, set x(v) { x = v; } };
-}
-"#;
-
-    let result = crate::compiler::compile_module(
-        source,
-        crate::compiler::ModuleCompileOptions {
-            dev: true,
-            filename: Some("test.svelte.js".to_string()),
-            ..Default::default()
-        },
-    )
-    .unwrap();
-    let code = &result.js.code;
-
-    // The arrow param `x` should NOT be wrapped
-    assert!(
-        code.contains("(x) => Math.abs(Math.floor(x))"),
-        "Nested fn calls in arrow body: param should not be wrapped: {}",
-        code
-    );
-    // But state reads should be wrapped
-    assert!(
-        code.contains("return $.get(x)"),
-        "State reads should be wrapped: {}",
-        code
-    );
-}
-
-#[test]
-fn test_module_state_with_nullish_coalescing_gets_proxy() {
-    // Bug: `$state(pData ?? defaultValue)` was not wrapped with $.proxy()
-    // because contains_top_level_logical only checked if the right side
-    // started with `{`, `[`, or `new`. The official compiler proxies ALL
-    // LogicalExpression initializers.
-    let source = r#"
-export function useStore(pData) {
-  let data = $state(pData ?? { name: '' });
-  return { get data() { return data; }, set data(v) { data = v; } };
-}
-"#;
-
-    let result = crate::compiler::compile_module(
-        source,
-        crate::compiler::ModuleCompileOptions {
-            dev: true,
-            filename: Some("test.svelte.js".to_string()),
-            ..Default::default()
-        },
-    )
-    .unwrap();
-    let code = &result.js.code;
-
-    // The initializer should be wrapped with $.proxy()
-    assert!(
-        code.contains("$.proxy(pData ?? { name: '' })")
-            || code.contains("$.proxy(pData ?? {name: ''})"),
-        "$state(x ?? obj) should be wrapped with $.proxy(): {}",
-        code
-    );
-}
-
-#[test]
-fn test_module_state_with_logical_or_gets_proxy() {
-    // Same as above but with || instead of ??
-    let source = r#"
-export function useStore(pData) {
-  let data = $state(pData || []);
-  return { get data() { return data; }, set data(v) { data = v; } };
-}
-"#;
-
-    let result = crate::compiler::compile_module(
-        source,
-        crate::compiler::ModuleCompileOptions {
-            dev: true,
-            filename: Some("test.svelte.js".to_string()),
-            ..Default::default()
-        },
-    )
-    .unwrap();
-    let code = &result.js.code;
-
-    // The initializer should be wrapped with $.proxy()
-    assert!(
-        code.contains("$.proxy(pData || [])"),
-        "$state(x || arr) should be wrapped with $.proxy(): {}",
-        code
-    );
-}
-
-#[test]
-fn test_module_state_literal_no_proxy() {
-    // Ensure that simple literals are NOT wrapped with $.proxy()
-    let source = r#"
-export function useStore() {
-  let count = $state(0);
-  let name = $state('hello');
-  return {
-    get count() { return count; },
-    set count(v) { count = v; },
-    get name() { return name; },
-    set name(v) { name = v; },
-  };
-}
-"#;
-
-    let result = crate::compiler::compile_module(
-        source,
-        crate::compiler::ModuleCompileOptions {
-            dev: true,
-            filename: Some("test.svelte.js".to_string()),
-            ..Default::default()
-        },
-    )
-    .unwrap();
-    let code = &result.js.code;
-
-    // Literals should NOT be proxied
-    assert!(
-        !code.contains("$.proxy(0)"),
-        "Numeric literal should not be proxied: {}",
-        code
-    );
-    assert!(
-        !code.contains("$.proxy('hello')") && !code.contains("$.proxy(\"hello\")"),
-        "String literal should not be proxied: {}",
-        code
-    );
-}
-
-#[test]
-fn test_module_derived_var_gets_get_in_arrow_return() {
-    // Bug: $derived variables declared with `const` inside a function were
-    // incorrectly treated as "shadowed by local var decl", which prevented
-    // $.get() wrapping when the variable was referenced in arrow functions.
-    let source = r#"
-export function useStore() {
-  let x = $state(0);
-  const y = $derived(x * 2);
-  return {
-    getValue: () => y,
-  };
-}
-"#;
-
-    let result = crate::compiler::compile_module(
-        source,
-        crate::compiler::ModuleCompileOptions {
-            dev: true,
-            filename: Some("test.svelte.js".to_string()),
-            ..Default::default()
-        },
-    )
-    .unwrap();
-    let code = &result.js.code;
-
-    assert!(
-        code.contains("() => $.get(y)"),
-        "$derived variable in arrow return should be wrapped with $.get(): {}",
-        code
-    );
-}
-
-#[test]
-fn test_module_derived_with_ts_annotation_gets_get() {
-    // Bug: TypeScript type annotations on $derived declarations (e.g.,
-    // `const contentStyle: string = $derived.by(...)`) prevented the
-    // variable from being detected as reactive, so $.get() was missing.
-    let source = r#"
-export const useStore = () => {
-  let position = $state({ x: 0, y: 0 });
-
-  const contentStyle = $derived.by(() => {
-    return `transform: translate(${position.x}px, ${position.y}px);`;
-  });
-
-  return {
-    contentStyle: () => contentStyle,
-  };
-};
-"#;
-
-    let result = crate::compiler::compile_module(
-        source,
-        crate::compiler::ModuleCompileOptions {
-            dev: true,
-            filename: Some("test.svelte.js".to_string()),
-            ..Default::default()
-        },
-    )
-    .unwrap();
-    let code = &result.js.code;
-
-    assert!(
-        code.contains("() => $.get(contentStyle)"),
-        "TypeScript-annotated $derived var should be wrapped with $.get(): {}",
-        code
-    );
-}
-
-#[test]
-fn test_module_state_with_ts_generic_gets_tracked() {
-    // Ensure $state<GenericType>() patterns are properly detected as reactive vars.
-    let source = r#"
-export function useStore() {
-  let cleanup = $state();
-  $effect(() => { cleanup?.(); });
-  return {
-    setCleanup: (fn) => { cleanup = fn; },
-  };
-}
-"#;
-
-    let result = crate::compiler::compile_module(
-        source,
-        crate::compiler::ModuleCompileOptions {
-            dev: true,
-            filename: Some("test.svelte.js".to_string()),
-            ..Default::default()
-        },
-    )
-    .unwrap();
-    let code = &result.js.code;
-
-    // The cleanup variable should be wrapped with $.get() inside $effect
-    assert!(
-        code.contains("$.get(cleanup)"),
-        "$state<GenericType>() variable should be wrapped with $.get(): {}",
-        code
-    );
-}
-
-#[test]
-fn test_module_const_state_after_obj_gets_proxy_only() {
-    // Bug: `const` $state variables after a `const $state({ obj })` declaration
-    // were incorrectly getting $.state() wrapping. The extract_var_name_before_rune
-    // function was finding a `:` inside the object literal of the previous declaration
-    // and treating it as a TypeScript type annotation.
-    let source = r#"
-export const fn = () => {
-  return (node) => {
-    const d = $state({ x: 1 });
-    const clearTooltipListeners = $state([]);
-    return clearTooltipListeners;
-  };
-};
-"#;
-
-    let result = crate::compiler::compile_module(
-        source,
-        crate::compiler::ModuleCompileOptions {
-            dev: true,
-            filename: Some("test.svelte.js".to_string()),
-            ..Default::default()
-        },
-    )
-    .unwrap();
-    let code = &result.js.code;
-
-    // const $state variables should only get $.proxy(), NOT $.state()
-    // In dev mode, $.proxy([]) is wrapped with $.tag_proxy() for debugging
-    assert!(
-        code.contains("$.proxy([])"),
-        "const $state([]) should contain $.proxy([]) not $.state(): {}",
-        code
-    );
-    // In dev mode, $.proxy({...}) is wrapped with $.tag_proxy() for debugging
-    assert!(
-        code.contains("$.proxy({ x: 1 })") || code.contains("$.proxy({x: 1})"),
-        "const $state(obj) should contain $.proxy(obj): {}",
-        code
-    );
-    // Should NOT have $.get() wrapping
-    assert!(
-        !code.contains("$.get(clearTooltipListeners)"),
-        "const $state var should not need $.get(): {}",
-        code
-    );
-}
-
-#[test]
-fn test_wrap_state_derived_with_tag_comma_separated() {
-    let input = "let tmp = setup(), num = $.state($.proxy(tmp.num));";
-    let result = wrap_state_derived_with_tag(input);
-    assert!(
-        result.contains("$.tag($.state($.proxy(tmp.num)), 'num')"),
-        "Expected $.tag wrapping for comma-separated declarator: {}",
-        result
-    );
-}
+mod tests;

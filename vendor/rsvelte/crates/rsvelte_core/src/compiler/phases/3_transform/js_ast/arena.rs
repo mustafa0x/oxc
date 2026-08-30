@@ -1,7 +1,7 @@
 //! Arena allocator for JavaScript AST nodes.
 //!
-//! We store all expressions and statements behind stable boxes and reference
-//! them by index (`ExprId` / `StmtId`).  This gives:
+//! We store expressions and statements in stable chunks and reference them by
+//! index (`ExprId` / `StmtId`). This gives:
 //!
 //! - **Zero-cost reads** (`arena.get_expr(id)` is a single array index)
 //! - **Stable shared references** (pushing more handles cannot move nodes)
@@ -17,15 +17,17 @@
 //!
 //! The arena is single-threaded (not `Sync`) and append-only for safe APIs.
 //! `UnsafeCell` is safe here because:
-//! - Safe allocation stores nodes behind `Box`, so `Vec` reallocation cannot
-//!   move values referenced by previously returned shared references
+//! - Growing the chunk-pointer `Vec` cannot move nodes in existing chunks
 //! - Builders return handles or owned values, not mutable references into
 //!   arena storage
 //! - Mutable/destructive access is `unsafe` and requires callers to prove no
 //!   aliases exist
 
 use super::nodes::{JsExpr, JsStatement};
+use compact_str::CompactString;
+use rustc_hash::FxHashMap;
 use std::cell::UnsafeCell;
+use std::mem::MaybeUninit;
 
 /// Handle to an expression stored in the arena.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -35,16 +37,79 @@ pub struct ExprId(pub u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct StmtId(pub u32);
 
+const NODE_CHUNK_BITS: usize = 5;
+const NODE_CHUNK_SIZE: usize = 1 << NODE_CHUNK_BITS;
+const NODE_CHUNK_MASK: usize = NODE_CHUNK_SIZE - 1;
+
+struct NodeStore<T> {
+    chunks: Vec<Box<[MaybeUninit<T>]>>,
+    len: usize,
+}
+
+impl<T> NodeStore<T> {
+    fn new() -> Self {
+        Self { chunks: Vec::new(), len: 0 }
+    }
+
+    #[inline(always)]
+    fn push(&mut self, value: T) -> usize {
+        if self.len & NODE_CHUNK_MASK == 0 {
+            self.chunks.push(Box::<[T]>::new_uninit_slice(NODE_CHUNK_SIZE));
+        }
+        let index = self.len;
+        self.len += 1;
+        // SAFETY: the chunk was allocated above and this slot is written once.
+        unsafe { self.ptr(index).write(value) };
+        index
+    }
+
+    #[inline(always)]
+    unsafe fn ptr(&self, index: usize) -> *mut T {
+        // SAFETY: callers only pass initialized indices below `len`.
+        unsafe {
+            self.chunks
+                .get_unchecked(index >> NODE_CHUNK_BITS)
+                .as_ptr()
+                .add(index & NODE_CHUNK_MASK)
+                .cast_mut()
+                .cast::<T>()
+        }
+    }
+}
+
+impl<T> Drop for NodeStore<T> {
+    fn drop(&mut self) {
+        for index in 0..self.len {
+            // SAFETY: slots below `len` were initialized exactly once.
+            unsafe { self.ptr(index).drop_in_place() };
+        }
+    }
+}
+
 /// Arena that owns all `JsExpr` and `JsStatement` nodes for a single
 /// compilation unit.
 ///
 /// Allocation takes `&self` (not `&mut self`) so that builder functions
 /// can nest calls without borrow-checker conflicts.
 pub struct JsArena {
-    #[allow(clippy::vec_box)] // Box keeps expression addresses stable across handle Vec growth.
-    exprs: UnsafeCell<Vec<Box<JsExpr>>>,
-    #[allow(clippy::vec_box)] // Box keeps statement addresses stable across handle Vec growth.
-    stmts: UnsafeCell<Vec<Box<JsStatement>>>,
+    exprs: UnsafeCell<NodeStore<JsExpr>>,
+    stmts: UnsafeCell<NodeStore<JsStatement>>,
+    /// Source spans for generated identifiers whose names are unique within
+    /// this compilation unit. Keeping this out of [`JsExpr`] lets lowering
+    /// continue to match ordinary `Identifier` nodes while both printers can
+    /// recover the location carried by upstream's shared identifier object.
+    identifier_spans: UnsafeCell<FxHashMap<CompactString, (u32, u32)>>,
+    /// Source spans inherited by otherwise-unlocated identifiers while one
+    /// generated expression is printed. Keying the scope by `ExprId` keeps
+    /// user identifiers with the same spelling elsewhere independent.
+    expression_identifier_spans: UnsafeCell<FxHashMap<ExprId, (CompactString, (u32, u32))>>,
+    /// Source spans for expressions that must remain bare IR variants.
+    ///
+    /// In particular, member-expression consumers inspect the object by
+    /// variant, so wrapping its root identifier in `JsExpr::Spanned` changes
+    /// transform semantics. Keep those uncommon spans out of band instead of
+    /// growing every expression node.
+    bare_expr_spans: UnsafeCell<Option<FxHashMap<ExprId, (u32, u32)>>>,
 }
 
 // JsArena is explicitly NOT Sync - it's single-threaded only.
@@ -55,11 +120,57 @@ pub struct JsArena {
 unsafe impl Send for JsArena {}
 
 impl JsArena {
-    /// Create a new arena with pre-allocated capacity for typical component size.
+    /// Create an empty arena. The first node allocates one fixed-size chunk.
     pub fn new() -> Self {
         Self {
-            exprs: UnsafeCell::new(Vec::with_capacity(256)),
-            stmts: UnsafeCell::new(Vec::with_capacity(64)),
+            exprs: UnsafeCell::new(NodeStore::new()),
+            stmts: UnsafeCell::new(NodeStore::new()),
+            identifier_spans: UnsafeCell::new(FxHashMap::default()),
+            expression_identifier_spans: UnsafeCell::new(FxHashMap::default()),
+            bare_expr_spans: UnsafeCell::new(None),
+        }
+    }
+
+    /// Associate every use of a generated, compilation-unit-unique identifier
+    /// with the source location from which it was derived.
+    pub fn note_identifier_span(&self, name: &str, start: u32, end: u32) {
+        // SAFETY: like node allocation, span registration is single-threaded.
+        unsafe {
+            (*self.identifier_spans.get()).insert(CompactString::new(name), (start, end));
+        }
+    }
+
+    /// Return the source span attached to a generated identifier name.
+    #[inline]
+    pub fn identifier_span(&self, name: &str) -> Option<(u32, u32)> {
+        // SAFETY: callers only read during/after single-threaded construction.
+        unsafe { (*self.identifier_spans.get()).get(name).copied() }
+    }
+
+    /// Associate unlocated uses of `name` below one generated expression with
+    /// the source identifier that upstream cloned into that expression.
+    pub fn note_expression_identifier_span(
+        &self,
+        expression: ExprId,
+        name: &str,
+        start: u32,
+        end: u32,
+    ) {
+        // SAFETY: like node allocation, span registration is single-threaded.
+        unsafe {
+            (*self.expression_identifier_spans.get())
+                .insert(expression, (CompactString::new(name), (start, end)));
+        }
+    }
+
+    /// Return the identifier span scope attached to an expression handle.
+    #[inline]
+    pub fn expression_identifier_span(&self, expression: ExprId) -> Option<(&str, (u32, u32))> {
+        // SAFETY: callers only read during/after single-threaded construction.
+        unsafe {
+            (*self.expression_identifier_spans.get())
+                .get(&expression)
+                .map(|(name, span)| (name.as_str(), *span))
         }
     }
 
@@ -70,13 +181,10 @@ impl JsArena {
     /// Takes `&self` (not `&mut self`) to allow nested builder calls.
     #[inline(always)]
     pub fn alloc_expr(&self, expr: JsExpr) -> ExprId {
-        // SAFETY: single-threaded append. Values are stored behind `Box`, so
-        // growing the handle Vec cannot move expressions referenced earlier.
+        // SAFETY: single-threaded append into stable chunks.
         unsafe {
-            let vec = &mut *self.exprs.get();
-            let id = ExprId(vec.len() as u32);
-            vec.push(Box::new(expr));
-            id
+            let store = &mut *self.exprs.get();
+            ExprId(store.push(expr) as u32)
         }
     }
 
@@ -85,24 +193,28 @@ impl JsArena {
     pub fn get_expr(&self, id: ExprId) -> &JsExpr {
         // SAFETY: single-threaded read from stable boxed storage.
         unsafe {
-            let vec = &*self.exprs.get();
-            vec[id.0 as usize].as_ref()
+            let store = &*self.exprs.get();
+            &*store.ptr(id.0 as usize)
         }
     }
 
-    /// Get a mutable reference to an expression by handle.
-    ///
-    /// # Safety
-    /// The caller must ensure no shared or mutable references to the same
-    /// expression are live for the duration of the returned borrow.
-    #[inline(always)]
-    #[allow(clippy::mut_from_ref)]
-    pub unsafe fn get_expr_mut(&self, id: ExprId) -> &mut JsExpr {
-        // SAFETY: Enforced by the caller's contract above.
+    /// Attach a source span without changing the expression's IR variant.
+    #[inline]
+    pub fn set_bare_expr_span(&self, id: ExprId, start: u32, end: u32) {
+        // SAFETY: like node allocation, span metadata is mutated only by the
+        // single thread that owns this arena.
         unsafe {
-            let vec = &mut *self.exprs.get();
-            vec[id.0 as usize].as_mut()
+            let spans = &mut *self.bare_expr_spans.get();
+            spans.get_or_insert_with(FxHashMap::default).insert(id, (start, end));
         }
+    }
+
+    /// Return an out-of-band source span, when this expression carries one.
+    #[inline]
+    pub fn bare_expr_span(&self, id: ExprId) -> Option<(u32, u32)> {
+        // SAFETY: the arena is single-threaded and callers do not retain a
+        // reference into the map across a mutation.
+        unsafe { (&*self.bare_expr_spans.get()).as_ref().and_then(|spans| spans.get(&id).copied()) }
     }
 
     /// Take an expression out of the arena, replacing it with a placeholder.
@@ -118,9 +230,9 @@ impl JsArena {
     pub unsafe fn take_expr(&self, id: ExprId) -> JsExpr {
         // SAFETY: Enforced by the caller's contract above.
         unsafe {
-            let vec = &mut *self.exprs.get();
+            let store = &mut *self.exprs.get();
             std::mem::replace(
-                vec[id.0 as usize].as_mut(),
+                &mut *store.ptr(id.0 as usize),
                 JsExpr::Literal(super::nodes::JsLiteral::Null),
             )
         }
@@ -135,10 +247,8 @@ impl JsArena {
     pub fn alloc_stmt(&self, stmt: JsStatement) -> StmtId {
         // SAFETY: same as alloc_expr
         unsafe {
-            let vec = &mut *self.stmts.get();
-            let id = StmtId(vec.len() as u32);
-            vec.push(Box::new(stmt));
-            id
+            let store = &mut *self.stmts.get();
+            StmtId(store.push(stmt) as u32)
         }
     }
 
@@ -147,56 +257,8 @@ impl JsArena {
     pub fn get_stmt(&self, id: StmtId) -> &JsStatement {
         // SAFETY: same as get_expr
         unsafe {
-            let vec = &*self.stmts.get();
-            vec[id.0 as usize].as_ref()
-        }
-    }
-
-    /// Get a mutable reference to a statement by handle.
-    ///
-    /// # Safety
-    /// The caller must ensure no shared or mutable references to the same
-    /// statement are live for the duration of the returned borrow.
-    #[inline(always)]
-    #[allow(clippy::mut_from_ref)]
-    pub unsafe fn get_stmt_mut(&self, id: StmtId) -> &mut JsStatement {
-        // SAFETY: Enforced by the caller's contract above.
-        unsafe {
-            let vec = &mut *self.stmts.get();
-            vec[id.0 as usize].as_mut()
-        }
-    }
-
-    /// Take a statement out of the arena, replacing it with Empty.
-    ///
-    /// Takes `&self` for the same reasons as `take_expr`.
-    ///
-    /// # Safety
-    /// The caller must ensure no shared or mutable references to the same
-    /// statement are live while the slot is replaced.
-    #[inline(always)]
-    pub unsafe fn take_stmt(&self, id: StmtId) -> JsStatement {
-        // SAFETY: Enforced by the caller's contract above.
-        unsafe {
-            let vec = &mut *self.stmts.get();
-            std::mem::replace(vec[id.0 as usize].as_mut(), JsStatement::Empty)
-        }
-    }
-}
-
-impl JsArena {
-    /// Clear all stored expressions and statements, keeping the allocated buffer
-    /// for reuse. This is O(n) for dropping stored elements but the next compilation
-    /// benefits from zero allocation (the Vec buffer is already sized).
-    ///
-    /// # Safety
-    /// The caller must ensure no shared or mutable references into this arena
-    /// are live while the arena is cleared.
-    pub unsafe fn reset(&self) {
-        // SAFETY: Enforced by the caller's contract above.
-        unsafe {
-            (*self.exprs.get()).clear();
-            (*self.stmts.get()).clear();
+            let store = &*self.stmts.get();
+            &*store.ptr(id.0 as usize)
         }
     }
 }
@@ -211,10 +273,17 @@ impl std::fmt::Debug for JsArena {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // SAFETY: only reading len, no mutation
         let (exprs_count, stmts_count) =
-            unsafe { ((*self.exprs.get()).len(), (*self.stmts.get()).len()) };
+            unsafe { ((*self.exprs.get()).len, (*self.stmts.get()).len) };
+        // SAFETY: only reading the map length, no mutation.
+        let identifier_spans_count = unsafe { (*self.identifier_spans.get()).len() };
+        // SAFETY: only reading the map length, no mutation.
+        let expression_identifier_spans_count =
+            unsafe { (*self.expression_identifier_spans.get()).len() };
         f.debug_struct("JsArena")
             .field("exprs_count", &exprs_count)
             .field("stmts_count", &stmts_count)
+            .field("identifier_spans_count", &identifier_spans_count)
+            .field("expression_identifier_spans_count", &expression_identifier_spans_count)
             .finish()
     }
 }
@@ -228,9 +297,7 @@ mod tests {
     fn test_alloc_and_get_expr() {
         let arena = JsArena::new();
         let id1 = arena.alloc_expr(JsExpr::Identifier(CompactString::new("foo")));
-        let id2 = arena.alloc_expr(JsExpr::Literal(super::super::nodes::JsLiteral::Number(
-            42.0,
-        )));
+        let id2 = arena.alloc_expr(JsExpr::Literal(super::super::nodes::JsLiteral::Number(42.0)));
 
         assert_eq!(id1.0, 0);
         assert_eq!(id2.0, 1);
@@ -276,40 +343,11 @@ mod tests {
     }
 
     #[test]
-    fn test_take_stmt() {
-        let arena = JsArena::new();
-        let id = arena.alloc_stmt(JsStatement::Debugger);
-
-        // SAFETY: `id` was just allocated and no reference into its slot is
-        // live here, satisfying `take_stmt`'s no-aliasing contract.
-        let taken = unsafe { arena.take_stmt(id) };
-        assert!(matches!(taken, JsStatement::Debugger));
-        // After take, slot should contain Empty
-        assert!(matches!(arena.get_stmt(id), JsStatement::Empty));
-    }
-
-    #[test]
-    fn test_get_expr_mut() {
-        let arena = JsArena::new();
-        let id = arena.alloc_expr(JsExpr::Identifier(CompactString::new("x")));
-
-        // SAFETY: `id` was just allocated and no other reference into its slot
-        // is live here, satisfying `get_expr_mut`'s no-aliasing contract.
-        *unsafe { arena.get_expr_mut(id) } = JsExpr::Identifier(CompactString::new("y"));
-
-        match arena.get_expr(id) {
-            JsExpr::Identifier(name) => assert_eq!(name.as_str(), "y"),
-            _ => panic!("expected identifier"),
-        }
-    }
-
-    #[test]
     fn test_many_allocs() {
         let arena = JsArena::new();
         for i in 0..1000u32 {
-            let id = arena.alloc_expr(JsExpr::Literal(super::super::nodes::JsLiteral::Number(
-                i as f64,
-            )));
+            let id =
+                arena.alloc_expr(JsExpr::Literal(super::super::nodes::JsLiteral::Number(i as f64)));
             assert_eq!(id.0, i);
         }
         // Verify random access
@@ -328,9 +366,7 @@ mod tests {
         let expr = arena.get_expr(id);
 
         for i in 0..10_000u32 {
-            arena.alloc_expr(JsExpr::Literal(super::super::nodes::JsLiteral::Number(
-                i as f64,
-            )));
+            arena.alloc_expr(JsExpr::Literal(super::super::nodes::JsLiteral::Number(i as f64)));
         }
 
         assert!(matches!(expr, JsExpr::Identifier(name) if name.as_str() == "first"));
@@ -341,8 +377,26 @@ mod tests {
         let arena = JsArena::default();
         assert_eq!(
             format!("{:?}", arena),
-            "JsArena { exprs_count: 0, stmts_count: 0 }"
+            "JsArena { exprs_count: 0, stmts_count: 0, identifier_spans_count: 0, expression_identifier_spans_count: 0 }"
         );
+    }
+
+    #[test]
+    fn test_generated_identifier_span() {
+        let arena = JsArena::new();
+        arena.note_identifier_span("div", 7, 10);
+
+        assert_eq!(arena.identifier_span("div"), Some((7, 10)));
+        assert_eq!(arena.identifier_span("main"), None);
+    }
+
+    #[test]
+    fn test_expression_identifier_span() {
+        let arena = JsArena::new();
+        let expression = arena.alloc_expr(JsExpr::Identifier("foo".into()));
+        arena.note_expression_identifier_span(expression, "foo", 7, 10);
+
+        assert_eq!(arena.expression_identifier_span(expression), Some(("foo", (7, 10))));
     }
 
     #[test]

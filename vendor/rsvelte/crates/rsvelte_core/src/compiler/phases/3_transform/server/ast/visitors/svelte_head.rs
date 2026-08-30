@@ -28,7 +28,7 @@ use crate::compiler::phases::phase3_transform::server::ast::ServerTransformState
 use super::shared::{TemplateEntry, build_fragment_body};
 
 /// Visit a `<svelte:head>…</svelte:head>` element.
-pub fn visit_svelte_head<'a>(node: &SvelteElement, state: &mut ServerTransformState<'a>) {
+pub fn visit_svelte_head<'a>(node: &SvelteElement<'a>, state: &mut ServerTransformState<'a>) {
     let b = state.b;
     let hash = state.analysis.filename_hash.clone();
 
@@ -36,7 +36,9 @@ pub fn visit_svelte_head<'a>(node: &SvelteElement, state: &mut ServerTransformSt
     // visited `b.block([...])` directly as the arrow body, so we splice the
     // fragment statements straight in — no extra `{ }` nesting).
     // SvelteHead body is NOT an `is_text_first` parent.
-    let body_stmts = build_fragment_body(&node.fragment, false, false, state);
+    let saved_scope = state.enter_template_scope(node.start);
+    let body_stmts = build_fragment_body(&node.fragment.nodes, false, false, state);
+    state.restore_scope(saved_scope);
 
     // `($$renderer) => { <body> }`
     let params = b.params(vec![b.id_pat("$$renderer")], None);

@@ -27,6 +27,7 @@ use oxc_ast_visit::Visit;
 use oxc_ast_visit::walk;
 use oxc_parser::ParseOptions;
 use oxc_span::SourceType;
+use rustc_hash::FxHashSet;
 
 use super::ast_rewrite::{self, Edit};
 
@@ -44,29 +45,37 @@ pub fn apply_effect_rune_transforms_ast(source: &str, is_ts: bool) -> Option<Str
     ast_rewrite::rewrite_once(
         &MODULE_EFFECT_ALLOC,
         source,
-        if is_ts {
-            SourceType::ts().with_module(true)
-        } else {
-            SourceType::mjs()
-        },
+        if is_ts { SourceType::ts().with_module(true) } else { SourceType::mjs() },
         ParseOptions::default(),
         false,
-        |program| {
-            let mut collector = EffectRuneCollector {
-                replacements: Vec::new(),
-            };
-            collector.visit_program(program);
-            collector.replacements
-        },
+        |program| collect_effect_rune_edits(program, &FxHashSet::default()),
     )
 }
 
-struct EffectRuneCollector {
+/// Collect `$effect.*` call-expression rewrites from a single parse.
+/// The batched module dev-tail driver folds this to a fixed point
+/// alongside the other dev-mode collectors.
+///
+/// `shadowed` holds the offsets of the rune-spelled identifiers that resolve to
+/// a declaration (`function f($effect) { $effect(1) }`), which upstream's
+/// `get_rune` reports as plain calls; it is empty unless the module declares
+/// such a name at all.
+pub(super) fn collect_effect_rune_edits(
+    program: &Program<'_>,
+    shadowed: &FxHashSet<usize>,
+) -> Vec<Edit> {
+    let mut collector = EffectRuneCollector { shadowed, replacements: Vec::new() };
+    collector.visit_program(program);
+    collector.replacements
+}
+
+struct EffectRuneCollector<'a> {
+    shadowed: &'a FxHashSet<usize>,
     /// Each entry is `(span_start, span_end, replacement_string)`.
     replacements: Vec<Edit>,
 }
 
-impl<'a> Visit<'a> for EffectRuneCollector {
+impl<'a> Visit<'a> for EffectRuneCollector<'_> {
     fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
         // Walk arguments first so nested `$effect(...)` (e.g.,
         // `$effect(() => $effect.tracking())`) get rewritten too.
@@ -75,15 +84,17 @@ impl<'a> Visit<'a> for EffectRuneCollector {
         match &call.callee {
             // `$effect(...)`
             Expression::Identifier(id) if id.name == "$effect" => {
-                self.replacements
-                    .push((id.span.start, id.span.end, "$.user_effect".to_string()));
+                if self.shadowed.contains(&(id.span.start as usize)) {
+                    return;
+                }
+                self.replacements.push((id.span.start, id.span.end, "$.user_effect".to_string()));
             }
             // `$effect.X(...)` family
             Expression::StaticMemberExpression(member) => {
                 let Expression::Identifier(obj) = &member.object else {
                     return;
                 };
-                if obj.name != "$effect" {
+                if obj.name != "$effect" || self.shadowed.contains(&(obj.span.start as usize)) {
                     return;
                 }
                 let property = member.property.name.as_str();
@@ -104,14 +115,14 @@ impl<'a> Visit<'a> for EffectRuneCollector {
                         "$.effect_tracking".to_string(),
                     )),
                     "pending" => {
-                        // Whole-call swap: `$effect.pending()` →
-                        // `$.eager(() => $.pending())`, matching upstream exactly
-                        // (`$.eager` receives a thunk that calls `$.pending()`).
-                        // The original takes no args; any are discarded.
+                        // Whole-call swap. Upstream builds
+                        // `b.thunk(b.call('$.pending'))`, and `thunk` unthunks a
+                        // zero-argument call of an identifier, so the argument is
+                        // the bare reference. Any args here are discarded.
                         self.replacements.push((
                             call.span.start,
                             call.span.end,
-                            "$.eager(() => $.pending())".to_string(),
+                            "$.eager($.pending)".to_string(),
                         ));
                     }
                     _ => {}
@@ -153,7 +164,7 @@ mod tests {
     #[test]
     fn rewrites_effect_pending() {
         let out = apply_effect_rune_transforms_ast("let p = $effect.pending();", false).unwrap();
-        assert_eq!(out, "let p = $.eager(() => $.pending());");
+        assert_eq!(out, "let p = $.eager($.pending);");
     }
 
     #[test]

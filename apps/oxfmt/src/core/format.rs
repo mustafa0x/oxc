@@ -1,5 +1,3 @@
-#[cfg(feature = "napi")]
-use std::borrow::Cow;
 use std::{path::Path, sync::Arc};
 
 use tracing::instrument;
@@ -8,7 +6,7 @@ use oxc_allocator::AllocatorPool;
 use oxc_diagnostics::OxcDiagnostic;
 use oxc_formatter::JsFormatOptions;
 use oxc_formatter_core::{CoreFormatOptions, FormatSession, InputKind, SessionServices};
-use oxc_formatter_css::CssFormatOptions;
+use oxc_formatter_css::{CssFormatOptions, CssVariant};
 use oxc_formatter_graphql::GraphqlFormatOptions;
 use oxc_formatter_json::{JsonFormatOptions, JsonVariant};
 use oxc_formatter_yaml::YamlFormatOptions;
@@ -17,8 +15,8 @@ use oxc_toml::Options as TomlFormatterOptions;
 
 #[cfg(feature = "napi")]
 use super::options::{
-    inject_filepath, inject_oxfmt_plugin_payload, inject_parser, inject_tailwind_plugin_payload,
-    to_prettier,
+    inject_filepath, inject_oxfmt_plugin_payload, inject_parser, inject_svelte_plugin_payload,
+    inject_tailwind_plugin_payload, to_prettier,
 };
 use super::{
     embed::dispatcher::ResolvedDispatchConfig,
@@ -101,6 +99,14 @@ pub enum FormatStrategy {
     },
     /// For TOML files.
     OxfmtToml { path: Arc<Path>, toml_options: TomlFormatterOptions, insert_final_newline: bool },
+    /// For Svelte files formatted by the native rsvelte backend.
+    #[cfg(feature = "svelte-rsvelte-backend")]
+    RsvelteFormatter {
+        path: Arc<Path>,
+        format_options: Box<JsFormatOptions>,
+        svelte_options: Box<oxc_svelte_backend::SvelteFormatOptions>,
+        insert_final_newline: bool,
+    },
     /// For non-JS files formatted by delegating to Prettier (Tier 3/4).
     ///
     /// `supports_xxx` are capability flags carried over from [`FileKind::Prettier`].
@@ -112,10 +118,11 @@ pub enum FormatStrategy {
     #[cfg(feature = "napi")]
     Prettier {
         path: Arc<Path>,
-        parser_name: Cow<'static, str>,
+        parser_name: &'static str,
         config: Box<FormatConfig>,
         supports_tailwind: bool,
         supports_oxfmt: bool,
+        supports_svelte: bool,
         insert_final_newline: bool,
     },
 }
@@ -217,6 +224,28 @@ impl FormatStrategy {
                 toml_options: to_oxc_toml(&config, core),
                 insert_final_newline,
             },
+            #[cfg(feature = "svelte-rsvelte-backend")]
+            FileKind::RsvelteFormatter { path } => {
+                let svelte = config.svelte_config().unwrap_or_default();
+                let svelte_options = oxc_svelte_backend::SvelteFormatOptions {
+                    indent_script_and_style: svelte.indent_script_and_style.unwrap_or(true),
+                    sort_order: svelte.sort_order,
+                    allow_shorthand: svelte.allow_shorthand.unwrap_or(true),
+                    single_attribute_per_line: config.single_attribute_per_line.unwrap_or(false),
+                    bracket_same_line: config.bracket_same_line.unwrap_or(false),
+                    style_options: Some(to_oxc_formatter_css(&config, core, CssVariant::Css)),
+                };
+                Self::RsvelteFormatter {
+                    path,
+                    format_options: Box::new(to_oxc_formatter(
+                        &config,
+                        core,
+                        validated.sort_imports.clone(),
+                    )),
+                    svelte_options: Box::new(svelte_options),
+                    insert_final_newline,
+                }
+            }
             #[cfg(feature = "napi")]
             FileKind::Prettier {
                 path,
@@ -230,6 +259,7 @@ impl FormatStrategy {
                 config: Box::new(config),
                 supports_tailwind,
                 supports_oxfmt,
+                supports_svelte,
                 insert_final_newline,
             },
         }
@@ -247,59 +277,6 @@ pub struct SourceFormatter {
     allocator_pool: AllocatorPool,
     #[cfg(feature = "napi")]
     external_services: Option<super::ExternalServices>,
-}
-
-fn trim_single_trailing_linebreak_len(text: &str) -> Option<usize> {
-    text.strip_suffix("\r\n")
-        .map(str::len)
-        .or_else(|| text.strip_suffix('\n').map(str::len))
-        .or_else(|| text.strip_suffix('\r').map(str::len))
-}
-
-#[cfg(test)]
-fn should_preserve_external_missing_final_newline(
-    entry: &FormatStrategy,
-    source_text: &str,
-    formatted_text: &str,
-) -> bool {
-    should_preserve_missing_final_newline_for_external(
-        is_external_format_strategy(entry),
-        source_text,
-        formatted_text,
-    )
-}
-
-fn is_external_format_strategy(entry: &FormatStrategy) -> bool {
-    #[cfg(feature = "napi")]
-    {
-        matches!(entry, FormatStrategy::ExternalFormatter { .. })
-    }
-
-    #[cfg(not(feature = "napi"))]
-    {
-        let _ = entry;
-        false
-    }
-}
-
-fn should_preserve_missing_final_newline_for_external(
-    is_external_formatter: bool,
-    source_text: &str,
-    formatted_text: &str,
-) -> bool {
-    if !is_external_formatter || source_text.ends_with('\n') || source_text.ends_with('\r') {
-        return false;
-    }
-
-    if source_text == formatted_text {
-        return true;
-    }
-
-    let Some(trimmed_len) = trim_single_trailing_linebreak_len(formatted_text) else {
-        return false;
-    };
-
-    source_text == &formatted_text[..trimmed_len]
 }
 
 impl SourceFormatter {
@@ -338,8 +315,6 @@ impl SourceFormatter {
                 code: String::new(),
             };
         }
-
-        let is_external_formatter = is_external_format_strategy(&resolved);
 
         let (result, insert_final_newline) = match resolved {
             FormatStrategy::OxcFormatter {
@@ -441,15 +416,17 @@ impl SourceFormatter {
                 config,
                 supports_tailwind,
                 supports_oxfmt,
+                supports_svelte,
                 insert_final_newline,
             } => (
                 self.format_by_prettier(
                     source_text,
                     &path,
-                    &parser_name,
+                    parser_name,
                     &config,
                     supports_tailwind,
                     supports_oxfmt,
+                    supports_svelte,
                 ),
                 insert_final_newline,
             ),
@@ -457,16 +434,13 @@ impl SourceFormatter {
 
         match result {
             Ok(mut code) => {
-                if insert_final_newline
-                    && should_preserve_missing_final_newline_for_external(
-                        is_external_formatter,
-                        source_text,
-                        &code,
-                    )
-                {
-                    preserve_external_missing_final_newline(&mut code);
-                } else {
-                    apply_final_newline(&mut code, insert_final_newline);
+                // NOTE: `insert_final_newline` relies on the fact that:
+                // - each formatter already ensures there is traliling newline
+                // - each formatter does not have an option to disable trailing newline
+                // So we can trim it here without allocating new string.
+                if !insert_final_newline {
+                    let trimmed_len = code.trim_end().len();
+                    code.truncate(trimmed_len);
                 }
 
                 FormatResult::Success { is_changed: source_text != code, code }
@@ -687,7 +661,7 @@ impl SourceFormatter {
         )
         .map_err(|err| {
             OxcDiagnostic::error(format!(
-                "Failed to format Svelte file with rsvelte: {}\n{err}",
+                "Failed to format Svelte source: {}\n{err}",
                 path.display()
             ))
         })
@@ -730,6 +704,7 @@ impl SourceFormatter {
         config: &FormatConfig,
         supports_tailwind: bool,
         supports_oxfmt: bool,
+        supports_svelte: bool,
     ) -> Result<String, OxcDiagnostic> {
         let mut prettier_options = to_prettier(config);
         inject_parser(&mut prettier_options, parser_name);
@@ -820,6 +795,24 @@ mod tests {
         let source = "/**\n * ```css\n * a{color:  red}\n * ```\n */\n";
         let code = format_ts(config, source);
         assert!(code.contains("color: red;"), "css fence should format natively: {code}");
+    }
+
+    #[test]
+    #[cfg(feature = "svelte-rsvelte-backend")]
+    fn svelte_uses_native_rsvelte_formatter() {
+        let config = FormatConfig::default();
+        let validated = validate(&config).expect("default config must validate");
+        let kind = FileKind::RsvelteFormatter { path: Arc::from(Path::new("App.svelte")) };
+        let strategy = FormatStrategy::from_format_config(config, &validated, kind);
+        let result = SourceFormatter::new(1)
+            .format("<script>let count=1+2</script>\n<button>{count}</button>", strategy);
+
+        let FormatResult::Success { code, is_changed } = result else {
+            panic!("expected rsvelte formatting to succeed");
+        };
+        assert!(is_changed);
+        assert!(code.contains("let count = 1 + 2;"));
+        assert!(code.ends_with('\n'));
     }
 
     /// `embeddedLanguageFormatting: off` installs no dispatcher:

@@ -60,10 +60,8 @@ fn gather_possible_values(
             if let (Some(exprs), Some(qs)) = (expressions, quasis)
                 && exprs.is_empty()
                 && qs.len() == 1
-                && let Some(cooked) = qs[0]
-                    .get("value")
-                    .and_then(|v| v.get("cooked"))
-                    .and_then(|c| c.as_str())
+                && let Some(cooked) =
+                    qs[0].get("value").and_then(|v| v.get("cooked")).and_then(|c| c.as_str())
             {
                 values.push(cooked.to_string());
                 return;
@@ -140,10 +138,8 @@ fn gather_possible_values(
                         *unknown = true;
                         continue;
                     }
-                    let computed = property
-                        .get("computed")
-                        .and_then(|c| c.as_bool())
-                        .unwrap_or(false);
+                    let computed =
+                        property.get("computed").and_then(|c| c.as_bool()).unwrap_or(false);
                     if computed {
                         *unknown = true;
                         continue;
@@ -183,6 +179,19 @@ fn get_possible_attr_values(
     expr: &crate::ast::js::Expression,
     is_class: bool,
 ) -> Option<Vec<String>> {
+    // Every node type `gather_possible_values` doesn't match falls to its `_`
+    // arm and returns `None` anyway, so skip the JSON materialization for
+    // those up front (mirrors the same guard in css/utils.rs).
+    if let Some(node_type) = expr.node_type() {
+        let inspected = matches!(
+            node_type,
+            "Literal" | "ConditionalExpression" | "LogicalExpression" | "TemplateLiteral"
+        ) || (is_class
+            && matches!(node_type, "ArrayExpression" | "ObjectExpression"));
+        if !inspected {
+            return None;
+        }
+    }
     let json = expr.as_json();
     let mut values = Vec::new();
     let mut unknown = false;
@@ -491,10 +500,7 @@ fn extract_selectors_from_css_node(
     match node_type {
         "Rule" => {
             if let Some(metadata) = node.get("metadata")
-                && metadata
-                    .get("is_global_block")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false)
+                && metadata.get("is_global_block").and_then(|v| v.as_bool()).unwrap_or(false)
             {
                 return;
             }
@@ -542,15 +548,12 @@ fn extract_selectors_from_css_node(
             }
         }
         "Atrule" => {
-            let is_keyframes = node
-                .get("name")
-                .and_then(|n| n.as_str())
-                .is_some_and(|name| {
-                    matches!(
-                        name,
-                        "keyframes" | "-webkit-keyframes" | "-moz-keyframes" | "-o-keyframes"
-                    )
-                });
+            let is_keyframes = node.get("name").and_then(|n| n.as_str()).is_some_and(|name| {
+                matches!(
+                    name,
+                    "keyframes" | "-webkit-keyframes" | "-moz-keyframes" | "-o-keyframes"
+                )
+            });
             if !is_keyframes
                 && let Some(block) = node.get("block")
                 && let Some(children) = block.get("children").and_then(|c| c.as_array())
@@ -571,26 +574,63 @@ fn substitute_nesting(
     child: &CssComplexSelector,
     parent: &CssComplexSelector,
 ) -> CssComplexSelector {
-    let has_nesting = child.children.iter().any(|rel| {
-        rel.selectors
-            .iter()
-            .any(|s| matches!(s, CssSimpleSelector::Nesting))
-    });
-
-    if !has_nesting {
-        // No explicit `&`: treat as descendant of parent
-        let mut combined = parent.children.clone();
-        // First child selector of `child` becomes descendant of parent
-        for (i, rel) in child.children.iter().enumerate() {
-            let mut r = rel.clone();
-            if i == 0 && r.combinator.is_none() {
-                r.combinator = Some(" ".to_string());
-            }
-            combined.push(r);
-        }
-        return CssComplexSelector { children: combined };
+    if complex_has_nesting(child) {
+        return substitute_explicit_nesting(child, parent);
     }
 
+    // No explicit `&`: treat as descendant of parent
+    let mut combined = parent.children.clone();
+    // First child selector of `child` becomes descendant of parent
+    for (i, rel) in child.children.iter().enumerate() {
+        let mut r = rel.clone();
+        if i == 0 && r.combinator.is_none() {
+            r.combinator = Some(" ".to_string());
+        }
+        combined.push(r);
+    }
+    CssComplexSelector { children: combined }
+}
+
+/// Whether a `&` appears anywhere in `sel`, a pseudo-class's argument list
+/// included. Upstream finds it with a `walk`, which descends into `args`, so
+/// `:is(&)` counts as explicit nesting and suppresses the implicit parent.
+fn complex_has_nesting(sel: &CssComplexSelector) -> bool {
+    sel.children.iter().any(|rel| rel.selectors.iter().any(simple_has_nesting))
+}
+
+fn simple_has_nesting(sel: &CssSimpleSelector) -> bool {
+    match sel {
+        CssSimpleSelector::Nesting => true,
+        CssSimpleSelector::PseudoClass(_, Some(args)) => args.iter().any(complex_has_nesting),
+        _ => false,
+    }
+}
+
+/// Resolve the `&`s inside a compound's pseudo-class arguments against `parent`.
+/// `:is(&)` is the parent selector, not "anything".
+fn substitute_nesting_in_args(
+    rel: &CssRelativeSelector,
+    parent: &CssComplexSelector,
+) -> CssRelativeSelector {
+    let mut out = rel.clone();
+    for simple in &mut out.selectors {
+        if let CssSimpleSelector::PseudoClass(_, Some(args)) = simple {
+            for arg in args.iter_mut() {
+                if complex_has_nesting(arg) {
+                    *arg = substitute_explicit_nesting(arg, parent);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Replace every `&` in `child` with `parent`, without prepending anything —
+/// `child` is known to carry an explicit nesting selector.
+fn substitute_explicit_nesting(
+    child: &CssComplexSelector,
+    parent: &CssComplexSelector,
+) -> CssComplexSelector {
     // Replace each relative selector that contains `&`:
     // - If the relative selector is ONLY `&`, replace it with the full parent chain.
     // - If it's `&.foo` or similar, replace the `&` simple selector with the
@@ -598,14 +638,14 @@ fn substitute_nesting(
     //   `.parent:hover`). Earlier relative selectors of parent are prepended.
     let mut result: Vec<CssRelativeSelector> = Vec::new();
     for rel in &child.children {
-        let has_nest = rel
-            .selectors
-            .iter()
-            .any(|s| matches!(s, CssSimpleSelector::Nesting));
+        // Arguments first, so a `&` in `&:is(&)` is resolved on both levels.
+        let rel = substitute_nesting_in_args(rel, parent);
+        let has_nest = rel.selectors.iter().any(|s| matches!(s, CssSimpleSelector::Nesting));
         if !has_nest {
-            result.push(rel.clone());
+            result.push(rel);
             continue;
         }
+        let rel = &rel;
 
         // If `&` is the ONLY simple selector, replace with parent's entire chain
         if rel.selectors.len() == 1 {
@@ -616,6 +656,18 @@ fn substitute_nesting(
                     // Preserve this child relative selector's combinator on the
                     // first parent relative selector.
                     pr.combinator = rel.combinator.clone();
+                }
+                if i + 1 == parent.children.len() {
+                    // These flags belong to the child relative selector, not
+                    // to the parent selector substituted for `&`. Upstream
+                    // keeps the NestingSelector and therefore keeps the
+                    // child's metadata here. Retain a no-op nesting marker as
+                    // well so a fully-global parent is treated as a possible
+                    // match rather than testing its selector against a local
+                    // element.
+                    pr.is_global = rel.is_global;
+                    pr.is_global_like = rel.is_global_like;
+                    pr.selectors.push(CssSimpleSelector::Nesting);
                 }
                 result.push(pr);
             }
@@ -643,12 +695,18 @@ fn substitute_nesting(
                     merged.selectors.push(s.clone());
                 }
             }
+            // The combined relative selector still represents the child
+            // rule. In the upstream AST its metadata remains on `&:...`; it
+            // does not inherit metadata.is_global from the parent expanded
+            // into `&`. Inheriting the parent flag makes truncate_globals
+            // discard the child rule and omits the scope class from markup.
+            merged.is_global = rel.is_global;
+            merged.is_global_like = rel.is_global_like;
             result.push(merged);
         } else {
             // No parent to substitute with — keep the rel as-is minus the nesting
             let mut r = rel.clone();
-            r.selectors
-                .retain(|s| !matches!(s, CssSimpleSelector::Nesting));
+            r.selectors.retain(|s| !matches!(s, CssSimpleSelector::Nesting));
             result.push(r);
         }
     }
@@ -667,9 +725,7 @@ fn parse_complex_selector(cs: &serde_json::Value) -> Option<CssComplexSelector> 
     if relative_selectors.is_empty() {
         return None;
     }
-    Some(CssComplexSelector {
-        children: relative_selectors,
-    })
+    Some(CssComplexSelector { children: relative_selectors })
 }
 
 fn parse_relative_selector(rel: &serde_json::Value) -> Option<CssRelativeSelector> {
@@ -677,9 +733,7 @@ fn parse_relative_selector(rel: &serde_json::Value) -> Option<CssRelativeSelecto
         if c.is_null() {
             None
         } else {
-            c.get("name")
-                .and_then(|n| n.as_str())
-                .map(|s| s.to_string())
+            c.get("name").and_then(|n| n.as_str()).map(|s| s.to_string())
         }
     });
 
@@ -708,37 +762,21 @@ fn parse_relative_selector(rel: &serde_json::Value) -> Option<CssRelativeSelecto
         }
     }
 
-    Some(CssRelativeSelector {
-        combinator,
-        selectors,
-        is_global,
-        is_global_like,
-    })
+    Some(CssRelativeSelector { combinator, selectors, is_global, is_global_like })
 }
 
 /// Mirror of upstream css-analyze.js RelativeSelector visitor's
 /// `is_global_like` computation (lines 156-181).
 fn compute_is_global_like(selectors_json: &[serde_json::Value]) -> bool {
-    let ty = |s: &serde_json::Value| {
-        s.get("type")
-            .and_then(|t| t.as_str())
-            .unwrap_or("")
-            .to_string()
-    };
-    let name = |s: &serde_json::Value| {
-        s.get("name")
-            .and_then(|n| n.as_str())
-            .unwrap_or("")
-            .to_string()
-    };
+    let ty =
+        |s: &serde_json::Value| s.get("type").and_then(|t| t.as_str()).unwrap_or("").to_string();
+    let name =
+        |s: &serde_json::Value| s.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
 
     if !selectors_json.is_empty()
-        && selectors_json.iter().all(|s| {
-            matches!(
-                ty(s).as_str(),
-                "PseudoClassSelector" | "PseudoElementSelector"
-            )
-        })
+        && selectors_json
+            .iter()
+            .all(|s| matches!(ty(s).as_str(), "PseudoClassSelector" | "PseudoElementSelector"))
     {
         let first = &selectors_json[0];
         let first_ty = ty(first);
@@ -758,12 +796,8 @@ fn compute_is_global_like(selectors_json: &[serde_json::Value]) -> bool {
         }
     }
 
-    selectors_json
-        .iter()
-        .any(|s| ty(s) == "PseudoClassSelector" && name(s) == "root")
-        && !selectors_json
-            .iter()
-            .any(|s| ty(s) == "PseudoClassSelector" && name(s) == "has")
+    selectors_json.iter().any(|s| ty(s) == "PseudoClassSelector" && name(s) == "root")
+        && !selectors_json.iter().any(|s| ty(s) == "PseudoClassSelector" && name(s) == "has")
 }
 
 fn parse_simple_selector(sel: &serde_json::Value) -> Option<CssSimpleSelector> {
@@ -782,11 +816,7 @@ fn parse_simple_selector(sel: &serde_json::Value) -> Option<CssSimpleSelector> {
             Some(CssSimpleSelector::Id(decode_css_escape(&name)))
         }
         "AttributeSelector" => {
-            let name = sel
-                .get("name")
-                .and_then(|n| n.as_str())
-                .unwrap_or("")
-                .to_string();
+            let name = sel.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
             let matcher = sel
                 .get("matcher")
                 .and_then(|m| if m.is_null() { None } else { m.as_str() })
@@ -799,12 +829,7 @@ fn parse_simple_selector(sel: &serde_json::Value) -> Option<CssSimpleSelector> {
                 .get("flags")
                 .and_then(|f| if f.is_null() { None } else { f.as_str() })
                 .map(|s| s.to_string());
-            Some(CssSimpleSelector::Attribute {
-                name,
-                matcher,
-                value,
-                flags,
-            })
+            Some(CssSimpleSelector::Attribute { name, matcher, value, flags })
         }
         "PseudoClassSelector" => {
             let name = sel.get("name")?.as_str()?.to_string();
@@ -899,7 +924,8 @@ fn test_attribute(operator: &str, expected: &str, case_insensitive: bool, value:
     };
     match operator {
         "=" => value == expected,
-        "~=" => value.split_whitespace().any(|w| w == expected),
+        // JS `"".split(/\s/)` is `[""]`, so `[a~=""]` matches an empty value.
+        "~=" => value.split(char::is_whitespace).any(|w| w == expected),
         "|=" => format!("{}-", value).starts_with(&format!("{}-", expected)),
         "^=" => value.starts_with(&expected),
         "$=" => value.ends_with(&expected),
@@ -978,9 +1004,8 @@ fn attribute_matches(
                     // Reconstruct concatenated possible strings similar to official
                     // `possible_values` logic. For a simple first-pass, treat each
                     // value as an independent candidate (joined by space when class).
-                    let matches = values
-                        .iter()
-                        .any(|v| test_attribute(op, expected, case_insensitive, v));
+                    let matches =
+                        values.iter().any(|v| test_attribute(op, expected, case_insensitive, v));
                     if !matches && (attr_name_lower == "class" || attr_name_lower == "style") {
                         continue;
                     }
@@ -1105,12 +1130,7 @@ fn element_matches_simple_selectors(
                     return false;
                 }
             }
-            CssSimpleSelector::Attribute {
-                name,
-                matcher,
-                value,
-                flags,
-            } => {
+            CssSimpleSelector::Attribute { name, matcher, value, flags } => {
                 // Check whitelisted attributes
                 let whitelisted = whitelist_attribute_selector(&element.tag_name);
                 if whitelisted.iter().any(|w| w.eq_ignore_ascii_case(name)) {
@@ -1148,14 +1168,23 @@ fn element_matches_simple_selectors(
                 }
                 if (name == "is" || name == "where") && args.is_some() {
                     let args = args.as_ref().unwrap();
-                    let any_matches = args.iter().any(|cs| {
-                        if let Some(last) = cs.children.last() {
-                            element_matches_simple_selectors(element, &last.selectors)
-                        } else {
-                            false
+                    let matched = args.iter().any(|cs| {
+                        // An argument made only of `:global(...)` truncates to
+                        // nothing, and upstream reads that as "matches anything"
+                        // rather than testing the global's own selectors.
+                        let relative = truncate_globals(&cs.children);
+                        match relative.last() {
+                            None => true,
+                            Some(last) => {
+                                element_matches_simple_selectors(element, &last.selectors)
+                                    // `foo :is(bar baz)` can also mean bar is an
+                                    // ancestor of foo, which this walk cannot
+                                    // check; upstream assumes it matches.
+                                    || cs.children.len() > 1
+                            }
                         }
                     });
-                    if !any_matches {
+                    if !matched {
                         return false;
                     }
                 }
@@ -1171,7 +1200,11 @@ fn element_matches_simple_selectors(
 fn truncate_globals(children: &[CssRelativeSelector]) -> &[CssRelativeSelector] {
     let last_non_global = children
         .iter()
-        .rposition(|rel| !is_relative_selector_global(rel));
+        // This mirrors upstream `truncate`, which deliberately uses the
+        // analysis metadata rather than its recursive `is_global` matcher.
+        // In particular, a nested `&:hover` has non-global child metadata even
+        // when `&` resolves to a fully-global parent.
+        .rposition(|rel| !rel.is_global && !rel.is_global_like);
     match last_non_global {
         Some(idx) => &children[..=idx],
         None => &[],
@@ -1181,11 +1214,7 @@ fn truncate_globals(children: &[CssRelativeSelector]) -> &[CssRelativeSelector] 
 /// Check if a complex selector has a sibling combinator (+ or ~).
 fn has_sibling_combinator(selector: &CssComplexSelector) -> bool {
     let effective = truncate_globals(&selector.children);
-    effective.iter().any(|rel| {
-        rel.combinator
-            .as_deref()
-            .is_some_and(|c| c == "+" || c == "~")
-    })
+    effective.iter().any(|rel| rel.combinator.as_deref().is_some_and(|c| c == "+" || c == "~"))
 }
 
 /// Extract the callee name from a RenderTag expression.
@@ -1199,10 +1228,7 @@ fn get_render_tag_callee_name(render_tag: &template::RenderTag) -> Option<String
     };
     let callee = expr.get("callee")?;
     if callee.get("type").and_then(|t| t.as_str()) == Some("Identifier") {
-        callee
-            .get("name")
-            .and_then(|n| n.as_str())
-            .map(String::from)
+        callee.get("name").and_then(|n| n.as_str()).map(String::from)
     } else {
         None
     }
@@ -1294,6 +1320,15 @@ fn collect_render_sites_in_node(
         }
         TemplateNode::SvelteBoundary(boundary) => {
             collect_render_sites_in_fragment(&boundary.fragment, ancestors, map);
+        }
+        TemplateNode::SvelteFragment(frag) => {
+            collect_render_sites_in_fragment(&frag.fragment, ancestors, map);
+        }
+        TemplateNode::SvelteComponent(comp) => {
+            collect_render_sites_in_fragment(&comp.fragment, ancestors, map);
+        }
+        TemplateNode::SvelteSelf(comp) => {
+            collect_render_sites_in_fragment(&comp.fragment, ancestors, map);
         }
         TemplateNode::SlotElement(slot) => {
             collect_render_sites_in_fragment(&slot.fragment, ancestors, map);
@@ -1406,6 +1441,21 @@ fn mark_all_elements_scoped_node(node: &mut TemplateNode) {
                 mark_all_elements_scoped_node(child);
             }
         }
+        TemplateNode::SvelteFragment(frag) => {
+            for child in &mut frag.fragment.nodes {
+                mark_all_elements_scoped_node(child);
+            }
+        }
+        TemplateNode::SvelteComponent(comp) => {
+            for child in &mut comp.fragment.nodes {
+                mark_all_elements_scoped_node(child);
+            }
+        }
+        TemplateNode::SvelteSelf(comp) => {
+            for child in &mut comp.fragment.nodes {
+                mark_all_elements_scoped_node(child);
+            }
+        }
         _ => {}
     }
 }
@@ -1421,11 +1471,8 @@ fn mark_elements_in_fragment(
     // Selectors containing `:has(...)` are handled exclusively by the
     // graph-based pass (which evaluates `:has` faithfully); everything else
     // goes through the direct-matching passes below.
-    let direct_selectors: Vec<CssComplexSelector> = css_selectors
-        .iter()
-        .filter(|s| !selector_contains_has(s))
-        .cloned()
-        .collect();
+    let direct_selectors: Vec<CssComplexSelector> =
+        css_selectors.iter().filter(|s| !selector_contains_has(s)).cloned().collect();
 
     // First pass: mark elements that match CSS selectors directly (type/class/id/ancestor matching)
     for node in &mut fragment.nodes {
@@ -1524,9 +1571,8 @@ fn process_node_scoping(
         TemplateNode::SnippetBlock(snippet) => {
             // Get the snippet name and look up render site ancestors
             let snippet_name = get_snippet_block_name(snippet);
-            let render_ancestors = snippet_name
-                .as_ref()
-                .and_then(|name| snippet_ancestors.get(name));
+            let render_ancestors =
+                snippet_name.as_ref().and_then(|name| snippet_ancestors.get(name));
 
             if let Some(render_site_chains) = render_ancestors {
                 // Process snippet body with each render site's ancestor chain.
@@ -1552,6 +1598,21 @@ fn process_node_scoping(
         }
         TemplateNode::SvelteBoundary(boundary) => {
             for child in &mut boundary.fragment.nodes {
+                process_node_scoping(child, css_selectors, ancestors, snippet_ancestors);
+            }
+        }
+        TemplateNode::SvelteFragment(frag) => {
+            for child in &mut frag.fragment.nodes {
+                process_node_scoping(child, css_selectors, ancestors, snippet_ancestors);
+            }
+        }
+        TemplateNode::SvelteComponent(comp) => {
+            for child in &mut comp.fragment.nodes {
+                process_node_scoping(child, css_selectors, ancestors, snippet_ancestors);
+            }
+        }
+        TemplateNode::SvelteSelf(comp) => {
+            for child in &mut comp.fragment.nodes {
                 process_node_scoping(child, css_selectors, ancestors, snippet_ancestors);
             }
         }
@@ -1622,6 +1683,15 @@ fn apply_scoping_marks(fragment: &mut Fragment, elements_to_scope: &FxHashSet<(u
             }
             TemplateNode::SvelteBoundary(boundary) => {
                 apply_scoping_marks(&mut boundary.fragment, elements_to_scope);
+            }
+            TemplateNode::SvelteFragment(frag) => {
+                apply_scoping_marks(&mut frag.fragment, elements_to_scope);
+            }
+            TemplateNode::SvelteComponent(comp) => {
+                apply_scoping_marks(&mut comp.fragment, elements_to_scope);
+            }
+            TemplateNode::SvelteSelf(comp) => {
+                apply_scoping_marks(&mut comp.fragment, elements_to_scope);
             }
             TemplateNode::SlotElement(slot) => {
                 apply_scoping_marks(&mut slot.fragment, elements_to_scope);
@@ -1820,10 +1890,7 @@ fn element_is_ancestor_in_matching_selector(
         return false;
     }
 
-    for (idx, child) in effective_children[..effective_children.len() - 1]
-        .iter()
-        .enumerate()
-    {
+    for (idx, child) in effective_children[..effective_children.len() - 1].iter().enumerate() {
         if element_matches_simple_selectors(element, &child.selectors) {
             let next = &effective_children[idx + 1];
             let comb = next.combinator.as_deref().unwrap_or(" ");
@@ -1931,9 +1998,8 @@ fn propagate_ancestor_scoping(
             }
             TemplateNode::SnippetBlock(snippet) => {
                 let snippet_name = get_snippet_block_name(snippet);
-                let render_site_chains = snippet_name
-                    .as_ref()
-                    .and_then(|name| snippet_ancestors.get(name));
+                let render_site_chains =
+                    snippet_name.as_ref().and_then(|name| snippet_ancestors.get(name));
                 if let Some(chains) = render_site_chains {
                     for site_anc in chains {
                         // Snippet bodies use the render-site ancestor chain
@@ -1967,6 +2033,30 @@ fn propagate_ancestor_scoping(
             TemplateNode::SvelteBoundary(boundary) => {
                 propagate_ancestor_scoping(
                     &mut boundary.fragment,
+                    css_selectors,
+                    ancestors,
+                    snippet_ancestors,
+                );
+            }
+            TemplateNode::SvelteFragment(frag) => {
+                propagate_ancestor_scoping(
+                    &mut frag.fragment,
+                    css_selectors,
+                    ancestors,
+                    snippet_ancestors,
+                );
+            }
+            TemplateNode::SvelteComponent(comp) => {
+                propagate_ancestor_scoping(
+                    &mut comp.fragment,
+                    css_selectors,
+                    ancestors,
+                    snippet_ancestors,
+                );
+            }
+            TemplateNode::SvelteSelf(comp) => {
+                propagate_ancestor_scoping(
+                    &mut comp.fragment,
                     css_selectors,
                     ancestors,
                     snippet_ancestors,
@@ -2052,9 +2142,12 @@ fn subtree_has_matching_subject_inner(
                 if complex_selector_matches_element(selector, &element_info, ancestors) {
                     return true;
                 }
-                // For selectors with sibling combinators, the sibling pass may have already
-                // scoped this element. Check if it's scoped and matches the subject selector.
-                if el.metadata.scoped
+                // The sibling pass may already have scoped this element for a selector
+                // whose chain this walker cannot evaluate. `metadata.scoped` is set by
+                // any selector, so without the sibling test a subject scoped by an
+                // unrelated rule satisfies an ancestor test the chain rejects.
+                if has_sibling_combinator(selector)
+                    && el.metadata.scoped
                     && let Some(subj) = subject_sel
                     && element_matches_simple_selectors(&element_info, &subj.selectors)
                 {
@@ -2077,7 +2170,8 @@ fn subtree_has_matching_subject_inner(
                 if complex_selector_matches_element(selector, &element_info, ancestors) {
                     return true;
                 }
-                if el.metadata.scoped
+                if has_sibling_combinator(selector)
+                    && el.metadata.scoped
                     && let Some(subj) = subject_sel
                     && element_matches_simple_selectors(&element_info, &subj.selectors)
                 {
@@ -2222,10 +2316,41 @@ fn subtree_has_matching_subject_inner(
                     }
                 }
             }
-            _ => {}
+            node => {
+                if let Some(child) = transparent_child_fragment(node)
+                    && subtree_has_matching_subject_inner(
+                        child,
+                        selector,
+                        ancestors,
+                        snippet_ancestors,
+                    )
+                {
+                    return true;
+                }
+            }
         }
     }
     false
+}
+
+/// The child fragment of a node that is transparent to ancestor matching.
+/// Upstream's `get_element_parent` walks the whole path and stops only at a
+/// `RegularElement` / `SvelteElement`, so every other container passes its
+/// children through — enumerating the transparent ones is what keeps leaving
+/// a container behind.
+fn transparent_child_fragment<'a, 'b>(node: &'a TemplateNode<'b>) -> Option<&'a Fragment<'b>> {
+    match node {
+        TemplateNode::SvelteHead(el)
+        | TemplateNode::SvelteBoundary(el)
+        | TemplateNode::SvelteFragment(el)
+        | TemplateNode::SvelteBody(el)
+        | TemplateNode::SvelteDocument(el)
+        | TemplateNode::SvelteWindow(el) => Some(&el.fragment),
+        TemplateNode::SvelteComponent(comp) => Some(&comp.fragment),
+        TemplateNode::SvelteSelf(el) => Some(&el.fragment),
+        TemplateNode::TitleElement(t) => Some(&t.fragment),
+        _ => None,
+    }
 }
 
 /// Decode CSS escape sequences in a selector name.
@@ -2322,10 +2447,7 @@ enum SKind {
 }
 
 fn is_block_kind(kind: SKind) -> bool {
-    matches!(
-        kind,
-        SKind::If | SKind::Each | SKind::Await | SKind::Key | SKind::Slot
-    )
+    matches!(kind, SKind::If | SKind::Each | SKind::Await | SKind::Key | SKind::Slot)
 }
 
 struct SNode {
@@ -2382,23 +2504,24 @@ fn build_sgraph(fragment: &Fragment, analysis: Option<&super::types::ComponentAn
         name: None,
     });
 
-    // (renderer id, callee name or None, kind) collected during the walk;
-    // component "resolved" state tracked separately.
-    let mut renderers: Vec<(usize, Option<String>, bool /* resolved-by-structure */)> = Vec::new();
-    let mut component_direct_snippets: FxHashMap<usize, Vec<usize>> = FxHashMap::default();
-    let mut all_snippets: Vec<usize> = Vec::new();
-    let mut snippets_by_name: FxHashMap<String, Vec<usize>> = FxHashMap::default();
+    /// Accumulators shared across the recursive `add_fragment` walk.
+    #[derive(Default)]
+    struct WalkAccum {
+        /// (renderer id, callee name or None, resolved-by-structure) collected
+        /// during the walk; component "resolved" state tracked separately.
+        renderers: Vec<(usize, Option<String>, bool)>,
+        component_direct_snippets: FxHashMap<usize, Vec<usize>>,
+        all_snippets: Vec<usize>,
+        snippets_by_name: FxHashMap<String, Vec<usize>>,
+    }
+    let mut accum = WalkAccum::default();
 
-    #[allow(clippy::too_many_arguments)]
     fn add_fragment(
         graph: &mut SGraph,
         nodes: &[TemplateNode],
         parent: usize,
         frag_idx: usize,
-        renderers: &mut Vec<(usize, Option<String>, bool)>,
-        component_direct_snippets: &mut FxHashMap<usize, Vec<usize>>,
-        all_snippets: &mut Vec<usize>,
-        snippets_by_name: &mut FxHashMap<String, Vec<usize>>,
+        accum: &mut WalkAccum,
     ) {
         for node in nodes {
             let id = graph.nodes.len();
@@ -2434,14 +2557,9 @@ fn build_sgraph(fragment: &Fragment, analysis: Option<&super::types::ComponentAn
                 TemplateNode::Component(comp) => {
                     (SKind::Component, None, comp.start, comp.end, false, None)
                 }
-                TemplateNode::SvelteComponent(comp) => (
-                    SKind::SvelteComponent,
-                    None,
-                    comp.start,
-                    comp.end,
-                    false,
-                    None,
-                ),
+                TemplateNode::SvelteComponent(comp) => {
+                    (SKind::SvelteComponent, None, comp.start, comp.end, false, None)
+                }
                 TemplateNode::SvelteSelf(el) => {
                     (SKind::SvelteSelf, None, el.start, el.end, false, None)
                 }
@@ -2457,14 +2575,9 @@ fn build_sgraph(fragment: &Fragment, analysis: Option<&super::types::ComponentAn
                 TemplateNode::EachBlock(b) => (SKind::Each, None, b.start, b.end, false, None),
                 TemplateNode::AwaitBlock(b) => (SKind::Await, None, b.start, b.end, false, None),
                 TemplateNode::KeyBlock(b) => (SKind::Key, None, b.start, b.end, false, None),
-                TemplateNode::SnippetBlock(s) => (
-                    SKind::Snippet,
-                    None,
-                    s.start,
-                    s.end,
-                    false,
-                    get_snippet_block_name(s),
-                ),
+                TemplateNode::SnippetBlock(s) => {
+                    (SKind::Snippet, None, s.start, s.end, false, get_snippet_block_name(s))
+                }
                 TemplateNode::SvelteHead(el)
                 | TemplateNode::SvelteBoundary(el)
                 | TemplateNode::SvelteFragment(el)
@@ -2477,10 +2590,8 @@ fn build_sgraph(fragment: &Fragment, analysis: Option<&super::types::ComponentAn
                 _ => continue,
             };
 
-            let parent_index = graph.nodes[parent].fragments[frag_idx]
-                .as_ref()
-                .map(|f| f.len())
-                .unwrap_or(0);
+            let parent_index =
+                graph.nodes[parent].fragments[frag_idx].as_ref().map(|f| f.len()).unwrap_or(0);
             graph.nodes.push(SNode {
                 kind,
                 elem,
@@ -2528,31 +2639,22 @@ fn build_sgraph(fragment: &Fragment, analysis: Option<&super::types::ComponentAn
             }
             for (i, cf) in child_fragments.iter().enumerate() {
                 if let Some(f) = cf {
-                    add_fragment(
-                        graph,
-                        &f.nodes,
-                        id,
-                        i,
-                        renderers,
-                        component_direct_snippets,
-                        all_snippets,
-                        snippets_by_name,
-                    );
+                    add_fragment(graph, &f.nodes, id, i, accum);
                 }
             }
 
             // Track snippets and renderers.
             match node {
                 TemplateNode::SnippetBlock(_) => {
-                    all_snippets.push(id);
+                    accum.all_snippets.push(id);
                     if let Some(n) = graph.nodes[id].name.clone() {
-                        snippets_by_name.entry(n).or_default().push(id);
+                        accum.snippets_by_name.entry(n).or_default().push(id);
                     }
                 }
                 TemplateNode::RenderTag(rt) => {
                     let callee = get_render_tag_callee_name(rt);
                     let structurally_resolved = callee.is_some();
-                    renderers.push((id, callee, structurally_resolved));
+                    accum.renderers.push((id, callee, structurally_resolved));
                 }
                 TemplateNode::Component(_)
                 | TemplateNode::SvelteComponent(_)
@@ -2575,9 +2677,9 @@ fn build_sgraph(fragment: &Fragment, analysis: Option<&super::types::ComponentAn
                                     .collect()
                             })
                             .unwrap_or_default();
-                        component_direct_snippets.insert(id, direct);
+                        accum.component_direct_snippets.insert(id, direct);
                     }
-                    renderers.push((id, None, resolved));
+                    accum.renderers.push((id, None, resolved));
                     // Names referenced via `foo={bar}` attributes are resolved
                     // against the snippet name map after the walk (stored in the
                     // otherwise-unused name slot, NUL-separated).
@@ -2590,16 +2692,8 @@ fn build_sgraph(fragment: &Fragment, analysis: Option<&super::types::ComponentAn
         }
     }
 
-    add_fragment(
-        &mut graph,
-        &fragment.nodes,
-        0,
-        0,
-        &mut renderers,
-        &mut component_direct_snippets,
-        &mut all_snippets,
-        &mut snippets_by_name,
-    );
+    add_fragment(&mut graph, &fragment.nodes, 0, 0, &mut accum);
+    let WalkAccum { renderers, component_direct_snippets, all_snippets, snippets_by_name } = accum;
 
     // Resolve renderer -> snippets, mirroring 2-analyze/index.js lines 846-855:
     // unresolved renderers link to EVERY local snippet; each linked snippet's
@@ -2923,10 +3017,7 @@ fn g_possible_element_siblings(
         if kind == SKind::Root {
             break;
         }
-        if matches!(
-            kind,
-            SKind::Component | SKind::SvelteComponent | SKind::SvelteSelf
-        ) {
+        if matches!(kind, SKind::Component | SKind::SvelteComponent | SKind::SvelteSelf) {
             continue;
         }
         if kind == SKind::Snippet {
@@ -3036,11 +3127,7 @@ fn g_loop_child(
 ) -> SiblingMap {
     let mut result: SiblingMap = Vec::new();
     let step: isize = if dir == Dir::Forward { 1 } else { -1 };
-    let mut i: isize = if dir == Dir::Forward {
-        0
-    } else {
-        children.len() as isize - 1
-    };
+    let mut i: isize = if dir == Dir::Forward { 0 } else { children.len() as isize - 1 };
     while i >= 0 && (i as usize) < children.len() {
         let child = children[i as usize];
         let kind = graph.node(child).kind;
@@ -3097,277 +3184,267 @@ fn g_every_is_global(selectors: &[CssRelativeSelector], from: usize, to: usize) 
     selectors[from..to].iter().all(is_relative_selector_global)
 }
 
-/// Port of `apply_selector`. Marks every matched element in `marks`.
-fn g_apply_selector(
-    graph: &SGraph,
-    selectors: &[CssRelativeSelector],
-    from: usize,
-    to: usize,
-    node: usize,
-    dir: Dir,
-    marks: &mut FxHashSet<(u32, u32)>,
-) -> bool {
-    if from >= to {
-        return false;
-    }
-    let idx = if dir == Dir::Forward { from } else { to - 1 };
-    let rel = &selectors[idx];
-    let (rest_from, rest_to) = if dir == Dir::Forward {
-        (from + 1, to)
-    } else {
-        (from, to - 1)
-    };
-
-    let matched = g_relative_might_apply(graph, rel, selectors, node, marks)
-        && g_apply_combinator(graph, rel, selectors, rest_from, rest_to, node, dir, marks);
-
-    if matched {
-        let n = graph.node(node);
-        marks.insert((n.start, n.end));
-    }
-
-    matched
+/// Graph-based selector matcher: the `apply_selector` /
+/// `apply_combinator` / `relative_selector_might_apply_to_node` port family
+/// shares the node graph and the `marks` accumulator through this struct
+/// instead of threading them through every recursive call.
+struct GMatcher<'a> {
+    graph: &'a SGraph,
+    marks: &'a mut FxHashSet<(u32, u32)>,
 }
 
-/// Port of `apply_combinator`.
-#[allow(clippy::too_many_arguments)]
-fn g_apply_combinator(
-    graph: &SGraph,
-    rel: &CssRelativeSelector,
-    selectors: &[CssRelativeSelector],
-    from: usize,
-    to: usize,
-    node: usize,
-    dir: Dir,
-    marks: &mut FxHashSet<(u32, u32)>,
-) -> bool {
-    let combinator: Option<String> = if dir == Dir::Forward {
-        if from < to {
-            selectors[from].combinator.clone()
-        } else {
-            None
+impl GMatcher<'_> {
+    /// Port of `apply_selector`. Marks every matched element in `marks`.
+    fn apply_selector(
+        &mut self,
+        selectors: &[CssRelativeSelector],
+        from: usize,
+        to: usize,
+        node: usize,
+        dir: Dir,
+    ) -> bool {
+        if from >= to {
+            return false;
         }
-    } else {
-        rel.combinator.clone()
-    };
-    let Some(comb) = combinator else {
-        return true;
-    };
+        let idx = if dir == Dir::Forward { from } else { to - 1 };
+        let rel = &selectors[idx];
+        let (rest_from, rest_to) =
+            if dir == Dir::Forward { (from + 1, to) } else { (from, to - 1) };
 
-    match comb.as_str() {
-        " " | ">" => {
-            let is_adjacent = comb == ">";
-            let parents = if dir == Dir::Forward {
-                g_descendant_elements(graph, node, is_adjacent, &mut FxHashSet::default())
-            } else {
-                g_ancestor_elements(graph, node, is_adjacent, &mut FxHashSet::default())
-            };
-            let mut parent_matched = false;
-            for parent in &parents {
-                if g_apply_selector(graph, selectors, from, to, *parent, dir, marks) {
-                    parent_matched = true;
-                }
-            }
-            parent_matched
-                || (dir == Dir::Backward
-                    && (!is_adjacent || parents.is_empty())
-                    && g_every_is_global(selectors, from, to))
+        let matched = self.relative_might_apply(rel, selectors, node)
+            && self.apply_combinator(rel, selectors, rest_from, rest_to, node, dir);
+
+        if matched {
+            let n = self.graph.node(node);
+            self.marks.insert((n.start, n.end));
         }
-        "+" | "~" => {
-            let siblings = g_possible_element_siblings(
-                graph,
-                node,
-                dir,
-                comb == "+",
-                &mut FxHashSet::default(),
-            );
-            let mut sibling_matched = false;
-            for (sibling, _) in &siblings {
-                let kind = graph.node(*sibling).kind;
-                if matches!(kind, SKind::RenderTag | SKind::Slot | SKind::Component) {
-                    // `{@render foo()}<p>foo</p>` with `:global(.x) + p` is a match
-                    if to - from == 1 && compute_is_global(&selectors[from].selectors) {
+
+        matched
+    }
+
+    /// Port of `apply_combinator`.
+    fn apply_combinator(
+        &mut self,
+        rel: &CssRelativeSelector,
+        selectors: &[CssRelativeSelector],
+        from: usize,
+        to: usize,
+        node: usize,
+        dir: Dir,
+    ) -> bool {
+        let combinator: Option<String> = if dir == Dir::Forward {
+            if from < to { selectors[from].combinator.clone() } else { None }
+        } else {
+            rel.combinator.clone()
+        };
+        let Some(comb) = combinator else {
+            return true;
+        };
+
+        match comb.as_str() {
+            " " | ">" => {
+                let is_adjacent = comb == ">";
+                let parents = if dir == Dir::Forward {
+                    g_descendant_elements(self.graph, node, is_adjacent, &mut FxHashSet::default())
+                } else {
+                    g_ancestor_elements(self.graph, node, is_adjacent, &mut FxHashSet::default())
+                };
+                let mut parent_matched = false;
+                for parent in &parents {
+                    if self.apply_selector(selectors, from, to, *parent, dir) {
+                        parent_matched = true;
+                    }
+                }
+                parent_matched
+                    || (dir == Dir::Backward
+                        && (!is_adjacent || parents.is_empty())
+                        && g_every_is_global(selectors, from, to))
+            }
+            "+" | "~" => {
+                let siblings = g_possible_element_siblings(
+                    self.graph,
+                    node,
+                    dir,
+                    comb == "+",
+                    &mut FxHashSet::default(),
+                );
+                let mut sibling_matched = false;
+                for (sibling, _) in &siblings {
+                    let kind = self.graph.node(*sibling).kind;
+                    if matches!(kind, SKind::RenderTag | SKind::Slot | SKind::Component) {
+                        // `{@render foo()}<p>foo</p>` with `:global(.x) + p` is a match
+                        if to - from == 1 && compute_is_global(&selectors[from].selectors) {
+                            sibling_matched = true;
+                        }
+                    } else if self.apply_selector(selectors, from, to, *sibling, dir) {
                         sibling_matched = true;
                     }
-                } else if g_apply_selector(graph, selectors, from, to, *sibling, dir, marks) {
-                    sibling_matched = true;
                 }
+                sibling_matched
+                    || (dir == Dir::Backward
+                        && g_element_parent(self.graph, node).is_none()
+                        && g_every_is_global(selectors, from, to))
             }
-            sibling_matched
-                || (dir == Dir::Backward
-                    && g_element_parent(graph, node).is_none()
-                    && g_every_is_global(selectors, from, to))
+            _ => true,
         }
-        _ => true,
     }
-}
 
-/// Port of `relative_selector_might_apply_to_node`, covering the `:has`,
-/// `:not`, `:is`/`:where` and `:global(...)` cases with graph-based matching;
-/// plain simple selectors delegate to `element_matches_simple_selectors`.
-fn g_relative_might_apply(
-    graph: &SGraph,
-    rel: &CssRelativeSelector,
-    complex: &[CssRelativeSelector],
-    node: usize,
-    marks: &mut FxHashSet<(u32, u32)>,
-) -> bool {
-    let Some(elem) = graph.node(node).elem.as_ref() else {
-        return false;
-    };
+    /// Port of `relative_selector_might_apply_to_node`, covering the `:has`,
+    /// `:not`, `:is`/`:where` and `:global(...)` cases with graph-based matching;
+    /// plain simple selectors delegate to `element_matches_simple_selectors`.
+    fn relative_might_apply(
+        &mut self,
+        rel: &CssRelativeSelector,
+        complex: &[CssRelativeSelector],
+        node: usize,
+    ) -> bool {
+        let Some(elem) = self.graph.node(node).elem.as_ref() else {
+            return false;
+        };
+        let root_has = rel.selectors.iter().any(|selector| {
+            matches!(selector, CssSimpleSelector::PseudoClass(name, None) if name == "root")
+        }) && rel.selectors.iter().any(|selector| {
+            matches!(selector, CssSimpleSelector::PseudoClass(name, Some(_)) if name == "has")
+        });
 
-    for selector in &rel.selectors {
-        match selector {
-            CssSimpleSelector::PseudoClass(name, Some(args)) if name == "has" => {
-                // If this is a :has inside a global selector, include the
-                // element itself, because the global part might match an
-                // element outside the component (e.g. `:root:has(.scoped)`).
-                let include_self = complex.iter().any(is_relative_selector_global)
-                    || complex.iter().any(|r| {
-                        r.selectors.iter().any(|s| {
-                            matches!(s, CssSimpleSelector::PseudoClass(n, a)
-                                if n == "root" || (n == "global" && a.is_some()))
-                        })
-                    });
-
-                let mut matched = false;
-                for cs in args {
-                    let truncated = truncate_globals(&cs.children);
-                    if truncated.is_empty() {
-                        // it was just a :global(...)
-                        matched = true;
-                        continue;
-                    }
-
-                    if include_self {
-                        let mut sel_inc: Vec<CssRelativeSelector> = truncated.to_vec();
-                        sel_inc[0].combinator = None;
-                        if g_apply_selector(
-                            graph,
-                            &sel_inc,
-                            0,
-                            sel_inc.len(),
-                            node,
-                            Dir::Forward,
-                            marks,
-                        ) {
-                            matched = true;
-                        }
-                    }
-
-                    // `.x:has(.y)` is treated as `.x .y`: prepend a synthetic
-                    // "any" selector representing the element itself.
-                    let mut sel_exc: Vec<CssRelativeSelector> =
-                        Vec::with_capacity(truncated.len() + 1);
-                    sel_exc.push(CssRelativeSelector {
-                        combinator: None,
-                        selectors: Vec::new(),
-                        is_global: false,
-                        is_global_like: false,
-                    });
-                    let mut first = truncated[0].clone();
-                    if first.combinator.is_none() {
-                        first.combinator = Some(" ".to_string());
-                    }
-                    sel_exc.push(first);
-                    sel_exc.extend_from_slice(&truncated[1..]);
-                    if g_apply_selector(
-                        graph,
-                        &sel_exc,
-                        0,
-                        sel_exc.len(),
-                        node,
-                        Dir::Forward,
-                        marks,
-                    ) {
-                        matched = true;
-                    }
-                }
-
-                if !matched {
-                    return false;
-                }
+        for selector in &rel.selectors {
+            if root_has
+                && !matches!(selector, CssSimpleSelector::PseudoClass(name, Some(_)) if name == "has")
+            {
+                continue;
             }
-            CssSimpleSelector::PseudoClass(name, args) => {
-                if name == "host" || name == "root" {
-                    return false;
-                }
-                if name == "global" {
-                    if let Some(args) = args {
-                        if rel.selectors.len() == 1 {
-                            let Some(cs) = args.first() else {
-                                return true;
-                            };
-                            return g_apply_selector(
-                                graph,
-                                &cs.children,
-                                0,
-                                cs.children.len(),
-                                node,
-                                Dir::Backward,
-                                marks,
-                            );
+            match selector {
+                CssSimpleSelector::PseudoClass(name, Some(args)) if name == "has" => {
+                    // If this is a :has inside a global selector, include the
+                    // element itself, because the global part might match an
+                    // element outside the component (e.g. `:root:has(.scoped)`).
+                    let include_self = complex.iter().any(is_relative_selector_global)
+                        || complex.iter().any(|r| {
+                            r.selectors.iter().any(|s| {
+                                matches!(s, CssSimpleSelector::PseudoClass(n, a)
+                                if n == "root" || (n == "global" && a.is_some()))
+                            })
+                        });
+
+                    let mut matched = false;
+                    for cs in args {
+                        let truncated = truncate_globals(&cs.children);
+                        if truncated.is_empty() {
+                            // it was just a :global(...)
+                            matched = true;
+                            continue;
                         }
-                        // `:global(...)` among other selectors: potential match.
-                        continue;
-                    }
-                    // bare `:global` — everything beyond it is global
-                    return true;
-                }
-                if name == "not" {
-                    if let Some(args) = args {
-                        for cs in args {
-                            if cs.children.len() > 1 {
-                                // foo:not(bar foo): assume bar is an ancestor of
-                                // foo; scope the element and its ancestors.
-                                let mut el = Some(node);
-                                while let Some(e) = el {
-                                    let n = graph.node(e);
-                                    marks.insert((n.start, n.end));
-                                    el = g_element_parent(graph, e);
-                                }
+
+                        if include_self {
+                            let mut sel_inc: Vec<CssRelativeSelector> = truncated.to_vec();
+                            sel_inc[0].combinator = None;
+                            if self.apply_selector(&sel_inc, 0, sel_inc.len(), node, Dir::Forward) {
+                                matched = true;
                             }
                         }
-                    }
-                    continue;
-                }
-                if (name == "is" || name == "where") && args.is_some() {
-                    let mut matched = false;
-                    for cs in args.as_ref().unwrap() {
-                        let relative = truncate_globals(&cs.children);
-                        if relative.is_empty()
-                            || g_apply_selector(
-                                graph,
-                                relative,
-                                0,
-                                relative.len(),
-                                node,
-                                Dir::Backward,
-                                marks,
-                            )
-                        {
-                            matched = true;
-                        } else if cs.children.len() > 1 {
-                            // foo :is(bar baz): assume bar is an ancestor of foo
+
+                        // `.x:has(.y)` is treated as `.x .y`: prepend a synthetic
+                        // "any" selector representing the element itself.
+                        let mut sel_exc: Vec<CssRelativeSelector> =
+                            Vec::with_capacity(truncated.len() + 1);
+                        sel_exc.push(CssRelativeSelector {
+                            combinator: None,
+                            selectors: Vec::new(),
+                            is_global: false,
+                            is_global_like: false,
+                        });
+                        let mut first = truncated[0].clone();
+                        if first.combinator.is_none() {
+                            first.combinator = Some(" ".to_string());
+                        }
+                        sel_exc.push(first);
+                        sel_exc.extend_from_slice(&truncated[1..]);
+                        if self.apply_selector(&sel_exc, 0, sel_exc.len(), node, Dir::Forward) {
                             matched = true;
                         }
                     }
+
                     if !matched {
                         return false;
                     }
                 }
-                // other pseudo-classes are a potential match
-            }
-            CssSimpleSelector::PseudoElement | CssSimpleSelector::Nesting => {}
-            simple => {
-                if !element_matches_simple_selectors(elem, std::slice::from_ref(simple)) {
-                    return false;
+                CssSimpleSelector::PseudoClass(name, args) => {
+                    if name == "host" || name == "root" {
+                        return false;
+                    }
+                    if name == "global" {
+                        if let Some(args) = args {
+                            if rel.selectors.len() == 1 {
+                                let Some(cs) = args.first() else {
+                                    return true;
+                                };
+                                return self.apply_selector(
+                                    &cs.children,
+                                    0,
+                                    cs.children.len(),
+                                    node,
+                                    Dir::Backward,
+                                );
+                            }
+                            // `:global(...)` among other selectors: potential match.
+                            continue;
+                        }
+                        // bare `:global` — everything beyond it is global
+                        return true;
+                    }
+                    if name == "not" {
+                        if let Some(args) = args {
+                            for cs in args {
+                                if cs.children.len() > 1 {
+                                    // foo:not(bar foo): assume bar is an ancestor of
+                                    // foo; scope the element and its ancestors.
+                                    let mut el = Some(node);
+                                    while let Some(e) = el {
+                                        let n = self.graph.node(e);
+                                        self.marks.insert((n.start, n.end));
+                                        el = g_element_parent(self.graph, e);
+                                    }
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    if (name == "is" || name == "where") && args.is_some() {
+                        let mut matched = false;
+                        for cs in args.as_ref().unwrap() {
+                            let relative = truncate_globals(&cs.children);
+                            if relative.is_empty()
+                                || self.apply_selector(
+                                    relative,
+                                    0,
+                                    relative.len(),
+                                    node,
+                                    Dir::Backward,
+                                )
+                            {
+                                matched = true;
+                            } else if cs.children.len() > 1 {
+                                // foo :is(bar baz): assume bar is an ancestor of foo
+                                matched = true;
+                            }
+                        }
+                        if !matched {
+                            return false;
+                        }
+                    }
+                    // other pseudo-classes are a potential match
+                }
+                CssSimpleSelector::PseudoElement | CssSimpleSelector::Nesting => {}
+                simple => {
+                    if !element_matches_simple_selectors(elem, std::slice::from_ref(simple)) {
+                        return false;
+                    }
                 }
             }
         }
-    }
 
-    true
+        true
+    }
 }
 
 /// Whether a complex selector contains a `:has(...)` anywhere.
@@ -3376,9 +3453,7 @@ fn selector_contains_has(selector: &CssComplexSelector) -> bool {
         rel.selectors.iter().any(|s| match s {
             CssSimpleSelector::PseudoClass(name, args) => {
                 (name == "has" && args.is_some())
-                    || args
-                        .as_ref()
-                        .is_some_and(|a| a.iter().any(selector_contains_has))
+                    || args.as_ref().is_some_and(|a| a.iter().any(selector_contains_has))
             }
             _ => false,
         })
@@ -3401,6 +3476,107 @@ fn selector_contains_complex_not(selector: &CssComplexSelector) -> bool {
         })
     }
     selector.children.iter().any(rel_has)
+}
+
+fn relative_supports_static_sibling_match(rel: &CssRelativeSelector) -> bool {
+    rel.selectors.iter().all(|selector| match selector {
+        CssSimpleSelector::PseudoClass(name, args) => match name.as_str() {
+            "has" | "global" | "is" | "where" => false,
+            "not" => !args
+                .as_ref()
+                .is_some_and(|args| args.iter().any(|selector| selector.children.len() > 1)),
+            _ => true,
+        },
+        _ => true,
+    })
+}
+
+fn static_relative_might_apply(graph: &SGraph, rel: &CssRelativeSelector, node: usize) -> bool {
+    let Some(elem) = graph.node(node).elem.as_ref() else {
+        return false;
+    };
+
+    for selector in &rel.selectors {
+        match selector {
+            CssSimpleSelector::PseudoClass(name, _) => {
+                if name == "host" || name == "root" {
+                    return false;
+                }
+            }
+            CssSimpleSelector::PseudoElement | CssSimpleSelector::Nesting => {}
+            simple => {
+                if !element_matches_simple_selectors(elem, std::slice::from_ref(simple)) {
+                    return false;
+                }
+            }
+        }
+    }
+
+    true
+}
+
+fn process_static_two_part_sibling_selector(
+    graph: &SGraph,
+    selector: &[CssRelativeSelector],
+    marks: &mut FxHashSet<(u32, u32)>,
+) -> bool {
+    if selector.len() != 2
+        || selector[0].combinator.is_some()
+        || !matches!(selector[1].combinator.as_deref(), Some("+") | Some("~"))
+        || !selector.iter().all(relative_supports_static_sibling_match)
+        || graph.nodes.iter().any(|node| {
+            !matches!(node.kind, SKind::Root | SKind::Regular) || node.has_slot_attribute
+        })
+    {
+        return false;
+    }
+
+    let mark = |marks: &mut FxHashSet<(u32, u32)>, node: &SNode| {
+        marks.insert((node.start, node.end));
+    };
+
+    for fragment in graph.nodes.iter().flat_map(|node| node.fragments.iter().flatten()) {
+        if fragment.len() < 2 {
+            continue;
+        }
+
+        let left: Vec<bool> = fragment
+            .iter()
+            .map(|node| static_relative_might_apply(graph, &selector[0], *node))
+            .collect();
+        let right: Vec<bool> = fragment
+            .iter()
+            .map(|node| static_relative_might_apply(graph, &selector[1], *node))
+            .collect();
+
+        if selector[1].combinator.as_deref() == Some("+") {
+            for index in 1..fragment.len() {
+                if left[index - 1] && right[index] {
+                    mark(marks, graph.node(fragment[index - 1]));
+                    mark(marks, graph.node(fragment[index]));
+                }
+            }
+            continue;
+        }
+
+        let mut has_left_before = false;
+        for index in 0..fragment.len() {
+            if right[index] && has_left_before {
+                mark(marks, graph.node(fragment[index]));
+            }
+            has_left_before |= left[index];
+        }
+
+        let mut has_right_after = false;
+        for index in (0..fragment.len()).rev() {
+            if left[index] && has_right_after {
+                mark(marks, graph.node(fragment[index]));
+            }
+            has_right_after |= right[index];
+        }
+    }
+
+    true
 }
 
 /// Run the graph-based pass: every element in the template is tested against
@@ -3426,25 +3602,20 @@ fn process_graph_selectors(
     }
 
     let graph = build_sgraph(fragment, analysis);
-
-    for id in 0..graph.nodes.len() {
-        if graph.node(id).elem.is_none() {
+    for selector in graph_selectors {
+        let effective = truncate_globals(&selector.children);
+        if effective.is_empty()
+            || process_static_two_part_sibling_selector(&graph, effective, marks)
+        {
             continue;
         }
-        for selector in &graph_selectors {
-            let effective = truncate_globals(&selector.children);
-            if effective.is_empty() {
+
+        let mut matcher = GMatcher { graph: &graph, marks };
+        for id in 0..matcher.graph.nodes.len() {
+            if matcher.graph.node(id).elem.is_none() {
                 continue;
             }
-            g_apply_selector(
-                &graph,
-                effective,
-                0,
-                effective.len(),
-                id,
-                Dir::Backward,
-                marks,
-            );
+            matcher.apply_selector(effective, 0, effective.len(), id, Dir::Backward);
         }
     }
 }

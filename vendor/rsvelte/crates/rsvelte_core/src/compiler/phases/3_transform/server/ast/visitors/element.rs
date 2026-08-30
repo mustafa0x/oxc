@@ -80,7 +80,7 @@ use super::shared::{TemplateEntry, process_children};
 const WHITESPACE_INSENSITIVE_ATTRIBUTES: [&str; 2] = ["class", "style"];
 
 /// Visit a `<name ...>children</name>` regular element.
-pub fn visit_regular_element<'a>(node: &RegularElement, state: &mut ServerTransformState<'a>) {
+pub fn visit_regular_element<'a>(node: &RegularElement<'a>, state: &mut ServerTransformState<'a>) {
     // 写经 upstream `RegularElement.js` l.18: in the HTML namespace the element
     // tag name is lowercased (`<iNPUT>` → `<input>`, `<thisShouldWarnMe>` →
     // `<thisshouldwarnme>`); SVG / MathML preserve case. This must precede the
@@ -127,9 +127,7 @@ pub fn visit_regular_element<'a>(node: &RegularElement, state: &mut ServerTransf
         // Build the element (open tag + attributes + `>`) into a FRESH buffer so
         // it flushes as its own push, isolated from the surrounding run.
         let saved = std::mem::take(&mut state.template);
-        state
-            .template
-            .push(TemplateEntry::Literal(format!("<{name}")));
+        state.template.push(TemplateEntry::Literal(format!("<{name}")));
         let css_hash: Option<String> =
             if node.metadata.scoped && !state.analysis.css.hash.is_empty() {
                 Some(state.analysis.css.hash.to_string())
@@ -138,9 +136,7 @@ pub fn visit_regular_element<'a>(node: &RegularElement, state: &mut ServerTransf
             };
         build_element_attributes(node, css_hash.as_deref(), state);
         // `>` + RAW child data + `</name>` (no escaping of the child).
-        state
-            .template
-            .push(TemplateEntry::Literal(format!(">{raw}</{name}>")));
+        state.template.push(TemplateEntry::Literal(format!(">{raw}</{name}>")));
         let element_template = std::mem::replace(&mut state.template, saved);
         let built = super::shared::build_template(element_template, state);
         for stmt in built {
@@ -179,11 +175,8 @@ pub fn visit_regular_element<'a>(node: &RegularElement, state: &mut ServerTransf
     // the block via `hoist_declarations`), wrap the result in a `BlockStatement`,
     // and push it as a single opaque `Stmt` so the block is scoped to this
     // element alone.
-    let has_declarations = node
-        .fragment
-        .nodes
-        .iter()
-        .any(|n| matches!(n, TemplateNode::DeclarationTag(_)));
+    let has_declarations =
+        node.fragment.nodes.iter().any(|n| matches!(n, TemplateNode::DeclarationTag(_)));
     if has_declarations {
         let saved = std::mem::take(&mut state.template);
         // Scope block-local constant folds to this element: a nested
@@ -214,15 +207,13 @@ pub fn visit_regular_element<'a>(node: &RegularElement, state: &mut ServerTransf
 /// Emit an element's open tag, attributes, `>`/`/>`, children, and close tag into
 /// `state.template`. Shared by the sync fast path and the async-buffered path.
 fn emit_element_body<'a>(
-    node: &RegularElement,
+    node: &RegularElement<'a>,
     name: &str,
     is_void: bool,
     state: &mut ServerTransformState<'a>,
 ) {
     // -- open tag `<name` ---------------------------------------------------
-    state
-        .template
-        .push(TemplateEntry::Literal(format!("<{name}")));
+    state.template.push(TemplateEntry::Literal(format!("<{name}")));
 
     // -- attributes (static + dynamic) --------------------------------------
     //
@@ -245,25 +236,13 @@ fn emit_element_body<'a>(
     let content = build_element_content(node, state);
 
     // -- `>` / `/>` ---------------------------------------------------------
-    state.template.push(TemplateEntry::Literal(
-        if is_void { "/>" } else { ">" }.to_string(),
-    ));
-
-    // -- dev element-location instrumentation (写经 RegularElement.js l.94-107)
-    // In dev mode, after the opening tag, push `$.push_element($$renderer,
-    // '<name>', <line>, <col>)`. The location is `locator(node.start)` — a
-    // 1-based line + 0-based column. For a void element, the matching
-    // `$.pop_element()` follows immediately (RegularElement.js l.211-213 only
-    // runs when there are children, but void elements have none — upstream's
-    // pop is gated on `!node_is_void` paths; the oracle emits pop right after
-    // push for void).
-    if state.options.dev {
-        push_element_dev(node, name, state);
-    }
+    state.template.push(TemplateEntry::Literal(if is_void { "/>" } else { ">" }.to_string()));
 
     // -- children -----------------------------------------------------------
     if !is_void {
-        let namespace = if node.metadata.svg {
+        let namespace = if node.name.as_str() == "foreignObject" {
+            "html"
+        } else if node.metadata.svg {
             "svg"
         } else if node.metadata.mathml {
             "mathml"
@@ -278,61 +257,90 @@ fn emit_element_body<'a>(
         if matches!(name, "pre" | "textarea") {
             state.preserve_whitespace = true;
         }
+        // Same STICKY treatment for upstream `clean_nodes`' `path.some((n) => n.name
+        // === 'text')`: whitespace survives at any depth below an SVG `<text>`.
+        let saved_in_text_element = state.in_text_element;
+        if name == "text" {
+            state.in_text_element = true;
+        }
         if let Some(content) = content {
+            if state.options.dev {
+                push_element_dev(node, name, state);
+            }
             // Content bind: render the bound value as the body when truthy,
             // otherwise fall back to the element's own (trimmed) children.
-            // Mirrors upstream RegularElement.js lines 178-198 + the text
-            // oracle's `TextareaBody` / `ContentEditableBody` split: a
-            // `<textarea>` suppresses the fallback children (its content IS the
-            // value), while a contenteditable element renders them in the else.
-            let is_textarea = name == "textarea";
-            emit_content_body(node, content, namespace, is_textarea, state);
+            emit_content_body(node, content, namespace, state);
         } else {
-            process_children(&node.fragment.nodes, Some(node), namespace, state);
+            let mut leading_debug = 0;
+            let mut has_debug = false;
+            for child in &node.fragment.nodes {
+                match child {
+                    TemplateNode::DebugTag(_) => {
+                        has_debug = true;
+                        leading_debug += 1;
+                    }
+                    TemplateNode::Text(text)
+                        if text.data.chars().all(|c| matches!(c, ' ' | '\t' | '\r' | '\n')) =>
+                    {
+                        leading_debug += 1;
+                    }
+                    _ => break,
+                }
+            }
+            if !has_debug {
+                leading_debug = 0;
+            }
+            if leading_debug > 0 {
+                process_children(
+                    &node.fragment.nodes[..leading_debug],
+                    Some(node),
+                    namespace,
+                    state,
+                );
+            }
+            if state.options.dev {
+                push_element_dev(node, name, state);
+            }
+            process_children(&node.fragment.nodes[leading_debug..], Some(node), namespace, state);
             // For a non-special `<optgroup>` / `<select>` with rich content,
             // upstream appends a `<!>` hydration marker after the children
             // (RegularElement.js lines 200-204).
             if matches!(name, "optgroup" | "select") && is_customizable_select_element(node) {
-                state
-                    .template
-                    .push(TemplateEntry::Literal("<!>".to_string()));
+                state.template.push(TemplateEntry::Literal("<!>".to_string()));
             }
         }
         state.preserve_whitespace = saved_preserve_ws;
-        state
-            .template
-            .push(TemplateEntry::Literal(format!("</{name}>")));
+        state.in_text_element = saved_in_text_element;
+        state.template.push(TemplateEntry::Literal(format!("</{name}>")));
         // -- dev `$.pop_element()` (写经 RegularElement.js l.211-213) --------
         if state.options.dev {
-            state.template.push(TemplateEntry::Stmt(
-                state.b.stmt(state.b.call("$.pop_element", vec![])),
-            ));
+            state
+                .template
+                .push(TemplateEntry::Stmt(state.b.stmt(state.b.call("$.pop_element", vec![]))));
         }
     } else if state.options.dev {
+        push_element_dev(node, name, state);
         // Void element: the `$.pop_element()` immediately follows the
         // `$.push_element(...)` (the void element has no children) — matches
         // the oracle's void-path pop.
-        state.template.push(TemplateEntry::Stmt(
-            state.b.stmt(state.b.call("$.pop_element", vec![])),
-        ));
+        state
+            .template
+            .push(TemplateEntry::Stmt(state.b.stmt(state.b.call("$.pop_element", vec![]))));
     }
 }
 
 /// Emit the dev-mode `$.push_element($$renderer, '<name>', <line>, <col>)`
 /// statement into the template buffer. The location is the 1-based line /
-/// 0-based column of `node.start`, computed via the existing (read-only)
-/// `locate_in_source` helper from the legacy server pipeline.
+/// 0-based column of `node.start`, computed via the shared `locate_in_source`.
 fn push_element_dev<'a>(node: &RegularElement, name: &str, state: &mut ServerTransformState<'a>) {
-    let (line, col) = super::shared::locate_in_source(state.source, node.start as usize);
+    let (line, col) = crate::compiler::phases::phase3_transform::utils::locate_in_source(
+        state.source,
+        node.start as usize,
+    );
     let b = state.b;
     let call = b.call(
         "$.push_element",
-        vec![
-            b.id("$$renderer"),
-            b.string(name),
-            b.number(line as f64),
-            b.number(col as f64),
-        ],
+        vec![b.id("$$renderer"), b.string(name), b.number(line as f64), b.number(col as f64)],
     );
     state.template.push(TemplateEntry::Stmt(b.stmt(call)));
 }
@@ -365,7 +373,7 @@ fn element_has_async_attribute(node: &RegularElement, state: &ServerTransformSta
                 // would spuriously route the element through `emit_async_element`,
                 // breaking the surrounding push coalescing.
                 let raw_name = a.name.as_str();
-                if is_event_attribute_name(raw_name)
+                if is_event_attribute(a)
                     || raw_name == "defaultValue"
                     || raw_name == "defaultChecked"
                 {
@@ -384,6 +392,20 @@ fn element_has_async_attribute(node: &RegularElement, state: &ServerTransformSta
                 // so a blocked / awaited bind expression makes the element async.
                 if !bind_skipped_in_ssr(node, bind)
                     && let Some(t) = bind_value_source(bind, state)
+                    && is_async_text(&t)
+                {
+                    return true;
+                }
+            }
+            Attribute::ClassDirective(dir) => {
+                if let Some(t) = state.expr_source(&dir.expression)
+                    && is_async_text(t)
+                {
+                    return true;
+                }
+            }
+            Attribute::StyleDirective(dir) => {
+                if let Some(t) = attribute_value_source(&dir.value, state)
                     && is_async_text(&t)
                 {
                     return true;
@@ -420,7 +442,7 @@ fn bind_skipped_in_ssr(node: &RegularElement, bind: &BindDirective) -> bool {
 /// (`$$renderer.child(async …)` / `$$renderer.async([$$promises[N]…], …)`). 写经
 /// `RegularElement.js`: `optimiser.render([b.block([...build_template(state.template)])])`.
 fn emit_async_element<'a>(
-    node: &RegularElement,
+    node: &RegularElement<'a>,
     name: &str,
     is_void: bool,
     state: &mut ServerTransformState<'a>,
@@ -468,21 +490,16 @@ fn emit_async_element<'a>(
 /// the surrounding literal-coalescing run (the `<textarea>`/`>` opener and the
 /// `</textarea>` closer stay outside it).
 fn emit_content_body<'a>(
-    node: &RegularElement,
+    node: &RegularElement<'a>,
     content: OxcExpression<'a>,
     namespace: &str,
-    suppress_children: bool,
     state: &mut ServerTransformState<'a>,
 ) {
     use super::shared::build_template;
 
     // Build the inner-children template into a SEPARATE buffer (the `else`
-    // branch body). Upstream uses a fresh `inner_state.template`. For
-    // `<textarea>` the children are SUPPRESSED (the value is the content), so
-    // the else branch is empty — matching the text oracle's `TextareaBody`.
-    let else_body = if suppress_children {
-        Vec::new()
-    } else {
+    // branch body). Upstream uses a fresh `inner_state.template`.
+    let else_body = {
         let saved = std::mem::take(&mut state.template);
         process_children(&node.fragment.nodes, Some(node), namespace, state);
         let inner_entries = std::mem::replace(&mut state.template, saved);
@@ -501,23 +518,17 @@ fn emit_content_body<'a>(
             format!("$$body_{}", state.body_counter)
         };
         state.body_counter += 1;
-        state
-            .template
-            .push(TemplateEntry::Stmt(state.b.const_id(&var_name, content)));
+        state.template.push(TemplateEntry::Stmt(state.b.const_id(&var_name, content)));
         state.b.id(&var_name)
     };
 
     // consequent: `$$renderer.push(`${id}`);`
     let consequent = {
         let tmpl = state.b.template(vec!["", ""], vec![id_clone(state, &id)]);
-        state.b.block(vec![
-            state.b.stmt(state.b.call("$$renderer.push", vec![tmpl])),
-        ])
+        state.b.block(vec![state.b.stmt(state.b.call("$$renderer.push", vec![tmpl]))])
     };
 
-    let if_stmt = state
-        .b
-        .if_stmt(id, consequent, Some(state.b.block(else_body)));
+    let if_stmt = state.b.if_stmt(id, consequent, Some(state.b.block(else_body)));
     state.template.push(TemplateEntry::Stmt(if_stmt));
 }
 
@@ -601,12 +612,9 @@ fn build_element_content<'a>(
 /// `class={x}` attribute is handled inline (it routes through `$.attr_class` with
 /// the hash), so it does NOT count here.
 fn has_class_directive_or_spread(node: &RegularElement) -> bool {
-    node.attributes.iter().any(|attr| {
-        matches!(
-            attr,
-            Attribute::ClassDirective(_) | Attribute::SpreadAttribute(_)
-        )
-    })
+    node.attributes
+        .iter()
+        .any(|attr| matches!(attr, Attribute::ClassDirective(_) | Attribute::SpreadAttribute(_)))
 }
 
 /// 写经 upstream `is_custom_element_node` (`phases/nodes.js`): a RegularElement is
@@ -648,7 +656,7 @@ fn attr_static_text(value: &AttributeValue) -> Option<String> {
 
 /// Find the sibling `value` plain-attribute node (for `bind:group`'s membership
 /// test). Mirrors upstream's `node.attributes.find(attr.name === 'value')`.
-fn find_value_attribute(node: &RegularElement) -> Option<&AttributeNode> {
+fn find_value_attribute<'a>(node: &'a RegularElement<'a>) -> Option<&'a AttributeNode<'a>> {
     node.attributes.iter().find_map(|a| match a {
         Attribute::Attribute(attr) if attr.name.as_str() == "value" => Some(attr),
         _ => None,
@@ -798,9 +806,7 @@ fn build_bind_directive<'a>(
             state.b.call(callee, vec![value_expr])
         } else {
             // `group === value`
-            state
-                .b
-                .binary(BinaryOperator::StrictEquality, group_expr, value_expr)
+            state.b.binary(BinaryOperator::StrictEquality, group_expr, value_expr)
         };
         return Some(("checked".to_string(), checked));
     }
@@ -845,11 +851,7 @@ pub(super) fn build_element_attributes<'a>(
     // `build_element_attributes` abandons the per-attribute emission and instead
     // builds ONE `$.attributes({ ...merged }, css_hash, classes, styles, flags?)`
     // call covering the whole element. Mirror that here.
-    if node
-        .attributes
-        .iter()
-        .any(|a| matches!(a, Attribute::SpreadAttribute(_)))
-    {
+    if node.attributes.iter().any(|a| matches!(a, Attribute::SpreadAttribute(_))) {
         build_element_spread_attributes(node, css_hash, state);
         return;
     }
@@ -895,10 +897,8 @@ pub(super) fn build_element_attributes<'a>(
     // class attribute (the client RegularElement injects the hash), so emit it
     // here at the upstream position instead of trailing after `attr_style`.
     let mut scope_class_emitted_early = false;
-    let has_style_directive = node
-        .attributes
-        .iter()
-        .any(|a| matches!(a, Attribute::StyleDirective(_)));
+    let has_style_directive =
+        node.attributes.iter().any(|a| matches!(a, Attribute::StyleDirective(_)));
 
     // `events_to_capture` (upstream `shared/element.js`): an `onload`/`onerror`
     // event handler on a load/error element (`<img>`, `<link>`, …) re-captures
@@ -935,11 +935,7 @@ pub(super) fn build_element_attributes<'a>(
                     vec![
                         Some(state.b.string(&bind_name)),
                         Some(value),
-                        if is_bool {
-                            Some(state.b.bool(true))
-                        } else {
-                            None
-                        },
+                        if is_bool { Some(state.b.bool(true)) } else { None },
                     ],
                 );
                 push_interp(state, call);
@@ -976,10 +972,7 @@ pub(super) fn build_element_attributes<'a>(
         // Event handlers (`on*` as Attribute form) + defaultValue/defaultChecked
         // are omitted by upstream as attributes. An `onload`/`onerror` handler on
         // a load/error element is recorded for the trailing capture literal.
-        if is_event_attribute_name(raw_name)
-            || raw_name == "defaultValue"
-            || raw_name == "defaultChecked"
-        {
+        if is_event_attribute(a) || raw_name == "defaultValue" || raw_name == "defaultChecked" {
             if (raw_name == "onload" || raw_name == "onerror")
                 && is_load_error_element(node.name.as_str())
             {
@@ -1011,15 +1004,16 @@ pub(super) fn build_element_attributes<'a>(
         if can_use_literal {
             match &a.value {
                 AttributeValue::True(_) => {
-                    let mut literal_value = String::new();
-                    if is_class && let Some(hash) = css_hash {
-                        literal_value = format!(" {hash}").trim().to_string();
-                    }
-                    if !is_class || !literal_value.is_empty() {
-                        state.template.push(TemplateEntry::Literal(format!(
-                            " {name}=\"{literal_value}\""
-                        )));
-                    }
+                    // Upstream carries the boolean into the class join, where it
+                    // stringifies to `true`, and its emptiness gate sees a truthy
+                    // value either way — so a valueless attribute always lands.
+                    let literal_value = match css_hash {
+                        Some(hash) if is_class => format!("true {hash}").trim().to_string(),
+                        _ => String::new(),
+                    };
+                    state
+                        .template
+                        .push(TemplateEntry::Literal(format!(" {name}=\"{literal_value}\"")));
                     continue;
                 }
                 AttributeValue::Sequence(parts) => {
@@ -1155,9 +1149,7 @@ pub(super) fn build_element_attributes<'a>(
                 && !has_class_dir_or_spread
                 && !scope_class_emitted_early
             {
-                state
-                    .template
-                    .push(TemplateEntry::Literal(format!(" class=\"{hash}\"")));
+                state.template.push(TemplateEntry::Literal(format!(" class=\"{hash}\"")));
                 scope_class_emitted_early = true;
             }
             if let Some(t) = &value_text {
@@ -1178,11 +1170,7 @@ pub(super) fn build_element_attributes<'a>(
                 vec![
                     Some(state.b.string(&name)),
                     Some(value),
-                    if is_bool {
-                        Some(state.b.bool(true))
-                    } else {
-                        None
-                    },
+                    if is_bool { Some(state.b.bool(true)) } else { None },
                 ],
             );
             push_interp(state, call);
@@ -1197,22 +1185,16 @@ pub(super) fn build_element_attributes<'a>(
         && !has_class_dir_or_spread
         && !scope_class_emitted_early
     {
-        state
-            .template
-            .push(TemplateEntry::Literal(format!(" class=\"{hash}\"")));
+        state.template.push(TemplateEntry::Literal(format!(" class=\"{hash}\"")));
     }
 
     // `events_to_capture`: emit ` onload="this.__e=event"` / ` onerror="..."`
     // literals (in Set insertion order) after all attributes.
     if capture_onload {
-        state.template.push(TemplateEntry::Literal(
-            " onload=\"this.__e=event\"".to_string(),
-        ));
+        state.template.push(TemplateEntry::Literal(" onload=\"this.__e=event\"".to_string()));
     }
     if capture_onerror {
-        state.template.push(TemplateEntry::Literal(
-            " onerror=\"this.__e=event\"".to_string(),
-        ));
+        state.template.push(TemplateEntry::Literal(" onerror=\"this.__e=event\"".to_string()));
     }
 }
 
@@ -1275,7 +1257,7 @@ fn build_element_spread_attributes<'a>(
                 {
                     super::shared::save_wrap_expr_text(state, t)
                 } else {
-                    state.visit_expr(&spread.expression)
+                    state.visit_expr_claiming(&spread.expression)
                 };
                 if let Some(t) = &spread_text {
                     expr = state.optimise_attr_value(t, expr);
@@ -1297,7 +1279,7 @@ fn build_element_spread_attributes<'a>(
                 if raw_name == "value" && matches!(node.name.as_str(), "select" | "textarea") {
                     continue;
                 }
-                if is_event_attribute_name(raw_name)
+                if is_event_attribute(a)
                     || raw_name == "defaultValue"
                     || raw_name == "defaultChecked"
                 {
@@ -1349,7 +1331,18 @@ fn build_element_spread_attributes<'a>(
         let members = class_directives
             .iter()
             .map(|dir| {
-                let val = state.visit_expr(&dir.expression);
+                let text = state.expr_source(&dir.expression).map(str::to_owned);
+                let mut val = if let Some(t) = text.as_deref()
+                    && state.attr_optimiser.is_some()
+                    && super::shared::text_has_await(t)
+                {
+                    super::shared::save_wrap_expr_text(state, t)
+                } else {
+                    state.visit_expr_claiming(&dir.expression)
+                };
+                if let Some(t) = text.as_deref() {
+                    val = state.optimise_attr_value(t, val);
+                }
                 state.b.init(dir.name.as_str(), val)
             })
             .collect();
@@ -1372,11 +1365,15 @@ fn build_element_spread_attributes<'a>(
                 if !sname.starts_with("--") {
                     sname = sname.to_lowercase();
                 }
-                let val = if matches!(dir.value, AttributeValue::True(_)) {
+                let text = attribute_value_source(&dir.value, state);
+                let mut val = if matches!(dir.value, AttributeValue::True(_)) {
                     state.b.id(dir.name.as_str())
                 } else {
                     build_attribute_value(&dir.value, true, state)
                 };
+                if let Some(t) = text.as_deref() {
+                    val = state.optimise_attr_value(t, val);
+                }
                 state.b.init(&sname, val)
             })
             .collect();
@@ -1392,37 +1389,23 @@ fn build_element_spread_attributes<'a>(
     } else if node.name.as_str() == "input" {
         flags |= ELEMENT_IS_INPUT;
     }
-    let flags_arg = if flags != 0 {
-        Some(state.b.number(flags as f64))
-    } else {
-        None
-    };
+    let flags_arg = if flags != 0 { Some(state.b.number(flags as f64)) } else { None };
 
     // `$.attributes(object, css_hash?, classes?, styles?, flags?)`. `call_opt`
     // drops trailing `None`s and replaces interior `None`s with `void 0`.
     let call = state.b.call_opt(
         "$.attributes",
-        vec![
-            Some(object),
-            css_hash_arg,
-            classes_arg,
-            styles_arg,
-            flags_arg,
-        ],
+        vec![Some(object), css_hash_arg, classes_arg, styles_arg, flags_arg],
     );
     push_interp(state, call);
 
     // `events_to_capture`: emit ` onload="this.__e=event"` / ` onerror="..."`
     // literals (in Set insertion order) after the `$.attributes(...)` call.
     if capture_onload {
-        state.template.push(TemplateEntry::Literal(
-            " onload=\"this.__e=event\"".to_string(),
-        ));
+        state.template.push(TemplateEntry::Literal(" onload=\"this.__e=event\"".to_string()));
     }
     if capture_onerror {
-        state.template.push(TemplateEntry::Literal(
-            " onerror=\"this.__e=event\"".to_string(),
-        ));
+        state.template.push(TemplateEntry::Literal(" onerror=\"this.__e=event\"".to_string()));
     }
 }
 
@@ -1481,18 +1464,14 @@ fn is_customizable_select(nodes: &[TemplateNode]) -> bool {
             // Block branches are recursed into (their contents are descendants).
             TemplateNode::IfBlock(b)
                 if is_customizable_select(&b.consequent.nodes)
-                    || b.alternate
-                        .as_ref()
-                        .is_some_and(|a| is_customizable_select(&a.nodes)) =>
+                    || b.alternate.as_ref().is_some_and(|a| is_customizable_select(&a.nodes)) =>
             {
                 return true;
             }
             TemplateNode::IfBlock(_) => {}
             TemplateNode::EachBlock(b)
                 if is_customizable_select(&b.body.nodes)
-                    || b.fallback
-                        .as_ref()
-                        .is_some_and(|f| is_customizable_select(&f.nodes)) =>
+                    || b.fallback.as_ref().is_some_and(|f| is_customizable_select(&f.nodes)) =>
             {
                 return true;
             }
@@ -1691,11 +1670,13 @@ fn select_find_descendants<'n>(
 /// `inner_state = { ...state, template: [], init: [] }; process_children(...);
 /// build_template(inner_state.template)`.
 fn render_children_body<'a>(
-    node: &RegularElement,
+    node: &RegularElement<'a>,
     state: &mut ServerTransformState<'a>,
 ) -> Vec<Statement<'a>> {
     use super::shared::build_template;
-    let namespace = if node.metadata.svg {
+    let namespace = if node.name.as_str() == "foreignObject" {
+        "html"
+    } else if node.metadata.svg {
         "svg"
     } else if node.metadata.mathml {
         "mathml"
@@ -1743,7 +1724,7 @@ fn prepare_element_spread_object<'a>(
         match attr {
             Attribute::SpreadAttribute(spread) => {
                 has_spread = true;
-                let expr = state.visit_expr(&spread.expression);
+                let expr = state.visit_expr_claiming(&spread.expression);
                 props.push(state.b.spread(expr));
             }
             Attribute::Attribute(a) => {
@@ -1768,10 +1749,16 @@ fn prepare_element_spread_object<'a>(
                 // emitted directly under its `get_attribute_name`, with NO
                 // `bind:value`-on-select skip and NO `bind:group` → `checked`
                 // transform (those are specific to `build_element_attributes`, the
-                // generic-element spread path). A `{get, set}` sequence would call
-                // `get()` — KNOWN GAP: the whole expression is used as-is.
+                // generic-element spread path). A `{get, set}` sequence collapses
+                // to `(getter)()` (upstream `b.call(expression.expressions[0])`).
                 let name = get_bind_attribute_name(node, bind.name.as_str());
-                let value = state.visit_expr(&bind.expression);
+                let value = if bind_expr_is_sequence(bind) {
+                    let seq = state.visit_expr(&bind.expression);
+                    let getter = sequence_first(seq, state);
+                    state.b.call(getter, vec![])
+                } else {
+                    state.visit_expr(&bind.expression)
+                };
                 props.push(state.b.init(&name, value));
             }
             Attribute::ClassDirective(dir) => class_directives.push(dir),
@@ -1804,7 +1791,7 @@ fn prepare_element_spread_object<'a>(
         let members = class_directives
             .iter()
             .map(|dir| {
-                let val = state.visit_expr(&dir.expression);
+                let val = state.visit_expr_claiming(&dir.expression);
                 state.b.init(dir.name.as_str(), val)
             })
             .collect();
@@ -1842,19 +1829,9 @@ fn prepare_element_spread_object<'a>(
     } else if node.name.as_str() == "input" {
         flags |= ELEMENT_IS_INPUT;
     }
-    let flags_arg = if flags != 0 {
-        Some(state.b.number(flags as f64))
-    } else {
-        None
-    };
+    let flags_arg = if flags != 0 { Some(state.b.number(flags as f64)) } else { None };
 
-    vec![
-        Some(object),
-        css_hash_arg,
-        classes_arg,
-        styles_arg,
-        flags_arg,
-    ]
+    vec![Some(object), css_hash_arg, classes_arg, styles_arg, flags_arg]
 }
 
 /// Emit `$$renderer.select(<attrs obj>, ($$renderer) => { <children> }, ...rest)`.
@@ -1862,7 +1839,7 @@ fn prepare_element_spread_object<'a>(
 /// (lines 109-128). The `...rest` is `[css_hash?, classes?, styles?, flags?]`
 /// (trailing `None`s pruned) with an extra `true` appended when the select has
 /// rich content (`is_customizable_select_element`).
-fn emit_select_special<'a>(node: &RegularElement, state: &mut ServerTransformState<'a>) {
+fn emit_select_special<'a>(node: &RegularElement<'a>, state: &mut ServerTransformState<'a>) {
     let css_hash: Option<String> = if node.metadata.scoped && !state.analysis.css.hash.is_empty() {
         Some(state.analysis.css.hash.to_string())
     } else {
@@ -1896,7 +1873,7 @@ fn emit_select_special<'a>(node: &RegularElement, state: &mut ServerTransformSta
 /// `is_option_special` branch of upstream `RegularElement.js` (lines 131-175).
 /// `body` is the synthetic value expression directly (when the option has a
 /// `synthetic_value_node`), else a `($$renderer) => { <children> }` callback.
-fn emit_option_special<'a>(node: &RegularElement, state: &mut ServerTransformState<'a>) {
+fn emit_option_special<'a>(node: &RegularElement<'a>, state: &mut ServerTransformState<'a>) {
     let css_hash: Option<String> = if node.metadata.scoped && !state.analysis.css.hash.is_empty() {
         Some(state.analysis.css.hash.to_string())
     } else {
@@ -1907,7 +1884,26 @@ fn emit_option_special<'a>(node: &RegularElement, state: &mut ServerTransformSta
         // Direct value (the option's lone expression child becomes its `value`).
         state.visit_expr(&synthetic.expression)
     } else {
-        let stmts = render_children_body(node, state);
+        let mut stmts = render_children_body(node, state);
+        if state.options.dev {
+            let (line, col) = crate::compiler::phases::phase3_transform::utils::locate_in_source(
+                state.source,
+                node.start as usize,
+            );
+            stmts.insert(
+                0,
+                state.b.stmt(state.b.call(
+                    "$.push_element",
+                    vec![
+                        state.b.id("$$renderer"),
+                        state.b.string("option"),
+                        state.b.number(line as f64),
+                        state.b.number(col as f64),
+                    ],
+                )),
+            );
+            stmts.push(state.b.stmt(state.b.call("$.pop_element", vec![])));
+        }
         let params = state.b.params(vec![state.b.id_pat("$$renderer")], None);
         let fn_body = state.b.body(stmts);
         state.b.arrow(params, fn_body, false, false)
@@ -1959,7 +1955,18 @@ fn build_attr_class<'a>(
         let members = class_directives
             .iter()
             .map(|dir| {
-                let val = state.visit_expr(&dir.expression);
+                let text = state.expr_source(&dir.expression).map(str::to_owned);
+                let mut val = if let Some(t) = text.as_deref()
+                    && state.attr_optimiser.is_some()
+                    && super::shared::text_has_await(t)
+                {
+                    super::shared::save_wrap_expr_text(state, t)
+                } else {
+                    state.visit_expr_claiming(&dir.expression)
+                };
+                if let Some(t) = text.as_deref() {
+                    val = state.optimise_attr_value(t, val);
+                }
                 // QUOTED key (`b.literal(directive.name)`) → string-literal key.
                 state.b.prop(
                     oxc_ast::ast::PropertyKind::Init,
@@ -1987,10 +1994,7 @@ fn build_attr_class<'a>(
 
     // `$.attr_class(value, css_hash?, directives?)`. `call_opt` drops trailing
     // `None`s and prints interior `None`s as `void 0`.
-    state.b.call_opt(
-        "$.attr_class",
-        vec![Some(value_arg), css_hash_arg, directives_arg],
-    )
+    state.b.call_opt("$.attr_class", vec![Some(value_arg), css_hash_arg, directives_arg])
 }
 
 /// `build_attr_style(expression, directives)` — the server form. Faithful port
@@ -2015,11 +2019,15 @@ fn build_attr_style<'a>(
         let mut normal: Vec<oxc_ast::ast::ObjectPropertyKind<'a>> = Vec::new();
         let mut important: Vec<oxc_ast::ast::ObjectPropertyKind<'a>> = Vec::new();
         for dir in style_directives {
-            let val = if matches!(dir.value, AttributeValue::True(_)) {
+            let text = attribute_value_source(&dir.value, state);
+            let mut val = if matches!(dir.value, AttributeValue::True(_)) {
                 state.b.id(dir.name.as_str())
             } else {
                 build_attribute_value(&dir.value, true, state)
             };
+            if let Some(t) = text.as_deref() {
+                val = state.optimise_attr_value(t, val);
+            }
             let mut sname = dir.name.to_string();
             if !sname.starts_with("--") {
                 sname = sname.to_lowercase();
@@ -2034,17 +2042,12 @@ fn build_attr_style<'a>(
         if important.is_empty() {
             Some(state.b.object(normal))
         } else {
-            Some(state.b.array(vec![
-                Some(state.b.object(normal)),
-                Some(state.b.object(important)),
-            ]))
+            Some(state.b.array(vec![Some(state.b.object(normal)), Some(state.b.object(important))]))
         }
     };
 
     // `$.attr_style(value, directives?)`. `call_opt` drops the trailing `None`.
-    state
-        .b
-        .call_opt("$.attr_style", vec![Some(expression), directives_arg])
+    state.b.call_opt("$.attr_style", vec![Some(expression), directives_arg])
 }
 
 /// Whether a `style:` directive carries the `|important` modifier.
@@ -2072,22 +2075,21 @@ fn build_attribute_value<'a>(
 ) -> OxcExpression<'a> {
     match value {
         AttributeValue::True(_) => state.b.bool(true),
-        AttributeValue::Expression(tag) => attr_expr_value(&tag.expression, state),
+        AttributeValue::Expression(tag) => {
+            attr_expr_value(&tag.expression, (tag.start + 1, tag.end - 1), state)
+        }
         AttributeValue::Sequence(parts) => {
             // Single-element sequence collapses to its lone part (upstream's
             // `value.length === 1` branch).
             if parts.len() == 1 {
                 return match &parts[0] {
                     AttributeValuePart::Text(t) => {
-                        let data = if trim_ws {
-                            collapse_ws(t.data.as_str())
-                        } else {
-                            t.data.to_string()
-                        };
+                        let data =
+                            if trim_ws { collapse_ws(t.data.as_ref()) } else { t.data.to_string() };
                         state.b.string(&escape_attr(&data))
                     }
                     AttributeValuePart::ExpressionTag(tag) => {
-                        attr_expr_value(&tag.expression, state)
+                        attr_expr_value(&tag.expression, (tag.start + 1, tag.end - 1), state)
                     }
                 };
             }
@@ -2102,7 +2104,7 @@ fn build_attribute_value<'a>(
                 match part {
                     AttributeValuePart::Text(t) => {
                         let data = if trim_ws {
-                            collapse_ws_no_trim(t.data.as_str())
+                            collapse_ws_no_trim(t.data.as_ref())
                         } else {
                             t.data.to_string()
                         };
@@ -2111,19 +2113,19 @@ fn build_attribute_value<'a>(
                     AttributeValuePart::ExpressionTag(tag) => {
                         // Constant-fold known values into the quasi (a known-nullish
                         // value contributes nothing — `attr ?? ""` omittance).
-                        let evaluation = state
-                            .eval_ctx()
-                            .evaluate_template_expression(&tag.expression);
+                        let evaluation =
+                            state.eval_ctx().evaluate_template_expression(&tag.expression);
                         if let Some(value) = evaluation.known_value() {
                             if !matches!(value, EvalValue::Null | EvalValue::Undefined) {
                                 let content = js_display_string(value);
                                 quasis.last_mut().unwrap().push_str(&content);
                             }
+                            state.defer_template_expression_comments((tag.start + 1, tag.end - 1));
                             continue;
                         }
                         // Live expression: wrap in `$.stringify` unless it is
                         // provably a defined string (`is_string && is_defined`).
-                        let visited = state.visit_expr(&tag.expression);
+                        let visited = state.visit_expr_claiming(&tag.expression);
                         let emitted = if evaluation.is_string() && evaluation.is_defined() {
                             visited
                         } else {
@@ -2175,6 +2177,7 @@ fn attribute_value_source(
 /// unchanged.
 fn attr_expr_value<'a>(
     expr: &crate::ast::js::Expression,
+    region: (u32, u32),
     state: &mut ServerTransformState<'a>,
 ) -> OxcExpression<'a> {
     if state.attr_optimiser.is_some()
@@ -2183,13 +2186,34 @@ fn attr_expr_value<'a>(
     {
         return super::shared::save_wrap_expr_text(state, &text);
     }
-    state.visit_expr(expr)
+    let mut visited = state.visit_expr(expr);
+    let source = state.expr_source(expr).map(str::to_owned);
+    if let (Some(start), Some(end)) = (expr.start(), expr.end()) {
+        state.place_template_expression_comments(region, (start, end), &mut visited);
+    }
+    state.claim_on_visited(source.as_deref(), &mut visited);
+    visited
 }
 
 /// Whether `name` is an event-handler attribute (`on` + lowercase letter), the
 /// `is_event_attribute` predicate from upstream `utils/ast.js`.
-fn is_event_attribute_name(name: &str) -> bool {
-    name.len() > 2 && name.starts_with("on") && name.as_bytes()[2].is_ascii_lowercase()
+fn is_event_attribute(a: &AttributeNode) -> bool {
+    // Upstream's name test reads the two leading characters and nothing else, so
+    // `onClick` is a handler; what keeps `onclick="alert(1)"` an ordinary
+    // attribute is the value shape, not the spelling of the name.
+    a.name.starts_with("on") && is_expression_attribute(&a.value)
+}
+
+/// Upstream `is_expression_attribute`: a lone expression, in either the bare or
+/// the one-part sequence spelling.
+fn is_expression_attribute(value: &AttributeValue) -> bool {
+    match value {
+        AttributeValue::True(_) => false,
+        AttributeValue::Expression(_) => true,
+        AttributeValue::Sequence(parts) => {
+            parts.len() == 1 && matches!(parts[0], AttributeValuePart::ExpressionTag(_))
+        }
+    }
 }
 
 /// Whether the element emits `load` / `error` events (upstream
@@ -2263,13 +2287,11 @@ fn fold_sequence_static<'a>(
             // upstream `build_attribute_value`'s `replace(regex_whitespaces_strict, ' ')`.
             // The trailing trim only happens at the css-hash join in the caller.
             AttributeValuePart::Text(t) if trim_ws => {
-                out.push_str(&collapse_ws_no_trim(t.data.as_str()))
+                out.push_str(&collapse_ws_no_trim(t.data.as_ref()))
             }
-            AttributeValuePart::Text(t) => out.push_str(t.data.as_str()),
+            AttributeValuePart::Text(t) => out.push_str(t.data.as_ref()),
             AttributeValuePart::ExpressionTag(tag) => {
-                let ev = state
-                    .eval_ctx()
-                    .evaluate_template_expression(&tag.expression);
+                let ev = state.eval_ctx().evaluate_template_expression(&tag.expression);
                 let value = ev.known_value()?;
                 if !matches!(value, EvalValue::Null | EvalValue::Undefined) {
                     out.push_str(&js_display_string(value));
@@ -2306,13 +2328,9 @@ fn static_text_of(parts: &[AttributeValuePart], trim_ws: bool) -> Option<String>
     let mut s = String::new();
     for part in parts {
         match part {
-            AttributeValuePart::Text(t) => s.push_str(t.data.as_str()),
+            AttributeValuePart::Text(t) => s.push_str(t.data.as_ref()),
             AttributeValuePart::ExpressionTag(_) => return None,
         }
     }
-    if trim_ws {
-        Some(collapse_ws(&s))
-    } else {
-        Some(s)
-    }
+    if trim_ws { Some(collapse_ws(&s)) } else { Some(s) }
 }

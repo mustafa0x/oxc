@@ -43,6 +43,12 @@ pub struct Location {
     pub column: usize,
 }
 
+fn locate(source: &str, offset: u32) -> Location {
+    let (line, column) =
+        crate::compiler::phases::phase3_transform::utils::locate_in_source(source, offset as usize);
+    Location { line, column }
+}
+
 /// Build location metadata for template nodes.
 fn build_locations(nodes: &[Node], locator: &Locator) -> JsExpr {
     let mut array_elements = Vec::new();
@@ -97,11 +103,7 @@ pub fn transform_template<'a>(
     let tree = state.options.fragments == FragmentsMode::Tree;
     let mut current_flags = flags.unwrap_or(0);
 
-    let expression = if tree {
-        state.template.as_tree(arena)
-    } else {
-        state.template.as_html()
-    };
+    let expression = if tree { state.template.as_tree(arena) } else { state.template.as_html() };
 
     if tree {
         if namespace == Namespace::Svg {
@@ -136,21 +138,13 @@ pub fn transform_template<'a>(
     };
 
     let mut call = if current_flags != 0 {
-        b::call(
-            arena,
-            function_name,
-            vec![expression, b::number(current_flags as f64)],
-        )
+        b::call(arena, function_name, vec![expression, b::number(current_flags as f64)])
     } else {
         b::call(arena, function_name, vec![expression])
     };
 
     if state.template.contains_script_tag {
-        call = b::call(
-            arena,
-            b::member(arena, b::id("$"), "with_script"),
-            vec![call],
-        );
+        call = b::call(arena, b::member(arena, b::id("$"), "with_script"), vec![call]);
     }
 
     if state.options.dev {
@@ -160,21 +154,7 @@ pub fn transform_template<'a>(
             loc
         } else {
             let source = state.analysis.source.clone();
-            auto_locator = Box::new(move |offset: u32| {
-                let offset = offset as usize;
-                let bytes = source.as_bytes();
-                let mut line = 1usize;
-                let mut col = 0usize;
-                for &byte in bytes.iter().take(offset.min(bytes.len())) {
-                    if byte == b'\n' {
-                        line += 1;
-                        col = 0;
-                    } else {
-                        col += 1;
-                    }
-                }
-                Location { line, column: col }
-            });
+            auto_locator = Box::new(move |offset: u32| locate(&source, offset));
             &auto_locator
         };
         let locations = build_locations(&state.template.nodes, loc_ref);
@@ -214,12 +194,7 @@ fn get_template_key(expression: &JsExpr, namespace: Namespace, flags: u32) -> Op
     if !template.expressions.is_empty() || template.quasis.len() != 1 {
         return None;
     }
-    Some(format!(
-        "{} {} {}",
-        namespace.as_str(),
-        flags,
-        template.quasis[0].raw
-    ))
+    Some(format!("{} {} {}", namespace.as_str(), flags, template.quasis[0].raw))
 }
 
 #[cfg(test)]
@@ -231,5 +206,26 @@ mod tests {
         assert_eq!(Namespace::Html.as_str(), "html");
         assert_eq!(Namespace::Svg.as_str(), "svg");
         assert_eq!(Namespace::Mathml.as_str(), "mathml");
+    }
+
+    /// Column of the `<p>` in each source, i.e. how much of the line precedes it.
+    fn column_of_p(source: &str) -> usize {
+        locate(source, source.find("<p>").unwrap() as u32).column
+    }
+
+    #[test]
+    fn columns_count_utf16_code_units() {
+        assert_eq!(column_of_p("ab<p>"), 2, "ascii");
+        assert_eq!(column_of_p("aé<p>"), 2, "2-byte char is one unit");
+        assert_eq!(column_of_p("a’<p>"), 2, "3-byte char is one unit");
+        // The discriminating case: a surrogate pair is one code point but two
+        // UTF-16 units, so a code-point count would report 2 here.
+        assert_eq!(column_of_p("a🎉<p>"), 3, "surrogate pair is two units");
+    }
+
+    #[test]
+    fn newlines_reset_the_column() {
+        let loc = locate("a🎉\nbc<p>", "a🎉\nbc<p>".find("<p>").unwrap() as u32);
+        assert_eq!((loc.line, loc.column), (2, 2));
     }
 }

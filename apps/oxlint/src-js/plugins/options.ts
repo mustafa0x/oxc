@@ -281,15 +281,10 @@ export function setOptions(optionsJson: string): void {
  * @throws `Error` if options fail validation
  */
 function processOptions(configOptions: Options, ruleDetails: RuleDetails): Readonly<Options> {
-  // Throw if no schema validator provided, unless the user explicitly supplied no options.
+  // Throw if no schema validator provided
   const validator = ruleDetails.optionsSchemaValidator;
   if (validator === null) {
-    if (configOptions.length !== 0) {
-      throw new Error(`Rule '${ruleDetails.context.id}' does not accept options`);
-    }
-
-    deepFreezeJsonArray(configOptions);
-    return configOptions;
+    throw new Error(`Rule '${ruleDetails.context.id}' does not accept options`);
   }
 
   // Merge with `defaultOptions` first

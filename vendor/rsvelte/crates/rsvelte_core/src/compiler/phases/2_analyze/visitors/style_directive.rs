@@ -6,23 +6,27 @@
 
 use super::super::errors;
 use super::VisitorContext;
+use super::shared::fragment::mark_subtree_dynamic;
 use super::shared::utils::walk_js_expression_node;
 use crate::ast::template::{AttributeValue, AttributeValuePart, StyleDirective};
 use crate::compiler::phases::phase2_analyze::AnalysisError;
+use crate::compiler::phases::phase2_analyze::scope::BindingKind;
 
 /// Visit a style directive.
 pub fn visit(
-    directive: &StyleDirective,
+    directive: &mut StyleDirective,
     context: &mut VisitorContext,
 ) -> Result<(), AnalysisError> {
     // style: directives set individual CSS properties
 
-    // Validate modifiers - only "important" is allowed
-    for modifier in &directive.modifiers {
-        if modifier.as_str() != "important" {
-            return Err(errors::style_directive_invalid_modifier());
-        }
+    // Validate modifiers - a single "important" is the only accepted list
+    if directive.modifiers.len() > 1
+        || directive.modifiers.first().is_some_and(|m| m.as_str() != "important")
+    {
+        return Err(errors::style_directive_invalid_modifier().at(directive.start, directive.end));
     }
+
+    mark_subtree_dynamic(&context.path);
 
     // Analyze the expression value
     match &directive.value {
@@ -31,7 +35,15 @@ pub fn visit(
             // Look up the binding for the directive name and add a reference
             // This corresponds to the official compiler's handling at StyleDirective.js L18-29
             let name = directive.name.as_str();
-            if let Some(&binding_idx) = context.analysis.root.scope.declarations.get(name) {
+            if let Some(binding_idx) = context.analysis.root.get_binding(name, context.scope) {
+                let binding = &context.analysis.root.bindings[binding_idx];
+                if binding.kind != BindingKind::Normal {
+                    directive.metadata.expression.set_has_state(true);
+                }
+                if binding.blocker.is_some() {
+                    directive.metadata.expression.dependencies.insert(binding_idx);
+                }
+
                 // Add a style directive reference for legacy state promotion
                 context.analysis.root.bindings[binding_idx].add_reference(
                     directive.start,
@@ -45,16 +57,35 @@ pub fn visit(
         AttributeValue::Expression(expr_tag) => {
             // Single expression: `style:color={expr}`
             let node = expr_tag.expression.as_node();
-            let mut metadata = crate::ast::template::ExpressionMetadata::default();
-            walk_js_expression_node(&node, context, &mut metadata)?;
+            walk_js_expression_node(&node, context, &mut directive.metadata.expression)?;
+            super::await_block::collect_pickled_awaits_node(
+                &node,
+                &mut context.analysis.pickled_awaits,
+                context.parse_arena,
+            );
         }
         AttributeValue::Sequence(parts) => {
             // Mixed content: `style:color="prefix{expr}suffix"`
             for part in parts {
-                if let AttributeValuePart::ExpressionTag(expr_tag) = part {
-                    let node = expr_tag.expression.as_node();
-                    let mut metadata = crate::ast::template::ExpressionMetadata::default();
-                    walk_js_expression_node(&node, context, &mut metadata)?;
+                match part {
+                    AttributeValuePart::ExpressionTag(expr_tag) => {
+                        let node = expr_tag.expression.as_node();
+                        walk_js_expression_node(
+                            &node,
+                            context,
+                            &mut directive.metadata.expression,
+                        )?;
+                        super::await_block::collect_pickled_awaits_node(
+                            &node,
+                            &mut context.analysis.pickled_awaits,
+                            context.parse_arena,
+                        );
+                    }
+                    AttributeValuePart::Text(text) => {
+                        super::text::check_bidirectional_control_characters(
+                            &text.data, text.start, context,
+                        );
+                    }
                 }
             }
         }

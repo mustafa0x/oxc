@@ -10,8 +10,8 @@ use crate::compiler::phases::phase3_transform::client::types::*;
 use crate::compiler::phases::phase3_transform::client::visitors::expression_converter::convert_expression;
 use crate::compiler::phases::phase3_transform::client::visitors::fragment::collect_ids_from_expr;
 use crate::compiler::phases::phase3_transform::client::visitors::shared::utils::{
-    apply_transforms_to_expression, expression_has_await, expression_has_reactive_state,
-    get_literal_value, is_expression_defined,
+    build_expression, expression_has_await, expression_has_reactive_state, get_literal_value,
+    is_expression_defined,
 };
 use crate::compiler::phases::phase3_transform::js_ast::builders as b;
 use crate::compiler::phases::phase3_transform::js_ast::nodes::*;
@@ -53,15 +53,9 @@ pub fn title_element(node: &TitleElement, context: &mut ComponentContext) {
     collect_ids_from_expr(&value, &context.arena, &mut value_ids);
 
     // Create the assignment: $.document.title = value
-    let document_title = b::member(
-        &context.arena,
-        b::member_path(&context.arena, "$.document"),
-        "title",
-    );
-    let assignment = b::stmt(
-        &context.arena,
-        b::assign(&context.arena, document_title, value),
-    );
+    let document_title =
+        b::member(&context.arena, b::member_path(&context.arena, "$.document"), "title");
+    let assignment = b::stmt(&context.arena, b::assign(&context.arena, document_title, value));
 
     // Use the memoised `deferred_template_effect` form whenever the title has
     // reactive state OR a memoised call/await value. Previously this branched on
@@ -163,11 +157,7 @@ pub fn title_element(node: &TitleElement, context: &mut ComponentContext) {
                     .collect();
                 all_blocker_exprs.extend(const_blocker_exprs);
 
-                if all_blocker_exprs.is_empty() {
-                    None
-                } else {
-                    Some(b::array(all_blocker_exprs))
-                }
+                if all_blocker_exprs.is_empty() { None } else { Some(b::array(all_blocker_exprs)) }
             }
         };
 
@@ -293,46 +283,50 @@ fn build_title_content(
         let mut has_state = false;
         for node in nodes {
             if let TemplateNode::ExpressionTag(expr) = node {
-                // Upstream `TitleElement`: `evaluated.is_known ? b.literal(value)`
-                // with `has_state = false` → a plain (non-reactive) `$.effect`.
-                // Inline string-valued knowns only; numeric/boolean knowns would
-                // need a numeric `b.literal` (`title = 0`, not `"0"`) to
-                // byte-match, so they fall through to the existing path.
-                if let Some(Some(v)) = get_literal_value(&expr.expression, context) {
-                    let is_num_or_bool = v.parse::<f64>().is_ok() || v == "true" || v == "false";
-                    if !is_num_or_bool {
-                        return (b::string(v), false, memo_entries);
-                    }
+                // Upstream's single-value chunk writes `b.literal((value ?? '') + '')`,
+                // so every known folds to a STRING — `0` and `true` included — and a
+                // known-nullish one folds to the empty string rather than keeping a
+                // `?? ''` around a name that is gone by then.
+                match get_literal_value(&expr.expression, context) {
+                    Some(Some(v)) => return (b::string(v), false, memo_entries),
+                    Some(None) => return (b::string(""), false, memo_entries),
+                    None => {}
                 }
                 if expression_has_reactive_state(&expr.expression, context) {
                     has_state = true;
                 }
                 let has_await = expression_has_await(&expr.expression);
                 let raw_value = convert_expression(&expr.expression, context);
-                let value = apply_transforms_to_expression(&raw_value, context);
+                // TitleElement duplicates upstream's `build_template_chunk` flow so it can
+                // keep a local memoizer. It must still use `build_expression`: in legacy
+                // mode this records coarse-grained dependencies before evaluating calls
+                // under `$.untrack(...)` (for example a store-backed `$t('key')`).
+                let metadata =
+                    ExpressionMetadata::from_template_metadata(&expr.metadata.expression);
+                let value = build_expression(context, &raw_value, &metadata);
 
                 // If expression has call or await, memoize it.
                 // Phase 2 already cached has_call on the tag metadata.
                 let has_call = expr.metadata.expression.has_call();
                 if has_call || has_await {
                     let param_name = format!("${}", memo_entries.len());
-                    memo_entries.push(MemoEntry {
-                        expression: value,
-                        is_async: has_await,
-                    });
+                    memo_entries.push(MemoEntry { expression: value, is_async: has_await });
                     let param_ref = b::id(&param_name);
-                    if !is_known_defined_expr(&expr.expression) {
-                        return (
-                            b::nullish(&context.arena, param_ref, b::string("")),
-                            has_state,
-                            memo_entries,
-                        );
-                    } else {
-                        return (param_ref, has_state, memo_entries);
-                    }
+                    // Upstream evaluates the value *after* Memoizer::add has
+                    // replaced the call/await with the fresh `$0` identifier.
+                    // That identifier is unknown to the component scope, so it
+                    // is never known-defined even when the original expression
+                    // is (for example, a CallExpression). Keep the fallback on
+                    // the memo parameter; checking the original expression here
+                    // incorrectly erased it.
+                    return (
+                        b::nullish(&context.arena, param_ref, b::string("")),
+                        has_state,
+                        memo_entries,
+                    );
                 }
 
-                if !is_known_defined_expr(&expr.expression) {
+                if !is_expression_defined(&expr.expression, context) {
                     return (
                         b::nullish(&context.arena, value, b::string("")),
                         has_state,
@@ -342,6 +336,37 @@ fn build_title_content(
                     return (value, has_state, memo_entries);
                 }
             }
+        }
+    }
+
+    // Upstream evaluates the BUILT template (`scope.evaluate(value)`) and
+    // assigns `b.literal(evaluated.value)` when known, so a title whose every
+    // chunk folds becomes a static string assignment (a known-nullish chunk
+    // already carries `?? ''`, so it contributes nothing).
+    {
+        let mut folded = String::new();
+        let mut all_known = true;
+        for node in nodes {
+            match node {
+                TemplateNode::Text(text) => folded.push_str(&text.data),
+                TemplateNode::ExpressionTag(expr) => {
+                    match get_literal_value(&expr.expression, context) {
+                        Some(Some(v)) => folded.push_str(&v),
+                        Some(None) => {}
+                        None => {
+                            all_known = false;
+                            break;
+                        }
+                    }
+                }
+                _ => {
+                    all_known = false;
+                    break;
+                }
+            }
+        }
+        if all_known {
+            return (b::string(folded), false, memo_entries);
         }
     }
 
@@ -357,6 +382,18 @@ fn build_title_content(
                 current_text.push_str(&text.data);
             }
             TemplateNode::ExpressionTag(expr) => {
+                // Upstream inlines a chunk whose evaluation is known into the
+                // quasi text (`Zoo — ${name}`, not `${site} — ${name}`); a
+                // known-nullish chunk contributes nothing (its `?? ''`).
+                match get_literal_value(&expr.expression, context) {
+                    Some(Some(v)) => {
+                        current_text.push_str(&v);
+                        continue;
+                    }
+                    Some(None) => continue,
+                    None => {}
+                }
+
                 if expression_has_reactive_state(&expr.expression, context) {
                     has_state = true;
                 }
@@ -368,21 +405,18 @@ fn build_title_content(
                 // Phase 2 already cached has_call on the tag metadata.
                 let has_call = expr.metadata.expression.has_call();
                 let raw_value = convert_expression(&expr.expression, context);
-                let value = apply_transforms_to_expression(&raw_value, context);
+                let metadata =
+                    ExpressionMetadata::from_template_metadata(&expr.metadata.expression);
+                let value = build_expression(context, &raw_value, &metadata);
 
                 // If expression has call or await, memoize it
                 if has_call || has_await {
                     let param_name = format!("${}", memo_entries.len());
-                    memo_entries.push(MemoEntry {
-                        expression: value,
-                        is_async: has_await,
-                    });
+                    memo_entries.push(MemoEntry { expression: value, is_async: has_await });
                     let param_ref = b::id(&param_name);
-                    if !is_expression_defined(&expr.expression, context) {
-                        expressions.push(b::nullish(&context.arena, param_ref, b::string("")));
-                    } else {
-                        expressions.push(param_ref);
-                    }
+                    // As in the single-expression path, scope.evaluate sees
+                    // the memo identifier rather than the original expression.
+                    expressions.push(b::nullish(&context.arena, param_ref, b::string("")));
                 } else if !is_expression_defined(&expr.expression, context) {
                     expressions.push(b::nullish(&context.arena, value, b::string("")));
                 } else {
@@ -400,12 +434,7 @@ fn build_title_content(
     let template_quasis: Vec<_> = quasis
         .iter()
         .enumerate()
-        .map(|(i, text)| {
-            b::quasi(
-                sanitize_template_string(text.as_str()),
-                i == quasis.len() - 1,
-            )
-        })
+        .map(|(i, text)| b::quasi(sanitize_template_string(text.as_str()), i == quasis.len() - 1))
         .collect();
     let value = b::template(template_quasis, expressions);
     (value, has_state, memo_entries)
@@ -413,31 +442,9 @@ fn build_title_content(
 
 /// Check if nodes contain a single expression tag (possibly with whitespace text nodes)
 fn is_single_expression_tag(nodes: &[TemplateNode]) -> bool {
-    let expr_count = nodes
-        .iter()
-        .filter(|n| matches!(n, TemplateNode::ExpressionTag(_)))
-        .count();
-    let non_text_non_expr = nodes
-        .iter()
-        .any(|n| !matches!(n, TemplateNode::Text(_) | TemplateNode::ExpressionTag(_)));
+    let expr_count = nodes.iter().filter(|n| matches!(n, TemplateNode::ExpressionTag(_))).count();
+    let non_text_non_expr =
+        nodes.iter().any(|n| !matches!(n, TemplateNode::Text(_) | TemplateNode::ExpressionTag(_)));
 
     expr_count == 1 && !non_text_non_expr && nodes.len() == 1
-}
-
-/// Check if an expression is known to be defined (not null/undefined).
-fn is_known_defined_expr(expr: &crate::ast::js::Expression) -> bool {
-    match expr.node_type() {
-        Some("Literal") => {
-            // Check if literal value is not null
-            let node = expr.as_node();
-            match &*node {
-                crate::ast::typed_expr::JsNode::Literal { value, .. } => {
-                    !matches!(value, crate::ast::typed_expr::LiteralValue::Null)
-                }
-                _ => false,
-            }
-        }
-        Some("TemplateLiteral") => true,
-        _ => false,
-    }
 }

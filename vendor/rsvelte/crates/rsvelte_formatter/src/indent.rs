@@ -19,11 +19,12 @@ use rsvelte_core::ast::template::{Fragment, IfBlock, TemplateNode};
 
 use crate::error::FormatError;
 use crate::options::FormatOptions;
+use crate::width::{VisualWidth, tab_width};
 
 /// `child_depth` is the indent level at which this fragment's children
 /// render. The root call uses `0`. Recursing into an element's
 /// children adds one level.
-pub(crate) fn collect_indent_edits(
+pub fn collect_indent_edits(
     source: &str,
     fragment: &Fragment,
     child_depth: usize,
@@ -79,11 +80,7 @@ fn collect_indent_edits_inner(
                 indent_for_level(child_depth - 1, &options.js)
             };
             let collapsed = data.split_whitespace().collect::<Vec<_>>().join(" ");
-            edits.push((
-                t.start,
-                t.end,
-                format!("\n{child_indent}{collapsed}\n{parent_indent}"),
-            ));
+            edits.push((t.start, t.end, format!("\n{child_indent}{collapsed}\n{parent_indent}")));
             return Ok(());
         }
     }
@@ -92,6 +89,7 @@ fn collect_indent_edits_inner(
 
     if has_block_children {
         let child_indent = indent_for_level(child_depth, &options.js);
+        let tw = tab_width(options);
         // The last whitespace returns to the *parent's* depth — one
         // less than the children's. The root has no enclosing parent,
         // so use an empty indent (just a newline).
@@ -109,7 +107,7 @@ fn collect_indent_edits_inner(
         // separators. For block bodies the fragment is always broken (has
         // surrounding whitespace newlines), so a stricter check is used.
         let fragment_is_broken = fragment.nodes.iter().any(|n| {
-            matches!(n, TemplateNode::Text(t) if t.data.contains('\n') && is_whitespace_only(t.data.as_str()))
+            matches!(n, TemplateNode::Text(t) if t.data.contains('\n') && is_whitespace_only(t.data.as_ref()))
         });
 
         // Whether the fragment has at least one indent-provoking child that
@@ -118,10 +116,11 @@ fn collect_indent_edits_inner(
         // Used for block bodies: only split inline spaces when such a sibling
         // is present. Without one (fragment is only ExpressionTags + ws),
         // the space is prose-sensitive and stays on one line.
-        let has_non_expression_block_child = fragment
-            .nodes
-            .iter()
-            .any(|n| is_indent_provoking(n) && !matches!(n, TemplateNode::ExpressionTag(_)));
+        let has_non_expression_block_child = fragment.nodes.iter().any(|n| {
+            is_indent_provoking(n)
+                && !matches!(n, TemplateNode::ExpressionTag(_))
+                && !is_inline_level_node(n, source, child_indent.visual_width(tw), options)
+        });
 
         // prettier-plugin-svelte's `forceBreakContent`: when any child is a
         // block-display HTML element AND there are multiple non-whitespace
@@ -130,7 +129,7 @@ fn collect_indent_edits_inner(
         let non_ws_count = fragment
             .nodes
             .iter()
-            .filter(|n| !matches!(n, TemplateNode::Text(t) if is_whitespace_only(t.data.as_str())))
+            .filter(|n| !matches!(n, TemplateNode::Text(t) if is_whitespace_only(t.data.as_ref())))
             .count();
         let has_block_html_child = fragment
             .nodes
@@ -142,7 +141,7 @@ fn collect_indent_edits_inner(
             let TemplateNode::Text(t) = node else {
                 continue;
             };
-            if is_whitespace_only(t.data.as_str()) {
+            if is_whitespace_only(t.data.as_ref()) {
                 if !t.data.contains('\n') {
                     // Inline spacing (no line break in the source).
                     //
@@ -250,7 +249,7 @@ fn collect_indent_edits_inner(
                     } else {
                         " ".to_string()
                     };
-                    if t.data.as_str() != replacement {
+                    if t.data.as_ref() != replacement {
                         edits.push((t.start, t.end, replacement));
                     }
                     continue;
@@ -295,11 +294,7 @@ fn collect_indent_edits_inner(
                 // newline) is left untouched. The node's trailing indentation is
                 // the next node's lead — children depth, or the parent's depth
                 // when this is the fragment's last node (it abuts the close tag).
-                let trailing_indent = if i == last {
-                    &parent_indent
-                } else {
-                    &child_indent
-                };
+                let trailing_indent = if i == last { &parent_indent } else { &child_indent };
                 // Reindent the RAW source slice when the text carries an HTML
                 // entity (`&ndash;`, `&#123;`, `&amp;`, …) — emitting the
                 // parser's decoded `data` would replace it with the decoded
@@ -310,11 +305,7 @@ fn collect_indent_edits_inner(
                 // entity-free text keep using `data` (its existing tested
                 // behaviour — raw and data can otherwise differ in whitespace).
                 let raw = source.get(t.start as usize..t.end as usize).unwrap_or("");
-                let text = if raw.contains('&') {
-                    raw
-                } else {
-                    t.data.as_str()
-                };
+                let text = if raw.contains('&') { raw } else { t.data.as_ref() };
                 let mut reindented = reindent_text_lines(text, &child_indent, trailing_indent);
                 // When the text node is sandwiched between two block-display
                 // elements (both prev and next siblings are block), prettier
@@ -372,9 +363,14 @@ fn collect_indent_edits_inner(
             }
             let is_comment =
                 matches!(a, TemplateNode::Comment(_)) || matches!(b, TemplateNode::Comment(_));
+            let both_comments =
+                matches!(a, TemplateNode::Comment(_)) && matches!(b, TemplateNode::Comment(_));
             let a_is_block = matches!(a, TemplateNode::RegularElement(e) if is_prettier_block_element(e.name.as_str()));
             let b_is_block = matches!(b, TemplateNode::RegularElement(e) if is_prettier_block_element(e.name.as_str()));
             if !is_comment && !a_is_block && !b_is_block {
+                continue;
+            }
+            if both_comments {
                 continue;
             }
             // Adjacent comments that are already inline (no newline in the fragment's
@@ -382,6 +378,13 @@ fn collect_indent_edits_inner(
             // inline layout. Only break them when the surrounding fragment is already
             // broken (has whitespace-with-newline text nodes). Block-display elements
             // (`<div>`, `<p>`, etc.) are always broken regardless.
+            if matches!(a, TemplateNode::Comment(_))
+                && matches!(b, TemplateNode::Comment(_))
+                && !a_is_block
+                && !b_is_block
+            {
+                continue;
+            }
             if is_comment && !a_is_block && !b_is_block && !fragment_is_broken {
                 continue;
             }
@@ -411,7 +414,7 @@ fn collect_indent_edits_inner(
                 continue;
             }
             let b_is_nonempty_text = matches!(b, TemplateNode::Text(t)
-                if !is_whitespace_only(t.data.as_str()) && !t.data.starts_with('\n'));
+                if !is_whitespace_only(t.data.as_ref()) && !t.data.starts_with('\n'));
             if !b_is_nonempty_text {
                 continue;
             }
@@ -432,19 +435,16 @@ fn collect_indent_edits_inner(
             // First non-whitespace child: needs a leading newline if no ws text
             // AND the first non-ws child is a non-text node.
             let first_non_ws = fragment.nodes.iter().find(
-                |n| !matches!(n, TemplateNode::Text(t) if is_whitespace_only(t.data.as_str())),
+                |n| !matches!(n, TemplateNode::Text(t) if is_whitespace_only(t.data.as_ref())),
             );
             if let Some(first) = first_non_ws
                 && !matches!(first, TemplateNode::Text(_))
             {
-                let first_idx = fragment
-                    .nodes
-                    .iter()
-                    .position(|n| std::ptr::eq(n, first))
-                    .unwrap_or(0);
+                let first_idx =
+                    fragment.nodes.iter().position(|n| std::ptr::eq(n, first)).unwrap_or(0);
                 let has_leading_ws = first_idx > 0
                     && matches!(&fragment.nodes[first_idx - 1],
-                        TemplateNode::Text(t) if is_whitespace_only(t.data.as_str()));
+                        TemplateNode::Text(t) if is_whitespace_only(t.data.as_ref()));
                 if !has_leading_ws {
                     let first_start = crate::collapse::template_node_span(first).0;
                     edits.push((first_start, first_start, format!("\n{child_indent}")));
@@ -453,47 +453,36 @@ fn collect_indent_edits_inner(
             // Last non-whitespace child: needs a trailing newline if no ws text
             // AND the last non-ws child is a non-text node.
             let last_non_ws = fragment.nodes.iter().rev().find(
-                |n| !matches!(n, TemplateNode::Text(t) if is_whitespace_only(t.data.as_str())),
+                |n| !matches!(n, TemplateNode::Text(t) if is_whitespace_only(t.data.as_ref())),
             );
             if let Some(last) = last_non_ws
                 && !matches!(last, TemplateNode::Text(_))
             {
-                let last_idx = fragment
-                    .nodes
-                    .iter()
-                    .rposition(|n| std::ptr::eq(n, last))
-                    .unwrap_or(0);
+                let last_idx =
+                    fragment.nodes.iter().rposition(|n| std::ptr::eq(n, last)).unwrap_or(0);
                 let has_trailing_ws = last_idx + 1 < fragment.nodes.len()
                     && matches!(&fragment.nodes[last_idx + 1],
-                        TemplateNode::Text(t) if is_whitespace_only(t.data.as_str()));
+                        TemplateNode::Text(t) if is_whitespace_only(t.data.as_ref()));
                 if !has_trailing_ws {
                     let last_end = crate::collapse::template_node_span(last).1;
-                    // The `\n{parent_indent}` insert and any synthetic close
-                    // tag for an empty implicitly-closed element are both
-                    // zero-length inserts at `last_end`. We push the newline
-                    // FIRST so it ends up earlier in the vec; the close tag is
-                    // pushed second. When applied in descending-start order the
-                    // close tag insert fires last and lands at the same position
-                    // as the newline (now the position of the newly-inserted
-                    // `\n`), placing `</tag>` BEFORE the `\n`:
-                    //   `<duiv>\n</duiv>\n</div>` — correct layout.
-                    // Note: non-empty implicitly-closed elements (e.g. `<li>a`)
-                    // are handled by `push_close_tag` case 4 in markup.rs
-                    // (replaces trailing whitespace span with `</tag>`), so we
-                    // only insert `</tag>` here for EMPTY elements.
-                    edits.push((last_end, last_end, format!("\n{parent_indent}")));
-                    // Implicitly-closed RegularElement with EMPTY content: insert
-                    // synthetic </tag> (pushed second so it lands before the \n).
+                    // A synthetic close tag for an empty implicitly-closed
+                    // element and the `\n{parent_indent}` separator are both
+                    // zero-length inserts at `last_end`; coincident inserts emit
+                    // in push order, so the close tag goes first:
+                    //   `<duiv>\n</duiv>\n</div>`.
+                    // Non-empty implicitly-closed elements are `push_close_tag`'s
+                    // job in markup.rs, which also pushes before this pass runs.
                     if let TemplateNode::RegularElement(e) = last {
                         let is_implicitly_closed =
                             source.as_bytes().get(e.end as usize - 1).copied() != Some(b'>');
                         let is_empty_content = e.fragment.nodes.iter().all(
-                            |n| matches!(n, TemplateNode::Text(t) if crate::is_blank_text(t.data.as_str())),
+                            |n| matches!(n, TemplateNode::Text(t) if crate::is_blank_text(t.data.as_ref())),
                         );
                         if is_implicitly_closed && is_empty_content {
                             edits.push((last_end, last_end, format!("</{}>", e.name.as_str())));
                         }
                     }
+                    edits.push((last_end, last_end, format!("\n{parent_indent}")));
                 }
             }
         }
@@ -507,25 +496,29 @@ fn collect_indent_edits_inner(
         // `\n  </div>`, then `</main>` needs its own preceding `\n`.
         if !force_break_content {
             let last_non_ws = fragment.nodes.iter().rev().find(
-                |n| !matches!(n, TemplateNode::Text(t) if is_whitespace_only(t.data.as_str())),
+                |n| !matches!(n, TemplateNode::Text(t) if is_whitespace_only(t.data.as_ref())),
             );
             if let Some(last_node) = last_non_ws
                 && let TemplateNode::RegularElement(e) = last_node
             {
-                let last_idx = fragment
-                    .nodes
-                    .iter()
-                    .rposition(|n| std::ptr::eq(n, last_node))
-                    .unwrap_or(0);
+                let last_idx =
+                    fragment.nodes.iter().rposition(|n| std::ptr::eq(n, last_node)).unwrap_or(0);
                 let has_trailing_ws = last_idx + 1 < fragment.nodes.len()
                     && matches!(&fragment.nodes[last_idx + 1],
-                        TemplateNode::Text(t) if is_whitespace_only(t.data.as_str()));
+                        TemplateNode::Text(t) if is_whitespace_only(t.data.as_ref()));
                 if !has_trailing_ws {
-                    let is_implicitly_closed =
-                        source.as_bytes().get(e.end as usize - 1).copied() != Some(b'>');
+                    // Only the trailing-whitespace shape needs a newline back:
+                    // when the content abuts the parent's close tag markup.rs
+                    // inserts `</tag>` and consumes nothing, so the oracle keeps
+                    // `<ul><li>a</li></ul>` on one line.
+                    let is_implicitly_closed = source
+                        .as_bytes()
+                        .get(e.end as usize - 1)
+                        .copied()
+                        .is_some_and(|b| b.is_ascii_whitespace());
                     let is_nonempty =
                         !e.fragment.nodes.iter().all(
-                            |n| matches!(n, TemplateNode::Text(t) if crate::is_blank_text(t.data.as_str())),
+                            |n| matches!(n, TemplateNode::Text(t) if crate::is_blank_text(t.data.as_ref())),
                         );
                     let parent_close_follows = source.as_bytes().get(e.end as usize).copied()
                         == Some(b'<')
@@ -549,6 +542,31 @@ fn collect_indent_edits_inner(
         recurse_into_children(source, node, child_depth, options, edits)?;
     }
 
+    Ok(())
+}
+
+fn collect_if_block_indent(
+    source: &str,
+    block: &IfBlock,
+    depth: usize,
+    options: &FormatOptions,
+    edits: &mut Vec<(u32, u32, String)>,
+) -> Result<(), FormatError> {
+    let mut current = block;
+    loop {
+        collect_indent_edits_inner(source, &current.consequent, depth, true, true, options, edits)?;
+        match &current.alternate {
+            Some(alternate) => {
+                if let Some(chained) = else_if_branch(alternate) {
+                    current = chained;
+                    continue;
+                }
+                collect_indent_edits_inner(source, alternate, depth, true, true, options, edits)?;
+                break;
+            }
+            None => break,
+        }
+    }
     Ok(())
 }
 
@@ -612,37 +630,8 @@ fn recurse_into_children(
         TemplateNode::SvelteElement(e) => {
             collect_indent_edits(source, &e.fragment, next_depth, options, edits)?;
         }
-        TemplateNode::IfBlock(blk) => {
-            // Walk the `{#if} / {:else if} / {:else}` chain at one consistent
-            // depth. svelte desugars `{:else if}` into an alternate fragment
-            // whose sole child is another IfBlock (`elseif = true`); prettier
-            // keeps every chained branch at the same indent as the opening
-            // `{#if}`, so follow the chain here rather than recursing (which
-            // would add one level per `{:else if}`).
-            let mut current: &IfBlock = blk;
-            loop {
-                collect_indent_edits_inner(
-                    source,
-                    &current.consequent,
-                    next_depth,
-                    true,
-                    true, // if/else body is a block body
-                    options,
-                    edits,
-                )?;
-                match &current.alternate {
-                    Some(alt) => match else_if_branch(alt) {
-                        Some(chained) => current = chained,
-                        None => {
-                            collect_indent_edits_inner(
-                                source, alt, next_depth, true, true, options, edits,
-                            )?;
-                            break;
-                        }
-                    },
-                    None => break,
-                }
-            }
+        TemplateNode::IfBlock(block) => {
+            collect_if_block_indent(source, block, next_depth, options, edits)?;
         }
         TemplateNode::EachBlock(blk) => {
             collect_indent_edits_inner(source, &blk.body, next_depth, true, true, options, edits)?;
@@ -651,39 +640,23 @@ fn recurse_into_children(
             }
         }
         TemplateNode::AwaitBlock(blk) => {
-            // When the pending block is whitespace-only AND there is a then/catch
-            // binding, the expression pass collapses the two headers into one
-            // (`{#await expr then value}`). Skip the pending fragment here so we
-            // don't emit a spurious blank-line edit inside the collapsed region.
-            // `await_pending_is_empty` returns false when pending is None (shorthand form)
-            // and true only when pending is Some but whitespace-only (expanded form to collapse).
-            // Mirror `try_collapse_await_header`'s collapse condition exactly so the
-            // two passes always agree on whether the pending block was collapsed.
-            let pending_collapsed = crate::expression::await_pending_is_empty(blk.pending.as_ref())
-                && ((blk.then.is_some() && blk.value.is_some())
-                    || (blk.catch.is_some() && blk.error.is_some()));
-            // When the pending block has real content but the `then` body is empty
-            // (and there's no catch), the expression pass strips the `{:then …}`
-            // separator entirely. Skip the then-body indent pass so we don't emit
-            // a spurious blank-line edit (`\n\n`) inside the erased region.
-            // Mirror `try_strip_await_then_separator`'s condition exactly.
-            let separator_stripped = !pending_collapsed
-                && blk.pending.is_some()
-                && blk.value.is_some()
-                && blk.catch.is_none()
-                && blk.then.as_ref().is_some_and(|f| {
-                    f.nodes.iter().all(|n| {
-                        matches!(n, rsvelte_core::ast::template::TemplateNode::Text(t)
-                            if crate::is_blank_text(t.data.as_str()))
-                    })
-                });
-            if !pending_collapsed && let Some(frag) = &blk.pending {
+            // The expression pass erases whatever clauses the oracle drops, so
+            // indenting inside one of those regions would emit a blank-line edit
+            // into text that no longer exists. Both passes read the same plan.
+            let plan = crate::expression::plan_await_block(source, blk);
+            if plan.keep_pending
+                && let Some(frag) = &blk.pending
+            {
                 collect_indent_edits_inner(source, frag, next_depth, true, true, options, edits)?;
             }
-            if !separator_stripped && let Some(frag) = &blk.then {
+            if plan.keep_then
+                && let Some(frag) = &blk.then
+            {
                 collect_indent_edits_inner(source, frag, next_depth, true, true, options, edits)?;
             }
-            if let Some(frag) = &blk.catch {
+            if plan.keep_catch
+                && let Some(frag) = &blk.catch
+            {
                 collect_indent_edits_inner(source, frag, next_depth, true, true, options, edits)?;
             }
         }
@@ -707,11 +680,11 @@ fn recurse_into_children(
 }
 
 /// If `alt` is the desugared body of an `{:else if}` — a fragment whose sole
-/// child is an `elseif` IfBlock — return that IfBlock so the caller can keep it
+/// child is an `elseif` `IfBlock` — return that `IfBlock` so the caller can keep it
 /// at the same depth. A plain `{:else}` whose body merely starts with an
 /// `{#if}` carries surrounding whitespace text nodes (and `elseif == false`),
 /// so it won't match and is indented as a normal nested block.
-pub(crate) fn else_if_branch(alt: &Fragment) -> Option<&IfBlock> {
+pub fn else_if_branch<'b, 'a>(alt: &'b Fragment<'a>) -> Option<&'b IfBlock<'a>> {
     match alt.nodes.as_slice() {
         [TemplateNode::IfBlock(b)] if b.elseif => Some(b.as_ref()),
         _ => None,
@@ -726,12 +699,41 @@ fn open_tag_is_multiline(source: &str, elem_start: u32, fragment: &Fragment) -> 
         return false;
     };
     let first_start = crate::collapse::template_node_span(first).0;
-    source
-        .get(elem_start as usize..first_start as usize)
-        .is_some_and(|s| s.contains('\n'))
+    source.get(elem_start as usize..first_start as usize).is_some_and(|s| s.contains('\n'))
 }
 
-fn is_indent_provoking(node: &TemplateNode) -> bool {
+/// Inline-level template nodes: a Component, or a non-block HTML element.
+/// A space next to one of these is prose glue, not a child separator.
+fn is_inline_level_node(
+    node: &TemplateNode,
+    source: &str,
+    indent_width: usize,
+    options: &FormatOptions,
+) -> bool {
+    let (start, end, attr_count) = match node {
+        TemplateNode::Component(c) => (c.start, c.end, c.attributes.len()),
+        TemplateNode::RegularElement(e) if !is_prettier_block_element(e.name.as_str()) => {
+            (e.start, e.end, e.attributes.len())
+        }
+        _ => return false,
+    };
+    // `singleAttributePerLine` breaks every attribute of a multi-attribute tag
+    // regardless of width, so such an element is never flat.
+    if options.attributes.single_attribute_per_line && attr_count > 1 {
+        return false;
+    }
+    // An element that cannot print flat breaks its own open tag, and prettier
+    // propagates that break to the whole children run. This is a source-width
+    // test: it does not model an attribute value that the JS printer expands on
+    // its own (a non-empty block statement in a handler), which stays flat here
+    // and breaks later.
+    let flat = source.get(start as usize..end as usize).unwrap_or("");
+    let line_width = options.js.line_width.value() as usize;
+    let tw = tab_width(options);
+    !flat.contains('\n') && indent_width + flat.visual_width(tw) <= line_width
+}
+
+const fn is_indent_provoking(node: &TemplateNode) -> bool {
     matches!(
         node,
         // Mustache tags and comments sit on their own line just like elements
@@ -933,8 +935,5 @@ fn is_prettier_block_element(tag: &str) -> bool {
 /// these should not be treated as prose glue (it converts to a newline on its
 /// own line in a broken fragment, just like a block element).
 fn is_inline_block_element(tag: &str) -> bool {
-    matches!(
-        tag,
-        "input" | "button" | "select" | "object" | "video" | "audio"
-    )
+    matches!(tag, "input" | "button" | "select" | "object" | "video" | "audio")
 }

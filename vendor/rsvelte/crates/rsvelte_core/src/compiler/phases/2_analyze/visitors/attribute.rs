@@ -37,17 +37,19 @@ pub fn visit(
     // Validate slot attribute must be a static value
     // Corresponds to validate_slot_attribute in shared/attribute.js
     if attribute.name == "slot" && !is_text_attribute(attribute) {
-        return Err(errors::slot_attribute_invalid());
+        return Err(errors::slot_attribute_invalid().at(attribute.start, attribute.end));
     }
 
     // Validate attribute name for invalid characters
     if is_invalid_attribute_name(&attribute.name) {
-        return Err(errors::attribute_invalid_name(&attribute.name));
+        return Err(
+            errors::attribute_invalid_name(&attribute.name).at(attribute.start, attribute.end)
+        );
     }
 
     // Validate attribute name for illegal colons
     if let Err(warning) = validate_attribute_name(&attribute.name) {
-        context.emit_warning(warning);
+        context.emit_warning(warning.at(attribute.start, attribute.end));
     }
 
     // Get the parent node to determine context
@@ -81,10 +83,7 @@ pub fn visit(
             let expr_type = expr_tag.expression.node_type().unwrap_or("");
 
             // If it's not a simple literal, template, or binary expression, it needs clsx
-            if !matches!(
-                expr_type,
-                "Literal" | "TemplateLiteral" | "BinaryExpression"
-            ) {
+            if !matches!(expr_type, "Literal" | "TemplateLiteral" | "BinaryExpression") {
                 mark_subtree_dynamic(&context.path);
                 attribute.metadata.needs_clsx = true;
             }
@@ -156,7 +155,7 @@ fn is_text_attribute(attribute: &AttributeNode) -> bool {
 ///
 /// Walks each inner `ExpressionTag` expression with
 /// `walk_js_expression_node`, populating `expr_tag.metadata.expression` so
-/// Phase 3 (`build_attribute_value`, `extract_metadata_from_tag`, etc.) can
+/// Phase 3 attribute builders can
 /// read `has_call` / `has_state` / `has_await` / dependencies / references
 /// without re-walking the JSON.
 pub fn visit_attribute_value_expressions(
@@ -174,16 +173,35 @@ pub fn visit_attribute_value_expressions(
                 context,
                 &mut expr_tag.metadata.expression,
             )?;
+            super::await_block::collect_pickled_awaits_node(
+                &node,
+                &mut context.analysis.pickled_awaits,
+                context.parse_arena,
+            );
         }
         AttributeValue::Sequence(parts) => {
             for part in parts {
-                if let AttributeValuePart::ExpressionTag(expr_tag) = part {
-                    let node = expr_tag.expression.as_node();
-                    super::shared::utils::walk_js_expression_node(
-                        &node,
-                        context,
-                        &mut expr_tag.metadata.expression,
-                    )?;
+                match part {
+                    AttributeValuePart::ExpressionTag(expr_tag) => {
+                        let node = expr_tag.expression.as_node();
+                        super::shared::utils::walk_js_expression_node(
+                            &node,
+                            context,
+                            &mut expr_tag.metadata.expression,
+                        )?;
+                        super::await_block::collect_pickled_awaits_node(
+                            &node,
+                            &mut context.analysis.pickled_awaits,
+                            context.parse_arena,
+                        );
+                    }
+                    // A value chunk is a `Text` node upstream, so its `Text`
+                    // visitor runs on it too.
+                    AttributeValuePart::Text(text) => {
+                        super::text::check_bidirectional_control_characters(
+                            &text.data, text.start, context,
+                        );
+                    }
                 }
             }
         }

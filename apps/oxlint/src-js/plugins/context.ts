@@ -32,10 +32,8 @@ import { settings, initSettings } from "./settings.ts";
 import visitorKeys from "../generated/keys.ts";
 import { debugAssertIsNonNull } from "../utils/asserts.ts";
 import { envs, globals, initGlobals } from "./globals.ts";
-import { parseProgram } from "./parser.ts";
-import { packageVersion } from "../utils/package_version.ts";
+import { version as packageVersion } from "../../package.json" with { type: "json" };
 
-import type { ParserLike } from "../package/parser.ts";
 import type { Globals, Envs } from "./globals.ts";
 import type { RuleDetails } from "./load.ts";
 import type { Options } from "./options.ts";
@@ -89,12 +87,8 @@ const SUPPORTED_ECMA_VERSIONS = Object.freeze([3, 5, 6, 7, 8, 9, 10, 11, 12, 13,
 // Singleton object for parser's `Syntax` property. Generated lazily.
 let Syntax: Record<string, string> | null = null;
 
-export interface ExternalParser extends ParserLike {}
-
-export type Parser = ParserLike;
-
 // Singleton object for parser.
-const DEFAULT_PARSER = Object.freeze({
+const PARSER = Object.freeze({
   /**
    * Parser name.
    */
@@ -111,12 +105,9 @@ const DEFAULT_PARSER = Object.freeze({
    * @param options? - Parser options
    * @returns AST
    */
+  // oxlint-disable-next-line no-unused-vars
   parse(code: string, options?: Record<string, unknown>): Program {
-    return parseProgram(filePath ?? "<input>", code, options ?? null);
-  },
-
-  parseForESLint(code: string, options?: Record<string, unknown>): { ast: Program } {
-    return { ast: parseProgram(filePath ?? "<input>", code, options ?? null) };
+    throw new Error("`context.languageOptions.parser.parse` not implemented yet."); // TODO
   },
 
   /**
@@ -149,8 +140,6 @@ const DEFAULT_PARSER = Object.freeze({
    */
   supportedEcmaVersions: SUPPORTED_ECMA_VERSIONS,
 });
-
-let currentParser: Parser = DEFAULT_PARSER;
 
 // In conformance build, setting properties of this object to `true` or `false` overrides the defaults
 export const ecmaFeaturesOverride: {
@@ -207,74 +196,27 @@ const ECMA_FEATURES = Object.freeze({
   },
 });
 
-
-function getSourceType(): ModuleKind {
-  // TODO: Would be better to get `sourceType` without deserializing whole AST,
-  // in case it's used in `create` to return an empty visitor if wrong type.
-  if (ast === null) initAst();
-  debugAssertIsNonNull(ast);
-
-  return ast.sourceType;
-}
-
-type ParserOptionsRecord = Readonly<Record<string, unknown>>;
-
-function createParserOptions(
-  parserOptionsInput?: ParserOptionsRecord | null,
-): ParserOptionsRecord {
-  const descriptors: PropertyDescriptorMap = {
-    sourceType: {
-      enumerable: true,
-      configurable: false,
-      get: getSourceType,
-    },
-    ecmaFeatures: {
-      enumerable: true,
-      configurable: false,
-      value: ECMA_FEATURES,
-    },
-  };
-
-  if (parserOptionsInput != null) {
-    for (const [key, value] of Object.entries(parserOptionsInput)) {
-      if (key === "sourceType" || key === "ecmaFeatures") continue;
-      descriptors[key] = {
-        enumerable: true,
-        configurable: false,
-        writable: false,
-        value,
-      };
-    }
-  }
-
-  return Object.freeze(Object.create(null, descriptors)) as ParserOptionsRecord;
-}
-
-const DEFAULT_PARSER_OPTIONS = createParserOptions();
-let currentParserOptions: ParserOptionsRecord = DEFAULT_PARSER_OPTIONS;
-
-export function setParserForFile(
-  parser: Parser | null | undefined,
-  parserOptions?: ParserOptionsRecord | null,
-): void {
-  currentParser = parser ?? DEFAULT_PARSER;
-  currentParserOptions =
-    parserOptions == null ? DEFAULT_PARSER_OPTIONS : createParserOptions(parserOptions);
-}
-
-export function resetParserForFile(): void {
-  currentParser = DEFAULT_PARSER;
-  currentParserOptions = DEFAULT_PARSER_OPTIONS;
-}
-
 // Singleton object for parser options.
 // TODO: `sourceType` and `ecmaFeatures` are the only property ESLint provides.
 // But does TS-ESLint provide any further properties?
-const PARSER_OPTIONS = {
-  get current(): ParserOptionsRecord {
-    return currentParserOptions;
+const PARSER_OPTIONS = Object.freeze({
+  /**
+   * Source type of the file being linted.
+   */
+  get sourceType(): ModuleKind {
+    // TODO: Would be better to get `sourceType` without deserializing whole AST,
+    // in case it's used in `create` to return an empty visitor if wrong type.
+    if (ast === null) initAst();
+    debugAssertIsNonNull(ast);
+
+    return ast.sourceType;
   },
-};
+
+  /**
+   * ECMA features.
+   */
+  ecmaFeatures: ECMA_FEATURES,
+});
 
 // Singleton object for language options.
 const LANGUAGE_OPTIONS = {
@@ -293,24 +235,18 @@ const LANGUAGE_OPTIONS = {
   /**
    * ECMAScript version of the file being linted.
    */
-  get ecmaVersion(): number {
-    return ecmaVersion;
-  },
+  ecmaVersion: ECMA_VERSION,
 
   /**
    * Parser used to parse the file being linted.
    */
-  get parser(): Parser {
-    return currentParser;
-  },
+  parser: PARSER,
 
   /**
    * Parser options used to parse the file being linted.
    */
   // Note: If we change this implementation, also change `parserOptions` getter on `FILE_CONTEXT` below
-  get parserOptions(): ParserOptionsRecord {
-    return PARSER_OPTIONS.current;
-  },
+  parserOptions: PARSER_OPTIONS,
 
   /**
    * Globals defined for the file being linted.
@@ -335,26 +271,22 @@ const LANGUAGE_OPTIONS = {
   },
 };
 
-// Current ECMAScript version visible through `context.languageOptions.ecmaVersion`.
-// Defaults to Oxlint's latest-version behavior, but can be overridden per file so runtime rules and
-// whole-file custom-parser runs stay aligned with resolved language options.
+// In conformance build, replace `LANGUAGE_OPTIONS.ecmaVersion` with a getter which returns value of local var.
+// This is to allow changing the ECMAScript version in conformance tests.
+// Some of ESLint's rules change behavior based on the version, and ESLint's tests rely on this.
 export let ecmaVersion = ECMA_VERSION;
 
-// Same normalization as ESLint's `normalizeEcmaVersionForLanguageOptions`, except we default to Oxlint's
-// latest supported version when no explicit value was configured.
-export function normalizeEcmaVersionForLanguageOptions(version: unknown): number {
-  if (typeof version === "number") {
-    return version > 5 && version < 2015 ? version + 2009 : version;
-  }
-  return ECMA_VERSION;
+export function setEcmaVersion(version: number): void {
+  if (!CONFORMANCE) throw new Error("Should be unreachable in release or debug builds");
+  ecmaVersion = version;
 }
 
-export function setEcmaVersion(version: unknown): void {
-  ecmaVersion = normalizeEcmaVersionForLanguageOptions(version);
-}
-
-export function resetEcmaVersion(): void {
-  ecmaVersion = ECMA_VERSION;
+if (CONFORMANCE) {
+  Object.defineProperty(LANGUAGE_OPTIONS, "ecmaVersion", {
+    get(): number {
+      return ecmaVersion;
+    },
+  });
 }
 
 Object.freeze(LANGUAGE_OPTIONS);
@@ -515,7 +447,7 @@ const FILE_CONTEXT = Object.freeze({
    */
   get parserOptions(): Record<string, unknown> {
     if (filePath === null) throw new Error("Cannot access `context.parserOptions` in `createOnce`");
-    return PARSER_OPTIONS.current;
+    return PARSER_OPTIONS;
   },
 
   /**

@@ -6,27 +6,27 @@
   x Error running JS plugin.
   | File path: <fixture>/files/throwInAfter/1.js
   | Error: `after` hook threw
-  |     at after (<fixture>/plugin.ts:120:15)
+  |     at after (<fixture>/plugin.ts:108:15)
 
   x create-once-errors-plugin(before-and-after-late): after hook:
   | id: create-once-errors-plugin/before-and-after-late
   | filename: <fixture>/files/throwInAfter/2.js
   | events: {
   |   "1.js": [
-  |     "after: before-and-after",
-  |     "after: before-and-after-late",
-  |     "after: throw-in-after",
   |     "before: before-and-after",
-  |     "before: before-and-after-late",
   |     "before: throw-in-after",
+  |     "before: before-and-after-late",
   |     "visit: before-and-after",
+  |     "visit: throw-in-after",
   |     "visit: before-and-after-late",
-  |     "visit: throw-in-after"
+  |     "after: before-and-after",
+  |     "after: throw-in-after",
+  |     "after: before-and-after-late"
   |   ],
   |   "2.js": [
-  |     "after: before-and-after-late",
   |     "before: before-and-after-late",
-  |     "visit: before-and-after-late"
+  |     "visit: before-and-after-late",
+  |     "after: before-and-after-late"
   |   ]
   | }
    ,-[files/throwInAfter/2.js:1:1]
@@ -44,14 +44,14 @@
   | filename: <fixture>/files/throwInBefore/2.js
   | events: {
   |   "1.js": [
-  |     "after: before-and-after",
   |     "before: before-and-after",
-  |     "before: throw-in-before"
+  |     "before: throw-in-before",
+  |     "after: before-and-after"
   |   ],
   |   "2.js": [
-  |     "after: before-and-after-late",
   |     "before: before-and-after-late",
-  |     "visit: before-and-after-late"
+  |     "visit: before-and-after-late",
+  |     "after: before-and-after-late"
   |   ]
   | }
    ,-[files/throwInBefore/2.js:1:1]
@@ -69,18 +69,19 @@
   | filename: <fixture>/files/throwInVisit/2.js
   | events: {
   |   "1.js": [
-  |     "after: before-and-after",
-  |     "after: before-and-after-late",
-  |     "after: throw-in-visit",
   |     "before: before-and-after",
-  |     "before: before-and-after-late",
   |     "before: throw-in-visit",
+  |     "before: before-and-after-late",
   |     "visit: before-and-after",
-  |     "visit: throw-in-visit"
+  |     "visit: throw-in-visit",
+  |     "after: before-and-after",
+  |     "after: throw-in-visit",
+  |     "after: before-and-after-late"
   |   ],
   |   "2.js": [
-  |     "after: before-and-after-late",
-  |     "before: before-and-after-late"
+  |     "before: before-and-after-late",
+  |     "visit: before-and-after-late",
+  |     "after: before-and-after-late"
   |   ]
   | }
    ,-[files/throwInVisit/2.js:1:1]
@@ -89,7 +90,7 @@
    `----
 
 Found 0 warnings and 6 errors.
-Finished in Xms on 6 files using X threads.
+Finished in Xms on 6 files with 5 rules using X threads.
 ```
 
 # stderr

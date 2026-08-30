@@ -51,10 +51,9 @@
 use crate::compiler::phases::phase2_analyze::ComponentAnalysis;
 use crate::compiler::phases::phase2_analyze::scope::{BindingKind, DeclarationKind};
 use crate::compiler::phases::phase3_transform::builders::B;
-use oxc_allocator::CloneIn;
 use oxc_ast::ast::{
     AssignmentExpression, AssignmentOperator, AssignmentTarget, BinaryOperator, Expression,
-    LogicalOperator, Statement, UpdateExpression,
+    LogicalOperator, Statement,
 };
 use oxc_ast_visit::VisitMut;
 use rustc_hash::FxHashSet;
@@ -136,6 +135,11 @@ impl<'a, 'b> ReadWrap<'a, 'b> {
     /// Classify how a referenced `name` should be read, mirroring upstream's
     /// `Identifier.js` → `build_getter` cascade.
     fn classify(&self, name: &str) -> ReadKind {
+        // `Identifier.js` short-circuits on the NAME before resolving a binding,
+        // so a local `$$props` (a parameter, an each item) is renamed too.
+        if name == "$$props" {
+            return ReadKind::SanitizedProps;
+        }
         if self.is_shadowed(name) {
             return ReadKind::Keep;
         }
@@ -143,10 +147,6 @@ impl<'a, 'b> ReadWrap<'a, 'b> {
         // `get_binding` (which may resolve a same-named non-derived sibling).
         if self.local_derived.contains(name) {
             return ReadKind::DerivedCall;
-        }
-        // Identifier.js short-circuits.
-        if name == "$$props" {
-            return ReadKind::SanitizedProps;
         }
         if name.starts_with("$$derived_array") {
             // Terrible-but-faithful upstream hack: `$$derived_array…` → `name()`.
@@ -181,9 +181,7 @@ impl<'a, 'b> ReadWrap<'a, 'b> {
             return false;
         };
         let name = m.field.name.as_str();
-        self.private_derived
-            .last()
-            .is_some_and(|frame| frame.contains(name))
+        self.private_derived.last().is_some_and(|frame| frame.contains(name))
     }
 
     /// Classify how a WRITE to `name` should be lowered.
@@ -222,23 +220,14 @@ impl<'a, 'b> ReadWrap<'a, 'b> {
         let b = self.b;
         let store_name = &name[1..];
         let inner_kind = self.classify(store_name);
-        let inner = self
-            .build_getter(store_name, inner_kind)
-            .unwrap_or_else(|| b.id(store_name));
-        b.call(
-            "$.store_get",
-            vec![self.store_subs(), b.string(name), inner],
-        )
+        let inner = self.build_getter(store_name, inner_kind).unwrap_or_else(|| b.id(store_name));
+        b.call("$.store_get", vec![self.store_subs(), b.string(name), inner])
     }
 
     /// `$$store_subs ??= {}`.
     fn store_subs(&self) -> Expression<'a> {
         let b = self.b;
-        b.assignment(
-            AssignmentOperator::LogicalNullish,
-            b.id("$$store_subs"),
-            b.object(vec![]),
-        )
+        b.assignment(AssignmentOperator::LogicalNullish, b.id("$$store_subs"), b.object(vec![]))
     }
 
     /// `build_assignment_value(op, left, right)` — for `=` it is just `right`;
@@ -388,12 +377,7 @@ impl<'a, 'b> ReadWrap<'a, 'b> {
                 let inner = std::mem::replace(expr, b.void0());
                 Some(b.call(
                     "$.store_mutate",
-                    vec![
-                        self.store_subs(),
-                        b.string(&store_name),
-                        b.id(&store),
-                        inner,
-                    ],
+                    vec![self.store_subs(), b.string(&store_name), b.id(&store), inner],
                 ))
             }
         }
@@ -403,9 +387,7 @@ impl<'a, 'b> ReadWrap<'a, 'b> {
     fn store_get_or_derived_read(&self, name: &str) -> Expression<'a> {
         match self.classify(name) {
             ReadKind::StoreSub => self.store_get(name),
-            kind => self
-                .build_getter(name, kind)
-                .unwrap_or_else(|| self.b.id(name)),
+            kind => self.build_getter(name, kind).unwrap_or_else(|| self.b.id(name)),
         }
     }
 
@@ -445,10 +427,7 @@ impl<'a, 'b> ReadWrap<'a, 'b> {
             );
             let changed = ok
                 && probe.iter().any(|(n, _)| {
-                    matches!(
-                        self.classify_write(n),
-                        WriteKind::StoreSub | WriteKind::Derived
-                    )
+                    matches!(self.classify_write(n), WriteKind::StoreSub | WriteKind::Derived)
                 });
             (ok, changed)
         };
@@ -499,9 +478,10 @@ impl<'a, 'b> ReadWrap<'a, 'b> {
         // `if (!changed) return null`, but we must keep the already-visited node.
         if !changed {
             taken.right = rhs;
-            return Some(Expression::AssignmentExpression(
-                oxc_allocator::ArenaBox::new_in(taken, &b.ab),
-            ));
+            return Some(Expression::AssignmentExpression(oxc_allocator::ArenaBox::new_in(
+                taken,
+                &b.ab(),
+            )));
         }
 
         let assignments: Vec<Expression<'a>> = leaves
@@ -572,18 +552,11 @@ impl<'a, 'b> ReadWrap<'a, 'b> {
         };
         let name = arg.name.to_string();
         let prefix = upd.prefix;
-        let is_dec = matches!(
-            upd.operator,
-            oxc_syntax::operator::UpdateOperator::Decrement
-        );
+        let is_dec = matches!(upd.operator, oxc_syntax::operator::UpdateOperator::Decrement);
         match self.classify_write(&name) {
             WriteKind::StoreSub => {
                 let store = name[1..].to_string();
-                let callee = if prefix {
-                    "$.update_store_pre"
-                } else {
-                    "$.update_store"
-                };
+                let callee = if prefix { "$.update_store_pre" } else { "$.update_store" };
                 let mut args = vec![self.store_subs(), b.string(&name), b.id(&store)];
                 if is_dec {
                     args.push(b.number(-1.0));
@@ -591,11 +564,7 @@ impl<'a, 'b> ReadWrap<'a, 'b> {
                 Some(b.call(callee, args))
             }
             WriteKind::Derived => {
-                let callee = if prefix {
-                    "$.update_derived_pre"
-                } else {
-                    "$.update_derived"
-                };
+                let callee = if prefix { "$.update_derived_pre" } else { "$.update_derived" };
                 let mut args = vec![b.id(&name)];
                 if is_dec {
                     args.push(b.number(-1.0));
@@ -676,26 +645,17 @@ struct AccessPath {
 
 impl AccessPath {
     fn root_named(name: &str) -> Self {
-        AccessPath {
-            root: name.to_string(),
-            segs: Vec::new(),
-        }
+        AccessPath { root: name.to_string(), segs: Vec::new() }
     }
     fn push_prop(&self, name: &str) -> Self {
         let mut segs = self.segs.clone();
         segs.push(AccessSeg::Prop(name.to_string()));
-        AccessPath {
-            root: self.root.clone(),
-            segs,
-        }
+        AccessPath { root: self.root.clone(), segs }
     }
     fn push_index(&self, i: u32) -> Self {
         let mut segs = self.segs.clone();
         segs.push(AccessSeg::Index(i));
-        AccessPath {
-            root: self.root.clone(),
-            segs,
-        }
+        AccessPath { root: self.root.clone(), segs }
     }
     fn build<'a>(&self, b: B<'a>) -> Expression<'a> {
         let mut expr = b.id(&self.root);
@@ -944,22 +904,6 @@ fn collect_binding_pattern_names(pat: &oxc_ast::ast::BindingPattern, out: &mut F
     }
 }
 
-/// Whether `expr` is a `$state.eager(<arg>)` call. The read-wrap pass leaves its
-/// argument unvisited (写经 the server `CallExpression` visitor returning
-/// `node.arguments[0]` without visiting), so the eager read stays bare.
-fn is_state_eager_call(expr: &Expression<'_>) -> bool {
-    let Expression::CallExpression(call) = expr else {
-        return false;
-    };
-    let Expression::StaticMemberExpression(m) = &call.callee else {
-        return false;
-    };
-    let Expression::Identifier(obj) = &m.object else {
-        return false;
-    };
-    obj.name.as_str() == "$state" && m.property.name.as_str() == "eager"
-}
-
 impl<'a, 'b> VisitMut<'a> for ReadWrap<'a, 'b> {
     fn visit_expression(&mut self, expr: &mut Expression<'a>) {
         match expr {
@@ -997,14 +941,6 @@ impl<'a, 'b> VisitMut<'a> for ReadWrap<'a, 'b> {
                     oxc_ast_visit::walk_mut::walk_expression(self, expr);
                 }
             }
-            // `$state.eager(<arg>)`: upstream's server `CallExpression` visitor
-            // returns `node.arguments[0]` WITHOUT visiting it, so the eager read
-            // is NOT derived-wrapped (`$state.eager(derivedCount)` stays a bare
-            // `derivedCount`, later unwrapped by `lower_effect_value_runes_expr`).
-            // Skip recursion here so the argument's derived/store reads are left
-            // bare — otherwise it would wrap to `derivedCount()` before the
-            // unwrap, yielding the wrong `derivedCount() !== derivedCount()`.
-            Expression::CallExpression(_) if is_state_eager_call(expr) => {}
             _ => oxc_ast_visit::walk_mut::walk_expression(self, expr),
         }
     }
@@ -1030,7 +966,9 @@ impl<'a, 'b> VisitMut<'a> for ReadWrap<'a, 'b> {
     ) {
         let mut frame = FxHashSet::default();
         Self::collect_param_names(&it.params, &mut frame);
-        collect_block_decl_names(&it.body.statements, &mut frame);
+        if let Some(block) = it.body.as_function_body() {
+            collect_block_decl_names(&block.statements, &mut frame);
+        }
         self.shadowed.push(frame);
         oxc_ast_visit::walk_mut::walk_arrow_function_expression(self, it);
         self.shadowed.pop();
@@ -1042,6 +980,34 @@ impl<'a, 'b> VisitMut<'a> for ReadWrap<'a, 'b> {
         self.shadowed.push(frame);
         oxc_ast_visit::walk_mut::walk_block_statement(self, it);
         self.shadowed.pop();
+    }
+
+    fn visit_switch_statement(&mut self, it: &mut oxc_ast::ast::SwitchStatement<'a>) {
+        // A switch's cases share one lexical environment even when a case has no
+        // explicit block. Collect every case's direct declarations before
+        // visiting any consequent, just as the semantic scope does. Without
+        // this frame, a case-local `var value = $derived(...)` can resolve to a
+        // same-named component binding and be getter-wrapped once here, then a
+        // second time by the nested-rune lowering pass.
+        self.visit_expression(&mut it.discriminant);
+        let mut frame = FxHashSet::default();
+        for case in it.cases.iter() {
+            collect_block_decl_names(&case.consequent, &mut frame);
+        }
+        self.shadowed.push(frame);
+        for case in it.cases.iter_mut() {
+            self.visit_switch_case(case);
+        }
+        self.shadowed.pop();
+    }
+
+    fn visit_binding_identifier(&mut self, it: &mut oxc_ast::ast::BindingIdentifier<'a>) {
+        // `is_reference` is true in binding positions too, so upstream's
+        // `$$props` → `$$sanitized_props` short-circuit renames a declaration
+        // (a parameter, a `let`) as well as a read.
+        if it.name == "$$props" {
+            it.name = self.b.str("$$sanitized_props").into();
+        }
     }
 
     fn visit_class(&mut self, it: &mut oxc_ast::ast::Class<'a>) {
@@ -1094,11 +1060,6 @@ impl<'a> IntoAssignment<'a> for Expression<'a> {
         }
     }
 }
-
-// Keep `CloneIn`, `UpdateExpression`, `Statement` referenced so unused-import
-// lints stay quiet across feature shapes.
-#[allow(unused_imports)]
-use {AssignmentExpression as _AE, CloneIn as _CI, Statement as _St, UpdateExpression as _UE};
 
 /// Apply the read-wrapping pass to `expr` in place. `scope_idx` is the scope to
 /// resolve names against (component/instance scope for the first cut).

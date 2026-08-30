@@ -6,10 +6,12 @@
 
 use super::VisitorContext;
 use super::shared::utils::validate_assignment_node;
-use crate::ast::template::{AttributeValue, BindDirective, RegularElement, TemplateNode};
+use crate::ast::template::{AttributeValue, BindDirective, RegularElement};
 use crate::ast::typed_expr::JsNode;
 use crate::compiler::phases::phase2_analyze::AnalysisError;
-use crate::compiler::phases::phase2_analyze::binding_properties::BINDING_PROPERTIES;
+use crate::compiler::phases::phase2_analyze::binding_properties::{
+    BINDING_PROPERTIES, all_binding_names, get_valid_bindings,
+};
 use crate::compiler::phases::phase2_analyze::errors;
 /// Visit a bind directive with explicit element context.
 ///
@@ -19,8 +21,7 @@ pub fn visit_with_element(
     element: &RegularElement,
     context: &mut VisitorContext,
 ) -> Result<(), AnalysisError> {
-    // Validate binding for the element
-    validate_binding_for_regular_element(&directive.name, element, context)?;
+    validate_binding_for_element(directive, &element.name, &element.attributes)?;
 
     // Continue with the rest of the validation
     visit_common(directive, context)
@@ -31,137 +32,30 @@ pub fn visit_with_element(
 /// This is called from special element visitors like svelte_window.
 pub fn visit_with_svelte_element(
     directive: &BindDirective,
-    element_name: &str,
     context: &mut VisitorContext,
 ) -> Result<(), AnalysisError> {
-    // Validate binding for the svelte element
-    validate_binding_for_svelte_element(&directive.name, element_name)?;
-
-    // Continue with the rest of the validation
     visit_common(directive, context)
 }
 
-/// Visit a bind directive.
-///
-/// Corresponds to the `BindDirective` function in BindDirective.js.
-///
-/// This function validates bind: directives by checking:
-/// - The binding is valid for the parent element type
-/// - Input types are correctly matched with bind:checked/files/group
-/// - Select elements have static `multiple` attributes
-/// - SVG elements don't use bind:offsetWidth
-/// - contenteditable elements have appropriate bindings
-///
-/// # Arguments
-///
-/// * `directive` - The bind directive to analyze
-/// * `context` - The visitor context
-pub fn visit(directive: &BindDirective, context: &mut VisitorContext) -> Result<(), AnalysisError> {
-    let parent = context.path.last();
-
-    // Check if parent is a valid element type for bindings
-    if let Some(parent_node) = parent {
-        let parent_name = match parent_node {
-            TemplateNode::RegularElement(el) => Some(el.name.as_str()),
-            TemplateNode::SvelteElement(_) => Some("svelte:element"),
-            TemplateNode::SvelteWindow(_) => Some("svelte:window"),
-            TemplateNode::SvelteDocument(_) => Some("svelte:document"),
-            TemplateNode::SvelteBody(_) => Some("svelte:body"),
-            _ => None,
-        };
-
-        if let Some(parent_name) = parent_name {
-            validate_binding_for_element(&directive.name, parent_name, parent_node, context)?;
-        }
-    }
-
-    visit_common(directive, context)
-}
-
-/// Common validation logic for bind directives.
-fn visit_common(
+/// The target half of the check, for callers that hold the attribute list
+/// immutably while `visit_with_svelte_element` needs `context` mutably.
+pub fn validate_binding_target(
     directive: &BindDirective,
-    context: &mut VisitorContext,
+    element_name: &str,
+    attributes: &[crate::ast::template::Attribute],
+) -> Result<(), AnalysisError> {
+    validate_binding_for_element(directive, element_name, attributes)
+}
+/// Everything upstream's `BindDirective` visitor does below its `parent_type`
+/// block — the half that is host-agnostic, so every host that accepts `bind:`
+/// runs all of it or none of it.
+pub(super) fn validate_expression_shape(
+    directive: &BindDirective,
+    context: &VisitorContext,
 ) -> Result<(), AnalysisError> {
     // Handle getter/setter syntax (SequenceExpression)
-    if directive.expression.node_type() == Some("SequenceExpression") {
-        if directive.name == "group" {
-            return Err(AnalysisError::ValidationWithCode {
-                code: "bind_group_invalid_expression".to_string(),
-                message: "bind:group cannot use getter/setter syntax".to_string(),
-            });
-        }
-
-        // Check for invalid parentheses in the binding expression, ignoring any
-        // '(' that sits inside a comment between the opening `{` and the
-        // expression. Comment regions are detected directly from the source
-        // (scanning `/* … */` and `// …`) rather than from the expression's
-        // `leadingComments` JSON — comment capture is off on the compile path,
-        // so the typed expression carries no comment metadata here; a source
-        // scan is the robust source of truth.
-        if let Some(start) = directive.expression.start() {
-            let start_usize = start as usize;
-            let source_bytes = context.analysis.source.as_bytes();
-            let mut i = start_usize;
-            while i > 0 && source_bytes.get(i.saturating_sub(1)) != Some(&b'{') {
-                i -= 1;
-            }
-
-            // Scan from just after `{` to the expression start, tracking comment
-            // state so parens inside comments are ignored.
-            let mut pos = i;
-            let mut found_invalid_paren = false;
-            while pos < start_usize {
-                match source_bytes.get(pos) {
-                    Some(&b'/') if source_bytes.get(pos + 1) == Some(&b'*') => {
-                        pos += 2;
-                        while pos < start_usize
-                            && !(source_bytes.get(pos) == Some(&b'*')
-                                && source_bytes.get(pos + 1) == Some(&b'/'))
-                        {
-                            pos += 1;
-                        }
-                        pos += 2;
-                    }
-                    Some(&b'/') if source_bytes.get(pos + 1) == Some(&b'/') => {
-                        pos += 2;
-                        while pos < start_usize && source_bytes.get(pos) != Some(&b'\n') {
-                            pos += 1;
-                        }
-                    }
-                    Some(&b'(') => {
-                        found_invalid_paren = true;
-                        break;
-                    }
-                    _ => pos += 1,
-                }
-            }
-
-            if found_invalid_paren {
-                return Err(AnalysisError::ValidationWithCode {
-                    code: "bind_invalid_parens".to_string(),
-                    message: format!(
-                        "bind:{} cannot have parentheses around the expression",
-                        directive.name
-                    ),
-                });
-            }
-        }
-
-        // Validate that sequence expression has exactly 2 expressions (getter and setter)
-        {
-            let node = directive.expression.as_node();
-            let expressions = node.expressions();
-            let arena = context.parse_arena;
-            let expr_slice = arena.get_js_children(expressions);
-            if !expr_slice.is_empty() && expr_slice.len() != 2 {
-                return Err(AnalysisError::ValidationWithCode {
-                    code: "bind_invalid_expression".to_string(),
-                    message: "Binding with getter/setter requires exactly two functions"
-                        .to_string(),
-                });
-            }
-        }
+    if is_get_set_pair(directive) {
+        validate_get_set_pair(directive, context)?;
 
         // Mark subtree as dynamic
         // In full implementation: mark_subtree_dynamic(context.path)
@@ -170,52 +64,63 @@ fn visit_common(
         // This is important for cases like:
         //   bind:checked={()=>check, (v)=>{ check = v }}
         // where the setter contains an assignment that marks `check` as reassigned
-        {
-            let node = directive.expression.as_node();
-            let expressions = node.expressions();
-            let arena = context.parse_arena;
-            for expr in arena.get_js_children(expressions) {
-                // Walk the expression to track mutations (e.g., assignments in setters).
-                // Use typed dispatch to skip the `to_value()` materialization.
-                super::script::walk_js_node_typed(expr, context)?;
-            }
-        }
-
-        // Check for await in the expression
-        // TODO: Check node.metadata.expression.has_await
-        // if has_await { return Err(errors::illegal_await_expression()); }
-
         return Ok(());
     }
 
     // Validate the assignment target
     {
         let node = directive.expression.as_node();
-        validate_assignment_node(&node, context, true)?;
+        validate_assignment_node((directive.start, directive.end), &node, context, true)?;
     }
 
     // Get the leftmost identifier (the binding target)
-    let expr_node = directive.expression.as_node();
-    let binding_name_owned: String;
-    let binding_name: &str = if let Some(left) = get_object_node(&expr_node, context.parse_arena) {
-        left.name().unwrap_or_default()
-    } else {
-        // Fall back to JSON for MemberExpression chains
-        binding_name_owned = get_object_name_via_json(&expr_node).unwrap_or_default();
-        if binding_name_owned.is_empty() {
-            return Err(AnalysisError::ValidationWithCode {
-                code: "bind_invalid_expression".to_string(),
-                message: "Invalid binding expression".to_string(),
-            });
-        }
-        &binding_name_owned
-    };
-
-    // Look up the binding in the scope using proper scope chain traversal
-    let binding_idx = context
+    let binding_name = bind_target_name(directive, context)?;
+    let binding = context
         .analysis
         .root
-        .get_binding(binding_name, context.scope);
+        .get_binding(&binding_name, context.scope)
+        .map(|idx| &context.analysis.root.bindings[idx]);
+
+    // For Identifier (not MemberExpression), validate the binding kind
+    validate_bind_value_identifier(directive, binding)?;
+
+    // Handle bind:group special logic
+    if directive.name == "group"
+        && let Some(binding) = binding
+        && matches!(
+            binding.kind,
+            crate::compiler::phases::phase2_analyze::BindingKind::SnippetParam
+        )
+    {
+        return Err(
+            errors::bind_group_invalid_snippet_parameter().at(directive.start, directive.end)
+        );
+    }
+
+    Ok(())
+}
+
+/// Common validation logic for bind directives.
+fn visit_common(
+    directive: &BindDirective,
+    context: &mut VisitorContext,
+) -> Result<(), AnalysisError> {
+    // On an element the `BindDirective` node stays on upstream's visitor path,
+    // so it grants the exemption itself.
+    super::shared::attribute::record_assign_exempt_expression(context, &directive.expression, true);
+
+    validate_expression_shape(directive, context)?;
+
+    if directive.expression.node_type() == Some("SequenceExpression") {
+        walk_get_set_pair(directive, context)?;
+        return Ok(());
+    }
+
+    let binding_name_owned = bind_target_name(directive, context)?;
+    let binding_name: &str = &binding_name_owned;
+
+    // Look up the binding in the scope using proper scope chain traversal
+    let binding_idx = context.analysis.root.get_binding(binding_name, context.scope);
 
     // Mark has_direct_template_read for non_reactive_update warning.
     // Corresponds to Svelte's 2-analyze/index.js L728-768.
@@ -238,53 +143,31 @@ fn visit_common(
         }
     }
 
-    // Re-borrow binding after mutable operations are done
+    // Re-borrow binding after mutable operations are done.
+    // Binding group name registration (populating analysis.binding_groups) is done in
+    // mod.rs's mark_each_block_group_bindings, which runs after template analysis.
     let binding = binding_idx.map(|idx| &context.analysis.root.bindings[idx]);
-
-    // TODO: Set node.metadata.binding = binding
-
-    // For Identifier (not MemberExpression), validate the binding kind
-    validate_bind_value_identifier(directive, binding)?;
-
-    // Handle bind:group special logic
-    if directive.name == "group"
-        && let Some(binding) = binding
-    {
-        // Check if binding is a snippet parameter
-        if matches!(
-            binding.kind,
-            crate::compiler::phases::phase2_analyze::BindingKind::SnippetParam
-        ) {
-            return Err(AnalysisError::ValidationWithCode {
-                code: "bind_group_invalid_snippet_parameter".to_string(),
-                message: "Cannot use bind:group with snippet parameters".to_string(),
-            });
-        }
-
-        // Note: Binding group name registration (populating analysis.binding_groups) is done
-        // in mod.rs's mark_each_block_group_bindings, which runs after template analysis.
-        // That function uses the full keypath + EachBlock position as keys to correctly
-        // differentiate between multiple bind:group directives that happen to share the
-        // same variable name (e.g., two {#each x as selected} blocks with bind:group={selected}).
-    }
 
     // Check for each block binding with rest
     // Corresponds to BindDirective.js L271-273:
     //   if (binding?.kind === 'each' && binding.metadata?.inside_rest) {
     //     w.bind_invalid_each_rest(binding.node, binding.node.name);
     //   }
-    if let Some(binding) = binding
-        && matches!(
-            binding.kind,
-            crate::compiler::phases::phase2_analyze::BindingKind::EachItem
-        )
-        && binding.inside_rest
-    {
-        context.emit_warning(
-            crate::compiler::phases::phase2_analyze::warnings::bind_invalid_each_rest(
-                &binding.name,
-            ),
-        );
+    let each_rest_name = binding
+        .filter(|b| {
+            matches!(b.kind, crate::compiler::phases::phase2_analyze::BindingKind::EachItem)
+                && b.inside_rest
+        })
+        .map(|b| b.name.clone());
+    if let Some(name) = each_rest_name {
+        // Upstream attributes this to `binding.node`; rsvelte's `Binding` keeps no
+        // declaring-node span for each-item bindings, so recover it from the pattern.
+        let mut warning =
+            crate::compiler::phases::phase2_analyze::warnings::bind_invalid_each_rest(&name);
+        if let Some((start, end)) = find_rest_binding_span(&name, context) {
+            warning = warning.at(start, end);
+        }
+        context.emit_warning(warning);
     }
 
     // Visit child expressions to add template references
@@ -298,13 +181,211 @@ fn visit_common(
     if directive.name == "this" {
         context.in_bind_this = true;
     }
-    super::script::walk_expression(&directive.expression, context)?;
+    let result = walk_bind_expression(directive, context);
     context.in_bind_this = prev_in_bind_this;
+    result
+}
 
-    // TODO: Check for await in expression
-    // if node.metadata.expression.has_await { return Err(errors::illegal_await_expression()); }
+/// Whether the directive uses the `bind:x={get, set}` pair form.
+pub(super) fn is_get_set_pair(directive: &BindDirective) -> bool {
+    directive.expression.node_type() == Some("SequenceExpression")
+}
+
+/// The `SequenceExpression` half of upstream's `BindDirective` visitor, which
+/// runs before it branches on the host. Every host must reach it: it is the only
+/// place `bind:group={get, set}` is rejected, and a component reached the
+/// getter/setter lowering without it.
+pub(super) fn validate_get_set_pair(
+    directive: &BindDirective,
+    context: &VisitorContext,
+) -> Result<(), AnalysisError> {
+    if directive.name == "group" {
+        return Err(errors::bind_group_invalid_expression().at(directive.start, directive.end));
+    }
+
+    // Check for invalid parentheses in the binding expression, ignoring any
+    // '(' that sits inside a comment between the opening `{` and the
+    // expression. Comment regions are detected directly from the source
+    // (scanning `/* … */` and `// …`) rather than from the expression's
+    // `leadingComments` JSON — comment capture is off on the compile path,
+    // so the typed expression carries no comment metadata here; a source
+    // scan is the robust source of truth.
+    if let Some(start) = directive.expression.start() {
+        let start_usize = start as usize;
+        let source_bytes = context.analysis.source.as_bytes();
+        let mut i = start_usize;
+        while i > 0 && source_bytes.get(i.saturating_sub(1)) != Some(&b'{') {
+            i -= 1;
+        }
+
+        // Scan from just after `{` to the expression start, tracking comment
+        // state so parens inside comments are ignored.
+        let mut pos = i;
+        let mut found_invalid_paren = false;
+        while pos < start_usize {
+            match source_bytes.get(pos) {
+                Some(&b'/') if source_bytes.get(pos + 1) == Some(&b'*') => {
+                    pos += 2;
+                    while pos < start_usize
+                        && !(source_bytes.get(pos) == Some(&b'*')
+                            && source_bytes.get(pos + 1) == Some(&b'/'))
+                    {
+                        pos += 1;
+                    }
+                    pos += 2;
+                }
+                Some(&b'/') if source_bytes.get(pos + 1) == Some(&b'/') => {
+                    pos += 2;
+                    while pos < start_usize && source_bytes.get(pos) != Some(&b'\n') {
+                        pos += 1;
+                    }
+                }
+                Some(&b'(') => {
+                    found_invalid_paren = true;
+                    break;
+                }
+                _ => pos += 1,
+            }
+        }
+
+        if found_invalid_paren {
+            return Err(AnalysisError::validation_at(
+                "bind_invalid_parens",
+                format!("bind:{} cannot have parentheses around the expression", directive.name),
+                directive.start,
+                directive.end,
+            ));
+        }
+    }
+
+    // Validate that sequence expression has exactly 2 expressions (getter and setter)
+    let node = directive.expression.as_node();
+    let expr_slice = context.parse_arena.get_js_children(node.expressions());
+    if !expr_slice.is_empty() && expr_slice.len() != 2 {
+        return Err(errors::bind_invalid_expression().at(directive.start, directive.end));
+    }
 
     Ok(())
+}
+
+/// Walk both halves of a `{get, set}` pair.
+///
+/// Upstream visits the get/set functions' **bodies** with `state.expression`
+/// installed, deliberately jumping across the function so an `await` in the body
+/// still suspends (`BindDirective.js` L157-170). `bind_await_depth` reproduces
+/// that without re-shaping the walk: a function-like half suspends one depth in.
+pub(super) fn walk_get_set_pair(
+    directive: &BindDirective,
+    context: &mut VisitorContext,
+) -> Result<(), AnalysisError> {
+    let node = directive.expression.as_node();
+    let expressions = node.expressions();
+    let arena = context.parse_arena;
+    let saw_await = std::mem::replace(&mut context.bind_has_await, false);
+    let saved_depth = context.bind_await_depth;
+
+    let mut result = Ok(());
+    for expr in arena.get_js_children(expressions) {
+        let depth = if matches!(
+            expr,
+            JsNode::ArrowFunctionExpression { .. } | JsNode::FunctionExpression { .. }
+        ) {
+            context.function_depth + 1
+        } else {
+            context.function_depth
+        };
+        context.bind_await_depth = Some(depth);
+        // Walk the expression to track mutations (e.g., assignments in setters).
+        // Use typed dispatch to skip the `to_value()` materialization.
+        result = super::script::walk_js_node_typed(expr, context);
+        if result.is_err() {
+            break;
+        }
+    }
+
+    context.bind_await_depth = saved_depth;
+    let has_await = std::mem::replace(&mut context.bind_has_await, saw_await);
+    result?;
+    if has_await {
+        return Err(errors::illegal_await_expression().at(directive.start, directive.end));
+    }
+    Ok(())
+}
+
+/// Walk a plain (non-pair) `bind:` expression the way upstream does — with
+/// `state.expression` installed, so an `await` that is not inside a nested
+/// function suspends.
+pub(super) fn walk_bind_expression(
+    directive: &BindDirective,
+    context: &mut VisitorContext,
+) -> Result<(), AnalysisError> {
+    let saw_await = std::mem::replace(&mut context.bind_has_await, false);
+    let saved_depth = context.bind_await_depth.replace(context.function_depth);
+    let result = super::script::walk_expression(&directive.expression, context);
+    context.bind_await_depth = saved_depth;
+    let has_await = std::mem::replace(&mut context.bind_has_await, saw_await);
+    result?;
+    if has_await {
+        return Err(errors::illegal_await_expression().at(directive.start, directive.end));
+    }
+    Ok(())
+}
+
+/// Locate the declaring identifier of an each-item binding that sits inside a rest
+/// element, searching the enclosing `{#each}` context patterns innermost-first.
+fn find_rest_binding_span(name: &str, context: &VisitorContext) -> Option<(u32, u32)> {
+    for node in context.path.iter().rev() {
+        let crate::ast::template::TemplateNode::EachBlock(each) = node else {
+            continue;
+        };
+        let Some(pattern) = each.context.as_ref().map(|c| c.as_node()) else {
+            continue;
+        };
+        if let Some(span) = find_rest_identifier(pattern.as_ref(), name, false, context.parse_arena)
+        {
+            return Some(span);
+        }
+    }
+    None
+}
+
+/// Mirrors `ScopeBuilder::declare_bindings_from_pattern_node_with_kind`'s traversal,
+/// returning the span of the identifier it would have declared with `inside_rest`.
+fn find_rest_identifier(
+    pattern: &JsNode,
+    name: &str,
+    inside_rest: bool,
+    arena: &crate::ast::arena::ParseArena,
+) -> Option<(u32, u32)> {
+    match pattern {
+        JsNode::Identifier { name: id, start, end, .. } => {
+            (inside_rest && id.as_str() == name).then_some((*start, *end))
+        }
+        JsNode::ObjectPattern { properties, .. } | JsNode::ObjectExpression { properties, .. } => {
+            arena.get_js_children(*properties).iter().find_map(|prop| match prop {
+                JsNode::RestElement { argument, .. } | JsNode::SpreadElement { argument, .. } => {
+                    find_rest_identifier(arena.get_js_node(*argument), name, true, arena)
+                }
+                JsNode::Property { value, .. } => {
+                    find_rest_identifier(arena.get_js_node(*value), name, inside_rest, arena)
+                }
+                _ => None,
+            })
+        }
+        JsNode::ArrayPattern { elements, .. } | JsNode::ArrayExpression { elements, .. } => {
+            elements
+                .iter()
+                .flatten()
+                .find_map(|elem| find_rest_identifier(elem, name, inside_rest, arena))
+        }
+        JsNode::RestElement { argument, .. } | JsNode::SpreadElement { argument, .. } => {
+            find_rest_identifier(arena.get_js_node(*argument), name, true, arena)
+        }
+        JsNode::AssignmentPattern { left, .. } => {
+            find_rest_identifier(arena.get_js_node(*left), name, inside_rest, arena)
+        }
+        _ => None,
+    }
 }
 
 /// Validate that an Identifier `bind:x={y}` expression targets state or props.
@@ -368,23 +449,29 @@ pub(super) fn validate_bind_value_identifier(
     };
 
     if !is_valid {
-        return Err(AnalysisError::ValidationWithCode {
-            code: "bind_invalid_value".to_string(),
-            message: "Can only bind to state or props\nhttps://svelte.dev/e/bind_invalid_value"
-                .to_string(),
-        });
+        return Err(AnalysisError::validation_at(
+            "bind_invalid_value",
+            "Can only bind to state or props\nhttps://svelte.dev/e/bind_invalid_value",
+            directive.expression.start().unwrap_or(0),
+            directive.expression.end().unwrap_or(0),
+        ));
     }
 
     Ok(())
 }
 
 /// Resolve the binding for an Identifier bind expression and run
-/// `validate_bind_value_identifier`. Used by the component visitor
-/// (`shared/component.rs`), which does not go through `visit_common`.
-pub(super) fn validate_bind_value_for_component(
+/// `validate_bind_value_identifier`. Used by the hosts that do not go through
+/// `visit_common` — a component, `<svelte:self>` and `<svelte:element>`.
+pub(super) fn validate_bind_value_target(
     directive: &BindDirective,
     context: &VisitorContext,
 ) -> Result<(), AnalysisError> {
+    // Runs before the shape branch below, or a component binding to an
+    // expression that names nothing is lowered into a getter/setter instead of
+    // being rejected.
+    bind_target_name(directive, context)?;
+
     if !directive.expression.is_identifier_node() {
         return Ok(());
     }
@@ -403,133 +490,22 @@ pub(super) fn validate_bind_value_for_component(
 
     validate_bind_value_identifier(directive, binding)
 }
-
-/// Validate a binding for a specific element type.
+/// Upstream runs one `BindDirective` check for a `RegularElement`, a `SvelteElement`,
+/// and `<svelte:window>` / `<svelte:document>` / `<svelte:body>` alike, keyed on the
+/// element's name. Three copies of it drifted: the special-element one reported the
+/// `invalid_elements` sentence for a `valid_elements` violation, and the
+/// `<svelte:element>` one hard-coded four names and never reached the
+/// contenteditable check.
 fn validate_binding_for_element(
-    binding_name: &str,
-    parent_name: &str,
-    parent_node: &TemplateNode,
-    context: &VisitorContext,
-) -> Result<(), AnalysisError> {
-    // Check if binding exists in binding_properties
-    if let Some(property) = BINDING_PROPERTIES.get(binding_name) {
-        // Check valid_elements
-        if let Some(valid_elements) = property.valid_elements
-            && !valid_elements.contains(&parent_name)
-        {
-            let valid_list = valid_elements
-                .iter()
-                .map(|e| format!("`<{e}>`"))
-                .collect::<Vec<_>>()
-                .join(", ");
-
-            return Err(errors::bind_invalid_target(binding_name, &valid_list));
-        }
-
-        // Check invalid_elements
-        if let Some(invalid_elements) = property.invalid_elements
-            && invalid_elements.contains(&parent_name)
-        {
-            let valid_bindings = get_valid_bindings_for_element(parent_name);
-            let message = format!(
-                "Possible bindings for <{}> are {}",
-                parent_name,
-                valid_bindings.join(", ")
-            );
-
-            return Err(errors::bind_invalid_name(binding_name, Some(&message)));
-        }
-
-        // Special validation for <input> elements
-        if parent_name == "input"
-            && binding_name != "this"
-            && let TemplateNode::RegularElement(element) = parent_node
-        {
-            validate_input_binding(binding_name, element, context)?;
-        }
-
-        // Special validation for <select> elements
-        if parent_name == "select"
-            && binding_name != "this"
-            && let TemplateNode::RegularElement(element) = parent_node
-        {
-            validate_select_binding(element)?;
-        }
-
-        // Special validation for SVG elements
-        if binding_name == "offsetWidth" && is_svg(parent_name) {
-            return Err(errors::bind_invalid_target(
-                binding_name,
-                "non-`<svg>` elements. Use `bind:clientWidth` for `<svg>` instead",
-            ));
-        }
-
-        // Validate contenteditable bindings
-        if is_content_editable_binding(binding_name)
-            && let TemplateNode::RegularElement(element) = parent_node
-        {
-            validate_contenteditable_binding(element)?;
-        }
-    } else {
-        // Binding not found - try fuzzy match
-        let match_name = fuzzy_match(binding_name, &get_all_binding_names());
-
-        if let Some(match_name) = match_name
-            && let Some(property) = BINDING_PROPERTIES.get(match_name)
-            && (property.valid_elements.is_none()
-                || property.valid_elements.unwrap().contains(&parent_name))
-        {
-            return Err(errors::bind_invalid_name(
-                binding_name,
-                Some(&format!("Did you mean '{}'?", match_name)),
-            ));
-        }
-
-        return Err(errors::bind_invalid_name(binding_name, None));
-    }
-
-    Ok(())
-}
-
-/// Validate binding for a Svelte special element (svelte:window, svelte:document, svelte:body).
-fn validate_binding_for_svelte_element(
-    binding_name: &str,
+    directive: &BindDirective,
     element_name: &str,
+    attributes: &[crate::ast::template::Attribute],
 ) -> Result<(), AnalysisError> {
-    // Check if binding exists in binding_properties
-    if let Some(property) = BINDING_PROPERTIES.get(binding_name) {
-        // Check valid_elements
-        if let Some(valid_elements) = property.valid_elements
-            && !valid_elements.contains(&element_name)
-        {
-            // For svelte: elements, provide a list of possible bindings
-            let valid_bindings = get_valid_bindings_for_element(element_name);
-            let message = format!(
-                "Possible bindings for <{}> are {}",
-                element_name,
-                valid_bindings.join(", ")
-            );
+    let binding_name = directive.name.as_str();
+    let (start, end) = (directive.start, directive.end);
 
-            return Err(errors::bind_invalid_name(binding_name, Some(&message)));
-        }
-
-        // Check invalid_elements
-        if let Some(invalid_elements) = property.invalid_elements
-            && invalid_elements.contains(&element_name)
-        {
-            let valid_bindings = get_valid_bindings_for_element(element_name);
-            let message = format!(
-                "Possible bindings for <{}> are {}",
-                element_name,
-                valid_bindings.join(", ")
-            );
-
-            return Err(errors::bind_invalid_name(binding_name, Some(&message)));
-        }
-    } else {
-        // Binding not found - try fuzzy match
-        let match_name = fuzzy_match(binding_name, &get_all_binding_names());
-
+    let Some(property) = BINDING_PROPERTIES.get(binding_name) else {
+        let match_name = fuzzy_match(binding_name, &all_binding_names());
         if let Some(match_name) = match_name
             && let Some(property) = BINDING_PROPERTIES.get(match_name)
             && (property.valid_elements.is_none()
@@ -538,90 +514,49 @@ fn validate_binding_for_svelte_element(
             return Err(errors::bind_invalid_name(
                 binding_name,
                 Some(&format!("Did you mean '{}'?", match_name)),
-            ));
+            )
+            .at(start, end));
         }
+        return Err(errors::bind_invalid_name(binding_name, None).at(start, end));
+    };
 
-        return Err(errors::bind_invalid_name(binding_name, None));
+    if let Some(valid_elements) = property.valid_elements
+        && !valid_elements.contains(&element_name)
+    {
+        let valid_list =
+            valid_elements.iter().map(|e| format!("`<{e}>`")).collect::<Vec<_>>().join(", ");
+        return Err(errors::bind_invalid_target(binding_name, &valid_list).at(start, end));
     }
 
-    Ok(())
-}
+    if let Some(invalid_elements) = property.invalid_elements
+        && invalid_elements.contains(&element_name)
+    {
+        let message = format!(
+            "Possible bindings for <{}> are {}",
+            element_name,
+            get_valid_bindings(element_name).join(", ")
+        );
+        return Err(errors::bind_invalid_name(binding_name, Some(&message)).at(start, end));
+    }
 
-/// Validate binding for a regular element directly (without going through path).
-fn validate_binding_for_regular_element(
-    binding_name: &str,
-    element: &RegularElement,
-    context: &VisitorContext,
-) -> Result<(), AnalysisError> {
-    let parent_name = element.name.as_str();
+    if element_name == "input" && binding_name != "this" {
+        validate_input_binding(directive, attributes)?;
+    }
 
-    // Check if binding exists in binding_properties
-    if let Some(property) = BINDING_PROPERTIES.get(binding_name) {
-        // Check valid_elements
-        if let Some(valid_elements) = property.valid_elements
-            && !valid_elements.contains(&parent_name)
-        {
-            let valid_list = valid_elements
-                .iter()
-                .map(|e| format!("`<{e}>`"))
-                .collect::<Vec<_>>()
-                .join(", ");
+    if element_name == "select" && binding_name != "this" {
+        validate_select_binding(attributes)?;
+    }
 
-            return Err(errors::bind_invalid_target(binding_name, &valid_list));
-        }
+    if binding_name == "offsetWidth" && is_svg(element_name) {
+        return Err(errors::bind_invalid_target(
+            binding_name,
+            "non-`<svg>` elements. Use `bind:clientWidth` for `<svg>` instead",
+        )
+        .at(start, end));
+    }
 
-        // Check invalid_elements
-        if let Some(invalid_elements) = property.invalid_elements
-            && invalid_elements.contains(&parent_name)
-        {
-            let valid_bindings = get_valid_bindings_for_element(parent_name);
-            let message = format!(
-                "Possible bindings for <{}> are {}",
-                parent_name,
-                valid_bindings.join(", ")
-            );
-
-            return Err(errors::bind_invalid_name(binding_name, Some(&message)));
-        }
-
-        // Special validation for <input> elements
-        if parent_name == "input" && binding_name != "this" {
-            validate_input_binding(binding_name, element, context)?;
-        }
-
-        // Special validation for <select> elements
-        if parent_name == "select" && binding_name != "this" {
-            validate_select_binding(element)?;
-        }
-
-        // Special validation for SVG elements
-        if binding_name == "offsetWidth" && is_svg(parent_name) {
-            return Err(errors::bind_invalid_target(
-                binding_name,
-                "non-`<svg>` elements. Use `bind:clientWidth` for `<svg>` instead",
-            ));
-        }
-
-        // Validate contenteditable bindings
-        if is_content_editable_binding(binding_name) {
-            validate_contenteditable_binding(element)?;
-        }
-    } else {
-        // Binding not found - try fuzzy match
-        let match_name = fuzzy_match(binding_name, &get_all_binding_names());
-
-        if let Some(match_name) = match_name
-            && let Some(property) = BINDING_PROPERTIES.get(match_name)
-            && (property.valid_elements.is_none()
-                || property.valid_elements.unwrap().contains(&parent_name))
-        {
-            return Err(errors::bind_invalid_name(
-                binding_name,
-                Some(&format!("Did you mean '{}'?", match_name)),
-            ));
-        }
-
-        return Err(errors::bind_invalid_name(binding_name, None));
+    if is_content_editable_binding(binding_name) {
+        validate_contenteditable_binding(directive, attributes)?;
     }
 
     Ok(())
@@ -629,12 +564,14 @@ fn validate_binding_for_regular_element(
 
 /// Validate binding for <input> elements based on their type attribute.
 fn validate_input_binding(
-    binding_name: &str,
-    element: &crate::ast::template::RegularElement,
-    _context: &VisitorContext,
+    directive: &BindDirective,
+    attributes: &[crate::ast::template::Attribute],
 ) -> Result<(), AnalysisError> {
+    let binding_name = directive.name.as_str();
+    let (start, end) = (directive.start, directive.end);
+
     // Find the type attribute
-    let type_attr = element.attributes.iter().find_map(|attr| {
+    let type_attr = attributes.iter().find_map(|attr| {
         if let crate::ast::template::Attribute::Attribute(a) = attr
             && a.name == "type"
         {
@@ -647,10 +584,7 @@ fn validate_input_binding(
         // Check if type attribute is dynamic
         if !is_text_attribute(type_attr) {
             if binding_name != "value" || matches!(type_attr.value, AttributeValue::True(_)) {
-                return Err(AnalysisError::ValidationWithCode {
-                    code: "attribute_invalid_type".to_string(),
-                    message: "The 'type' attribute cannot be dynamic".to_string(),
-                });
+                return Err(errors::attribute_invalid_type().at(type_attr.start, type_attr.end));
             }
         } else {
             // Get the static type value
@@ -670,7 +604,8 @@ fn validate_input_binding(
                     return Err(errors::bind_invalid_target(
                         binding_name,
                         &format!("`<input type=\"checkbox\">`{}", hint),
-                    ));
+                    )
+                    .at(start, end));
                 }
 
                 // Validate bind:files
@@ -678,7 +613,8 @@ fn validate_input_binding(
                     return Err(errors::bind_invalid_target(
                         binding_name,
                         "`<input type=\"file\">`",
-                    ));
+                    )
+                    .at(start, end));
                 }
             }
         }
@@ -688,17 +624,14 @@ fn validate_input_binding(
         // type-checked, so binding them to a type-less input is accepted
         // (matches `BindDirective.js`). H-036.
         if binding_name == "checked" {
-            return Err(errors::bind_invalid_target(
-                binding_name,
-                "`<input type=\"checkbox\">`",
-            ));
+            return Err(errors::bind_invalid_target(binding_name, "`<input type=\"checkbox\">`")
+                .at(start, end));
         }
 
         if binding_name == "files" {
-            return Err(errors::bind_invalid_target(
-                binding_name,
-                "`<input type=\"file\">`",
-            ));
+            return Err(
+                errors::bind_invalid_target(binding_name, "`<input type=\"file\">`").at(start, end)
+            );
         }
     }
 
@@ -707,36 +640,32 @@ fn validate_input_binding(
 
 /// Validate binding for <select> elements.
 fn validate_select_binding(
-    element: &crate::ast::template::RegularElement,
+    attributes: &[crate::ast::template::Attribute],
 ) -> Result<(), AnalysisError> {
     // Find the multiple attribute that is dynamic (not static text, not boolean true)
-    let multiple = element.attributes.iter().find(|attr| {
-        if let crate::ast::template::Attribute::Attribute(a) = attr {
-            if a.name == "multiple" {
-                // Check if the value is dynamic (not static text and not boolean true)
-                match &a.value {
-                    AttributeValue::True(_) => false,      // Static boolean true is OK
-                    AttributeValue::Expression(_) => true, // Dynamic expression is an error
-                    AttributeValue::Sequence(seq) => {
-                        // Check if any part is an expression (dynamic)
-                        seq.iter().any(|part| {
-                            matches!(
-                                part,
-                                crate::ast::template::AttributeValuePart::ExpressionTag(_)
-                            )
-                        })
-                    }
-                }
-            } else {
-                false
-            }
-        } else {
-            false
+    let multiple = attributes.iter().find_map(|attr| {
+        let crate::ast::template::Attribute::Attribute(a) = attr else {
+            return None;
+        };
+        if a.name != "multiple" {
+            return None;
         }
+        // Check if the value is dynamic (not static text and not boolean true)
+        let is_dynamic = match &a.value {
+            AttributeValue::True(_) => false,      // Static boolean true is OK
+            AttributeValue::Expression(_) => true, // Dynamic expression is an error
+            AttributeValue::Sequence(seq) => {
+                // Check if any part is an expression (dynamic)
+                seq.iter().any(|part| {
+                    matches!(part, crate::ast::template::AttributeValuePart::ExpressionTag(_))
+                })
+            }
+        };
+        is_dynamic.then_some(a)
     });
 
-    if multiple.is_some() {
-        return Err(errors::attribute_invalid_multiple());
+    if let Some(multiple) = multiple {
+        return Err(errors::attribute_invalid_multiple().at(multiple.start, multiple.end));
     }
 
     Ok(())
@@ -744,10 +673,11 @@ fn validate_select_binding(
 
 /// Validate contenteditable bindings.
 fn validate_contenteditable_binding(
-    element: &crate::ast::template::RegularElement,
+    directive: &BindDirective,
+    attributes: &[crate::ast::template::Attribute],
 ) -> Result<(), AnalysisError> {
     // Find contenteditable attribute
-    let contenteditable = element.attributes.iter().find_map(|attr| {
+    let contenteditable = attributes.iter().find_map(|attr| {
         if let crate::ast::template::Attribute::Attribute(a) = attr
             && a.name == "contenteditable"
         {
@@ -756,15 +686,12 @@ fn validate_contenteditable_binding(
         None
     });
 
-    if contenteditable.is_none() {
-        return Err(errors::attribute_contenteditable_missing());
-    }
+    let Some(attr) = contenteditable else {
+        return Err(errors::attribute_contenteditable_missing().at(directive.start, directive.end));
+    };
 
-    if let Some(attr) = contenteditable
-        && !is_text_attribute(attr)
-        && !matches!(attr.value, AttributeValue::True(_))
-    {
-        return Err(errors::attribute_contenteditable_dynamic());
+    if !is_text_attribute(attr) && !matches!(attr.value, AttributeValue::True(_)) {
+        return Err(errors::attribute_contenteditable_dynamic().at(attr.start, attr.end));
     }
 
     Ok(())
@@ -796,11 +723,32 @@ fn is_svg(name: &str) -> bool {
 /// Check if an attribute has a static text value.
 fn is_text_attribute(attr: &crate::ast::template::AttributeNode) -> bool {
     if let AttributeValue::Sequence(seq) = &attr.value {
-        seq.iter()
-            .all(|item| matches!(item, crate::ast::template::AttributeValuePart::Text(_)))
+        seq.iter().all(|item| matches!(item, crate::ast::template::AttributeValuePart::Text(_)))
     } else {
         false
     }
+}
+
+/// The binding's target name — upstream's `object(node.expression)`, which is
+/// `null` for anything that is not an identifier or a member chain rooted in
+/// one, and raises `bind_invalid_expression` there.
+///
+/// Element and component bindings must share it: upstream runs the check once,
+/// before it branches on the shape, and a copy per branch drifts.
+pub(super) fn bind_target_name(
+    directive: &BindDirective,
+    context: &VisitorContext,
+) -> Result<String, AnalysisError> {
+    let expr_node = directive.expression.as_node();
+    let name = match get_object_node(&expr_node, context.parse_arena) {
+        Some(left) => left.name().unwrap_or_default().to_string(),
+        // Fall back to JSON for MemberExpression chains
+        None => get_object_name_via_json(&expr_node).unwrap_or_default(),
+    };
+    if name.is_empty() {
+        return Err(errors::bind_invalid_expression().at(directive.start, directive.end));
+    }
+    Ok(name)
 }
 
 /// Get the object (leftmost identifier) from a JsNode expression.
@@ -819,6 +767,15 @@ fn get_object_node<'a>(
         JsNode::Identifier { .. } => Some(node),
         JsNode::MemberExpression { object, .. } => {
             get_object_node(arena.get_js_node(*object), arena)
+        }
+        // Upstream analyses the AST with the TypeScript nodes already removed,
+        // so `x as T` reaches `object()` as the bare `x`.
+        JsNode::TSAsExpression { expression, .. }
+        | JsNode::TSSatisfiesExpression { expression, .. }
+        | JsNode::TSNonNullExpression { expression, .. }
+        | JsNode::TSTypeAssertion { expression, .. }
+        | JsNode::TSInstantiationExpression { expression, .. } => {
+            get_object_node(arena.get_js_node(*expression), arena)
         }
         _ => None,
     }
@@ -840,30 +797,13 @@ fn get_object_name_from_json(v: &serde_json::Value) -> Option<String> {
             let obj = v.get("object")?;
             get_object_name_from_json(obj)
         }
+        "TSAsExpression"
+        | "TSSatisfiesExpression"
+        | "TSNonNullExpression"
+        | "TSTypeAssertion"
+        | "TSInstantiationExpression" => get_object_name_from_json(v.get("expression")?),
         _ => None,
     }
-}
-
-/// Get all valid binding names for an element.
-fn get_valid_bindings_for_element(element_name: &str) -> Vec<String> {
-    BINDING_PROPERTIES
-        .iter()
-        .filter(|(_, property)| {
-            if let Some(valid) = property.valid_elements {
-                valid.contains(&element_name)
-            } else if let Some(invalid) = property.invalid_elements {
-                !invalid.contains(&element_name)
-            } else {
-                true
-            }
-        })
-        .map(|(name, _)| name.to_string())
-        .collect()
-}
-
-/// Get all binding names.
-fn get_all_binding_names() -> Vec<&'static str> {
-    BINDING_PROPERTIES.keys().copied().collect()
 }
 
 /// Fuzzy match a string against a list of candidates.
@@ -894,7 +834,6 @@ fn fuzzy_match<'a>(input: &str, candidates: &[&'a str]) -> Option<&'a str> {
 }
 
 /// Calculate Levenshtein distance between two strings.
-#[allow(clippy::needless_range_loop)]
 fn levenshtein_distance(a: &str, b: &str) -> usize {
     let a_len = a.chars().count();
     let b_len = b.chars().count();
@@ -908,27 +847,23 @@ fn levenshtein_distance(a: &str, b: &str) -> usize {
 
     let mut matrix = vec![vec![0; b_len + 1]; a_len + 1];
 
-    for i in 0..=a_len {
-        matrix[i][0] = i;
+    for (i, row) in matrix.iter_mut().enumerate() {
+        row[0] = i;
     }
-    for j in 0..=b_len {
-        matrix[0][j] = j;
+    for (j, cell) in matrix[0].iter_mut().enumerate() {
+        *cell = j;
     }
 
     let a_chars: Vec<char> = a.chars().collect();
     let b_chars: Vec<char> = b.chars().collect();
 
-    for i in 1..=a_len {
-        for j in 1..=b_len {
-            let cost = if a_chars[i - 1] == b_chars[j - 1] {
-                0
-            } else {
-                1
-            };
+    for (i, &a_char) in a_chars.iter().enumerate() {
+        for (j, &b_char) in b_chars.iter().enumerate() {
+            let cost = usize::from(a_char != b_char);
 
-            matrix[i][j] = (matrix[i - 1][j] + 1) // deletion
-                .min(matrix[i][j - 1] + 1) // insertion
-                .min(matrix[i - 1][j - 1] + cost); // substitution
+            matrix[i + 1][j + 1] = (matrix[i][j + 1] + 1) // deletion
+                .min(matrix[i + 1][j] + 1) // insertion
+                .min(matrix[i][j] + cost); // substitution
         }
     }
 

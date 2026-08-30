@@ -4,7 +4,10 @@
 
 use super::arena::JsArena;
 use super::nodes::*;
+use rustc_hash::FxHashMap;
+use std::cell::RefCell;
 use std::fmt::Write;
+use std::rc::Rc;
 
 /// A raw source span recorded during codegen: (output_byte_offset, source_start, source_end).
 /// output_byte_offset is the position in the generated output string.
@@ -71,32 +74,7 @@ pub fn generate_with_sourcemap(
     let trimmed_len = codegen.output.trim_end_matches('\n').len();
     codegen.output.truncate(trimmed_len);
 
-    Ok(CodegenResult {
-        code: codegen.output,
-        mappings,
-    })
-}
-
-/// Generate JavaScript source code for a list of statements at a given indent level.
-///
-/// This is used by the SSR bridge to convert `Vec<JsStatement>` (produced by
-/// `build_template`) into a string that can be embedded in the component function body.
-pub fn generate_stmts(
-    stmts: &[super::nodes::JsStatement],
-    arena: &JsArena,
-    indent_level: usize,
-) -> String {
-    let mut codegen = JsCodegen {
-        output: String::with_capacity(1024),
-        indent_level,
-        needs_semicolon: false,
-        track_mappings: false,
-        raw_spans: Vec::new(),
-        source_code: None,
-        arena,
-    };
-    codegen.emit_body(stmts);
-    codegen.output
+    Ok(CodegenResult { code: codegen.output, mappings })
 }
 
 /// Generate JavaScript source code for a single expression.
@@ -110,9 +88,34 @@ pub fn generate_expr(expr: &super::nodes::JsExpr, arena: &JsArena) -> String {
         raw_spans: Vec::new(),
         source_code: None,
         arena,
+        identifier_span_scopes: Vec::new(),
+        measuring: false,
+        measures: Rc::new(MeasureCache::default()),
     };
     codegen.emit_expression(expr);
     codegen.output
+}
+
+/// Rendered size of a node. `len` is only meaningful when `!multiline`, since a
+/// multiline render embeds indentation that depends on where it was measured.
+#[derive(Clone, Copy)]
+struct Measure {
+    len: usize,
+    multiline: bool,
+}
+
+/// Memoized wrapping measurements, shared with every temporary codegen: wrapping
+/// decisions never look at the indent level, so one measurement is valid at any
+/// depth, and without memoization each level re-renders its whole subtree.
+/// Invariant: node addresses only identify a node within a single `generate` /
+/// `generate_expr` call (`take_expr` refills a slot, roots can be stack values),
+/// so a cache must never be shared across calls.
+#[derive(Default)]
+struct MeasureCache {
+    exprs: RefCell<FxHashMap<usize, Measure>>,
+    members: RefCell<FxHashMap<usize, Measure>>,
+    /// Statements record esrap's blank-line test (>1 newline), not `Measure`'s.
+    stmts: RefCell<FxHashMap<usize, bool>>,
 }
 
 /// JavaScript code generator.
@@ -128,6 +131,12 @@ struct JsCodegen<'a> {
     source_code: Option<&'a str>,
     /// Arena containing all expressions and statements
     arena: &'a JsArena,
+    /// Identifier locations inherited from the generated expression currently
+    /// being emitted. Explicit `Spanned(Identifier)` nodes take precedence.
+    identifier_span_scopes: Vec<(&'a str, (u32, u32))>,
+    /// Whether this codegen is a throwaway pre-render feeding `measures`
+    measuring: bool,
+    measures: Rc<MeasureCache>,
 }
 
 impl<'a> JsCodegen<'a> {
@@ -140,6 +149,9 @@ impl<'a> JsCodegen<'a> {
             raw_spans: Vec::new(),
             source_code: None,
             arena,
+            identifier_span_scopes: Vec::new(),
+            measuring: false,
+            measures: Rc::new(MeasureCache::default()),
         }
     }
 
@@ -171,9 +183,13 @@ impl<'a> JsCodegen<'a> {
         let mut mappings = Vec::with_capacity(self.raw_spans.len());
 
         for span in &self.raw_spans {
-            let (gen_line, gen_col) = offset_to_line_col(&output_line_starts, span.output_offset);
-            let (orig_line, orig_col) =
-                offset_to_line_col(&source_line_starts, span.source_start as usize);
+            let (gen_line, gen_col) =
+                offset_to_line_col_utf16(&self.output, &output_line_starts, span.output_offset);
+            let (orig_line, orig_col) = offset_to_line_col_utf16(
+                source_code,
+                &source_line_starts,
+                span.source_start as usize,
+            );
 
             mappings.push(SourceMapping {
                 gen_line: gen_line as u32,
@@ -265,7 +281,13 @@ impl<'a> JsCodegen<'a> {
             // we check multiline status of only the LAST logical line, since that's what
             // will be adjacent to the next statement.
             let rendered = &self.output[start_pos..];
-            if matches!(stmt, JsStatement::Raw(_) | JsStatement::RawMapped { .. }) {
+            if matches!(
+                stmt,
+                JsStatement::Raw(_)
+                    | JsStatement::RawEffect(_)
+                    | JsStatement::RawMapped { .. }
+                    | JsStatement::RawMappedEffect { .. }
+            ) {
                 // For Raw blocks, check if the last logical statement is multiline.
                 // Find the last non-empty line (excluding trailing newline).
                 let trimmed_end = rendered.trim_end_matches('\n');
@@ -291,6 +313,7 @@ impl<'a> JsCodegen<'a> {
 
     #[inline]
     fn emit_statement(&mut self, stmt: &JsStatement) {
+        let start = self.output.len();
         self.indent();
         self.emit_statement_inner(stmt);
         if self.needs_semicolon {
@@ -298,6 +321,10 @@ impl<'a> JsCodegen<'a> {
             self.needs_semicolon = false;
         }
         self.newline();
+        if self.measuring {
+            let m = has_multiple_newlines(&self.output.as_bytes()[start..]);
+            self.measures.stmts.borrow_mut().insert(std::ptr::from_ref(stmt) as usize, m);
+        }
     }
 
     fn emit_statement_inner(&mut self, stmt: &JsStatement) {
@@ -307,6 +334,10 @@ impl<'a> JsCodegen<'a> {
             JsStatement::ExportNamed(export) => self.emit_export_named(export),
             JsStatement::VariableDeclaration(decl) => self.emit_variable_declaration(decl),
             JsStatement::FunctionDeclaration(decl) => self.emit_function_declaration(decl),
+            JsStatement::ClassDeclaration { class, .. } => {
+                self.emit_class_expression(class);
+                self.needs_semicolon = false;
+            }
             JsStatement::Expression(expr_stmt) => {
                 self.emit_expression(self.arena.get_expr(expr_stmt.expression));
                 self.needs_semicolon = true;
@@ -363,14 +394,23 @@ impl<'a> JsCodegen<'a> {
                 self.output.push_str(code);
                 self.needs_semicolon = false; // Raw code handles its own semicolons
             }
-            JsStatement::RawMapped {
-                code,
-                source_offset,
-            } => {
+            JsStatement::RawEffect(code) => {
+                self.output.push_str(code);
+                self.needs_semicolon = false;
+            }
+            JsStatement::RawMapped { code, source_offset, .. } => {
                 // Output raw JavaScript code with per-line source mappings.
                 // Each line of the raw code maps to the corresponding position
                 // in the original source, offset by `source_offset`.
                 self.emit_raw_mapped(code, *source_offset);
+                self.needs_semicolon = false;
+            }
+            JsStatement::RawMappedEffect { code, source_offset, .. } => {
+                self.emit_raw_mapped(code, *source_offset);
+                self.needs_semicolon = false;
+            }
+            JsStatement::RetainedAst { fallback, source_offset, .. } => {
+                self.emit_raw_mapped(fallback, *source_offset);
                 self.needs_semicolon = false;
             }
         }
@@ -671,8 +711,7 @@ impl<'a> JsCodegen<'a> {
             }
             JsForOfLeft::Pattern(pattern) => self.emit_pattern(pattern),
         }
-        self.output
-            .push_str(if for_of.is_for_in { " in " } else { " of " });
+        self.output.push_str(if for_of.is_for_in { " in " } else { " of " });
         self.emit_expression(self.arena.get_expr(for_of.right));
         self.output.push_str(") ");
         self.emit_statement_as_block(self.arena.get_stmt(for_of.body));
@@ -815,9 +854,49 @@ impl<'a> JsCodegen<'a> {
 
     #[inline]
     fn emit_expression(&mut self, expr: &JsExpr) {
+        if !self.measuring {
+            self.emit_expression_inner(expr);
+            return;
+        }
+        let start = self.output.len();
+        self.emit_expression_inner(expr);
+        let m = measure_of(&self.output.as_bytes()[start..]);
+        self.measures.exprs.borrow_mut().insert(std::ptr::from_ref(expr) as usize, m);
+    }
+
+    fn emit_expression_inner(&mut self, expr: &JsExpr) {
         match expr {
-            JsExpr::Identifier(name) => self.output.push_str(name),
-            JsExpr::OpaqueIdentifier(name) => self.output.push_str(name),
+            JsExpr::Identifier(name) => {
+                let span = self.arena.identifier_span(name).or_else(|| {
+                    self.identifier_span_scopes.iter().rev().find_map(|(scope_name, span)| {
+                        (*scope_name == name.as_str()).then_some(*span)
+                    })
+                });
+                if self.track_mappings
+                    && let Some((start, end)) = span
+                {
+                    self.record_span_start(start, end);
+                    self.output.push_str(name);
+                    self.record_span_start(end, end);
+                } else {
+                    self.output.push_str(name);
+                }
+            }
+            JsExpr::OpaqueIdentifier(name) => {
+                let span =
+                    self.identifier_span_scopes.iter().rev().find_map(|(scope_name, span)| {
+                        (*scope_name == name.as_str()).then_some(*span)
+                    });
+                if self.track_mappings
+                    && let Some((start, end)) = span
+                {
+                    self.record_span_start(start, end);
+                    self.output.push_str(name);
+                    self.record_span_start(end, end);
+                } else {
+                    self.output.push_str(name);
+                }
+            }
             JsExpr::Literal(lit) => self.emit_literal(lit),
             JsExpr::TemplateLiteral(template) => self.emit_template_literal(template),
             JsExpr::TaggedTemplate(tagged) => self.emit_tagged_template(tagged),
@@ -896,9 +975,44 @@ impl<'a> JsCodegen<'a> {
                 self.output.push_str(code);
             }
             JsExpr::Spanned(inner_id, start, end) => {
-                self.record_span_start(*start, *end);
-                self.emit_expression(self.arena.get_expr(*inner_id));
+                let is_comment_argument_marker =
+                    *start >= rsvelte_esrap::COMMENT_ARGUMENT_CALLEE_BASE;
+                if !is_comment_argument_marker {
+                    self.record_span_start(*start, *end);
+                }
+                let suppress_scope = matches!(
+                    self.arena.get_expr(*inner_id),
+                    JsExpr::Identifier(name) | JsExpr::OpaqueIdentifier(name)
+                        if self.identifier_span_scopes.iter().any(|(scope_name, _)| *scope_name == name.as_str())
+                );
+                if suppress_scope {
+                    let scopes = std::mem::take(&mut self.identifier_span_scopes);
+                    self.emit_expression_id(*inner_id);
+                    self.identifier_span_scopes = scopes;
+                } else {
+                    self.emit_expression_id(*inner_id);
+                }
+                if !is_comment_argument_marker {
+                    self.record_span_start(*end, *end);
+                }
             }
+            // The comment coordinates only reach the oxc printer; the text
+            // fallback has no comment channel to place them in.
+            JsExpr::SourceAnchored(anchor) => {
+                self.emit_expression(self.arena.get_expr(anchor.inner));
+            }
+        }
+    }
+
+    /// Emit an arena expression under any identifier-location scope attached
+    /// to that stable handle.
+    fn emit_expression_id(&mut self, id: super::arena::ExprId) {
+        if let Some((name, span)) = self.arena.expression_identifier_span(id) {
+            self.identifier_span_scopes.push((name, span));
+            self.emit_expression(self.arena.get_expr(id));
+            self.identifier_span_scopes.pop();
+        } else {
+            self.emit_expression(self.arena.get_expr(id));
         }
     }
 
@@ -1007,10 +1121,7 @@ impl<'a> JsCodegen<'a> {
         // Use heuristic to detect likely-multiline objects without pre-rendering.
         // This avoids exponential blowup from pre-rendering deeply nested structures.
         let likely_multiline = obj.properties.len() > 3
-            || obj
-                .properties
-                .iter()
-                .any(|m| self.is_member_likely_multiline(m));
+            || obj.properties.iter().any(|m| self.is_member_likely_multiline(m));
 
         if likely_multiline {
             // Render directly in multiline mode without pre-rendering
@@ -1042,28 +1153,14 @@ impl<'a> JsCodegen<'a> {
             self.indent_level -= 1;
             self.indent();
         } else {
-            // Small, simple objects: use a single tmp codegen to measure length
-            // and detect multiline, avoiding per-member String allocations.
-            let mut tmp = self.tmp_codegen();
-            let mut offsets: smallvec::SmallVec<[(usize, usize); 4]> =
-                smallvec::SmallVec::with_capacity(obj.properties.len());
-            for m in &obj.properties {
-                let start = tmp.output.len();
-                tmp.emit_object_member(m);
-                offsets.push((start, tmp.output.len()));
-            }
+            // The heuristic found nothing complex, so fall back to exact widths.
+            let measures: smallvec::SmallVec<[Measure; 4]> =
+                obj.properties.iter().map(|m| self.measure_member(m)).collect();
 
-            let total_len: usize = offsets.iter().map(|(s, e)| e - s).sum::<usize>()
-                + if offsets.len() > 1 {
-                    (offsets.len() - 1) * 2
-                } else {
-                    0
-                };
+            let total_len: usize = measures.iter().map(|m| m.len).sum::<usize>()
+                + if measures.len() > 1 { (measures.len() - 1) * 2 } else { 0 };
 
-            let tmp_bytes = tmp.output.as_bytes();
-            let any_multiline = offsets
-                .iter()
-                .any(|(s, e)| memchr::memchr(b'\n', &tmp_bytes[*s..*e]).is_some());
+            let any_multiline = measures.iter().any(|m| m.multiline);
             let multiline = any_multiline || total_len > 60;
 
             if multiline {
@@ -1108,7 +1205,19 @@ impl<'a> JsCodegen<'a> {
         self.output.push('}');
     }
 
+    #[inline]
     fn emit_object_member(&mut self, member: &JsObjectMember) {
+        if !self.measuring {
+            self.emit_object_member_inner(member);
+            return;
+        }
+        let start = self.output.len();
+        self.emit_object_member_inner(member);
+        let m = measure_of(&self.output.as_bytes()[start..]);
+        self.measures.members.borrow_mut().insert(std::ptr::from_ref(member) as usize, m);
+    }
+
+    fn emit_object_member_inner(&mut self, member: &JsObjectMember) {
         match member {
             JsObjectMember::Property(prop) => {
                 // Auto-detect shorthand: Init property where key identifier
@@ -1207,6 +1316,16 @@ impl<'a> JsCodegen<'a> {
     fn emit_property_key(&mut self, key: &JsPropertyKey) {
         match key {
             JsPropertyKey::Identifier(name) => self.output.push_str(name),
+            JsPropertyKey::SpannedIdentifier { name, start, end } => {
+                self.record_span_start(*start, *end);
+                self.output.push_str(name);
+                self.record_span_start(*end, *end);
+            }
+            JsPropertyKey::SpannedStringLiteral { value, start, end } => {
+                self.record_span_start(*start, *end);
+                self.emit_literal(&JsLiteral::String(value.clone()));
+                self.record_span_start(*end, *end);
+            }
             JsPropertyKey::Literal(lit) => self.emit_literal(lit),
             JsPropertyKey::Computed(expr_id) => self.emit_expression(self.arena.get_expr(*expr_id)),
         }
@@ -1269,6 +1388,16 @@ impl<'a> JsCodegen<'a> {
     #[inline]
     fn emit_call_expression(&mut self, call: &JsCallExpression) {
         let callee = self.arena.get_expr(call.callee);
+        if matches!(callee, JsExpr::OpaqueIdentifier(name)
+            if name.as_str() == super::to_oxc::SNIPPET_DEFAULT_PAREN_MARKER)
+            && call.arguments.len() == 1
+            && !call.optional
+        {
+            self.output.push('(');
+            self.emit_expression(&call.arguments[0]);
+            self.output.push(')');
+            return;
+        }
         let needs_parens = matches!(
             callee,
             JsExpr::Arrow(_)
@@ -1347,10 +1476,19 @@ impl<'a> JsCodegen<'a> {
     #[inline]
     fn emit_member_expression(&mut self, member: &JsMemberExpression) {
         let object = self.arena.get_expr(member.object);
+        // esrap gives every `Literal` precedence 18, below a member access, so
+        // each literal spelling wraps — not just the two plain variants.
         let needs_parens = matches!(
             object,
             JsExpr::Literal(JsLiteral::Number(_))
                 | JsExpr::Literal(JsLiteral::String(_))
+                | JsExpr::Literal(JsLiteral::RawNumber { .. })
+                | JsExpr::Literal(JsLiteral::RawString { .. })
+                | JsExpr::Literal(JsLiteral::Boolean(_))
+                | JsExpr::Literal(JsLiteral::BigInt(_))
+                | JsExpr::Literal(JsLiteral::Regex { .. })
+                // `undefined` is an Identifier upstream, so it stays unwrapped.
+                | JsExpr::Literal(JsLiteral::Null)
                 | JsExpr::Binary(_)
                 | JsExpr::Unary(_)
                 | JsExpr::Conditional(_)
@@ -1375,7 +1513,13 @@ impl<'a> JsCodegen<'a> {
         if needs_parens {
             self.output.push('(');
         }
-        self.emit_expression(object);
+        if let Some((start, end)) = self.arena.bare_expr_span(member.object) {
+            self.record_span_start(start, end);
+            self.emit_expression(object);
+            self.record_span_start(end, end);
+        } else {
+            self.emit_expression(object);
+        }
         if needs_parens {
             self.output.push(')');
         }
@@ -1390,7 +1534,8 @@ impl<'a> JsCodegen<'a> {
                 JsMemberProperty::Expression(expr_id) => {
                     self.emit_expression(self.arena.get_expr(*expr_id))
                 }
-                JsMemberProperty::Identifier(name) => {
+                JsMemberProperty::Identifier(name)
+                | JsMemberProperty::SpannedIdentifier { name, .. } => {
                     self.output.push('\'');
                     self.output.push_str(name);
                     self.output.push('\'');
@@ -1406,7 +1551,8 @@ impl<'a> JsCodegen<'a> {
                 self.output.push('.');
             }
             match &member.property {
-                JsMemberProperty::Identifier(name) => self.output.push_str(name),
+                JsMemberProperty::Identifier(name)
+                | JsMemberProperty::SpannedIdentifier { name, .. } => self.output.push_str(name),
                 JsMemberProperty::PrivateIdentifier(name) => {
                     self.output.push('#');
                     self.output.push_str(name);
@@ -1461,8 +1607,11 @@ impl<'a> JsCodegen<'a> {
         is_left: bool,
     ) -> bool {
         match operand {
-            // Conditional and assignment always need parens inside binary
-            JsExpr::Conditional(_) | JsExpr::Assignment(_) | JsExpr::Sequence(_) => true,
+            // Low-precedence operands need parens inside binary expressions.
+            JsExpr::Conditional(_)
+            | JsExpr::Assignment(_)
+            | JsExpr::Sequence(_)
+            | JsExpr::Arrow(_) => true,
             JsExpr::Binary(inner) => {
                 let parent_prec = binary_op_precedence(parent_op);
                 let inner_prec = binary_op_precedence(&inner.operator);
@@ -1560,6 +1709,7 @@ impl<'a> JsCodegen<'a> {
                 | JsExpr::Assignment(_)
                 | JsExpr::Conditional(_)
                 | JsExpr::Sequence(_)
+                | JsExpr::Arrow(_)
         )
     }
 
@@ -1567,10 +1717,7 @@ impl<'a> JsCodegen<'a> {
         let op_str = unary.operator.as_str();
         if unary.prefix {
             self.output.push_str(op_str);
-            if matches!(
-                unary.operator,
-                JsUnaryOp::TypeOf | JsUnaryOp::Void | JsUnaryOp::Delete
-            ) {
+            if matches!(unary.operator, JsUnaryOp::TypeOf | JsUnaryOp::Void | JsUnaryOp::Delete) {
                 self.output.push(' ');
             }
             let arg = self.arena.get_expr(unary.argument);
@@ -1609,7 +1756,15 @@ impl<'a> JsCodegen<'a> {
     }
 
     fn emit_conditional_expression(&mut self, cond: &JsConditionalExpression) {
-        self.emit_expression(self.arena.get_expr(cond.test));
+        let test = self.arena.get_expr(cond.test);
+        let test_needs_parens = matches!(test, JsExpr::Arrow(_));
+        if test_needs_parens {
+            self.output.push('(');
+        }
+        self.emit_expression(test);
+        if test_needs_parens {
+            self.output.push(')');
+        }
         self.output.push_str(" ? ");
         self.emit_expression(self.arena.get_expr(cond.consequent));
         self.output.push_str(" : ");
@@ -1662,10 +1817,12 @@ impl<'a> JsCodegen<'a> {
         self.indent_level += 1;
         for member in &class.body.body {
             self.newline();
+            self.indent();
             self.emit_class_member(member);
         }
         self.indent_level -= 1;
         self.newline();
+        self.indent();
         self.output.push('}');
     }
 
@@ -1736,6 +1893,12 @@ impl<'a> JsCodegen<'a> {
     fn emit_pattern(&mut self, pattern: &JsPattern) {
         match pattern {
             JsPattern::Identifier(name) => self.output.push_str(name),
+            JsPattern::SpannedIdentifier { name, start, end } => {
+                self.record_span_start(*start, *end);
+                self.output.push_str(name);
+                self.record_span_start(*end, *end);
+            }
+            JsPattern::SourceAnchored(anchor) => self.emit_pattern(&anchor.inner),
             JsPattern::Array(arr) => {
                 self.output.push('[');
                 for (i, elem) in arr.elements.iter().enumerate() {
@@ -1755,12 +1918,7 @@ impl<'a> JsCodegen<'a> {
                         self.output.push_str(", ");
                     }
                     match prop {
-                        JsObjectPatternProperty::Property {
-                            key,
-                            value,
-                            shorthand,
-                            computed,
-                        } => {
+                        JsObjectPatternProperty::Property { key, value, shorthand, computed } => {
                             if *shorthand {
                                 self.emit_pattern(value);
                             } else {
@@ -1801,6 +1959,7 @@ impl<'a> JsCodegen<'a> {
         match stmt {
             // These are always multiline
             JsStatement::FunctionDeclaration(_)
+            | JsStatement::ClassDeclaration { .. }
             | JsStatement::For(_)
             | JsStatement::ForOf(_)
             | JsStatement::While(_)
@@ -1819,6 +1978,10 @@ impl<'a> JsCodegen<'a> {
             // Raw code: check if it contains newlines (memchr is SIMD-accelerated)
             JsStatement::Raw(code) => memchr::memchr(b'\n', code.as_bytes()).is_some(),
             JsStatement::RawMapped { code, .. } => memchr::memchr(b'\n', code.as_bytes()).is_some(),
+            JsStatement::RawEffect(code) => memchr::memchr(b'\n', code.as_bytes()).is_some(),
+            JsStatement::RawMappedEffect { code, .. } => {
+                memchr::memchr(b'\n', code.as_bytes()).is_some()
+            }
             // Variable declarations: multiline if they have complex initializers
             JsStatement::VariableDeclaration(decl) => {
                 decl.declarations.len() > 1
@@ -1848,7 +2011,34 @@ impl<'a> JsCodegen<'a> {
             raw_spans: Vec::new(),
             source_code: None,
             arena: self.arena,
+            identifier_span_scopes: Vec::new(),
+            measuring: true,
+            measures: Rc::clone(&self.measures),
         }
+    }
+
+    /// Measure how an expression renders, pre-rendering it once and memoizing the result.
+    fn measure_expr(&self, expr: &JsExpr) -> Measure {
+        let key = std::ptr::from_ref(expr) as usize;
+        let hit = self.measures.exprs.borrow().get(&key).copied();
+        if let Some(m) = hit {
+            return m;
+        }
+        let mut tmp = self.tmp_codegen();
+        tmp.emit_expression(expr);
+        measure_of(tmp.output.as_bytes())
+    }
+
+    /// Measure how an object member renders, pre-rendering it once and memoizing the result.
+    fn measure_member(&self, member: &JsObjectMember) -> Measure {
+        let key = std::ptr::from_ref(member) as usize;
+        let hit = self.measures.members.borrow().get(&key).copied();
+        if let Some(m) = hit {
+            return m;
+        }
+        let mut tmp = self.tmp_codegen();
+        tmp.emit_object_member(member);
+        measure_of(tmp.output.as_bytes())
     }
 
     /// Pre-render a statement and check if it's multiline.
@@ -1862,6 +2052,11 @@ impl<'a> JsCodegen<'a> {
         // pre-render to check. This handles cases like expression statements
         // or variable declarations with complex initializers (e.g. calls with
         // arrays whose total length exceeds 60 chars).
+        let key = std::ptr::from_ref(stmt) as usize;
+        let hit = self.measures.stmts.borrow().get(&key).copied();
+        if let Some(m) = hit {
+            return m;
+        }
         let mut tmp = self.tmp_codegen();
         tmp.emit_statement(stmt);
         has_multiple_newlines(tmp.output.as_bytes())
@@ -1879,23 +2074,16 @@ impl<'a> JsCodegen<'a> {
             // any property value that is itself likely multiline.
             JsExpr::Object(obj) => {
                 obj.properties.len() > 1
-                    || obj
-                        .properties
-                        .iter()
-                        .any(|m| self.is_member_likely_multiline(m))
+                    || obj.properties.iter().any(|m| self.is_member_likely_multiline(m))
             }
             JsExpr::Array(arr) => {
                 // Arrays are multiline only if they contain complex sub-expressions.
                 // Simple arrays of numbers/literals/small sub-arrays should be inline.
-                arr.elements.iter().any(|e| {
-                    e.as_ref()
-                        .is_some_and(|ex| self.is_expr_likely_multiline(ex))
-                })
+                arr.elements
+                    .iter()
+                    .any(|e| e.as_ref().is_some_and(|ex| self.is_expr_likely_multiline(ex)))
             }
-            JsExpr::Call(call) => call
-                .arguments
-                .iter()
-                .any(|a| self.is_expr_likely_multiline(a)),
+            JsExpr::Call(call) => call.arguments.iter().any(|a| self.is_expr_likely_multiline(a)),
             JsExpr::Conditional(c) => {
                 self.is_expr_likely_multiline(self.arena.get_expr(c.consequent))
                     || self.is_expr_likely_multiline(self.arena.get_expr(c.alternate))
@@ -1935,10 +2123,10 @@ impl<'a> JsCodegen<'a> {
         // AND items contain complex expressions (functions, block arrows, etc.).
         // Simple arrays of literals/small sub-arrays should always be pre-rendered
         // to check actual width, matching esrap behavior.
-        let has_complex_items = items
-            .iter()
-            .any(|item| item.is_some_and(|expr| self.is_expr_likely_multiline(expr)));
-        let likely_multiline = items.len() > 3 && has_complex_items;
+        let likely_multiline = items.len() > 3
+            && items
+                .iter()
+                .any(|item| item.is_some_and(|expr| self.is_expr_likely_multiline(expr)));
 
         if likely_multiline {
             // Render directly in multiline mode without pre-rendering.
@@ -1990,31 +2178,19 @@ impl<'a> JsCodegen<'a> {
             self.indent_level -= 1;
             self.indent();
         } else {
-            // Small, simple items: use a single tmp codegen to measure total length
-            // and detect multiline, avoiding per-item String allocations.
-            let mut tmp = self.tmp_codegen();
-            // Record (start_offset, end_offset) for each rendered item in the tmp buffer.
-            let mut offsets: smallvec::SmallVec<[(usize, usize); 8]> =
-                smallvec::SmallVec::with_capacity(items.len());
-            for item in items.iter() {
-                let start = tmp.output.len();
-                if let Some(expr) = item {
-                    tmp.emit_expression(expr);
-                }
-                offsets.push((start, tmp.output.len()));
-            }
-
-            let total_len: usize = offsets.iter().map(|(s, e)| e - s).sum::<usize>()
-                + if offsets.len() > 1 {
-                    (offsets.len() - 1) * 2
-                } else {
-                    0
-                };
-
-            let tmp_bytes = tmp.output.as_bytes();
-            let any_multiline = offsets
+            // The heuristic found nothing complex, so fall back to exact widths.
+            let measures: smallvec::SmallVec<[Measure; 8]> = items
                 .iter()
-                .any(|(s, e)| memchr::memchr(b'\n', &tmp_bytes[*s..*e]).is_some());
+                .map(|item| match item {
+                    Some(expr) => self.measure_expr(expr),
+                    None => Measure { len: 0, multiline: false },
+                })
+                .collect();
+
+            let total_len: usize = measures.iter().map(|m| m.len).sum::<usize>()
+                + if measures.len() > 1 { (measures.len() - 1) * 2 } else { 0 };
+
+            let any_multiline = measures.iter().any(|m| m.multiline);
             let multiline = any_multiline || total_len > 60;
 
             if multiline {
@@ -2032,17 +2208,13 @@ impl<'a> JsCodegen<'a> {
                         self.output.push(',');
                     }
 
-                    if i < items.len() - 1 {
-                        let (cs, ce) = offsets[i];
-                        let (ns, ne) = offsets[i + 1];
-                        let tmp_bytes = tmp.output.as_bytes();
-                        if memchr::memchr(b'\n', &tmp_bytes[cs..ce]).is_some()
-                            && memchr::memchr(b'\n', &tmp_bytes[ns..ne]).is_some()
-                            && !has_object_or_array_value(item)
-                            && !has_object_or_array_value(&items[i + 1])
-                        {
-                            self.newline(); // margin
-                        }
+                    if i < items.len() - 1
+                        && measures[i].multiline
+                        && measures[i + 1].multiline
+                        && !has_object_or_array_value(item)
+                        && !has_object_or_array_value(&items[i + 1])
+                    {
+                        self.newline(); // margin
                     }
 
                     self.newline();
@@ -2080,27 +2252,13 @@ impl<'a> JsCodegen<'a> {
         // Fast path: use heuristic to check if any non-final argument is likely multiline.
         // This avoids expensive pre-rendering for the common case where all args are simple.
         let non_final = &arguments[..arguments.len().saturating_sub(1)];
-        let any_likely_multiline = non_final
-            .iter()
-            .any(|arg| self.is_expr_likely_multiline(arg));
+        let any_likely_multiline = non_final.iter().any(|arg| self.is_expr_likely_multiline(arg));
 
         // Only pre-render if the heuristic didn't find anything (to catch edge cases
         // where simple-looking expressions render as multiline due to width)
         // If heuristic found multiline, we can skip pre-rendering entirely.
-        let non_final_multiline = if any_likely_multiline {
-            true
-        } else if non_final.is_empty() {
-            false
-        } else {
-            // Pre-render non-final arguments in a single tmp codegen to check actual
-            // multiline status. Reuses one buffer instead of allocating per-argument.
-            let mut tmp = self.tmp_codegen();
-            non_final.iter().any(|arg| {
-                let start = tmp.output.len();
-                tmp.emit_expression(arg);
-                memchr::memchr(b'\n', &tmp.output.as_bytes()[start..]).is_some()
-            })
-        };
+        let non_final_multiline =
+            any_likely_multiline || non_final.iter().any(|arg| self.measure_expr(arg).multiline);
 
         if non_final_multiline {
             self.indent_level += 1;
@@ -2128,6 +2286,11 @@ impl<'a> JsCodegen<'a> {
     }
 }
 
+#[inline]
+fn measure_of(rendered: &[u8]) -> Measure {
+    Measure { len: rendered.len(), multiline: memchr::memchr(b'\n', rendered).is_some() }
+}
+
 /// Check if a byte slice contains more than one newline character.
 /// Uses memchr for SIMD-accelerated search, short-circuiting after finding 2 newlines.
 #[inline]
@@ -2143,11 +2306,7 @@ fn has_multiple_newlines(bytes: &[u8]) -> bool {
 /// In esrap, consecutive multiline properties with object/array values don't get extra margins.
 #[inline]
 fn has_object_or_array_value(item: &Option<&JsExpr>) -> bool {
-    if let Some(expr) = item {
-        matches!(expr, JsExpr::Object(_) | JsExpr::Array(_))
-    } else {
-        false
-    }
+    if let Some(expr) = item { matches!(expr, JsExpr::Object(_) | JsExpr::Array(_)) } else { false }
 }
 
 /// Get the ESTree-style type name for a statement, used for blank line logic.
@@ -2161,6 +2320,7 @@ fn stmt_type_name(stmt: &JsStatement) -> &'static str {
         JsStatement::ExportNamed(_) => "ExportNamedDeclaration",
         JsStatement::VariableDeclaration(_) => "VariableDeclaration",
         JsStatement::FunctionDeclaration(_) => "FunctionDeclaration",
+        JsStatement::ClassDeclaration { .. } => "ClassDeclaration",
         JsStatement::Expression(_) => "ExpressionStatement",
         JsStatement::Return(_) => "ReturnStatement",
         JsStatement::If(_) => "IfStatement",
@@ -2179,6 +2339,9 @@ fn stmt_type_name(stmt: &JsStatement) -> &'static str {
         JsStatement::Try(_) => "TryStatement",
         JsStatement::Raw(code) => raw_stmt_type_name(code),
         JsStatement::RawMapped { code, .. } => raw_stmt_type_name(code),
+        JsStatement::RawEffect(code) => raw_stmt_type_name(code),
+        JsStatement::RawMappedEffect { code, .. } => raw_stmt_type_name(code),
+        JsStatement::RetainedAst { fallback, .. } => raw_stmt_type_name(fallback),
     }
 }
 
@@ -2351,10 +2514,7 @@ fn extract_tokens(code: &str) -> Vec<Token<'_>> {
             {
                 i += 1;
             }
-            tokens.push(Token {
-                text: &code[start..i],
-                output_offset: start,
-            });
+            tokens.push(Token { text: &code[start..i], output_offset: start });
             continue;
         }
 
@@ -2371,10 +2531,7 @@ fn extract_tokens(code: &str) -> Vec<Token<'_>> {
             if i < len && bytes[i] == b'n' {
                 i += 1;
             }
-            tokens.push(Token {
-                text: &code[start..i],
-                output_offset: start,
-            });
+            tokens.push(Token { text: &code[start..i], output_offset: start });
             continue;
         }
 
@@ -2393,10 +2550,7 @@ fn extract_tokens(code: &str) -> Vec<Token<'_>> {
             if i < len {
                 i += 1; // skip closing quote
             }
-            tokens.push(Token {
-                text: &code[start..i],
-                output_offset: start,
-            });
+            tokens.push(Token { text: &code[start..i], output_offset: start });
             continue;
         }
 
@@ -2433,10 +2587,7 @@ fn extract_tokens(code: &str) -> Vec<Token<'_>> {
                             {
                                 i += 1;
                             }
-                            tokens.push(Token {
-                                text: &code[start..i],
-                                output_offset: start,
-                            });
+                            tokens.push(Token { text: &code[start..i], output_offset: start });
                         } else if eb.is_ascii_digit() {
                             let start = i;
                             i += 1;
@@ -2447,10 +2598,7 @@ fn extract_tokens(code: &str) -> Vec<Token<'_>> {
                             {
                                 i += 1;
                             }
-                            tokens.push(Token {
-                                text: &code[start..i],
-                                output_offset: start,
-                            });
+                            tokens.push(Token { text: &code[start..i], output_offset: start });
                         } else {
                             i += 1;
                         }
@@ -2531,6 +2679,42 @@ pub fn offset_to_line_col(line_starts: &[usize], offset: usize) -> (usize, usize
     }
 }
 
+/// Convert a byte offset to a source-map line and UTF-16 column.
+///
+/// Source Map v3 positions use JavaScript string columns, so an astral
+/// character occupies two units even though its Rust UTF-8 representation is
+/// four bytes.
+pub fn offset_to_line_col_utf16(
+    source: &str,
+    line_starts: &[usize],
+    offset: usize,
+) -> (usize, usize) {
+    // A column indexes a character, so an offset that lands inside one (a
+    // producer that measured in bytes across an em dash or an emoji) has exactly
+    // one defined answer: the character it is inside. The ~25 mapping producers
+    // that feed this cannot each be trusted to hand over a boundary.
+    let mut offset = offset.min(source.len());
+    while offset > 0 && !source.is_char_boundary(offset) {
+        offset -= 1;
+    }
+    let (line, _) = offset_to_line_col(line_starts, offset);
+    let line_start = line_starts[line];
+    // A span whose end is not a character boundary is a producer bug; keep it
+    // loud in tests but never abort a user's build over a source-map column.
+    debug_assert!(
+        source.is_char_boundary(offset),
+        "source-map offset {offset} is not a char boundary"
+    );
+    let offset = if source.is_char_boundary(offset) {
+        offset
+    } else {
+        (line_start..offset).rev().find(|i| source.is_char_boundary(*i)).unwrap_or(line_start)
+    };
+    let column = &source[line_start..offset];
+    let column = if column.is_ascii() { column.len() } else { column.encode_utf16().count() };
+    (line, column)
+}
+
 /// Encode a list of source mappings into a VLQ-encoded mappings string.
 pub fn encode_vlq_mappings(mappings: &[SourceMapping]) -> String {
     if mappings.is_empty() {
@@ -2589,11 +2773,7 @@ pub fn encode_vlq_mappings(mappings: &[SourceMapping]) -> String {
 fn vlq_encode(out: &mut String, value: i64) {
     // Base64 chars as a static array for direct indexing
     const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut v = if value < 0 {
-        ((-value) << 1) | 1
-    } else {
-        value << 1
-    } as u64;
+    let mut v = if value < 0 { ((-value) << 1) | 1 } else { value << 1 } as u64;
 
     loop {
         let mut digit = (v & 0x1F) as u8;
@@ -2624,61 +2804,63 @@ pub fn get_source_name(
     }
 }
 
-/// Get relative path from `from` to `to`, matching Svelte's `get_relative_path`.
+/// Get relative path from `from` to `to`, matching Svelte's `get_relative_path`
+/// (`utils/mapped_code.js`), which joins the parts verbatim — no `./` prefix.
 fn get_relative_path(from: &str, to: &str) -> String {
-    let from_parts: Vec<&str> = from.split('/').collect();
-    let to_parts: Vec<&str> = to.split('/').collect();
+    let from_parts: Vec<&str> = from.split(['/', '\\']).collect();
+    let to_parts: Vec<&str> = to.split(['/', '\\']).collect();
 
     // Remove filename part from `from`
     let from_dir = &from_parts[..from_parts.len().saturating_sub(1)];
 
     let mut common = 0;
-    for (a, b) in from_dir.iter().zip(to_parts.iter()) {
-        if a == b {
-            common += 1;
-        } else {
-            break;
-        }
+    // Upstream stops shifting once `to_parts` is exhausted (it would otherwise
+    // spin on `undefined === undefined`).
+    while common < from_dir.len() && common < to_parts.len() && from_dir[common] == to_parts[common]
+    {
+        common += 1;
     }
 
-    let ups = from_dir.len() - common;
-    let mut parts: Vec<&str> = vec![".."; ups];
-    for p in &to_parts[common..] {
-        parts.push(p);
-    }
-
-    let result = parts.join("/");
-    if result.starts_with("../") || result.starts_with("./") {
-        result
-    } else {
-        format!("./{}", result)
-    }
+    let mut parts: Vec<&str> = vec![".."; from_dir.len() - common];
+    parts.extend_from_slice(&to_parts[common..]);
+    parts.join("/")
 }
 
 /// Get basename of a path (last component).
 fn get_basename(path: &str) -> &str {
-    path.rsplit('/').next().unwrap_or(path)
+    path.rsplit(['/', '\\']).next().unwrap_or(path)
 }
 
 /// Generate a complete source map JSON string (v3 format).
+///
+/// `file` is `None` for the JS map: upstream builds it through esrap's `print()`,
+/// which never sets the key. Only the CSS map names its output file.
 pub fn generate_sourcemap_json(
-    file: &str,
+    file: Option<&str>,
     source_name: &str,
-    source_content: &str,
+    source_content: Option<&str>,
     mappings: &str,
     names: &[&str],
 ) -> String {
-    let mut json = String::with_capacity(256 + source_content.len() + mappings.len());
+    let mut json = String::with_capacity(256 + source_content.map_or(0, str::len) + mappings.len());
     json.push_str("{\"version\":3");
-    json.push_str(",\"file\":\"");
-    json_escape_str(&mut json, file);
-    json.push('"');
+    if let Some(file) = file {
+        json.push_str(",\"file\":\"");
+        json_escape_str(&mut json, file);
+        json.push('"');
+    }
     json.push_str(",\"sources\":[\"");
     json_escape_str(&mut json, source_name);
     json.push_str("\"]");
-    json.push_str(",\"sourcesContent\":[\"");
-    json_escape_str(&mut json, source_content);
-    json.push_str("\"]");
+    json.push_str(",\"sourcesContent\":[");
+    if let Some(source_content) = source_content {
+        json.push('"');
+        json_escape_str(&mut json, source_content);
+        json.push('"');
+    } else {
+        json.push_str("null");
+    }
+    json.push(']');
     json.push_str(",\"names\":[");
     for (i, name) in names.iter().enumerate() {
         if i > 0 {
@@ -2696,20 +2878,30 @@ pub fn generate_sourcemap_json(
 }
 
 /// Escape a string for use in JSON.
+///
+/// Every escaped byte is ASCII, and no UTF-8 continuation byte is below 0x80,
+/// so scanning bytewise and copying the runs in between keeps whole-source
+/// `sourcesContent` off the per-character path.
 fn json_escape_str(out: &mut String, s: &str) {
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => {
-                let _ = write!(out, "\\u{:04x}", c as u32);
-            }
-            c => out.push(c),
+    let mut clean_from = 0;
+    for (i, &b) in s.as_bytes().iter().enumerate() {
+        if b >= 0x20 && b != b'"' && b != b'\\' {
+            continue;
         }
+        out.push_str(&s[clean_from..i]);
+        match b {
+            b'"' => out.push_str("\\\""),
+            b'\\' => out.push_str("\\\\"),
+            b'\n' => out.push_str("\\n"),
+            b'\r' => out.push_str("\\r"),
+            b'\t' => out.push_str("\\t"),
+            _ => {
+                let _ = write!(out, "\\u{:04x}", b);
+            }
+        }
+        clean_from = i + 1;
     }
+    out.push_str(&s[clean_from..]);
 }
 
 /// Decoded source map segment: [gen_col, source_index, orig_line, orig_col, name_index?]
@@ -2823,11 +3015,7 @@ fn vlq_decode(bytes: &[u8]) -> (i64, usize) {
     }
 
     // Convert from unsigned to signed
-    let signed = if value & 1 == 1 {
-        -((value >> 1) as i64)
-    } else {
-        (value >> 1) as i64
-    };
+    let signed = if value & 1 == 1 { -((value >> 1) as i64) } else { (value >> 1) as i64 };
 
     (signed, i)
 }
@@ -2855,11 +3043,7 @@ pub fn remap_through_sourcemap(mappings: &mut [SourceMapping], preprocessor_map_
     let names: Vec<String> = map
         .get("names")
         .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
         .unwrap_or_default();
 
     // For each of our mappings, orig_line/orig_col point to the preprocessed code.
@@ -2888,9 +3072,8 @@ pub fn remap_through_sourcemap(mappings: &mut [SourceMapping], preprocessor_map_
             if seg.len() >= 4 && seg[0] as usize <= pp_col {
                 best = Some(seg);
                 // Track the next segment's column to know the extent of this segment
-                next_seg_col = segments
-                    .get(i + 1)
-                    .and_then(|s| if s.len() >= 4 { Some(s[0]) } else { None });
+                next_seg_col =
+                    segments.get(i + 1).and_then(|s| if s.len() >= 4 { Some(s[0]) } else { None });
             } else if seg[0] as usize > pp_col {
                 break;
             }
@@ -2912,9 +3095,7 @@ pub fn remap_through_sourcemap(mappings: &mut [SourceMapping], preprocessor_map_
 
                     // Determine the generated (preprocessed) text length for this segment.
                     // This is the distance to the next segment, or we assume a short replacement.
-                    let gen_len = next_seg_col
-                        .map(|nc| nc - seg[0])
-                        .unwrap_or(original_name_len); // fallback
+                    let gen_len = next_seg_col.map(|nc| nc - seg[0]).unwrap_or(original_name_len); // fallback
 
                     if col_offset >= gen_len && gen_len > 0 {
                         // Position is at or past the end of the replaced text;
@@ -2947,7 +3128,7 @@ pub fn remap_through_sourcemap(mappings: &mut [SourceMapping], preprocessor_map_
 
 /// Generate a source map JSON with multiple sources support.
 pub fn generate_sourcemap_json_multi(
-    file: &str,
+    file: Option<&str>,
     sources: &[&str],
     sources_content: &[&str],
     mappings: &str,
@@ -2955,9 +3136,11 @@ pub fn generate_sourcemap_json_multi(
 ) -> String {
     let mut json = String::with_capacity(256 + mappings.len());
     json.push_str("{\"version\":3");
-    json.push_str(",\"file\":\"");
-    json_escape_str(&mut json, file);
-    json.push('"');
+    if let Some(file) = file {
+        json.push_str(",\"file\":\"");
+        json_escape_str(&mut json, file);
+        json.push('"');
+    }
     json.push_str(",\"sources\":[");
     for (i, src) in sources.iter().enumerate() {
         if i > 0 {
@@ -3000,15 +3183,118 @@ mod tests {
     use crate::compiler::phases::phase3_transform::js_ast::builders::*;
 
     #[test]
+    fn generated_identifier_uses_carry_the_registered_source_span() {
+        let arena = JsArena::new();
+        arena.note_identifier_span("div", 1, 4);
+        let program = program(vec![stmt(&arena, id("div")), stmt(&arena, id("div"))]);
+
+        let generated = generate_with_sourcemap(&program, "<div>", &arena).unwrap();
+        assert_eq!(generated.code, "div;\ndiv;");
+        for expected in [(0, 0, 0, 1), (0, 3, 0, 4), (1, 0, 0, 1), (1, 3, 0, 4)] {
+            assert!(
+                generated.mappings.iter().any(|mapping| {
+                    (mapping.gen_line, mapping.gen_col, mapping.orig_line, mapping.orig_col)
+                        == expected
+                }),
+                "missing generated identifier mapping {expected:?}: {:?}",
+                generated.mappings
+            );
+        }
+    }
+
+    #[test]
+    fn expression_identifier_spans_are_scoped_and_keep_explicit_children() {
+        let arena = JsArena::new();
+        let explicit = JsExpr::Spanned(arena.alloc_expr(id("foo")), 1, 4);
+        let call = call(
+            &arena,
+            id("consume"),
+            vec![id("foo"), explicit, JsExpr::OpaqueIdentifier("foo".into())],
+        );
+        let call_id = arena.alloc_expr(call);
+        arena.note_expression_identifier_span(call_id, "foo", 8, 11);
+        let program = program(vec![stmt(&arena, JsExpr::Spanned(call_id, 0, 0))]);
+
+        let generated = generate_with_sourcemap(&program, "xfoo....foo", &arena).unwrap();
+        assert_eq!(generated.code, "consume(foo, foo, foo);");
+        let starts = generated
+            .code
+            .match_indices("foo")
+            .map(|(offset, _)| offset as u32)
+            .collect::<Vec<_>>();
+        for (generated_column, original_column) in [(starts[0], 8), (starts[1], 1), (starts[2], 8)]
+        {
+            assert!(generated.mappings.iter().any(|mapping| {
+                (mapping.gen_col, mapping.orig_col) == (generated_column, original_column)
+            }));
+        }
+    }
+
+    #[test]
+    fn sourcemap_can_externalize_single_source_content() {
+        let json = generate_sourcemap_json(Some("out.js"), "App.svelte", None, "AAAA", &[]);
+        let map: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(map["sourcesContent"], serde_json::json!([null]));
+    }
+
+    #[test]
+    fn sourcemap_preserves_embedded_source_content() {
+        let json = generate_sourcemap_json(
+            Some("out.js"),
+            "App.svelte",
+            Some("<h1>\"x\"</h1>"),
+            "AAAA",
+            &[],
+        );
+        let map: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(map["sourcesContent"], serde_json::json!(["<h1>\"x\"</h1>"]));
+    }
+
+    #[test]
+    fn sourcemap_columns_count_astral_characters_as_two_utf16_units() {
+        let source = "🎉anchor\n";
+        let starts = build_line_starts(source);
+
+        assert_eq!(offset_to_line_col_utf16(source, &starts, "🎉".len()), (0, 2));
+        assert_eq!(offset_to_line_col_utf16(source, &starts, source.len()), (1, 0));
+    }
+
+    #[test]
+    fn text_fallback_maps_bare_member_object_span() {
+        let arena = JsArena::new();
+        let object = arena.alloc_expr(JsExpr::Identifier("Math".into()));
+        arena.set_bare_expr_span(object, 7, 11);
+        let member = JsExpr::Member(JsMemberExpression {
+            object,
+            property: JsMemberProperty::Identifier("random".into()),
+            computed: false,
+            optional: false,
+        });
+        let program = JsProgram::with_body(vec![stmt(&arena, member)]);
+
+        let generated = generate_with_sourcemap(&program, "xxxxxxxMath.random", &arena).unwrap();
+
+        assert_eq!(generated.code, "Math.random;");
+        assert!(generated.mappings.iter().any(|mapping| {
+            mapping.gen_line == 0
+                && mapping.gen_col == 0
+                && mapping.orig_line == 0
+                && mapping.orig_col == 7
+        }));
+        assert!(generated.mappings.iter().any(|mapping| {
+            mapping.gen_line == 0
+                && mapping.gen_col == 4
+                && mapping.orig_line == 0
+                && mapping.orig_col == 11
+        }));
+    }
+
+    #[test]
     fn test_simple_program() {
         let arena = JsArena::new();
         let prog = program(vec![
             import_namespace("$", "svelte/internal/client"),
-            var_decl(
-                &arena,
-                "root",
-                Some(svelte_from_html(&arena, "<h1>Hello</h1>", None)),
-            ),
+            var_decl(&arena, "root", Some(svelte_from_html(&arena, "<h1>Hello</h1>", None))),
             export_default_function(
                 "Test",
                 vec![id_pattern("$$anchor")],
@@ -3045,15 +3331,92 @@ mod tests {
     }
 
     #[test]
+    fn arrow_parentheses_match_in_both_client_printers() {
+        let arena = JsArena::new();
+        let prog = program(vec![
+            const_decl(&arena, "plain", arrow(&arena, vec![], number(1.0))),
+            const_decl(&arena, "iife", call(&arena, arrow(&arena, vec![], number(2.0)), vec![])),
+            const_decl(
+                &arena,
+                "conditional",
+                conditional(
+                    &arena,
+                    id("flag"),
+                    arrow(&arena, vec![], number(3.0)),
+                    arrow(&arena, vec![], number(4.0)),
+                ),
+            ),
+            const_decl(
+                &arena,
+                "nullish",
+                nullish(&arena, id("value"), arrow(&arena, vec![], number(5.0))),
+            ),
+            const_decl(
+                &arena,
+                "logical",
+                and(&arena, id("value"), arrow(&arena, vec![], number(6.0))),
+            ),
+            const_decl(&arena, "nested", arrow(&arena, vec![], arrow(&arena, vec![], number(7.0)))),
+            const_decl(
+                &arena,
+                "binary",
+                binary(&arena, JsBinaryOp::Add, arrow(&arena, vec![], number(8.0)), number(1.0)),
+            ),
+            const_decl(
+                &arena,
+                "conditional_test",
+                conditional(&arena, arrow(&arena, vec![], boolean(true)), id("yes"), id("no")),
+            ),
+            const_decl(
+                &arena,
+                "negated",
+                JsExpr::Unary(JsUnaryExpression {
+                    operator: JsUnaryOp::Not,
+                    argument: arena.alloc_expr(arrow(&arena, vec![], boolean(true))),
+                    prefix: true,
+                }),
+            ),
+            const_decl(&arena, "string_value", string("literal (() => marker")),
+            const_decl(&arena, "template_value", template_string("literal (() => marker")),
+        ]);
+
+        let handwritten = generate(&prog, &arena).unwrap();
+        let allocator = oxc_allocator::Allocator::default();
+        let converted = super::super::to_oxc::program_to_oxc(&prog, &arena, &allocator).unwrap();
+        let esrap = rsvelte_esrap::print(&converted.program, "");
+
+        for (printer, code) in [("handwritten", handwritten), ("oxc/esrap", esrap)] {
+            let parse_allocator = oxc_allocator::Allocator::default();
+            let parsed =
+                oxc_parser::Parser::new(&parse_allocator, &code, oxc_span::SourceType::mjs())
+                    .parse();
+            assert!(parsed.diagnostics.is_empty(), "{printer} emitted invalid JavaScript: {code}");
+
+            for expected in [
+                "const plain = () => 1;",
+                "const iife = (() => 2)();",
+                "const conditional = flag ? () => 3 : () => 4;",
+                "const nullish = value ?? (() => 5);",
+                "const logical = value && (() => 6);",
+                "const nested = () => () => 7;",
+                "const binary = (() => 8) + 1;",
+                "const conditional_test = (() => true) ? yes : no;",
+                "const negated = !(() => true);",
+                "const string_value = 'literal (() => marker';",
+                "const template_value = `literal (() => marker`;",
+            ] {
+                assert!(code.contains(expected), "{printer} did not emit `{expected}`:\n{code}");
+            }
+        }
+    }
+
+    #[test]
     fn test_template_literal() {
         let arena = JsArena::new();
         let prog = program(vec![const_decl(
             &arena,
             "msg",
-            template(
-                vec![quasi("Hello, ", false), quasi("!", true)],
-                vec![id("name")],
-            ),
+            template(vec![quasi("Hello, ", false), quasi("!", true)], vec![id("name")]),
         )]);
 
         let code = generate(&prog, &arena).unwrap();
@@ -3141,6 +3504,7 @@ mod tests {
                                 number(2.0),
                             )),
                         })),
+                        comment_anchor: None,
                     },
                 )]),
                 is_async: false,
@@ -3152,9 +3516,7 @@ mod tests {
             method: false,
         });
 
-        let obj = JsExpr::Object(JsObjectExpression {
-            properties: vec![getter, setter],
-        });
+        let obj = JsExpr::Object(JsObjectExpression { properties: vec![getter, setter] });
 
         let arrow_fn = arrow(&arena, vec![], obj);
         let prog = program(vec![const_decl(
@@ -3296,11 +3658,7 @@ mod tests {
     #[test]
     fn test_new_parenthesises_conditional_callee() {
         let arena = JsArena::new();
-        let new_e = new_expr(
-            &arena,
-            conditional(&arena, id("a"), id("B"), id("C")),
-            vec![],
-        );
+        let new_e = new_expr(&arena, conditional(&arena, id("a"), id("B"), id("C")), vec![]);
         let code = generate_expr(&new_e, &arena);
         assert_eq!(code, "new (a ? B : C)()", "got: {code}");
     }
@@ -3308,11 +3666,7 @@ mod tests {
     #[test]
     fn test_member_parenthesises_arrow_object() {
         let arena = JsArena::new();
-        let m = member(
-            &arena,
-            arrow(&arena, vec![id_pattern("x")], id("x")),
-            "prop",
-        );
+        let m = member(&arena, arrow(&arena, vec![id_pattern("x")], id("x")), "prop");
         let code = generate_expr(&m, &arena);
         assert_eq!(code, "((x) => x).prop", "got: {code}");
     }
@@ -3343,14 +3697,45 @@ mod tests {
         let class = JsExpr::Class(JsClassExpression {
             id: Some("Thing".into()),
             super_class: None,
-            body: JsClassBody {
-                body: vec![method, field],
-            },
+            body: JsClassBody { body: vec![method, field] },
         });
         let code = generate_expr(&class, &arena);
         assert!(code.contains("class Thing {"), "got: {code}");
         assert!(code.contains("foo()"), "got: {code}");
         assert!(code.contains("static count = 0;"), "got: {code}");
         assert!(!code.contains("class Thing {}"), "body dropped: {code}");
+    }
+
+    #[test]
+    fn class_declaration_fallback_uses_generated_indentation() {
+        let arena = JsArena::new();
+        let class = JsClassExpression {
+            id: Some("K".into()),
+            super_class: None,
+            body: JsClassBody {
+                body: vec![JsClassMember::Property(JsPropertyDefinition {
+                    key: JsPropertyKey::Identifier("#x".into()),
+                    value: Some(arena.alloc_expr(number(1.0))),
+                    computed: false,
+                    is_static: false,
+                })],
+            },
+        };
+        let program =
+            JsProgram::with_body(vec![JsStatement::FunctionDeclaration(JsFunctionDeclaration {
+                id: Some("outer".into()),
+                params: smallvec::smallvec![],
+                body: JsBlockStatement::with_body(vec![JsStatement::ClassDeclaration {
+                    class,
+                    source: "class K {\n\t#x = 1;\n}".into(),
+                }]),
+                is_async: false,
+                is_generator: false,
+            })]);
+
+        assert_eq!(
+            generate(&program, &arena).unwrap(),
+            "function outer() {\n\tclass K {\n\t\t#x = 1;\n\t}\n}"
+        );
     }
 }

@@ -33,15 +33,16 @@
 
 /// Canonical priority of each section. Markup is priority 3. The caller
 /// (`lib.rs`) tags each section span with one of these.
-pub(crate) const P_OPTIONS: u8 = 0;
-pub(crate) const P_MODULE: u8 = 1;
-pub(crate) const P_INSTANCE: u8 = 2;
+pub const P_OPTIONS: u8 = 0;
+pub const P_MODULE: u8 = 1;
+pub const P_INSTANCE: u8 = 2;
 const P_MARKUP: u8 = 3;
-pub(crate) const P_STYLE: u8 = 4;
+pub const P_STYLE: u8 = 4;
 
 /// Resolved `svelteSortOrder`: the print priority of each top-level section
-/// kind. Lower prints earlier. The four prettier-plugin-svelte keywords
-/// (`options`, `scripts`, `markup`, `styles`) map onto five rsvelte sections —
+/// kind. Lower prints earlier.
+///
+/// The four prettier-plugin-svelte keywords (`options`, `scripts`, `markup`, `styles`) map onto five rsvelte sections —
 /// `scripts` covers both `<script context="module">` (module) and the instance
 /// `<script>`, with module kept before instance within the group.
 #[derive(Clone, Copy, Debug)]
@@ -77,13 +78,11 @@ impl SortOrderSpec {
     /// warn). Each keyword's position in the list becomes its group priority;
     /// `scripts` expands to module-then-instance so they stay adjacent and in
     /// order.
+    #[must_use]
     pub fn parse(s: &str) -> Option<Self> {
         let s = s.trim();
         if s == "none" {
-            return Some(Self {
-                reorder: false,
-                ..Self::default()
-            });
+            return Some(Self { reorder: false, ..Self::default() });
         }
         let keywords: Vec<&str> = s.split('-').collect();
         // Must be exactly the four keywords, each once.
@@ -98,7 +97,7 @@ impl SortOrderSpec {
             // Multiply by 2 so module/instance can interleave within `scripts`
             // (module = base, instance = base + 1) without colliding with the
             // neighbouring group's priority.
-            let base = (idx as u8) * 2;
+            let base = u8::try_from(idx).ok()? * 2;
             let slot = match *kw {
                 "options" => &mut options,
                 "scripts" => &mut scripts,
@@ -137,7 +136,7 @@ struct Unit {
 /// non-markup sections (options / module / instance script / style) **in `out`'s
 /// coordinates** — the caller remaps them from the parsed source through the
 /// applied edits, so this pass never re-parses. Markup is everything else.
-pub(crate) fn reorder_sections(
+pub fn reorder_sections(
     out: &str,
     mut sections: Vec<(u8, usize, usize)>,
     markup_priority: u8,
@@ -172,17 +171,11 @@ pub(crate) fn reorder_sections(
         };
 
         if !markup_part.is_empty() {
-            units.push(Unit {
-                priority: markup_priority,
-                text: markup_part.to_string(),
-            });
+            units.push(Unit { priority: markup_priority, text: markup_part.to_string() });
         }
 
         if comment_run.is_empty() {
-            units.push(Unit {
-                priority,
-                text: section_text.to_string(),
-            });
+            units.push(Unit { priority, text: section_text.to_string() });
         } else {
             // Preserve the separator between the comment and the section as in
             // the source: a blank line (`\n\n`) if the source had one between the
@@ -195,20 +188,14 @@ pub(crate) fn reorder_sections(
             } else {
                 "\n"
             };
-            units.push(Unit {
-                priority,
-                text: format!("{comment_run}{separator}{section_text}"),
-            });
+            units.push(Unit { priority, text: format!("{comment_run}{separator}{section_text}") });
         }
         cursor = cursor.max(end);
     }
     if cursor < out.len() {
         let trailing = out[cursor..].trim();
         if !trailing.is_empty() {
-            units.push(Unit {
-                priority: markup_priority,
-                text: trailing.to_string(),
-            });
+            units.push(Unit { priority: markup_priority, text: trailing.to_string() });
         }
     }
 
@@ -231,9 +218,7 @@ pub(crate) fn reorder_sections(
         let mut merged: Vec<Unit> = Vec::with_capacity(units.len());
         for unit in units {
             if unit.priority == markup_priority
-                && merged
-                    .last()
-                    .is_some_and(|last| last.priority == markup_priority)
+                && merged.last().is_some_and(|last| last.priority == markup_priority)
             {
                 let last = merged.last_mut().expect("checked above");
                 last.text.push('\n');
@@ -248,11 +233,7 @@ pub(crate) fn reorder_sections(
     // Reassemble with exactly one blank line between every pair of adjacent
     // units. prettier / oxfmt always insert one blank line between top-level
     // sections (options / scripts / markup / style).
-    let mut result = units
-        .into_iter()
-        .map(|u| u.text)
-        .collect::<Vec<_>>()
-        .join("\n\n");
+    let mut result = units.into_iter().map(|u| u.text).collect::<Vec<_>>().join("\n\n");
     if !result.is_empty() {
         result.push('\n');
     }
@@ -272,44 +253,34 @@ fn split_trailing_comment_run(gap: &str) -> Option<(&str, &str)> {
     let mut base = 0usize; // byte offset of `rest` within `gap`
     let mut rest = gap;
     loop {
-        match rest.find("<!--") {
-            Some(open) => {
-                // Characters before this comment are markup-or-whitespace; record
-                // the byte offset just past the last non-whitespace one.
-                if let Some(p) = rest[..open].rfind(|c: char| !c.is_whitespace()) {
-                    let ch_len = rest[p..].chars().next().map_or(1, char::len_utf8);
-                    last_markup_end = base + p + ch_len;
-                }
-                let after_open = open + 4;
-                match rest[after_open..].find("-->") {
-                    Some(close) => {
-                        let consumed = after_open + close + 3;
-                        base += consumed;
-                        rest = &rest[consumed..];
-                    }
-                    // Unterminated comment — treat the remainder as markup.
-                    None => {
-                        last_markup_end = gap.len();
-                        break;
-                    }
-                }
+        if let Some(open) = rest.find("<!--") {
+            // Characters before this comment are markup-or-whitespace; record
+            // the byte offset just past the last non-whitespace one.
+            if let Some(p) = rest[..open].rfind(|c: char| !c.is_whitespace()) {
+                let ch_len = rest[p..].chars().next().map_or(1, char::len_utf8);
+                last_markup_end = base + p + ch_len;
             }
-            None => {
-                if let Some(p) = rest.rfind(|c: char| !c.is_whitespace()) {
-                    let ch_len = rest[p..].chars().next().map_or(1, char::len_utf8);
-                    last_markup_end = base + p + ch_len;
-                }
+            let after_open = open + 4;
+            if let Some(close) = rest[after_open..].find("-->") {
+                let consumed = after_open + close + 3;
+                base += consumed;
+                rest = &rest[consumed..];
+            } else {
+                // Unterminated comment — treat the remainder as markup.
+                last_markup_end = gap.len();
                 break;
             }
+        } else {
+            if let Some(p) = rest.rfind(|c: char| !c.is_whitespace()) {
+                let ch_len = rest[p..].chars().next().map_or(1, char::len_utf8);
+                last_markup_end = base + p + ch_len;
+            }
+            break;
         }
     }
     let markup = gap[..last_markup_end].trim();
     let comment_run = gap[last_markup_end..].trim();
-    if markup.is_empty() || comment_run.is_empty() {
-        None
-    } else {
-        Some((markup, comment_run))
-    }
+    if markup.is_empty() || comment_run.is_empty() { None } else { Some((markup, comment_run)) }
 }
 
 /// Whether `s` contains only HTML comments and whitespace.

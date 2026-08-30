@@ -16,7 +16,10 @@ use crate::ast::template::Component;
 /// delegates to the shared visit_component function for full analysis.
 ///
 /// Corresponds to `Component(node, context)` in Component.js.
-pub fn visit(component: &mut Component, context: &mut VisitorContext) -> Result<(), AnalysisError> {
+pub fn visit<'a, 'b: 'a>(
+    component: &mut Component<'b>,
+    context: &mut VisitorContext<'a>,
+) -> Result<(), AnalysisError> {
     // Extract the base name from the component name
     // If the name contains a dot (e.g., Foo.Bar), use the part before the dot
     let base_name = if let Some(dot_pos) = component.name.find('.') {
@@ -52,16 +55,21 @@ pub fn visit(component: &mut Component, context: &mut VisitorContext) -> Result<
     component.metadata.dynamic = is_dynamic;
 
     if let Some(binding_idx) = binding_idx_opt {
-        let binding = &context.analysis.root.bindings[binding_idx];
+        let binding = &mut context.analysis.root.bindings[binding_idx];
 
         // Update expression metadata
         component.metadata.expression.set_has_state(is_dynamic);
-        component
-            .metadata
-            .expression
-            .dependencies
-            .insert(binding_idx);
+        component.metadata.expression.dependencies.insert(binding_idx);
         component.metadata.expression.references.insert(binding_idx);
+
+        let reference_start = component.start + 1;
+        binding.add_reference(
+            reference_start,
+            reference_start + base_name.len() as u32,
+            true,
+            false,
+            false,
+        );
 
         // Check if the binding contains state
         if matches!(
@@ -79,6 +87,19 @@ pub fn visit(component: &mut Component, context: &mut VisitorContext) -> Result<
 
     // Delegate to shared visit_component for full analysis (includes directive validation)
     visit_component(component, context)?;
+
+    // Upstream's lone-arrow arm also requires `path.at(-3) === 'Fragment'`, and a
+    // `RegularElement`'s children are the one container reached without an
+    // intervening `Fragment` node.
+    let parent_is_regular_element = matches!(
+        context.path.iter().nth_back(1),
+        Some(crate::ast::template::TemplateNode::RegularElement(_))
+    );
+    super::shared::attribute::record_component_assign_exempt(
+        context,
+        &component.attributes,
+        !parent_is_regular_element,
+    );
 
     Ok(())
 }

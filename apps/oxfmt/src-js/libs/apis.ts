@@ -146,6 +146,118 @@ function hasTsxScriptBlock(sourceText: string): boolean {
   return false;
 }
 
+async function resolvePluginSpecs(options: Options): Promise<void> {
+  if (!Array.isArray(options.plugins)) return;
+
+  options.plugins = await Promise.all(
+    options.plugins.map(async (plugin) => {
+      if (typeof plugin !== "string") return plugin;
+      return getRegisteredPlugin(plugin) ?? (await loadPluginSpec(plugin, options.filepath)) ?? plugin;
+    }),
+  );
+}
+
+async function loadPluginSpec(spec: string, filepath: Options["filepath"]): Promise<Plugin | null> {
+  try {
+    return await loadExternalPlugin(spec, filepath);
+  } catch {
+    return null;
+  }
+}
+
+function decodePluginSpecifier(rawSpec: string): ExternalPluginSpecifier {
+  if (!rawSpec.startsWith(EXTERNAL_PLUGIN_SPEC_WITH_RESOLVE_FROM_PREFIX)) return { spec: rawSpec };
+
+  try {
+    const parsed = JSON.parse(rawSpec.slice(EXTERNAL_PLUGIN_SPEC_WITH_RESOLVE_FROM_PREFIX.length)) as {
+      spec?: unknown;
+      resolveFrom?: unknown;
+    };
+
+    if (typeof parsed.spec !== "string" || parsed.spec.length === 0) return { spec: rawSpec };
+
+    return {
+      spec: parsed.spec,
+      resolveFrom: typeof parsed.resolveFrom === "string" && parsed.resolveFrom.length > 0
+        ? parsed.resolveFrom
+        : undefined,
+    };
+  } catch {
+    return { spec: rawSpec };
+  }
+}
+
+function getPluginImportSpecifier(rawSpec: string, filepath?: Options["filepath"]): string {
+  const { spec, resolveFrom } = decodePluginSpecifier(rawSpec);
+
+  if (spec.startsWith("file:")) return spec;
+  if (isAbsolute(spec)) return pathToFileURL(spec).href;
+
+  const baseDir = resolveFrom
+    ?? (typeof filepath === "string" && filepath.length > 0 ? dirname(filepath) : undefined);
+  if (baseDir) {
+    const requireFrom = createRequire(join(baseDir, "oxfmt-plugin-resolver.cjs"));
+    const resolved = requireFrom.resolve(spec);
+    return isAbsolute(resolved) ? pathToFileURL(resolved).href : resolved;
+  }
+
+  return spec;
+}
+
+async function loadExternalPlugin(
+  spec: string,
+  filepath?: Options["filepath"],
+): Promise<ExternalPlugin> {
+  const registeredPlugin = getRegisteredPlugin(spec);
+  if (registeredPlugin) return registeredPlugin as ExternalPlugin;
+
+  const cacheKey = getPluginImportSpecifier(spec, filepath);
+  const cached = externalPluginCache.get(cacheKey);
+  if (cached) return cached;
+
+  const imported = await import(cacheKey);
+  const plugin = unwrapPluginModule(imported) as ExternalPlugin;
+  externalPluginCache.set(cacheKey, plugin);
+  return plugin;
+}
+
+function unwrapPluginModule(pluginModule: unknown): Plugin {
+  if (isPluginLike(pluginModule)) return pluginModule;
+
+  if (pluginModule != null && typeof pluginModule === "object" && "default" in pluginModule) {
+    const defaultExport = pluginModule.default;
+    if (isPluginLike(defaultExport)) return defaultExport;
+  }
+
+  return pluginModule as Plugin;
+}
+
+function serializePluginLanguage(language: ExternalPluginLanguage): string {
+  return JSON.stringify({
+    parsers: Array.isArray(language.parsers) ? language.parsers : [],
+    extensions: Array.isArray(language.extensions) ? language.extensions : [],
+    filenames: Array.isArray(language.filenames) ? language.filenames : [],
+  });
+}
+
+/** Resolve configured external plugins and return serialized `languages` metadata. */
+export async function resolvePlugins(pluginSpecs: string[] = []): Promise<string[]> {
+  if (pluginSpecs.length === 0) return [];
+
+  const plugins = await Promise.all(pluginSpecs.map((spec) => loadExternalPlugin(spec)));
+  return plugins.flatMap((plugin) =>
+    Array.isArray(plugin.languages) ? plugin.languages.map(serializePluginLanguage) : [],
+  );
+}
+
+function isPluginLike(value: unknown): value is Plugin {
+  return (
+    value != null &&
+    typeof value === "object" &&
+    ("languages" in value || "parsers" in value || "printers" in value || "options" in value)
+  );
+}
+
 // ---
 
 export type FormatEmbeddedCodeParam = {

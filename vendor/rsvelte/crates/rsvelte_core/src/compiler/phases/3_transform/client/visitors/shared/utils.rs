@@ -5,10 +5,17 @@
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::compiler::phases::phase2_analyze::scope::BindingKind;
+use crate::compiler::phases::phase2_analyze::scope::{Binding, BindingKind};
 use crate::compiler::phases::phase3_transform::client::types::*;
+use crate::compiler::phases::phase3_transform::client::visitors::shared::assignment_helpers::build_assignment_value;
 use crate::compiler::phases::phase3_transform::js_ast::builders as b;
+use crate::compiler::phases::phase3_transform::js_ast::builders::is_valid_identifier;
 use crate::compiler::phases::phase3_transform::js_ast::nodes::*;
+// The `scope.evaluate` port lives with the server transform, but it is the one
+// shared model of a folded JS value used by Phase 2 and both transforms.
+use crate::compiler::phases::phase3_transform::server::evaluate::{
+    EvalScope, EvalValue, Evaluation, evaluate_binding_initial, evaluate_estree, to_js_string,
+};
 
 /// Local scope information for tracking shadowed variables and their init expression types.
 ///
@@ -38,11 +45,64 @@ enum JsExprKind {
     Other,
 }
 
+/// Resolve an each binding by lexical ownership, preferring the innermost block.
+/// The optional path is the writable source location for a destructured binding.
+fn find_each_binding_context<'a>(
+    contexts: &'a [EachBindingContext],
+    name: &str,
+) -> Option<(&'a EachBindingContext, Option<&'a str>)> {
+    contexts.iter().rev().find_map(|each_ctx| {
+        if each_ctx.item_name == name {
+            Some((each_ctx, None))
+        } else {
+            each_ctx.destructured_update_paths.get(name).map(|path| (each_ctx, Some(path.as_str())))
+        }
+    })
+}
+
+/// Mark the lexically owning identifier-context each block as assigned or mutated.
+/// Destructured contexts do not register a flag because their transforms do not
+/// force the callback's index parameter in the official compiler.
+fn mark_each_item_assigned_or_mutated(state: &ComponentClientTransformState<'_>, name: &str) {
+    if let Some((_, flag)) =
+        state.each_item_name_flags.iter().rev().find(|(item_name, _)| item_name.as_str() == name)
+    {
+        flag.set(true);
+    }
+}
+
+/// Rest bindings are values computed from the item, not locations within it.
+/// Writing to the generated call expression is both semantically wrong and, for
+/// a direct assignment, invalid JavaScript (upstream issue #3306).
+fn is_writable_destructured_path(path: &str) -> bool {
+    !path.contains(".slice(") && !path.starts_with("$.exclude_from_object(")
+}
+
+fn append_each_invalidation(
+    each_ctx: &EachBindingContext,
+    mutation: JsExpr,
+    arena: &crate::compiler::phases::phase3_transform::js_ast::arena::JsArena,
+) -> JsExpr {
+    let mut expressions = vec![mutation];
+
+    if !each_ctx.invalidation_exprs.is_empty() {
+        expressions.push(build_invalidate_inner_signals(&each_ctx.invalidation_exprs, arena));
+    }
+
+    if let Some(store_name) = &each_ctx.store_to_invalidate {
+        expressions.push(b::call(
+            arena,
+            b::member_path(arena, "$.invalidate_store"),
+            vec![b::id("$$stores"), b::string(store_name)],
+        ));
+    }
+
+    b::sequence(expressions)
+}
+
 impl LocalScope {
     fn new() -> Self {
-        Self {
-            vars: FxHashMap::default(),
-        }
+        Self { vars: FxHashMap::default() }
     }
 
     /// Create a LocalScope from a set of shadowed variable names.
@@ -85,6 +145,32 @@ impl LocalScope {
     }
 }
 
+/// Is `expr` a `$.state(…)` / `$.derived(…)` call — the two shapes a lowered
+/// rune declaration produces, and the only ones that make a local a signal?
+/// `$.tag(…)` wraps either of them in dev mode.
+fn is_signal_source_call(
+    expr: &JsExpr,
+    arena: &crate::compiler::phases::phase3_transform::js_ast::arena::JsArena,
+) -> bool {
+    let JsExpr::Call(call) = expr else {
+        return false;
+    };
+    let JsExpr::Member(member) = arena.get_expr(call.callee) else {
+        return false;
+    };
+    if !matches!(arena.get_expr(member.object), JsExpr::Identifier(o) if o.as_str() == "$") {
+        return false;
+    }
+    let JsMemberProperty::Identifier(property) = &member.property else {
+        return false;
+    };
+    match property.as_str() {
+        "state" | "derived" => true,
+        "tag" => call.arguments.first().is_some_and(|arg| is_signal_source_call(arg, arena)),
+        _ => false,
+    }
+}
+
 /// Classify a JsExpr into a JsExprKind for proxy decisions.
 fn classify_expr(expr: &JsExpr) -> JsExprKind {
     match expr {
@@ -104,9 +190,10 @@ fn classify_expr(expr: &JsExpr) -> JsExprKind {
 /// outer variable transforms.
 fn extract_pattern_names(pattern: &JsPattern, names: &mut FxHashSet<String>) {
     match pattern {
-        JsPattern::Identifier(name) => {
+        JsPattern::Identifier(name) | JsPattern::SpannedIdentifier { name, .. } => {
             names.insert(name.to_string());
         }
+        JsPattern::SourceAnchored(anchor) => extract_pattern_names(&anchor.inner, names),
         JsPattern::Array(array) => {
             for p in array.elements.iter().flatten() {
                 extract_pattern_names(p, names);
@@ -133,6 +220,55 @@ fn extract_pattern_names(pattern: &JsPattern, names: &mut FxHashSet<String>) {
     }
 }
 
+fn collect_pattern_evaluations(
+    pattern: &JsPattern,
+    context: &ComponentContext,
+    getters: &mut Vec<JsExpr>,
+    seen: &mut FxHashSet<String>,
+) {
+    match pattern {
+        JsPattern::Assignment(assign) => {
+            collect_pattern_evaluations(&assign.left, context, getters, seen);
+            collect_reactive_references_inner(
+                context.arena.get_expr(assign.right),
+                context,
+                getters,
+                seen,
+            );
+        }
+        JsPattern::Rest(inner) => collect_pattern_evaluations(inner, context, getters, seen),
+        JsPattern::Array(array) => {
+            for element in array.elements.iter().flatten() {
+                collect_pattern_evaluations(element, context, getters, seen);
+            }
+        }
+        JsPattern::Object(object) => {
+            for property in &object.properties {
+                match property {
+                    JsObjectPatternProperty::Property { key, value, .. } => {
+                        if let JsPropertyKey::Computed(key) = key {
+                            collect_reactive_references_inner(
+                                context.arena.get_expr(*key),
+                                context,
+                                getters,
+                                seen,
+                            );
+                        }
+                        collect_pattern_evaluations(value, context, getters, seen);
+                    }
+                    JsObjectPatternProperty::Rest(rest) => {
+                        collect_pattern_evaluations(rest, context, getters, seen);
+                    }
+                }
+            }
+        }
+        JsPattern::Identifier(_) | JsPattern::SpannedIdentifier { .. } => {}
+        JsPattern::SourceAnchored(anchor) => {
+            collect_pattern_evaluations(&anchor.inner, context, getters, seen)
+        }
+    }
+}
+
 /// Extract all identifier names from a pattern and add them to a LocalScope as shadowed.
 fn extract_pattern_names_to_scope(pattern: &JsPattern, scope: &mut LocalScope) {
     let mut names = FxHashSet::default();
@@ -154,6 +290,18 @@ fn register_block_local_vars(
         if let JsStatement::VariableDeclaration(var_decl) = stmt {
             for decl in &var_decl.declarations {
                 if let JsPattern::Identifier(name) = &decl.id {
+                    // A local the converter just turned into a signal
+                    // (`let x = $.state(…)` / `$.derived(…)`, from a rune written
+                    // inside a template expression's function body) is not a plain
+                    // shadow: its reads still have to go through `$.get`. Only a
+                    // local that shadows an outer transform gets registered here.
+                    if decl
+                        .init
+                        .as_ref()
+                        .is_some_and(|init| is_signal_source_call(arena.get_expr(*init), arena))
+                    {
+                        continue;
+                    }
                     let init_kind = decl
                         .init
                         .as_ref()
@@ -250,10 +398,7 @@ fn should_proxy_with_context(
             // For template @const bindings, prefer the one with a known initial type
             // since phase3 doesn't track precise lexical scope inside each blocks.
             let mut found_binding = context.state.get_binding(name);
-            if found_binding
-                .map(|b| b.initial_node_type.is_none())
-                .unwrap_or(true)
-            {
+            if found_binding.map(|b| b.initial_node_type.is_none()).unwrap_or(true) {
                 // Look for a template binding with this name (from {@const ...})
                 for scope in &context.state.scope_root.all_scopes {
                     if let Some(&idx) = scope.declarations.get(name.as_str())
@@ -346,7 +491,133 @@ pub fn apply_transforms_to_expression(expr: &JsExpr, context: &ComponentContext)
     {
         return expr.clone();
     }
-    apply_transforms_to_expression_with_shadowed(expr, context, &LocalScope::new())
+    let transformed =
+        apply_transforms_to_expression_with_shadowed(expr, context, &LocalScope::new());
+    if idempotency_check_enabled() {
+        assert_transform_is_idempotent(&transformed, context);
+    }
+    transformed
+}
+
+/// The store a `$.store_set` / `$.store_mutate` writes to is read through its own
+/// binding's transform — a prop reads as the getter call `store()`, a state source
+/// as `$.get(store)` — mirroring upstream's `get_store()` =
+/// `context.visit(b.id(store_name))`. The context-free store transforms emit the
+/// bare name, so resolve it here where `context` is available.
+fn resolve_store_source_arg(
+    expr: JsExpr,
+    store_sub_name: &str,
+    context: &ComponentContext,
+) -> JsExpr {
+    let Some(store_name) = store_sub_name.strip_prefix('$') else {
+        return expr;
+    };
+    let JsExpr::Call(mut call) = expr else {
+        return expr;
+    };
+    if let Some(first) = call.arguments.first_mut()
+        && matches!(first, JsExpr::Identifier(n) if n.as_str() == store_name)
+        && let Some(read_fn) = context.state.transform.get(store_name).and_then(|t| t.read)
+    {
+        *first = read_fn(&context.arena, b::id(store_name));
+    }
+    JsExpr::Call(call)
+}
+
+/// Is `RSVELTE_ASSERT_TRANSFORM_IDEMPOTENT` set?
+fn idempotency_check_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("RSVELTE_ASSERT_TRANSFORM_IDEMPOTENT").is_some())
+}
+
+thread_local! {
+    static IN_IDEMPOTENCY_CHECK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Marker the harness requires before it may report a clean run.
+///
+/// A binary with no check compiled in emits nothing, which is indistinguishable from a
+/// tree that satisfies the property — a `main` binding measured 0 violations for exactly
+/// that reason. Printed once per process from inside the comparison, so it also proves
+/// the comparison was reached, not just that the variable was read.
+fn announce_idempotency_check_armed() {
+    static ANNOUNCED: std::sync::Once = std::sync::Once::new();
+    ANNOUNCED.call_once(|| eprintln!("RSVELTE_IDEMPOTENCY_ARMED"));
+}
+
+/// Does every bracket in `s` close?
+fn is_balanced(s: &str) -> bool {
+    let mut depth = 0i32;
+    for b in s.bytes() {
+        match b {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            _ => {}
+        }
+        if depth < 0 {
+            return false;
+        }
+    }
+    depth == 0
+}
+
+/// Report when transforming an already-transformed expression changes it.
+///
+/// A transform whose output the next pass can transform again is #3026's defect class:
+/// `try_transform_assignment` hands a converted subtree back to the outer walk, so any
+/// read whose output is re-readable is applied twice. Shape cannot carry provenance, so
+/// the property has to be asserted rather than inspected. Off unless the env var is set —
+/// it doubles the walk and prints through the fallback text printer, which renders
+/// `Raw` nodes opaquely and so can only miss a divergence, never invent one.
+fn assert_transform_is_idempotent(transformed: &JsExpr, context: &ComponentContext) {
+    if IN_IDEMPOTENCY_CHECK.with(|c| c.get()) {
+        return;
+    }
+    IN_IDEMPOTENCY_CHECK.with(|c| c.set(true));
+    let again =
+        apply_transforms_to_expression_with_shadowed(transformed, context, &LocalScope::new());
+    IN_IDEMPOTENCY_CHECK.with(|c| c.set(false));
+
+    use crate::compiler::phases::phase3_transform::js_ast::codegen::generate_expr;
+    announce_idempotency_check_armed();
+    let once = generate_expr(transformed, &context.arena);
+    let twice = generate_expr(&again, &context.arena);
+    if let Some(line) = idempotency_report(&once, &twice) {
+        // A panic would abort the process (`panic = "abort"` in release), which turns a
+        // sweep into a bisect; the harness greps for this marker instead.
+        eprintln!("{line}");
+    }
+}
+
+/// The marker line for a pair of prints, or `None` when they agree.
+///
+/// Split out so the reporting rule — including the truncated-print skip — is reachable
+/// from a test; a comparison that silently stopped reporting would otherwise read as a
+/// clean sweep.
+fn idempotency_report(once: &str, twice: &str) -> Option<String> {
+    // The fallback text printer truncates the nodes it cannot render, and a truncated
+    // print differs from its twin for a reason that is not the transform.
+    if once == twice || !is_balanced(once) || !is_balanced(twice) {
+        return None;
+    }
+    Some(format!("RSVELTE_NON_IDEMPOTENT_TRANSFORM\t{once}\t{twice}"))
+}
+
+#[cfg(test)]
+mod idempotency_report_tests {
+    use super::idempotency_report;
+
+    #[test]
+    fn reports_a_doubled_getter_and_skips_a_truncated_print() {
+        assert_eq!(
+            idempotency_report("p().a", "p()().a").as_deref(),
+            Some("RSVELTE_NON_IDEMPOTENT_TRANSFORM\tp().a\tp()().a")
+        );
+        assert_eq!(idempotency_report("p().a", "p().a"), None);
+        // Either side truncated by the printer: not a transform difference.
+        assert_eq!(idempotency_report("() => {", ""), None);
+        assert_eq!(idempotency_report("{ a: p() }", "{"), None);
+    }
 }
 
 /// Apply transforms while treating specified variables as shadowed (preventing transformation).
@@ -362,17 +633,50 @@ pub fn apply_transforms_to_expression_with_shadowed(
         };
     }
 
+    // A source span sitting directly on an identifier travels *into* the read
+    // transform, because upstream stamps the location on the identifier node and
+    // builds the read wrapper (`foo()`, `$.get(foo)`) around it unlocated — so a
+    // map segment covers the name, not the whole generated call.
+    let spanned_identifier = expr;
+    let (expr, identifier_span) = match expr {
+        JsExpr::Spanned(inner, start, end)
+            if matches!(context.arena.get_expr(*inner), JsExpr::Identifier(_)) =>
+        {
+            (context.arena.get_expr(*inner), Some((*start, *end)))
+        }
+        other => (other, None),
+    };
+    let respan = |e: JsExpr| match identifier_span {
+        Some((start, end)) => JsExpr::Spanned(context.arena.alloc_expr(e), start, end),
+        None => e,
+    };
+    // An identifier no transform rewrote keeps the wrapper it arrived in, which
+    // costs no arena node: `respan` would allocate a second one holding the same
+    // span over a clone of the same identifier.
+    let unchanged = || spanned_identifier.clone();
+
     match expr {
         JsExpr::Identifier(name) => {
+            // `Identifier.js` short-circuits on the NAME before any binding is
+            // resolved, so a local `$$props` (an each item, a snippet
+            // parameter) is renamed too. Upstream only ever visits USER
+            // expressions; the `$$props` object rsvelte's own prop reads are
+            // built on has no binding, which is what separates the two here.
+            if name.as_str() == "$$props" && context.state.get_binding(name).is_some() {
+                return JsExpr::Identifier("$$sanitized_props".into());
+            }
             // Skip transforms for shadowed variables (function parameters, local vars)
             if local_scope.contains(name) {
-                return expr.clone();
+                return unchanged();
             }
             // Track each block index usage for proper callback parameter generation.
             // When the index variable is referenced during body traversal, we need
             // to include it in the render callback parameters.
+            // A `{@const}` / snippet parameter of the same name shadows the index,
+            // so this is not a read of it and the callback parameter stays off.
+            let shadowed = context.state.each_shadowing_names.contains_key(name.as_str());
             let current_idx_name = context.state.each_index_name.as_deref();
-            if current_idx_name == Some(name.as_str()) {
+            if current_idx_name == Some(name.as_str()) && !shadowed {
                 context.state.each_index_used.set(true);
             }
             // Also check ancestor each-block index names (for nested each blocks).
@@ -384,7 +688,9 @@ pub fn apply_transforms_to_expression_with_shadowed(
             // (still on the ancestor stack under the same name) must NOT be marked.
             for (ancestor_idx_name, ancestor_used_flag) in &context.state.ancestor_each_index_names
             {
-                if name == ancestor_idx_name && Some(ancestor_idx_name.as_str()) != current_idx_name
+                if name == ancestor_idx_name
+                    && Some(ancestor_idx_name.as_str()) != current_idx_name
+                    && !shadowed
                 {
                     ancestor_used_flag.set(true);
                 }
@@ -413,12 +719,13 @@ pub fn apply_transforms_to_expression_with_shadowed(
                     .state
                     .each_binding_context
                     .iter()
+                    .rev()
                     .find(|ctx| ctx.item_name == *name && ctx.item_reassigned)
             {
                 // Build collection[$$index] access
                 // Note: We do NOT set each_item_assign_or_mutate here - that's only for
                 // writes (assign/mutate). The read transform just redirects to arr[$$index].
-                return build_reassigned_item_read(each_ctx, &context.arena);
+                return respan(build_reassigned_item_read(each_ctx, &context.arena));
             }
             // Check if there's a transform registered for this identifier
             if let Some(transform) = context.state.transform.get(name.as_str()) {
@@ -426,7 +733,7 @@ pub fn apply_transforms_to_expression_with_shadowed(
                 // is part of a destructured @const declaration, so reads become
                 // $.get(computed_const).identifier_name
                 if let Some(ref source_var) = transform.read_source {
-                    return b::member(
+                    return respan(b::member(
                         &context.arena,
                         b::svelte_call(
                             &context.arena,
@@ -434,7 +741,7 @@ pub fn apply_transforms_to_expression_with_shadowed(
                             vec![JsExpr::Identifier(source_var.clone().into())],
                         ),
                         name.clone(),
-                    );
+                    ));
                 }
                 if let Some(read_fn) = transform.read {
                     // If this transform has a replacement_id, use it instead of the original name.
@@ -444,10 +751,10 @@ pub fn apply_transforms_to_expression_with_shadowed(
                     } else {
                         JsExpr::Identifier(name.clone())
                     };
-                    return read_fn(&context.arena, input_id);
+                    return read_fn(&context.arena, respan(input_id));
                 }
             }
-            expr.clone()
+            unchanged()
         }
 
         JsExpr::Member(member) => {
@@ -458,9 +765,7 @@ pub fn apply_transforms_to_expression_with_shadowed(
                 JsMemberProperty::Expression(prop_expr) if member.computed => {
                     // For computed properties, also apply transforms
                     JsMemberProperty::Expression(
-                        context
-                            .arena
-                            .alloc_expr(recurse!(context.arena.get_expr(*prop_expr))),
+                        context.arena.alloc_expr(recurse!(context.arena.get_expr(*prop_expr))),
                     )
                 }
                 _ => member.property.clone(),
@@ -564,15 +869,10 @@ pub fn apply_transforms_to_expression_with_shadowed(
         }
 
         JsExpr::Array(array) => {
-            let transformed_elements: Vec<Option<JsExpr>> = array
-                .elements
-                .iter()
-                .map(|elem| elem.as_ref().map(|e| recurse!(e)))
-                .collect();
+            let transformed_elements: Vec<Option<JsExpr>> =
+                array.elements.iter().map(|elem| elem.as_ref().map(|e| recurse!(e))).collect();
 
-            JsExpr::Array(JsArrayExpression {
-                elements: transformed_elements,
-            })
+            JsExpr::Array(JsArrayExpression { elements: transformed_elements })
         }
 
         JsExpr::Object(obj) => {
@@ -623,16 +923,12 @@ pub fn apply_transforms_to_expression_with_shadowed(
                         })
                     }
                     JsObjectMember::SpreadElement(spread_expr) => JsObjectMember::SpreadElement(
-                        context
-                            .arena
-                            .alloc_expr(recurse!(context.arena.get_expr(*spread_expr))),
+                        context.arena.alloc_expr(recurse!(context.arena.get_expr(*spread_expr))),
                     ),
                 })
                 .collect();
 
-            JsExpr::Object(JsObjectExpression {
-                properties: transformed_properties,
-            })
+            JsExpr::Object(JsObjectExpression { properties: transformed_properties })
         }
 
         JsExpr::Arrow(arrow) => {
@@ -644,15 +940,13 @@ pub fn apply_transforms_to_expression_with_shadowed(
 
             // Transform arrow function bodies with updated local scope
             let transformed_body = match &arrow.body {
-                JsArrowBody::Expression(expr_id) => {
-                    JsArrowBody::Expression(context.arena.alloc_expr(
-                        apply_transforms_to_expression_with_shadowed(
-                            context.arena.get_expr(*expr_id),
-                            context,
-                            &new_scope,
-                        ),
-                    ))
-                }
+                JsArrowBody::Expression(expr_id) => JsArrowBody::Expression(
+                    context.arena.alloc_expr(apply_transforms_to_expression_with_shadowed(
+                        context.arena.get_expr(*expr_id),
+                        context,
+                        &new_scope,
+                    )),
+                ),
                 JsArrowBody::Block(block) => {
                     // Scan the block for local variable declarations before transforming
                     // so that should_proxy() can look up their init expression types
@@ -666,9 +960,7 @@ pub fn apply_transforms_to_expression_with_shadowed(
                             apply_transforms_to_statement_with_shadowed(stmt, context, &new_scope)
                         })
                         .collect();
-                    JsArrowBody::Block(JsBlockStatement {
-                        body: transformed_body,
-                    })
+                    JsArrowBody::Block(JsBlockStatement::with_body(transformed_body))
                 }
             };
 
@@ -700,9 +992,7 @@ pub fn apply_transforms_to_expression_with_shadowed(
             JsExpr::Function(JsFunctionExpression {
                 id: func.id.clone(),
                 params: func.params.clone(),
-                body: JsBlockStatement {
-                    body: transformed_body,
-                },
+                body: JsBlockStatement::with_body(transformed_body),
                 is_async: func.is_async,
                 is_generator: func.is_generator,
             })
@@ -711,7 +1001,11 @@ pub fn apply_transforms_to_expression_with_shadowed(
         JsExpr::Assignment(assign) => {
             // For assignments, check if the left side is a state variable that needs transform
             // Skip if the identifier is in local scope (function parameter or local declaration)
-            if let JsExpr::Identifier(name) = context.arena.get_expr(assign.left)
+            let mut assignment_target = context.arena.get_expr(assign.left);
+            while let JsExpr::Spanned(inner, _, _) = assignment_target {
+                assignment_target = context.arena.get_expr(*inner);
+            }
+            if let JsExpr::Identifier(name) = assignment_target
                 && !local_scope.contains(name)
                 && let Some(transform) = context.state.transform.get(name.as_str())
                 && let Some(assign_fn) = transform.assign
@@ -756,32 +1050,17 @@ pub fn apply_transforms_to_expression_with_shadowed(
                     JsAssignmentOp::BitAndAssign => {
                         let read_fn = transform.read.unwrap_or(|_arena, e| e);
                         let current = read_fn(&context.arena, JsExpr::Identifier(name.clone()));
-                        b::binary(
-                            &context.arena,
-                            JsBinaryOp::BitAnd,
-                            current,
-                            transformed_right,
-                        )
+                        b::binary(&context.arena, JsBinaryOp::BitAnd, current, transformed_right)
                     }
                     JsAssignmentOp::BitOrAssign => {
                         let read_fn = transform.read.unwrap_or(|_arena, e| e);
                         let current = read_fn(&context.arena, JsExpr::Identifier(name.clone()));
-                        b::binary(
-                            &context.arena,
-                            JsBinaryOp::BitOr,
-                            current,
-                            transformed_right,
-                        )
+                        b::binary(&context.arena, JsBinaryOp::BitOr, current, transformed_right)
                     }
                     JsAssignmentOp::BitXorAssign => {
                         let read_fn = transform.read.unwrap_or(|_arena, e| e);
                         let current = read_fn(&context.arena, JsExpr::Identifier(name.clone()));
-                        b::binary(
-                            &context.arena,
-                            JsBinaryOp::BitXor,
-                            current,
-                            transformed_right,
-                        )
+                        b::binary(&context.arena, JsBinaryOp::BitXor, current, transformed_right)
                     }
                     JsAssignmentOp::ShlAssign => {
                         let read_fn = transform.read.unwrap_or(|_arena, e| e);
@@ -864,115 +1143,91 @@ pub fn apply_transforms_to_expression_with_shadowed(
                         local_scope,
                     );
 
-                return assign_fn(
+                let assigned = assign_fn(
+                    transform,
                     &context.arena,
                     JsExpr::Identifier(name.clone()),
                     final_value,
                     needs_proxy,
                 );
+                let is_store_sub = context
+                    .state
+                    .get_binding(name)
+                    .is_some_and(|b| b.kind == BindingKind::StoreSub);
+                return if is_store_sub {
+                    resolve_store_source_arg(assigned, name.as_str(), context)
+                } else {
+                    assigned
+                };
             }
 
-            // Track each item assignment for uses_index detection.
-            // In the official Svelte compiler, the assign transform callback on the each item
-            // sets `uses_index = true`. Since Rust uses fn pointers (not closures), we track
-            // this via a shared flag on the state.
-            //
-            // For legacy mode (non-runes), also transform the assignment to use
-            // collection[$$index] and append $.invalidate_inner_signals().
+            // Transform writes through the lexically owning each item. Identifier contexts
+            // write through collection[$$index] in legacy mode and force the callback index;
+            // destructured contexts write through their path into $$item in both modes.
             // This mirrors the official compiler's `assign` transform registered in EachBlock.js:
             //   assign: (_, value) => {
             //     uses_index = true;
             //     const left = b.member(collection, index, true);
             //     return b.sequence([b.assignment('=', left, value), ...sequence]);
             //   }
-            if let JsExpr::Identifier(name) = context.arena.get_expr(assign.left)
+            if let JsExpr::Identifier(name) =
+                unspanned_expr(context.arena.get_expr(assign.left), &context.arena)
                 && !local_scope.contains(name)
-                && context.state.each_item_names.contains(name)
+                && let Some((each_ctx, destructured_path)) =
+                    find_each_binding_context(&context.state.each_binding_context, name)
+                        .map(|(each_ctx, path)| (each_ctx.clone(), path.map(str::to_owned)))
+                && destructured_path.as_deref().is_none_or(is_writable_destructured_path)
             {
-                context.state.each_item_assign_or_mutate.set(true);
+                let transformed_right = recurse!(context.arena.get_expr(assign.right));
 
-                // In legacy mode, transform the assignment to use collection[$$index]
-                // and append the invalidation sequence.
-                if !context.state.analysis.runes
-                    && let Some(each_ctx) = context
+                let (assignment_target, current_value) = if let Some(path) = &destructured_path {
+                    let current_value = context
                         .state
-                        .each_binding_context
-                        .iter()
-                        .rev()
-                        .find(|ctx| ctx.item_name == *name)
-                        .cloned()
-                {
-                    let collection_access = build_reassigned_item_read(&each_ctx, &context.arena);
-
-                    // Build the assignment value. For compound operators (o *= 2),
-                    // we need to expand to: collection[$$index] = collection[$$index] * 2
-                    // For simple assignment (o = 5), just use the right side.
-                    let transformed_right = recurse!(context.arena.get_expr(assign.right));
-                    let assign_value = if matches!(assign.operator, JsAssignmentOp::Assign) {
-                        transformed_right
+                        .transform
+                        .get(name.as_str())
+                        .and_then(|transform| transform.read)
+                        .map_or_else(
+                            || JsExpr::Identifier(name.clone()),
+                            |read| read(&context.arena, b::id(name.as_str())),
+                        );
+                    (b::raw(path.as_str()), current_value)
+                } else {
+                    // Only identifier-context transforms set uses_index. A destructured
+                    // path writes directly through $$item and needs no index argument.
+                    mark_each_item_assigned_or_mutated(&context.state, name);
+                    if context.state.analysis.runes {
+                        (b::id(name.as_str()), b::id(name.as_str()))
                     } else {
-                        // Expand compound assignment: collection[$$index] OP right
-                        // e.g., *= becomes collection[$$index] * right
-                        let binary_op = match assign.operator {
-                            JsAssignmentOp::AddAssign => "+",
-                            JsAssignmentOp::SubAssign => "-",
-                            JsAssignmentOp::MulAssign => "*",
-                            JsAssignmentOp::DivAssign => "/",
-                            JsAssignmentOp::ModAssign => "%",
-                            JsAssignmentOp::PowAssign => "**",
-                            JsAssignmentOp::BitAndAssign => "&",
-                            JsAssignmentOp::BitOrAssign => "|",
-                            JsAssignmentOp::BitXorAssign => "^",
-                            JsAssignmentOp::ShlAssign => "<<",
-                            JsAssignmentOp::ShrAssign => ">>",
-                            JsAssignmentOp::UShrAssign => ">>>",
-                            JsAssignmentOp::OrAssign => "||",
-                            JsAssignmentOp::AndAssign => "&&",
-                            JsAssignmentOp::NullishAssign => "??",
-                            _ => "=",
-                        };
-                        // Generate: collection[$$index] OP right
-                        let collection_read = build_reassigned_item_read(&each_ctx, &context.arena);
-                        let collection_str = crate::compiler::phases::phase3_transform::js_ast::codegen::generate_expr(&collection_read, &context.arena);
-                        let right_str = crate::compiler::phases::phase3_transform::js_ast::codegen::generate_expr(&transformed_right, &context.arena);
-                        JsExpr::Raw(
-                            format!("{} {} {}", collection_str, binary_op, right_str).into(),
+                        (
+                            build_reassigned_item_read(&each_ctx, &context.arena),
+                            build_reassigned_item_read(&each_ctx, &context.arena),
                         )
-                    };
+                    }
+                };
 
-                    // Build: collection[$$index] = value
+                if destructured_path.is_some() || !context.state.analysis.runes {
+                    let value = build_assignment_value(
+                        &context.arena,
+                        assign.operator.as_str(),
+                        &current_value,
+                        &transformed_right,
+                    );
                     let assignment = JsExpr::Assignment(JsAssignmentExpression {
                         operator: JsAssignmentOp::Assign,
-                        left: context.arena.alloc_expr(collection_access),
-                        right: context.arena.alloc_expr(assign_value),
+                        left: context.arena.alloc_expr(assignment_target),
+                        right: context.arena.alloc_expr(value),
                     });
 
-                    // Build the invalidation sequence
-                    let invalidation_exprs = each_ctx.invalidation_exprs.clone();
-                    let mut seq_exprs = vec![assignment];
-                    if !invalidation_exprs.is_empty() {
-                        let invalidate_inner =
-                            build_invalidate_inner_signals(&invalidation_exprs, &context.arena);
-                        seq_exprs.push(invalidate_inner);
-                    }
-
-                    // Add store invalidation if needed
-                    if let Some(ref store_name) = each_ctx.store_to_invalidate {
-                        seq_exprs.push(b::call(
-                            &context.arena,
-                            b::member_path(&context.arena, "$.invalidate_store"),
-                            vec![b::id("$$stores"), b::string(store_name)],
-                        ));
-                    }
-
-                    return b::sequence(seq_exprs);
+                    return append_each_invalidation(&each_ctx, assignment, &context.arena);
                 }
             }
 
             // Check for mutation case: when assigning to a member expression where
             // the base object has a mutate transform (e.g., $store.prop = value)
             // This corresponds to the mutation case in AssignmentExpression.js
-            if let JsExpr::Member(_) = context.arena.get_expr(assign.left) {
+            if let JsExpr::Member(_) =
+                unspanned_expr(context.arena.get_expr(assign.left), &context.arena)
+            {
                 // Find the base object of the member expression
                 let base_object =
                     get_base_object(context.arena.get_expr(assign.left), &context.arena);
@@ -981,9 +1236,13 @@ pub fn apply_transforms_to_expression_with_shadowed(
                 // Also handle legacy mode each item mutation: append $.invalidate_inner_signals()
                 if let JsExpr::Identifier(name) = &base_object
                     && !local_scope.contains(name)
-                    && context.state.each_item_names.contains(name)
+                    && let Some((each_ctx, destructured_path)) =
+                        find_each_binding_context(&context.state.each_binding_context, name)
+                            .map(|(each_ctx, path)| (each_ctx.clone(), path.map(str::to_owned)))
                 {
-                    context.state.each_item_assign_or_mutate.set(true);
+                    if destructured_path.is_none() {
+                        mark_each_item_assigned_or_mutated(&context.state, name);
+                    }
 
                     // In legacy mode, wrap the mutation with $.invalidate_inner_signals()
                     // This mirrors the official compiler's `mutate` transform on each items:
@@ -991,16 +1250,7 @@ pub fn apply_transforms_to_expression_with_shadowed(
                     //     uses_index = true;
                     //     return b.sequence([mutation, ...sequence]);
                     //   }
-                    if !context.state.analysis.runes
-                        && let Some(each_ctx) = context
-                            .state
-                            .each_binding_context
-                            .iter()
-                            .rev()
-                            .find(|ctx| ctx.item_name == *name)
-                            .cloned()
-                        && !each_ctx.invalidation_exprs.is_empty()
-                    {
+                    if destructured_path.is_some() || !context.state.analysis.runes {
                         // Transform the full assignment (apply read transforms to both sides)
                         let transformed_left = recurse!(context.arena.get_expr(assign.left));
                         let transformed_right = recurse!(context.arena.get_expr(assign.right));
@@ -1010,21 +1260,7 @@ pub fn apply_transforms_to_expression_with_shadowed(
                             right: context.arena.alloc_expr(transformed_right),
                         });
 
-                        let invalidation_exprs = each_ctx.invalidation_exprs.clone();
-                        let mut seq_exprs = vec![mutation];
-                        let invalidate_inner =
-                            build_invalidate_inner_signals(&invalidation_exprs, &context.arena);
-                        seq_exprs.push(invalidate_inner);
-
-                        if let Some(ref store_name) = each_ctx.store_to_invalidate {
-                            seq_exprs.push(b::call(
-                                &context.arena,
-                                b::member_path(&context.arena, "$.invalidate_store"),
-                                vec![b::id("$$stores"), b::string(store_name)],
-                            ));
-                        }
-
-                        return b::sequence(seq_exprs);
+                        return append_each_invalidation(&each_ctx, mutation, &context.arena);
                     }
                 }
 
@@ -1085,13 +1321,18 @@ pub fn apply_transforms_to_expression_with_shadowed(
                         // the base read transform is applied.
                         // e.g., `selected[0] = $$value` -> `selected(selected()[0] = $$value, true)`
                         // e.g., `handler.value = log_b` -> `$$_import_handler($$_import_handler().value = log_b)`
-                        context
-                            .arena
-                            .alloc_expr(recurse!(context.arena.get_expr(assign.left)))
+                        context.arena.alloc_expr(recurse!(context.arena.get_expr(assign.left)))
                     } else if is_store_sub {
-                        // Store subscriptions: keep original left side for store_sub_mutate to handle
-                        // Recursing would turn `$store` into `$store()` which is wrong
-                        assign.left
+                        // Store subscriptions: preserve the root for store_sub_mutate, but
+                        // still transform reactive reads inside computed property indices.
+                        // e.g. `$values[$key]` must become
+                        // `$.untrack($values)[$key()] = value`, not
+                        // `$.untrack($values)[$key] = value`.
+                        context.arena.alloc_expr(transform_computed_indices_only(
+                            context.arena.get_expr(assign.left),
+                            context,
+                            local_scope,
+                        ))
                     } else {
                         // State/mutable source bindings: transform computed property indices
                         // so that reactive each-item variables inside brackets get $.get() wrappers.
@@ -1121,31 +1362,11 @@ pub fn apply_transforms_to_expression_with_shadowed(
                         JsExpr::Identifier(name.clone())
                     };
 
-                    let mutated = mutate_fn(&context.arena, mutate_target, full_assignment);
+                    let mutated =
+                        mutate_fn(transform, &context.arena, mutate_target, full_assignment);
 
-                    // For store subscriptions, the store *source* (first arg of
-                    // `$.store_mutate`) is read through its own binding's transform —
-                    // a prop reads as the getter call `store()`, a state /
-                    // mutable_source as `$.get(store)` — mirroring upstream's
-                    // `get_store()` = `context.visit(b.id(store_name))`. The
-                    // context-free `store_sub_mutate` emits the bare name, so apply
-                    // the transform here where `context` is available.
                     if is_store_sub {
-                        return match mutated {
-                            JsExpr::Call(mut call) => {
-                                let store_name =
-                                    name.as_str().strip_prefix('$').unwrap_or(name.as_str());
-                                if let Some(first) = call.arguments.first_mut()
-                                    && let Some(store_transform) =
-                                        context.state.transform.get(store_name)
-                                    && let Some(read_fn) = store_transform.read
-                                {
-                                    *first = read_fn(&context.arena, b::id(store_name));
-                                }
-                                JsExpr::Call(call)
-                            }
-                            other => other,
-                        };
+                        return resolve_store_source_arg(mutated, name.as_str(), context);
                     }
 
                     return mutated;
@@ -1190,12 +1411,18 @@ pub fn apply_transforms_to_expression_with_shadowed(
         }
 
         JsExpr::Sequence(seq) => {
+            // JavaScript source cannot contain a one-element SequenceExpression;
+            // this shape is synthesized by transforms such as the each-item
+            // mutation path. Its child has already been transformed, so walking
+            // it again would wrap the same mutation in another sequence.
+            if seq.expressions.len() == 1 {
+                return JsExpr::Sequence(seq.clone());
+            }
+
             let transformed_exprs: Vec<JsExpr> =
                 seq.expressions.iter().map(|e| recurse!(e)).collect();
 
-            JsExpr::Sequence(JsSequenceExpression {
-                expressions: transformed_exprs,
-            })
+            JsExpr::Sequence(JsSequenceExpression { expressions: transformed_exprs })
         }
 
         JsExpr::New(new_expr) => {
@@ -1215,11 +1442,10 @@ pub fn apply_transforms_to_expression_with_shadowed(
         }
 
         JsExpr::Yield(yield_expr) => {
-            let transformed_arg = yield_expr.argument.as_ref().map(|arg| {
-                context
-                    .arena
-                    .alloc_expr(recurse!(context.arena.get_expr(*arg)))
-            });
+            let transformed_arg = yield_expr
+                .argument
+                .as_ref()
+                .map(|arg| context.arena.alloc_expr(recurse!(context.arena.get_expr(*arg))));
 
             JsExpr::Yield(JsYieldExpression {
                 argument: transformed_arg,
@@ -1235,12 +1461,14 @@ pub fn apply_transforms_to_expression_with_shadowed(
         JsExpr::Update(update) => {
             // For update expressions, check if the argument has an update transform
             // Skip if the identifier is in local scope
-            if let JsExpr::Identifier(name) = context.arena.get_expr(update.argument)
+            if let JsExpr::Identifier(name) =
+                unspanned_expr(context.arena.get_expr(update.argument), &context.arena)
                 && !local_scope.contains(name)
                 && let Some(transform) = context.state.transform.get(name.as_str())
                 && let Some(update_fn) = transform.update
             {
                 return update_fn(
+                    transform,
                     &context.arena,
                     update.operator,
                     JsExpr::Identifier(name.clone()),
@@ -1249,44 +1477,38 @@ pub fn apply_transforms_to_expression_with_shadowed(
             }
 
             // Track each item update (++ or --) for uses_index detection.
-            // For reassigned each items in legacy mode, transform `n++` into
-            // `collection[$$index]++, $.invalidate_inner_signals(() => collection)`
+            // Identifier contexts update collection[$$index] in legacy mode and force the
+            // callback index; destructured contexts update their path into $$item.
             // This mirrors the official Svelte compiler's `mutate` transform on each items:
             //   mutate: (_, mutation) => {
             //     uses_index = true;
             //     return b.sequence([mutation, ...sequence]);
             //   }
-            if let JsExpr::Identifier(name) = context.arena.get_expr(update.argument)
+            if let JsExpr::Identifier(name) =
+                unspanned_expr(context.arena.get_expr(update.argument), &context.arena)
                 && !local_scope.contains(name)
-                && context.state.each_item_names.contains(name)
+                && let Some((each_ctx, destructured_path)) =
+                    find_each_binding_context(&context.state.each_binding_context, name)
+                        .map(|(each_ctx, path)| (each_ctx.clone(), path.map(str::to_owned)))
+                && destructured_path.as_deref().is_none_or(is_writable_destructured_path)
             {
-                context.state.each_item_assign_or_mutate.set(true);
+                if destructured_path.is_none() {
+                    mark_each_item_assigned_or_mutated(&context.state, name);
+                }
 
                 // For reassigned each items in legacy mode, we need to transform `n++` to
                 // `collection[$$index]++, $.invalidate_inner_signals(() => collection)`
-                if !context.state.analysis.runes
-                    && let Some(binding) = context.state.get_binding(name)
-                    && binding.reassigned
-                    && let Some(each_ctx) = context.state.each_binding_context.last()
-                    && each_ctx.item_name == *name
+                if destructured_path.is_some()
+                    || (!context.state.analysis.runes && each_ctx.item_reassigned)
                 {
-                    let collection_access = build_reassigned_item_read(each_ctx, &context.arena);
-                    let update_expr = b::update(
-                        &context.arena,
-                        update.operator,
-                        collection_access,
-                        update.prefix,
+                    let update_target = destructured_path.as_deref().map_or_else(
+                        || build_reassigned_item_read(&each_ctx, &context.arena),
+                        b::raw,
                     );
+                    let update_expr =
+                        b::update(&context.arena, update.operator, update_target, update.prefix);
 
-                    // Build the invalidation sequence expressions
-                    let invalidation_exprs = each_ctx.invalidation_exprs.clone();
-                    let mut seq_exprs = vec![update_expr];
-                    if !invalidation_exprs.is_empty() {
-                        let invalidate_inner =
-                            build_invalidate_inner_signals(&invalidation_exprs, &context.arena);
-                        seq_exprs.push(invalidate_inner);
-                    }
-                    return b::sequence(seq_exprs);
+                    return append_each_invalidation(&each_ctx, update_expr, &context.arena);
                 }
             }
 
@@ -1296,7 +1518,9 @@ pub fn apply_transforms_to_expression_with_shadowed(
             // - Store subscriptions: $store[0].value++ -> $.store_mutate(...)
             // - Legacy state: name.value++ -> $.mutate(name, $.get(name).value++)
             // - Runes state: name.value++ -> $.get(name).value++
-            if let JsExpr::Member(_) = context.arena.get_expr(update.argument) {
+            if let JsExpr::Member(_) =
+                unspanned_expr(context.arena.get_expr(update.argument), &context.arena)
+            {
                 let base_object =
                     get_base_object(context.arena.get_expr(update.argument), &context.arena);
 
@@ -1304,21 +1528,16 @@ pub fn apply_transforms_to_expression_with_shadowed(
                 // Also handle legacy mode each item mutation: append $.invalidate_inner_signals()
                 if let JsExpr::Identifier(name) = &base_object
                     && !local_scope.contains(name)
-                    && context.state.each_item_names.contains(name)
+                    && let Some((each_ctx, destructured_path)) =
+                        find_each_binding_context(&context.state.each_binding_context, name)
+                            .map(|(each_ctx, path)| (each_ctx.clone(), path.map(str::to_owned)))
                 {
-                    context.state.each_item_assign_or_mutate.set(true);
+                    if destructured_path.is_none() {
+                        mark_each_item_assigned_or_mutated(&context.state, name);
+                    }
 
                     // In legacy mode, wrap the update with $.invalidate_inner_signals()
-                    if !context.state.analysis.runes
-                        && let Some(each_ctx) = context
-                            .state
-                            .each_binding_context
-                            .iter()
-                            .rev()
-                            .find(|ctx| ctx.item_name == *name)
-                            .cloned()
-                        && !each_ctx.invalidation_exprs.is_empty()
-                    {
+                    if destructured_path.is_some() || !context.state.analysis.runes {
                         // Transform the update expression (apply read transforms)
                         let transformed_arg = recurse!(context.arena.get_expr(update.argument));
                         let mutation = JsExpr::Update(JsUpdateExpression {
@@ -1327,21 +1546,7 @@ pub fn apply_transforms_to_expression_with_shadowed(
                             prefix: update.prefix,
                         });
 
-                        let invalidation_exprs = each_ctx.invalidation_exprs.clone();
-                        let mut seq_exprs = vec![mutation];
-                        let invalidate_inner =
-                            build_invalidate_inner_signals(&invalidation_exprs, &context.arena);
-                        seq_exprs.push(invalidate_inner);
-
-                        if let Some(ref store_name) = each_ctx.store_to_invalidate {
-                            seq_exprs.push(b::call(
-                                &context.arena,
-                                b::member_path(&context.arena, "$.invalidate_store"),
-                                vec![b::id("$$stores"), b::string(store_name)],
-                            ));
-                        }
-
-                        return b::sequence(seq_exprs);
+                        return append_each_invalidation(&each_ctx, mutation, &context.arena);
                     }
                 }
 
@@ -1372,7 +1577,7 @@ pub fn apply_transforms_to_expression_with_shadowed(
                         JsExpr::Identifier(name.clone())
                     };
 
-                    return mutate_fn(&context.arena, mutate_target, full_update);
+                    return mutate_fn(transform, &context.arena, mutate_target, full_update);
                 }
             }
 
@@ -1399,12 +1604,8 @@ pub fn apply_transforms_to_expression_with_shadowed(
         JsExpr::TaggedTemplate(tagged) => {
             // Transform both the tag and the expressions in the quasi
             let transformed_tag = recurse!(context.arena.get_expr(tagged.tag));
-            let transformed_exprs: Vec<JsExpr> = tagged
-                .quasi
-                .expressions
-                .iter()
-                .map(|e| recurse!(e))
-                .collect();
+            let transformed_exprs: Vec<JsExpr> =
+                tagged.quasi.expressions.iter().map(|e| recurse!(e)).collect();
 
             JsExpr::TaggedTemplate(JsTaggedTemplate {
                 tag: context.arena.alloc_expr(transformed_tag),
@@ -1415,7 +1616,37 @@ pub fn apply_transforms_to_expression_with_shadowed(
             })
         }
 
-        // Expressions that don't need transformation
+        JsExpr::Class(class) => {
+            // The class binding name is in scope inside its own body.
+            let mut class_scope = local_scope.clone();
+            if let Some(id) = &class.id {
+                class_scope.add_shadowed(id.to_string());
+            }
+            JsExpr::Class(JsClassExpression {
+                id: class.id.clone(),
+                super_class: class.super_class.map(|sc| {
+                    context.arena.alloc_expr(apply_transforms_to_expression_with_shadowed(
+                        context.arena.get_expr(sc),
+                        context,
+                        &class_scope,
+                    ))
+                }),
+                body: JsClassBody {
+                    body: class
+                        .body
+                        .body
+                        .iter()
+                        .map(|member| {
+                            apply_transforms_to_class_member(member, context, &class_scope)
+                        })
+                        .collect(),
+                },
+            })
+        }
+
+        // Expressions that don't need transformation. `Chain` and `Void` are only
+        // ever synthesized by the builders around already-transformed subtrees,
+        // never produced from user source, so recursing would transform twice.
         JsExpr::Literal(_)
         | JsExpr::This
         | JsExpr::Super
@@ -1423,7 +1654,6 @@ pub fn apply_transforms_to_expression_with_shadowed(
         | JsExpr::ImportExpression { .. }
         | JsExpr::Raw(_)
         | JsExpr::OpaqueIdentifier(_)
-        | JsExpr::Class(_)
         | JsExpr::Chain(_)
         | JsExpr::Void(_) => expr.clone(),
 
@@ -1435,6 +1665,17 @@ pub fn apply_transforms_to_expression_with_shadowed(
                 local_scope,
             );
             JsExpr::Spanned(context.arena.alloc_expr(transformed), *start, *end)
+        }
+
+        JsExpr::SourceAnchored(anchor) => {
+            let transformed = apply_transforms_to_expression_with_shadowed(
+                context.arena.get_expr(anchor.inner),
+                context,
+                local_scope,
+            );
+            let mut anchor = anchor.clone();
+            anchor.inner = context.arena.alloc_expr(transformed);
+            JsExpr::SourceAnchored(anchor)
         }
     }
 }
@@ -1463,7 +1704,8 @@ fn classify_svelte_runtime_callee(
     if let JsExpr::Member(member) = callee
         && let JsExpr::Identifier(obj_name) = arena.get_expr(member.object)
         && obj_name == "$"
-        && let JsMemberProperty::Identifier(prop_name) = &member.property
+        && let JsMemberProperty::Identifier(prop_name)
+        | JsMemberProperty::SpannedIdentifier { name: prop_name, .. } = &member.property
     {
         return match prop_name.as_str() {
             "set" | "update" | "update_pre" | "get" | "safe_get" | "mutate" | "update_prop"
@@ -1488,32 +1730,20 @@ fn classify_svelte_runtime_callee(
 ///   );
 /// }
 /// ```
-fn build_reassigned_item_read(
+pub(crate) fn build_reassigned_item_read(
     each_ctx: &crate::compiler::phases::phase3_transform::client::types::EachBindingContext,
     arena: &crate::compiler::phases::phase3_transform::js_ast::arena::JsArena,
 ) -> JsExpr {
-    // Build the collection expression (either $$array() or the collection itself)
-    let collection_expr = if let Some(ref coll_id) = each_ctx.collection_id {
-        // Computed: $$array()
-        b::call(arena, b::id(coll_id), vec![])
-    } else {
-        // Raw collection expression string (already has transforms applied, e.g., $.get(arr))
-        JsExpr::Raw(each_ctx.collection_expr.clone().into())
-    };
-
     // Build the index expression (either $.get($$index) for reactive or just $$index)
     let index_expr = if each_ctx.index_reactive {
-        b::call(
-            arena,
-            b::member_path(arena, "$.get"),
-            vec![b::id(&each_ctx.index_name)],
-        )
+        b::call(arena, b::member_path(arena, "$.get"), vec![b::id(&each_ctx.index_name)])
     } else {
         b::id(&each_ctx.index_name)
     };
 
     // Build the computed member expression: collection[index]
-    b::member_computed(arena, collection_expr, index_expr)
+    let collection = b::close_optional_chain(arena, each_ctx.collection_expr.clone());
+    b::member_computed(arena, collection, index_expr)
 }
 
 /// Build a `$.invalidate_inner_signals(() => (expr1, expr2, ...))` call.
@@ -1524,10 +1754,8 @@ fn build_invalidate_inner_signals(
     invalidation_exprs: &[String],
     arena: &crate::compiler::phases::phase3_transform::js_ast::arena::JsArena,
 ) -> JsExpr {
-    let exprs: Vec<JsExpr> = invalidation_exprs
-        .iter()
-        .map(|s| JsExpr::Raw(s.clone().into()))
-        .collect();
+    let exprs: Vec<JsExpr> =
+        invalidation_exprs.iter().map(|s| JsExpr::Raw(s.clone().into())).collect();
 
     // Always wrap in sequence parens, even for a single expression.
     // The official compiler always produces `() => (expr)` not `() => expr`.
@@ -1550,10 +1778,21 @@ fn get_base_object(
     arena: &crate::compiler::phases::phase3_transform::js_ast::arena::JsArena,
 ) -> JsExpr {
     match expr {
+        JsExpr::Spanned(inner, _, _) => get_base_object(arena.get_expr(*inner), arena),
         JsExpr::Member(member) => get_base_object(arena.get_expr(member.object), arena),
         JsExpr::Call(call) => get_base_object(arena.get_expr(call.callee), arena),
         _ => expr.clone(),
     }
+}
+
+fn unspanned_expr<'a>(
+    mut expr: &'a JsExpr,
+    arena: &'a crate::compiler::phases::phase3_transform::js_ast::arena::JsArena,
+) -> &'a JsExpr {
+    while let JsExpr::Spanned(inner, _, _) = expr {
+        expr = arena.get_expr(*inner);
+    }
+    expr
 }
 
 /// Check if the chain from the expression to its base Identifier goes through
@@ -1626,6 +1865,84 @@ fn transform_computed_indices_only(
     }
 }
 
+/// Apply transforms to a class member (field initializer, method, static block).
+fn apply_transforms_to_class_member(
+    member: &JsClassMember,
+    context: &ComponentContext,
+    local_scope: &LocalScope,
+) -> JsClassMember {
+    let transform_key = |key: &JsPropertyKey, computed: bool| match key {
+        JsPropertyKey::Computed(key_expr) if computed => JsPropertyKey::Computed(
+            context.arena.alloc_expr(apply_transforms_to_expression_with_shadowed(
+                context.arena.get_expr(*key_expr),
+                context,
+                local_scope,
+            )),
+        ),
+        other => other.clone(),
+    };
+
+    match member {
+        JsClassMember::Method(method) => {
+            let mut method_scope = local_scope.clone();
+            for param in &method.value.params {
+                extract_pattern_names_to_scope(param, &mut method_scope);
+            }
+            register_block_local_vars(&method.value.body.body, &context.arena, &mut method_scope);
+            JsClassMember::Method(JsMethodDefinition {
+                key: transform_key(&method.key, method.computed),
+                value: JsFunctionExpression {
+                    id: method.value.id.clone(),
+                    params: method.value.params.clone(),
+                    body: JsBlockStatement::with_body(
+                        method
+                            .value
+                            .body
+                            .body
+                            .iter()
+                            .map(|s| {
+                                apply_transforms_to_statement_with_shadowed(
+                                    s,
+                                    context,
+                                    &method_scope,
+                                )
+                            })
+                            .collect(),
+                    ),
+                    is_async: method.value.is_async,
+                    is_generator: method.value.is_generator,
+                },
+                kind: method.kind,
+                computed: method.computed,
+                is_static: method.is_static,
+            })
+        }
+        JsClassMember::Property(prop) => JsClassMember::Property(JsPropertyDefinition {
+            key: transform_key(&prop.key, prop.computed),
+            value: prop.value.map(|v| {
+                context.arena.alloc_expr(apply_transforms_to_expression_with_shadowed(
+                    context.arena.get_expr(v),
+                    context,
+                    local_scope,
+                ))
+            }),
+            computed: prop.computed,
+            is_static: prop.is_static,
+        }),
+        JsClassMember::StaticBlock(block) => {
+            let mut block_scope = local_scope.clone();
+            register_block_local_vars(&block.body, &context.arena, &mut block_scope);
+            JsClassMember::StaticBlock(JsBlockStatement::with_body(
+                block
+                    .body
+                    .iter()
+                    .map(|s| apply_transforms_to_statement_with_shadowed(s, context, &block_scope))
+                    .collect(),
+            ))
+        }
+    }
+}
+
 /// Apply transforms to a statement recursively with local scope tracking.
 fn apply_transforms_to_statement_with_shadowed(
     stmt: &JsStatement,
@@ -1645,14 +1962,13 @@ fn apply_transforms_to_statement_with_shadowed(
             expression: context
                 .arena
                 .alloc_expr(transform_expr(context.arena.get_expr(expr_stmt.expression))),
+            comment_anchor: expr_stmt.comment_anchor,
         }),
 
         JsStatement::Return(ret_stmt) => JsStatement::Return(JsReturnStatement {
-            argument: ret_stmt.argument.map(|arg| {
-                context
-                    .arena
-                    .alloc_expr(transform_expr(context.arena.get_expr(arg)))
-            }),
+            argument: ret_stmt
+                .argument
+                .map(|arg| context.arena.alloc_expr(transform_expr(context.arena.get_expr(arg)))),
         }),
 
         JsStatement::VariableDeclaration(var_decl) => {
@@ -1662,10 +1978,9 @@ fn apply_transforms_to_statement_with_shadowed(
                 .map(|decl| JsVariableDeclarator {
                     id: decl.id.clone(),
                     init: decl.init.map(|init| {
-                        context
-                            .arena
-                            .alloc_expr(transform_expr(context.arena.get_expr(init)))
+                        context.arena.alloc_expr(transform_expr(context.arena.get_expr(init)))
                     }),
+                    comment_anchor: None,
                 })
                 .collect();
 
@@ -1676,9 +1991,7 @@ fn apply_transforms_to_statement_with_shadowed(
         }
 
         JsStatement::If(if_stmt) => JsStatement::If(JsIfStatement {
-            test: context
-                .arena
-                .alloc_expr(transform_expr(context.arena.get_expr(if_stmt.test))),
+            test: context.arena.alloc_expr(transform_expr(context.arena.get_expr(if_stmt.test))),
             consequent: {
                 let s = context.arena.get_stmt(if_stmt.consequent).clone();
                 context.arena.alloc_stmt(transform_stmt(&s))
@@ -1700,9 +2013,7 @@ fn apply_transforms_to_statement_with_shadowed(
                 .iter()
                 .map(|s| apply_transforms_to_statement_with_shadowed(s, context, &block_scope))
                 .collect();
-            JsStatement::Block(JsBlockStatement {
-                body: transformed_body,
-            })
+            JsStatement::Block(JsBlockStatement::with_body(transformed_body))
         }
 
         JsStatement::For(for_stmt) => {
@@ -1743,6 +2054,7 @@ fn apply_transforms_to_statement_with_shadowed(
                                     ),
                                 )
                             }),
+                            comment_anchor: None,
                         })
                         .collect();
                     JsForInit::Variable(JsVariableDeclaration {
@@ -1759,30 +2071,24 @@ fn apply_transforms_to_statement_with_shadowed(
                 )),
             });
             let transformed_test = for_stmt.test.map(|t| {
-                context
-                    .arena
-                    .alloc_expr(apply_transforms_to_expression_with_shadowed(
-                        context.arena.get_expr(t),
-                        context,
-                        &for_scope,
-                    ))
+                context.arena.alloc_expr(apply_transforms_to_expression_with_shadowed(
+                    context.arena.get_expr(t),
+                    context,
+                    &for_scope,
+                ))
             });
             let transformed_update = for_stmt.update.map(|u| {
-                context
-                    .arena
-                    .alloc_expr(apply_transforms_to_expression_with_shadowed(
-                        context.arena.get_expr(u),
-                        context,
-                        &for_scope,
-                    ))
+                context.arena.alloc_expr(apply_transforms_to_expression_with_shadowed(
+                    context.arena.get_expr(u),
+                    context,
+                    &for_scope,
+                ))
             });
             let transformed_body = {
                 let s = context.arena.get_stmt(for_stmt.body).clone();
-                context
-                    .arena
-                    .alloc_stmt(apply_transforms_to_statement_with_shadowed(
-                        &s, context, &for_scope,
-                    ))
+                context.arena.alloc_stmt(apply_transforms_to_statement_with_shadowed(
+                    &s, context, &for_scope,
+                ))
             };
             JsStatement::For(JsForStatement {
                 init: transformed_init,
@@ -1792,10 +2098,46 @@ fn apply_transforms_to_statement_with_shadowed(
             })
         }
 
+        JsStatement::Switch(switch_stmt) => {
+            // All cases share one lexical scope, so `let`/`const` declared in any
+            // consequent shadows outer transforms for the whole switch body.
+            let mut switch_scope = local_scope.clone();
+            for case in &switch_stmt.cases {
+                register_block_local_vars(&case.consequent, &context.arena, &mut switch_scope);
+            }
+            let transform_in_switch = |e: &JsExpr| {
+                apply_transforms_to_expression_with_shadowed(e, context, &switch_scope)
+            };
+            JsStatement::Switch(JsSwitchStatement {
+                // The discriminant is evaluated in the enclosing scope.
+                discriminant: context
+                    .arena
+                    .alloc_expr(transform_expr(context.arena.get_expr(switch_stmt.discriminant))),
+                cases: switch_stmt
+                    .cases
+                    .iter()
+                    .map(|case| JsSwitchCase {
+                        test: case.test.map(|t| {
+                            context.arena.alloc_expr(transform_in_switch(context.arena.get_expr(t)))
+                        }),
+                        consequent: case
+                            .consequent
+                            .iter()
+                            .map(|s| {
+                                apply_transforms_to_statement_with_shadowed(
+                                    s,
+                                    context,
+                                    &switch_scope,
+                                )
+                            })
+                            .collect(),
+                    })
+                    .collect(),
+            })
+        }
+
         JsStatement::While(while_stmt) => JsStatement::While(JsWhileStatement {
-            test: context
-                .arena
-                .alloc_expr(transform_expr(context.arena.get_expr(while_stmt.test))),
+            test: context.arena.alloc_expr(transform_expr(context.arena.get_expr(while_stmt.test))),
             body: {
                 let s = context.arena.get_stmt(while_stmt.body).clone();
                 context.arena.alloc_stmt(transform_stmt(&s))
@@ -1807,21 +2149,17 @@ fn apply_transforms_to_statement_with_shadowed(
                 let s = context.arena.get_stmt(do_while.body).clone();
                 context.arena.alloc_stmt(transform_stmt(&s))
             },
-            test: context
-                .arena
-                .alloc_expr(transform_expr(context.arena.get_expr(do_while.test))),
+            test: context.arena.alloc_expr(transform_expr(context.arena.get_expr(do_while.test))),
         }),
 
         JsStatement::Throw(expr_id) => JsStatement::Throw(
-            context
-                .arena
-                .alloc_expr(transform_expr(context.arena.get_expr(*expr_id))),
+            context.arena.alloc_expr(transform_expr(context.arena.get_expr(*expr_id))),
         ),
 
         JsStatement::Try(try_stmt) => {
-            let transformed_block = JsBlockStatement {
-                body: try_stmt.block.body.iter().map(transform_stmt).collect(),
-            };
+            let transformed_block = JsBlockStatement::with_body(
+                try_stmt.block.body.iter().map(transform_stmt).collect(),
+            );
             let transformed_handler = try_stmt.handler.as_ref().map(|handler| {
                 // The catch parameter shadows outer transforms
                 let mut catch_scope = local_scope.clone();
@@ -1830,8 +2168,8 @@ fn apply_transforms_to_statement_with_shadowed(
                 }
                 JsCatchClause {
                     param: handler.param.clone(),
-                    body: JsBlockStatement {
-                        body: handler
+                    body: JsBlockStatement::with_body(
+                        handler
                             .body
                             .body
                             .iter()
@@ -1843,16 +2181,12 @@ fn apply_transforms_to_statement_with_shadowed(
                                 )
                             })
                             .collect(),
-                    },
+                    ),
                 }
             });
-            let transformed_finalizer =
-                try_stmt
-                    .finalizer
-                    .as_ref()
-                    .map(|finalizer| JsBlockStatement {
-                        body: finalizer.body.iter().map(transform_stmt).collect(),
-                    });
+            let transformed_finalizer = try_stmt.finalizer.as_ref().map(|finalizer| {
+                JsBlockStatement::with_body(finalizer.body.iter().map(transform_stmt).collect())
+            });
             JsStatement::Try(JsTryStatement {
                 block: transformed_block,
                 handler: transformed_handler,
@@ -1873,18 +2207,15 @@ fn apply_transforms_to_statement_with_shadowed(
                     extract_pattern_names_to_scope(pat, &mut for_of_scope);
                 }
             }
-            let transformed_right = context
-                .arena
-                .alloc_expr(transform_expr(context.arena.get_expr(for_of.right)));
+            let transformed_right =
+                context.arena.alloc_expr(transform_expr(context.arena.get_expr(for_of.right)));
             let transformed_body = {
                 let s = context.arena.get_stmt(for_of.body).clone();
-                context
-                    .arena
-                    .alloc_stmt(apply_transforms_to_statement_with_shadowed(
-                        &s,
-                        context,
-                        &for_of_scope,
-                    ))
+                context.arena.alloc_stmt(apply_transforms_to_statement_with_shadowed(
+                    &s,
+                    context,
+                    &for_of_scope,
+                ))
             };
             JsStatement::ForOf(JsForOfStatement {
                 left: for_of.left.clone(),
@@ -1914,14 +2245,14 @@ fn apply_transforms_to_statement_with_shadowed(
                 func_scope.vars.insert(id.to_string(), None);
             }
             register_block_local_vars(&func_decl.body.body, &context.arena, &mut func_scope);
-            let transformed_body = JsBlockStatement {
-                body: func_decl
+            let transformed_body = JsBlockStatement::with_body(
+                func_decl
                     .body
                     .body
                     .iter()
                     .map(|s| apply_transforms_to_statement_with_shadowed(s, context, &func_scope))
                     .collect(),
-            };
+            );
             JsStatement::FunctionDeclaration(JsFunctionDeclaration {
                 id: func_decl.id.clone(),
                 params: func_decl.params.clone(),
@@ -2013,11 +2344,8 @@ pub fn build_expression(
     // sequence.expressions.push(b.call('$.untrack', b.thunk(value)));
     // return sequence;
     let thunk = b::thunk(&context.arena, value.clone());
-    let untracked = b::call(
-        &context.arena,
-        b::member_path(&context.arena, "$.untrack"),
-        vec![thunk],
-    );
+    let untracked =
+        b::call(&context.arena, b::member_path(&context.arena, "$.untrack"), vec![thunk]);
 
     // Add the untracked value as the last expression in the sequence
     sequence_exprs.push(untracked);
@@ -2064,27 +2392,6 @@ fn collect_reactive_references_from_metadata(
 
         let name = &binding.name;
 
-        // Store dependency: a reactive expression that references a store value
-        // (e.g. `$view`, or a `$.store_set(view, …)` write) depends on the store's
-        // subscribed value, read via the generated `$name()` getter — NOT
-        // `$.deep_read_state(name)` (which would deep-read the store object). The
-        // `$:` dependency builder already does this (reactive_transforms.rs); mirror
-        // it here for attribute/derived dependency lists. Detected by the presence
-        // of a synthesized `$name` StoreSub binding.
-        if binding.kind != BindingKind::StoreSub {
-            let store_getter = format!("${name}");
-            let is_store = context
-                .state
-                .scope_root
-                .bindings
-                .iter()
-                .any(|b| b.kind == BindingKind::StoreSub && b.name == store_getter);
-            if is_store {
-                getters.push(b::call(&context.arena, b::id(&store_getter), vec![]));
-                continue;
-            }
-        }
-
         // For reassigned each-block items in legacy mode, the dependency getter
         // should use collection[$$index] instead of $.get(item).
         if !context.state.analysis.runes
@@ -2092,6 +2399,7 @@ fn collect_reactive_references_from_metadata(
                 .state
                 .each_binding_context
                 .iter()
+                .rev()
                 .find(|ctx| ctx.item_name == *name && ctx.item_reassigned)
         {
             let reassigned_read = build_reassigned_item_read(each_ctx, &context.arena);
@@ -2099,13 +2407,31 @@ fn collect_reactive_references_from_metadata(
             continue;
         }
 
+        let declaration_start = binding.declaration_start.or_else(|| {
+            binding
+                .references
+                .iter()
+                .find(|reference| reference.is_self_declaration)
+                .map(|reference| reference.start)
+        });
+        let span_declaration_identifier = |identifier: JsExpr| match declaration_start {
+            Some(start) => JsExpr::Spanned(
+                context.arena.alloc_expr(identifier),
+                start,
+                start.saturating_add(name.len() as u32),
+            ),
+            None => identifier,
+        };
+
         // Build the getter by applying the read transform if one exists
-        // (mirrors build_getter in the official compiler)
+        // (mirrors build_getter in the official compiler). The source location
+        // belongs to the identifier passed to the transform, not the call or
+        // member expression the transform builds around it.
         let getter = if let Some(transform) = context.state.transform.get(name.as_str()) {
             if let Some(ref read_source) = transform.read_source {
                 // read_source is set for destructured @const and let directive bindings.
                 // The getter should be $.get(read_source).name instead of $.get(name).
-                b::member(
+                span_declaration_identifier(b::member(
                     &context.arena,
                     b::call(
                         &context.arena,
@@ -2113,20 +2439,20 @@ fn collect_reactive_references_from_metadata(
                         vec![b::id(read_source)],
                     ),
                     name,
-                )
+                ))
             } else if let Some(read_fn) = transform.read {
                 let input_id = if let Some(ref replacement) = transform.replacement_id {
                     JsExpr::Identifier(replacement.clone().into())
                 } else {
                     JsExpr::Identifier(name.clone().into())
                 };
-                read_fn(&context.arena, input_id)
+                read_fn(&context.arena, span_declaration_identifier(input_id))
             } else {
-                JsExpr::Identifier(name.clone().into())
+                span_declaration_identifier(JsExpr::Identifier(name.clone().into()))
             }
         } else {
             // No transform registered (e.g., imports) - use the identifier directly
-            JsExpr::Identifier(name.clone().into())
+            span_declaration_identifier(JsExpr::Identifier(name.clone().into()))
         };
 
         // Check if we need to wrap in $.deep_read_state()
@@ -2139,15 +2465,9 @@ fn collect_reactive_references_from_metadata(
         // while non-keyed have kind 'static'. Our Rust code uses EachIndex for both.
         // We distinguish by checking if a read transform was registered: keyed (reactive)
         // indices have a $.get() read transform, non-keyed (static) indices don't.
-        let has_read_transform = context
-            .state
-            .transform
-            .get(name.as_str())
-            .is_some_and(|t| t.read.is_some());
-        let deep_read_marked = context
-            .state
-            .transform_deep_read
-            .contains_key(name.as_str());
+        let has_read_transform =
+            context.state.transform.get(name.as_str()).is_some_and(|t| t.read.is_some());
+        let deep_read_marked = context.state.transform_deep_read.contains_key(name.as_str());
         let needs_deep_read = if name == "$$props" || name == "$$restProps" || deep_read_marked {
             true
         } else {
@@ -2277,26 +2597,6 @@ fn collect_reactive_references_inner(
 
             seen.insert(name.to_string());
 
-            // Store dependency: a referenced store value depends on the store's
-            // subscribed value, read via the generated `$name()` getter — not
-            // `$.deep_read_state(name)`. Mirrors the metadata-based builder and the
-            // `$:` dependency builder. Detected by a synthesized `$name` StoreSub
-            // binding.
-            {
-                use crate::compiler::phases::phase2_analyze::scope::BindingKind;
-                let store_getter = format!("${name}");
-                let is_store = context
-                    .state
-                    .scope_root
-                    .bindings
-                    .iter()
-                    .any(|b| b.kind == BindingKind::StoreSub && b.name == store_getter);
-                if is_store {
-                    getters.push(b::call(&context.arena, b::id(&store_getter), vec![]));
-                    return;
-                }
-            }
-
             // For reassigned each-block items in legacy mode, the dependency getter
             // should use collection[$$index] instead of $.get(item).
             // Use each_binding_context.item_reassigned (not binding_info.reassigned) because
@@ -2308,6 +2608,7 @@ fn collect_reactive_references_inner(
                     .state
                     .each_binding_context
                     .iter()
+                    .rev()
                     .find(|ctx| ctx.item_name == *name && ctx.item_reassigned)
             {
                 let reassigned_read = build_reassigned_item_read(each_ctx, &context.arena);
@@ -2315,18 +2616,34 @@ fn collect_reactive_references_inner(
                 return;
             }
 
+            let declaration_start = binding_info.and_then(|binding| {
+                binding.declaration_start.or_else(|| {
+                    binding
+                        .references
+                        .iter()
+                        .find(|reference| reference.is_self_declaration)
+                        .map(|reference| reference.start)
+                })
+            });
+            let span_declaration_identifier = |identifier: JsExpr| match declaration_start {
+                Some(start) => JsExpr::Spanned(
+                    context.arena.alloc_expr(identifier),
+                    start,
+                    start.saturating_add(name.len() as u32),
+                ),
+                None => identifier,
+            };
+
             // Build the getter by applying the read transform if one exists
-            // (mirrors build_getter in the official compiler)
-            let has_read_transform = context
-                .state
-                .transform
-                .get(name.as_str())
-                .is_some_and(|t| t.read.is_some());
+            // (mirrors build_getter in the official compiler). Keep the source
+            // span on the identifier consumed by the transform.
+            let has_read_transform =
+                context.state.transform.get(name.as_str()).is_some_and(|t| t.read.is_some());
             let getter = if let Some(transform) = context.state.transform.get(name.as_str()) {
                 if let Some(ref read_source) = transform.read_source {
                     // read_source is set for destructured @const and let directive bindings.
                     // The getter should be $.get(read_source).name instead of $.get(name).
-                    b::member(
+                    span_declaration_identifier(b::member(
                         &context.arena,
                         b::call(
                             &context.arena,
@@ -2334,7 +2651,7 @@ fn collect_reactive_references_inner(
                             vec![b::id(read_source)],
                         ),
                         name.clone(),
-                    )
+                    ))
                 } else if let Some(read_fn) = transform.read {
                     // If this transform has a replacement_id, use it instead of the original name.
                     // This is used for legacy reactive imports where `numbers` -> `$$_import_numbers()`.
@@ -2343,13 +2660,13 @@ fn collect_reactive_references_inner(
                     } else {
                         JsExpr::Identifier(name.clone())
                     };
-                    read_fn(&context.arena, input_id)
+                    read_fn(&context.arena, span_declaration_identifier(input_id))
                 } else {
-                    JsExpr::Identifier(name.clone())
+                    span_declaration_identifier(JsExpr::Identifier(name.clone()))
                 }
             } else {
                 // No transform registered (e.g., imports) - use the identifier directly
-                JsExpr::Identifier(name.clone())
+                span_declaration_identifier(JsExpr::Identifier(name.clone()))
             };
 
             // Check if we need to wrap in $.deep_read_state().
@@ -2367,10 +2684,7 @@ fn collect_reactive_references_inner(
             // imports, bindable props that didn't go through the const/let
             // path, etc.) we fall back to the binding-kind check mirroring
             // the official compiler.
-            let deep_read_marked = context
-                .state
-                .transform_deep_read
-                .contains_key(name.as_str());
+            let deep_read_marked = context.state.transform_deep_read.contains_key(name.as_str());
             let needs_deep_read = if name == "$$props" || name == "$$restProps" || deep_read_marked
             {
                 true
@@ -2414,13 +2728,27 @@ fn collect_reactive_references_inner(
         }
 
         JsExpr::Call(call) => {
-            // Recurse into callee and arguments
-            collect_reactive_references_inner(
-                context.arena.get_expr(call.callee),
-                context,
-                getters,
-                seen,
-            );
+            // A read transform's getter call carries an opaque callee so a second
+            // transform pass cannot read it again; the dependency it stands for is
+            // still that identifier.
+            let callee = unspanned_expr(context.arena.get_expr(call.callee), &context.arena);
+            if call.arguments.is_empty()
+                && let JsExpr::OpaqueIdentifier(name) = callee
+            {
+                collect_reactive_references_inner(
+                    &JsExpr::Identifier(name.clone()),
+                    context,
+                    getters,
+                    seen,
+                );
+            } else {
+                collect_reactive_references_inner(
+                    context.arena.get_expr(call.callee),
+                    context,
+                    getters,
+                    seen,
+                );
+            }
             for arg in &call.arguments {
                 collect_reactive_references_inner(arg, context, getters, seen);
             }
@@ -2589,11 +2917,11 @@ fn collect_reactive_references_inner(
             }
             // Add only the names we actually introduce (so we don't clobber an
             // outer same-named dependency on restore).
-            let newly_added: Vec<String> = local_names
-                .iter()
-                .filter(|n| seen.insert((*n).clone()))
-                .cloned()
-                .collect();
+            let newly_added: Vec<String> =
+                local_names.iter().filter(|n| seen.insert((*n).clone())).cloned().collect();
+            for param in &arrow.params {
+                collect_pattern_evaluations(param, context, getters, seen);
+            }
             match &arrow.body {
                 JsArrowBody::Expression(body_expr) => {
                     collect_reactive_references_inner(
@@ -2622,11 +2950,11 @@ fn collect_reactive_references_inner(
                 extract_pattern_names(param, &mut local_names);
             }
             collect_block_local_decl_names(&func.body.body, &mut local_names);
-            let newly_added: Vec<String> = local_names
-                .iter()
-                .filter(|n| seen.insert((*n).clone()))
-                .cloned()
-                .collect();
+            let newly_added: Vec<String> =
+                local_names.iter().filter(|n| seen.insert((*n).clone())).cloned().collect();
+            for param in &func.params {
+                collect_pattern_evaluations(param, context, getters, seen);
+            }
             for stmt in &func.body.body {
                 collect_reactive_references_from_statement(stmt, context, getters, seen);
             }
@@ -2662,6 +2990,14 @@ fn collect_reactive_references_inner(
         | JsExpr::ImportExpression { .. }
         | JsExpr::Chain(_)
         | JsExpr::Void(_) => {}
+        JsExpr::SourceAnchored(anchor) => {
+            collect_reactive_references_inner(
+                context.arena.get_expr(anchor.inner),
+                context,
+                getters,
+                seen,
+            );
+        }
         JsExpr::Spanned(inner, _, _) => {
             collect_reactive_references_inner(
                 context.arena.get_expr(*inner),
@@ -2742,71 +3078,6 @@ fn collect_reactive_references_from_statement(
     }
 }
 
-/// Build bind:this directive.
-///
-/// Corresponds to `build_bind_this` in utils.js.
-///
-/// # Arguments
-///
-/// * `expression` - The bind expression (getter/setter pair or simple identifier)
-/// * `value` - The value to bind (usually an element reference)
-/// * `context` - The component context
-///
-/// # Returns
-///
-/// Returns a call to `$.bind_this()` with appropriate getter/setter.
-pub fn build_bind_this(
-    expression: BindExpression,
-    value: JsExpr,
-    context: &mut ComponentContext,
-) -> JsExpr {
-    match expression {
-        BindExpression::Simple(expr) => {
-            // Simple identifier: just pass it as both getter and setter
-            // $.bind_this(value, () => expr, (v) => { expr = v })
-            let getter = b::arrow(&context.arena, vec![], expr.clone());
-            let setter = b::arrow_block(
-                vec![b::id_pattern("$$value")],
-                vec![b::stmt(
-                    &context.arena,
-                    b::assign(&context.arena, expr, b::id("$$value")),
-                )],
-            );
-
-            b::call(
-                &context.arena,
-                b::member_path(&context.arena, "$.bind_this"),
-                vec![value, getter, setter],
-            )
-        }
-
-        BindExpression::Sequence(getter_expr, setter_expr) => {
-            // Already have getter/setter pair
-            b::call(
-                &context.arena,
-                b::member_path(&context.arena, "$.bind_this"),
-                vec![value, getter_expr, setter_expr],
-            )
-        }
-    }
-}
-
-/// Validate a binding in dev mode.
-///
-/// In development mode, this adds validation to ensure bindings
-/// are used correctly.
-pub fn validate_binding(
-    _state: &mut ComponentClientTransformState,
-    _binding: &BindDirective,
-    _expression: &JsMemberExpression,
-) {
-    // TODO: Implement dev mode validation
-    // This would check:
-    // - Binding is to a valid target
-    // - Target is not read-only
-    // - etc.
-}
-
 /// Add Svelte metadata for dev mode.
 ///
 /// Wraps an expression with metadata about its source location
@@ -2852,17 +3123,12 @@ pub fn add_svelte_meta_dev(
     ];
 
     if let Some(entries) = additional {
-        let props: Vec<JsObjectMember> = entries
-            .into_iter()
-            .map(|(k, v)| b::prop(arena, &k, v))
-            .collect();
+        let props: Vec<JsObjectMember> =
+            entries.into_iter().map(|(k, v)| b::prop(arena, &k, v)).collect();
         args.push(b::object(props));
     }
 
-    b::stmt(
-        arena,
-        b::call(arena, b::member_path(arena, "$.add_svelte_meta"), args),
-    )
+    b::stmt(arena, b::call(arena, b::member_path(arena, "$.add_svelte_meta"), args))
 }
 
 /// Build a template effect.
@@ -2903,14 +3169,7 @@ pub fn build_template_effect(
         )
     } else {
         // $.template_effect(() => expr) or $.template_effect(() => { stmts })
-        b::stmt(
-            arena,
-            b::call(
-                arena,
-                b::member_path(arena, "$.template_effect"),
-                vec![effect_fn],
-            ),
-        )
+        b::stmt(arena, b::call(arena, b::member_path(arena, "$.template_effect"), vec![effect_fn]))
     }
 }
 
@@ -2975,11 +3234,7 @@ pub fn build_render_statement_with_memoizer(
         && let JsStatement::Expression(expr_stmt) = &statements[0]
     {
         // Single expression - use expression body
-        b::arrow(
-            arena,
-            param_patterns,
-            arena.get_expr(expr_stmt.expression).clone(),
-        )
+        b::arrow(arena, param_patterns, arena.get_expr(expr_stmt.expression).clone())
     } else {
         // Multiple statements - use block body
         b::arrow_block(param_patterns, statements)
@@ -3011,29 +3266,6 @@ pub fn build_render_statement_with_memoizer(
     b::call(arena, b::member_path(arena, "$.template_effect"), args)
 }
 
-/// Bind expression types.
-#[derive(Debug, Clone)]
-pub enum BindExpression {
-    /// Simple identifier binding (e.g., bind:this={myRef})
-    Simple(JsExpr),
-
-    /// Getter/setter pair (e.g., for complex member expressions)
-    Sequence(JsExpr, JsExpr),
-}
-
-/// Bind directive metadata.
-///
-/// Placeholder for bind directive information.
-/// TODO: Replace with actual BindDirective from AST when available.
-#[derive(Debug, Clone)]
-pub struct BindDirective {
-    /// The name of the property being bound
-    pub name: String,
-
-    /// The expression being bound to
-    pub expression: JsExpr,
-}
-
 /// Parse a directive name into a member expression.
 ///
 /// This allows for accessing members of an object.
@@ -3049,6 +3281,17 @@ pub struct BindDirective {
 /// # Returns
 ///
 /// Returns a member expression or identifier.
+/// Upstream lowercases an HTML element/attribute name with JS `toLowerCase`,
+/// which is not limited to ASCII; only the no-op fast path is.
+pub fn html_lowercase(name: &str) -> String {
+    let needs_lowering = if name.is_ascii() {
+        name.bytes().any(|b| b.is_ascii_uppercase())
+    } else {
+        name.chars().any(|c| c.to_lowercase().next() != Some(c))
+    };
+    if needs_lowering { name.to_lowercase() } else { name.to_string() }
+}
+
 pub fn parse_directive_name(
     arena: &crate::compiler::phases::phase3_transform::js_ast::arena::JsArena,
     name: &str,
@@ -3081,231 +3324,6 @@ pub fn parse_directive_name(
     expression
 }
 
-/// Check if a string is a valid JavaScript identifier.
-fn is_valid_identifier(s: &str) -> bool {
-    if s.is_empty() {
-        return false;
-    }
-
-    // First character must be a letter, underscore, or dollar sign
-    let first_char = s.chars().next().unwrap();
-    if !first_char.is_alphabetic() && first_char != '_' && first_char != '$' {
-        return false;
-    }
-
-    // Remaining characters must be alphanumeric, underscore, or dollar sign
-    s.chars()
-        .all(|c| c.is_alphanumeric() || c == '_' || c == '$')
-}
-
-/// Validate a mutation in dev mode.
-///
-/// In development mode, this adds validation to ensure mutations
-/// to props are tracked correctly.
-///
-/// Corresponds to `validate_mutation` in
-/// `svelte/packages/svelte/src/compiler/phases/3-transform/client/visitors/shared/utils.js`.
-///
-/// # Arguments
-///
-/// * `node` - The original assignment/update node
-/// * `context` - The component transformation context
-/// * `expression` - The transformed expression
-///
-/// # Returns
-///
-/// Returns the expression, potentially wrapped with ownership validation.
-///
-/// # Implementation
-///
-/// The JavaScript implementation:
-/// ```javascript
-/// export function validate_mutation(node, context, expression) {
-///     let left = node.type === 'AssignmentExpression' ? node.left : node.argument;
-///
-///     if (!dev || left.type !== 'MemberExpression' || is_ignored(node, 'ownership_invalid_mutation')) {
-///         return expression;
-///     }
-///
-///     const name = object(left);
-///     if (!name) return expression;
-///
-///     const binding = context.state.scope.get(name.name);
-///     if (binding?.kind !== 'prop' && binding?.kind !== 'bindable_prop') return expression;
-///
-///     const state = context.state;
-///     state.analysis.needs_mutation_validation = true;
-///
-///     const path = [];
-///
-///     while (left.type === 'MemberExpression') {
-///         if (left.property.type === 'Literal') {
-///             path.unshift(left.property);
-///         } else if (left.property.type === 'Identifier') {
-///             const transform = context.state.transform[left.property.name];
-///             if (left.computed) {
-///                 path.unshift(transform?.read ? transform.read(left.property) : left.property);
-///             } else {
-///                 path.unshift(b.literal(left.property.name));
-///             }
-///         } else {
-///             return expression;
-///         }
-///
-///         left = left.object;
-///     }
-///
-///     path.unshift(b.literal(name.name));
-///
-///     const loc = locator(left.start);
-///
-///     return b.call(
-///         '$$ownership_validator.mutation',
-///         b.literal(binding.prop_alias),
-///         b.array(path),
-///         expression,
-///         loc && b.literal(loc.line),
-///         loc && b.literal(loc.column)
-///     );
-/// }
-/// ```
-pub fn validate_mutation(
-    node: &JsAssignmentExpression,
-    context: &ComponentContext,
-    expression: JsExpr,
-) -> JsExpr {
-    // Early return if not in dev mode
-    if !context.state.dev {
-        return expression;
-    }
-
-    // Only validate member expressions
-    let member_expr = match context.arena.get_expr(node.left) {
-        JsExpr::Member(m) => m,
-        _ => return expression,
-    };
-
-    // Get the root object of the member expression
-    let root_name = match get_root_object(member_expr, &context.arena) {
-        Some(name) => name,
-        None => return expression,
-    };
-
-    // Get the binding for the root object
-    let binding = match context.state.get_binding(&root_name) {
-        Some(b) => b,
-        None => return expression,
-    };
-
-    // Only validate mutations to props
-    use crate::compiler::phases::phase2_analyze::scope::BindingKind;
-    if !matches!(binding.kind, BindingKind::Prop | BindingKind::BindableProp) {
-        return expression;
-    }
-
-    // Build the property path array
-    let path = build_member_path(member_expr, context);
-
-    // Prepend the root name to the path
-    let mut full_path = vec![b::string(&root_name)];
-    full_path.extend(path);
-
-    // Set the needs_mutation_validation flag
-    context.state.needs_mutation_validation.set(true);
-
-    // Build the validation call
-    let prop_alias = binding.prop_alias.as_ref().unwrap_or(&binding.name).clone();
-
-    let args = vec![b::string(&prop_alias), b::array(full_path), expression];
-
-    // TODO: Add source location (line, column) when original AST positions are available
-
-    b::call(
-        &context.arena,
-        b::member_path(&context.arena, "$$ownership_validator.mutation"),
-        args,
-    )
-}
-
-/// Get the root object identifier from a member expression chain.
-///
-/// For example, `obj.foo.bar` returns `"obj"`.
-fn get_root_object<'a>(
-    mut expr: &'a JsMemberExpression,
-    arena: &'a crate::compiler::phases::phase3_transform::js_ast::arena::JsArena,
-) -> Option<String> {
-    loop {
-        match arena.get_expr(expr.object) {
-            JsExpr::Identifier(name) => return Some(name.to_string()),
-            JsExpr::Member(m) => expr = m,
-            _ => return None,
-        }
-    }
-}
-
-/// Build the property path for a member expression.
-///
-/// Returns a list of property accessors (as strings or expressions).
-fn build_member_path(member: &JsMemberExpression, context: &ComponentContext) -> Vec<JsExpr> {
-    // SAFETY: Extract arena reference to break the borrow chain between
-    // arena.get_expr() results and the loop variable.
-    let _arena: &crate::compiler::phases::phase3_transform::js_ast::arena::JsArena =
-        unsafe { &*(&context.arena as *const _) };
-    let mut expr: &JsMemberExpression = member;
-    let mut path = Vec::new();
-
-    loop {
-        // Add the current property to the path
-        match &expr.property {
-            JsMemberProperty::Identifier(name) => {
-                // Check if there's a transform for this identifier
-                let transform = context.state.transform.get(name.as_str());
-
-                if expr.computed {
-                    // Computed property: use the transform's read if available
-                    if let Some(t) = transform {
-                        if let Some(read_fn) = t.read {
-                            path.push(read_fn(&context.arena, JsExpr::Identifier(name.clone())));
-                        } else {
-                            path.push(JsExpr::Identifier(name.clone()));
-                        }
-                    } else {
-                        path.push(JsExpr::Identifier(name.clone()));
-                    }
-                } else {
-                    // Non-computed property: use as literal string
-                    path.push(b::string(name.clone()));
-                }
-            }
-            JsMemberProperty::Expression(expr_box) => {
-                match context.arena.get_expr(*expr_box) {
-                    JsExpr::Literal(lit) => {
-                        path.push(JsExpr::Literal(lit.clone()));
-                    }
-                    _ => {
-                        // Complex expression - can't build static path
-                        break;
-                    }
-                }
-            }
-            JsMemberProperty::PrivateIdentifier(name) => {
-                // Private identifier: use as literal string
-                path.push(b::string(name.clone()));
-            }
-        }
-
-        // Move to the parent object
-        match context.arena.get_expr(expr.object) {
-            JsExpr::Member(m) => expr = m,
-            _ => break,
-        }
-    }
-
-    // Reverse the path since we built it from leaf to root
-    path.reverse();
-    path
-}
-
 /// Result of building a template chunk.
 pub struct TemplateChunkResult {
     /// The generated expression (template literal or string)
@@ -3317,6 +3335,67 @@ pub struct TemplateChunkResult {
     /// they may reference variables that depend on async operations and need
     /// to be blocked until those operations complete.
     pub blocker_indices: Vec<usize>,
+}
+
+/// The JS comments inside `source[start..end]`, as absolute `(start, end)`
+/// pairs. The `/` probe keeps the re-parse off every comment-free template
+/// expression, which is nearly all of them; a real parse is what tells a
+/// comment apart from a division or a regex literal.
+fn interior_comment_spans(source: &str, start: usize, end: usize) -> Vec<(usize, usize)> {
+    if start >= end || end > source.len() {
+        return Vec::new();
+    }
+    let slice = &source[start..end];
+    if memchr::memchr(b'/', slice.as_bytes()).is_none() {
+        return Vec::new();
+    }
+    let allocator = oxc_allocator::Allocator::default();
+    let owned = allocator.alloc_str(slice);
+    let ret = oxc_parser::Parser::new(&allocator, owned, oxc_span::SourceType::mjs()).parse();
+    if !ret.diagnostics.is_empty() {
+        return Vec::new();
+    }
+    ret.program
+        .comments
+        .iter()
+        .map(|comment| (start + comment.span.start as usize, start + comment.span.end as usize))
+        .collect()
+}
+
+/// Upstream's comment cursor hands a comment to whichever LOCATED node comes
+/// next, so a constant-folded tag — which leaves no node behind — does not
+/// swallow the one written inside it. Re-emit it as an opaque chunk at its
+/// source position; it parses to zero statements and one comment, so the next
+/// generated node that carries a source anchor flushes it, exactly as upstream's
+/// cursor does.
+fn push_folded_tag_comments(tag_start: u32, tag_end: u32, context: &mut ComponentContext) {
+    let (Some(start), Some(end)) = (tag_start.checked_add(1), tag_end.checked_sub(1)) else {
+        return;
+    };
+    // Upstream's component block borrows the instance script's `loc`
+    // (`component_block.loc = instance.loc`), and `reset_comment_index` then
+    // parks the cursor at the first comment that is not before it: with no
+    // `<script>` there is no `loc`, the cursor starts dead, and every comment in
+    // the file is dropped — as is every comment written ahead of the script.
+    let Some(cursor_start) =
+        context.state.analysis.instance_script_content.as_ref().map(|script| script.start as usize)
+    else {
+        return;
+    };
+    let spans =
+        interior_comment_spans(&context.state.analysis.source, start as usize, end as usize);
+    for (start, end) in spans {
+        if start < cursor_start {
+            continue;
+        }
+        let code = context.state.analysis.source[start..end].to_string();
+        context.state.init.push(JsStatement::RawMapped {
+            code: code.into(),
+            source_offset: start as u32,
+            comment_anchor: None,
+            copied_spans: Vec::new(),
+        });
+    }
 }
 
 /// Build a template chunk from text/expression nodes.
@@ -3333,7 +3412,7 @@ pub struct TemplateChunkResult {
 ///
 /// Returns a TemplateChunkResult with the generated expression and state flag.
 pub fn build_template_chunk(
-    values: &[crate::compiler::phases::phase3_transform::client::visitors::shared::fragment::TextOrExpr],
+    values: &[crate::compiler::phases::phase3_transform::client::visitors::shared::fragment::TextOrExpr<'_>],
     context: &mut ComponentContext,
 ) -> TemplateChunkResult {
     use crate::compiler::phases::phase3_transform::client::visitors::expression_converter::convert_expression;
@@ -3363,6 +3442,7 @@ pub fn build_template_chunk(
                         last_quasi.raw.push_str(&val);
                         last_quasi.cooked.push_str(&val);
                     }
+                    push_folded_tag_comments(expr_tag.start, expr_tag.end, context);
                     // Even when the expression evaluates to a literal, check if it
                     // references variables in the blocker_map. This corresponds to
                     // the official compiler's `has_blockers()` check in build_template_chunk:
@@ -3387,8 +3467,8 @@ pub fn build_template_chunk(
                     // Convert Expression to JsExpr using the proper converter
                     let converted_expr = convert_expression(&expr_tag.expression, context);
 
-                    // Check if the expression references reactive state, contains calls, member expressions, or await
-                    // in a single pass over the AST, instead of 4 separate walks.
+                    // Keep the remaining Phase 3 property checks in one pass. `has_call`
+                    // comes from Phase 2, matching upstream's metadata consumer.
                     // Special case: $effect.pending() is inherently reactive (has_state=true)
                     // but NOT a "call" for memoization. This matches the official Svelte compiler's
                     // phase 2 analysis where $effect.pending() explicitly sets has_state = true
@@ -3397,20 +3477,20 @@ pub fn build_template_chunk(
                         is_effect_pending_expr(&expr_tag.expression, context.state.parse_arena);
                     let expr_props = analyze_expression_properties(&expr_tag.expression, context);
                     let expr_has_state = expr_props.has_state || is_pending_rune;
-                    // $effect.pending() is treated as a pure call by the official compiler,
-                    // so it should NOT have has_call=true. This prevents it from being memoized.
-                    let expr_has_call = if is_pending_rune {
-                        false
-                    } else {
-                        expr_props.has_call
-                    };
                     let expr_has_member = expr_props.has_member;
                     let expr_has_await = expr_props.has_await;
 
                     // Build the expression with transforms applied (e.g., $.get() wrapping)
-                    let mut expr_metadata = ExpressionMetadata::default();
+                    let expr_has_call = expr_tag.metadata.expression.has_call();
+                    // Preserve the scope-resolved binding references collected in
+                    // Phase 2. The name-based fallback in `build_expression` cannot
+                    // distinguish a template-local binding from a same-named binding
+                    // in another scope, so rebuilding this metadata from flags alone
+                    // drops the dependency reads that legacy expressions need before
+                    // their `$.untrack(...)` value.
+                    let mut expr_metadata =
+                        ExpressionMetadata::from_template_metadata(&expr_tag.metadata.expression);
                     expr_metadata.set_has_state(expr_has_state);
-                    expr_metadata.set_has_call(expr_has_call);
                     expr_metadata.set_has_member_expression(expr_has_member);
                     expr_metadata.set_has_await(expr_has_await);
 
@@ -3426,6 +3506,20 @@ pub fn build_template_chunk(
                         expr_has_state,
                     );
 
+                    {
+                        let map = context.state.blocker_map.borrow();
+                        for name in
+                            collect_expression_identifiers_for_blockers(&expr_tag.expression)
+                        {
+                            if let Some(&idx) = map.get(&name) {
+                                if !blocker_indices.contains(&idx) {
+                                    blocker_indices.push(idx);
+                                }
+                                has_state = true;
+                            }
+                        }
+                    }
+
                     // Track if any expression has state, call, or await (need reactive update).
                     // In the official Svelte compiler, has_call is only set for non-pure calls
                     // (calls to local functions, not globals like console.log), and when set,
@@ -3436,11 +3530,7 @@ pub fn build_template_chunk(
 
                     // For single expression, return directly
                     if values.len() == 1 {
-                        return TemplateChunkResult {
-                            value,
-                            has_state,
-                            blocker_indices,
-                        };
+                        return TemplateChunkResult { value, has_state, blocker_indices };
                     }
 
                     // Check if the expression is guaranteed to be non-null.
@@ -3462,7 +3552,11 @@ pub fn build_template_chunk(
                     // index `i`), we check the original expression which has binding context
                     // (knows EachIndex is always a number). For everything else, we check
                     // the built JsExpr.
-                    let is_defined = if let JsExpr::Identifier(name) = &value {
+                    let mut value_for_definedness = &value;
+                    while let JsExpr::Spanned(inner, _, _) = value_for_definedness {
+                        value_for_definedness = context.arena.get_expr(*inner);
+                    }
+                    let is_defined = if let JsExpr::Identifier(name) = value_for_definedness {
                         // Check if this is a memoized parameter ($0, $1, etc.)
                         // Memoized parameters are unknown identifiers, so they're not defined.
                         // The official compiler evaluates the memoized expression through
@@ -3476,7 +3570,7 @@ pub fn build_template_chunk(
                         }
                     } else {
                         // Value was transformed. Check the built expression.
-                        is_js_expr_defined(&value, &context.arena)
+                        is_js_expr_defined(value_for_definedness, &context.arena, context)
                     };
 
                     // Add ?? '' where necessary (only if not guaranteed to be defined)
@@ -3510,16 +3604,14 @@ pub fn build_template_chunk(
         b::string(last_quasi.clone().cooked)
     };
 
-    TemplateChunkResult {
-        value,
-        has_state,
-        blocker_indices,
-    }
+    TemplateChunkResult { value, has_state, blocker_indices }
 }
 
 /// Collect identifiers from an AST Expression for blocker map checking.
 /// This walks the JSON AST to find all Identifier nodes.
-fn collect_expression_identifiers_for_blockers(expr: &crate::ast::js::Expression) -> Vec<String> {
+pub(crate) fn collect_expression_identifiers_for_blockers(
+    expr: &crate::ast::js::Expression,
+) -> Vec<String> {
     let mut names = Vec::new();
     let val = expr.as_json();
     collect_expr_ids_recursive(val, &mut names);
@@ -3554,14 +3646,13 @@ fn collect_expr_ids_recursive(val: &serde_json::Value, names: &mut Vec<String>) 
     }
 }
 
-/// Decode `\uXXXX`, `\u{X…}` and `\xHH` escape sequences in a string-literal's
-/// raw inner text to their actual characters. Other escapes (`\n`, `\t`, `\'`,
-/// …) and a literal `\\` are left untouched — only the arbitrary-codepoint
-/// escapes are resolved, because those produce plain characters that inline
-/// verbatim wherever the folded value lands (e.g. a known-const string of
-/// bidirectional-control escapes folds to the literal characters, matching
-/// upstream's `scope.evaluate` which returns the cooked value).
-pub(crate) fn decode_unicode_escapes(s: &str) -> String {
+/// Cook a string literal's raw inner text: resolve every JS escape sequence to
+/// the character it denotes, the way upstream's `scope.evaluate` yields the
+/// literal's `value`. The result is a *value*, not source — whoever emits it
+/// re-escapes for the quoting it lands in (`sanitize_template_string` for a
+/// quasi, the printer for a string literal), so leaving an escape undecoded
+/// here escapes it a second time.
+pub(crate) fn cook_string_literal(s: &str) -> String {
     if !s.contains('\\') {
         return s.to_string();
     }
@@ -3571,12 +3662,6 @@ pub(crate) fn decode_unicode_escapes(s: &str) -> String {
     while i < bytes.len() {
         if bytes[i] == b'\\' && i + 1 < bytes.len() {
             match bytes[i + 1] {
-                b'\\' => {
-                    // Literal escaped backslash — keep both bytes, don't reinterpret.
-                    out.push_str("\\\\");
-                    i += 2;
-                    continue;
-                }
                 b'u' if i + 2 < bytes.len() && bytes[i + 2] == b'{' => {
                     if let Some(close) = s[i + 3..].find('}') {
                         let hex = &s[i + 3..i + 3 + close];
@@ -3593,13 +3678,27 @@ pub(crate) fn decode_unicode_escapes(s: &str) -> String {
                     continue;
                 }
                 b'u' if i + 6 <= bytes.len() => {
-                    let hex = &s[i + 2..i + 6];
-                    if let Ok(cp) = u32::from_str_radix(hex, 16)
-                        && let Some(c) = char::from_u32(cp)
-                    {
-                        out.push(c);
-                        i += 6;
-                        continue;
+                    if let Ok(cp) = u32::from_str_radix(&s[i + 2..i + 6], 16) {
+                        if let Some(c) = char::from_u32(cp) {
+                            out.push(c);
+                            i += 6;
+                            continue;
+                        }
+                        // A lone surrogate has no `char`; only a well-formed pair
+                        // does, and Rust cannot hold the unpaired half either way.
+                        if (0xD800..=0xDBFF).contains(&cp)
+                            && i + 12 <= bytes.len()
+                            && bytes[i + 6] == b'\\'
+                            && bytes[i + 7] == b'u'
+                            && let Ok(lo) = u32::from_str_radix(&s[i + 8..i + 12], 16)
+                            && (0xDC00..=0xDFFF).contains(&lo)
+                            && let Some(c) =
+                                char::from_u32(0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00))
+                        {
+                            out.push(c);
+                            i += 12;
+                            continue;
+                        }
                     }
                     out.push('\\');
                     i += 1;
@@ -3618,10 +3717,48 @@ pub(crate) fn decode_unicode_escapes(s: &str) -> String {
                     i += 1;
                     continue;
                 }
-                _ => {
-                    // Other escapes (`\n`, `\t`, `\'`, …) — leave as-is.
+                b'\n' => {
+                    // Line continuation — contributes nothing to the value.
+                    i += 2;
+                    continue;
+                }
+                b'\r' => {
+                    i += if bytes.get(i + 2) == Some(&b'\n') { 3 } else { 2 };
+                    continue;
+                }
+                // Legacy octal is a syntax error in the module goal, so `\0` is
+                // NUL only when no digit follows.
+                b'0' if !bytes.get(i + 2).is_some_and(u8::is_ascii_digit) => {
+                    out.push('\0');
+                    i += 2;
+                    continue;
+                }
+                b'1'..=b'7' => {
                     out.push('\\');
                     i += 1;
+                    continue;
+                }
+                c => {
+                    out.push(match c {
+                        b'n' => '\n',
+                        b'r' => '\r',
+                        b't' => '\t',
+                        b'b' => '\u{8}',
+                        b'f' => '\u{c}',
+                        b'v' => '\u{b}',
+                        _ => {
+                            // `\<anything else>` is that character verbatim, and it
+                            // may be multi-byte (`\é`).
+                            let mut next = i + 2;
+                            while next < bytes.len() && !s.is_char_boundary(next) {
+                                next += 1;
+                            }
+                            out.push_str(&s[i + 1..next]);
+                            i = next;
+                            continue;
+                        }
+                    });
+                    i += 2;
                     continue;
                 }
             }
@@ -3646,577 +3783,53 @@ pub(crate) fn get_literal_value(
     expr: &crate::ast::js::Expression,
     context: &ComponentContext,
 ) -> Option<Option<String>> {
-    use crate::ast::typed_expr::LiteralValue;
+    eval_value_text(&get_literal_value_json(expr.as_json(), context)?)
+}
 
-    {
-        let expr_type = expr.node_type()?;
+/// A folded value as the inlining callers consume it: `None` for a nullish
+/// value they omit, `Some(text)` for anything they can write into the template.
+fn eval_value_text(v: &EvalValue) -> Option<Option<String>> {
+    if v.is_nullish()? { Some(None) } else { to_js_string(v).map(Some) }
+}
 
-        // Upstream `build_template_chunk` memoizes the expression FIRST
-        // (`memoizer.add` replaces any `has_call` / `has_await` chunk with an
-        // opaque `$N` identifier) and only THEN runs `scope.evaluate` on the
-        // result. An opaque identifier never evaluates to a known constant, so a
-        // chunk that contains a (non-pure) call is ALWAYS kept reactive — even
-        // when its branches would otherwise fold to a literal (e.g.
-        // `duration ? format(duration) : '--:--'` with `duration === 0`). Mirror
-        // that ordering here by refusing to fold any expression whose
-        // `has_call` flag is set, so the chunk falls through to memoization.
-        // This subsumes the per-`Math.*` state-arg guard below.
-        if matches!(
-            expr_type,
-            "CallExpression"
-                | "BinaryExpression"
-                | "LogicalExpression"
-                | "ConditionalExpression"
-                | "UnaryExpression"
-                | "TemplateLiteral"
-                | "MemberExpression"
-                | "SequenceExpression"
-                | "ChainExpression"
-        ) {
-            let jv = expr.as_json();
-            if has_call_json(jv, context) {
-                return None;
-            }
-        }
+/// A folded value only when it is a concrete one — a marker (`NUMBER`,
+/// `STRING`, `UNKNOWN`) means the fold failed.
+/// Fold a template expression through the shared port of upstream
+/// `scope.evaluate`.
+fn get_literal_value_json(jv: &serde_json::Value, context: &ComponentContext) -> Option<EvalValue> {
+    let expr_type = jv.get("type").and_then(|t| t.as_str())?;
 
-        match expr_type {
-            "Literal" => {
-                let node = expr.as_node();
-                match &*node {
-                    crate::ast::typed_expr::JsNode::Literal { value, .. } => match value {
-                        LiteralValue::String(s) => Some(Some(s.to_string())),
-                        LiteralValue::Number(n) => {
-                            if n.fract() == 0.0 {
-                                Some(Some(format!("{}", *n as i64)))
-                            } else {
-                                Some(Some(n.to_string()))
-                            }
-                        }
-                        LiteralValue::Bool(b_val) => Some(Some(b_val.to_string())),
-                        LiteralValue::Null => Some(None),
-                        LiteralValue::Regex(r) => Some(Some(format!("/{}/{}", r.pattern, r.flags))),
-                    },
-                    _ => None,
-                }
-            }
-            "Identifier" => {
-                let name = expr.name()?;
-                if name == "undefined" {
-                    return Some(None);
-                }
-
-                // If there's a transform registered for this identifier (e.g., from let: directive),
-                // it's been overridden in the current scope and should not be folded as a literal
-                if context.state.transform.contains_key(name) {
-                    return None;
-                }
-
-                // An identifier that names an enclosing `{#each … as <item>[, <index>]}`
-                // loop variable shadows any outer `const` of the same name: inside the
-                // block it is the (reactive) loop variable, NOT a foldable constant.
-                // Without this, `const title = '…'; {#each xs as title}{title}{/each}`
-                // wrongly folds `{title}` to the const's value.
-                if context.state.each_binding_context.iter().any(|c| {
-                    c.item_name == name || (!c.index_name.is_empty() && c.index_name == name)
-                }) {
-                    return None;
-                }
-
-                // Check if the identifier is a constant binding
-                let binding = context.state.get_binding(name)?;
-
-                // `{@const}` / `{const}` / `{let}` template declarations made
-                // inside a `{#snippet}` body are local to that snippet's
-                // generated function. Upstream resolves identifiers through
-                // `scope.evaluate`, so a binding declared in a sibling snippet
-                // is simply not reachable and the reference stays a (possibly
-                // global) identifier. `get_binding`'s any-scope fallback would
-                // otherwise leak the binding here and substitute its value
-                // across snippet boundaries.
-                if matches!(
-                    binding.kind,
-                    crate::compiler::phases::phase2_analyze::scope::BindingKind::Template
-                ) && context
-                    .state
-                    .scope_root
-                    .snippet_scope_indices
-                    .contains(&binding.scope_index)
-                    && !context.state.scope_chain_contains(binding.scope_index)
-                {
-                    return None;
-                }
-
-                // Only fold if:
-                // 1. Not updated (reassigned or mutated)
-                // 2. Not a prop (props come from outside and can change)
-                // This matches Svelte's scope.js evaluate() logic:
-                // if (!binding.updated && binding.initial !== null && !is_prop)
-                // Note: reactive bindings like $state('hello') CAN be folded if not updated,
-                // because their initial value is still known at compile time.
-                if binding.is_updated() {
-                    return None;
-                }
-                let is_prop = matches!(
-                    binding.kind,
-                    crate::compiler::phases::phase2_analyze::scope::BindingKind::Prop
-                        | crate::compiler::phases::phase2_analyze::scope::BindingKind::BindableProp
-                        | crate::compiler::phases::phase2_analyze::scope::BindingKind::RestProp
-                );
-                if is_prop {
-                    return None;
-                }
-
-                // A no-arg `$state()` / `$state.raw()` evaluates to `undefined`
-                // (known), so a read of it omits the `?? ""` fallback. Mirrors
-                // upstream scope.js `$state`/`$state.raw` with no argument.
-                // `$state(foo)` is excluded — it records `initial_node_type` — so
-                // it correctly stays unknown.
-                {
-                    use crate::compiler::phases::phase2_analyze::scope::BindingKind;
-                    if matches!(binding.kind, BindingKind::State | BindingKind::RawState)
-                        && binding.initial.is_none()
-                        && binding.initial_node_type.is_none()
-                    {
-                        return Some(None);
-                    }
-                }
-
-                // Check if we have a known initial value (stored as source string)
-                let init = binding.initial.as_ref()?;
-                // Parse simple string literals like 'world' or "world"
-                let trimmed = init.trim();
-                let is_string_literal = (trimmed.starts_with('\'') && trimmed.ends_with('\''))
-                    || (trimmed.starts_with('"') && trimmed.ends_with('"'));
-                if is_string_literal && trimmed.len() >= 2 {
-                    return Some(Some(decode_unicode_escapes(&trimmed[1..trimmed.len() - 1])));
-                }
-                // Parse number literals
-                if let Ok(n) = trimmed.parse::<f64>() {
-                    if n.fract() == 0.0 {
-                        return Some(Some(format!("{}", n as i64)));
-                    }
-                    return Some(Some(n.to_string()));
-                }
-                // Handle boolean and null literals
-                match trimmed {
-                    "true" => Some(Some("true".to_string())),
-                    "false" => Some(Some("false".to_string())),
-                    "null" | "undefined" => Some(None),
-                    _ => {
-                        // Check for a JSON `Literal` node form (from binding.initial,
-                        // e.g. a `{const x = 'nested'}` DeclarationTag whose initial is
-                        // stored as `{"type":"Literal",...,"value":"nested","raw":"'nested'"}`).
-                        // Mirrors upstream `scope.evaluate()` returning the literal value.
-                        if init.contains("\"type\":\"Literal\"")
-                            && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(init)
-                            && parsed.get("type").and_then(|t| t.as_str()) == Some("Literal")
-                        {
-                            // Regex literal: value is null but "regex" field is present.
-                            if parsed.get("regex").is_some() {
-                                let pattern = parsed
-                                    .get("regex")
-                                    .and_then(|r| r.get("pattern"))
-                                    .and_then(|p| p.as_str())
-                                    .unwrap_or("");
-                                let flags = parsed
-                                    .get("regex")
-                                    .and_then(|r| r.get("flags"))
-                                    .and_then(|f| f.as_str())
-                                    .unwrap_or("");
-                                return Some(Some(format!("/{}/{}", pattern, flags)));
-                            }
-                            return match parsed.get("value") {
-                                Some(v) if v.is_string() => {
-                                    Some(Some(v.as_str().unwrap().to_string()))
-                                }
-                                Some(v) if v.is_f64() || v.is_i64() || v.is_u64() => {
-                                    let n = v.as_f64().unwrap();
-                                    if n.fract() == 0.0 {
-                                        Some(Some(format!("{}", n as i64)))
-                                    } else {
-                                        Some(Some(n.to_string()))
-                                    }
-                                }
-                                Some(v) if v.is_boolean() => {
-                                    Some(Some(v.as_bool().unwrap().to_string()))
-                                }
-                                Some(v) if v.is_null() => Some(None),
-                                _ => None,
-                            };
-                        }
-                        // Check for TemplateLiteral JSON format (from binding.initial)
-                        // Template literals without expressions are known compile-time values
-                        if init.contains("\"type\":\"TemplateLiteral\"")
-                            && init.contains("\"expressions\":[]")
-                        {
-                            // Extract the cooked value from the quasis
-                            // Format: {"type":"TemplateLiteral",...,"quasis":[{"value":{"cooked":"..."}}]}
-                            let quasis = serde_json::from_str::<serde_json::Value>(init)
-                                .ok()
-                                .and_then(|parsed| {
-                                    parsed.get("quasis").and_then(|q| q.as_array().cloned())
-                                });
-
-                            if let Some(quasis) = quasis {
-                                // Collect all cooked values from quasis
-                                let mut result = String::new();
-                                for quasi in quasis {
-                                    if let Some(cooked) = quasi
-                                        .get("value")
-                                        .and_then(|v| v.get("cooked"))
-                                        .and_then(|c| c.as_str())
-                                    {
-                                        result.push_str(cooked);
-                                    }
-                                }
-                                return Some(Some(result));
-                            }
-                        }
-                        // Fix D: binding.initial for declaration tags is stored as a full AST
-                        // JSON node (e.g. CallExpression, BinaryExpression). Parse it and
-                        // recursively evaluate — mirrors upstream scope.js `evaluate()` which
-                        // recurses into `binding.initial`. Skip Derived bindings: their
-                        // runtime value is `$.get(binding)`, not the compile-time init.
-                        {
-                            use crate::compiler::phases::phase2_analyze::scope::BindingKind;
-                            if !matches!(binding.kind, BindingKind::Derived)
-                                && init.contains("\"type\":")
-                                && let Ok(parsed_expr) =
-                                    serde_json::from_str::<crate::ast::js::Expression>(init)
-                            {
-                                return get_literal_value(&parsed_expr, context);
-                            }
-                        }
-                        None
-                    }
-                }
-            }
-            "LogicalExpression"
-            | "CallExpression"
+    // `build_template_chunk` memoizes first. A call-bearing chunk is therefore
+    // an opaque temporary by the time upstream evaluates it, while recursion
+    // into a binding initializer is not memoized.
+    if matches!(
+        expr_type,
+        "CallExpression"
             | "BinaryExpression"
+            | "LogicalExpression"
+            | "ConditionalExpression"
             | "UnaryExpression"
-            | "ConditionalExpression" => {
-                // These complex branches need JSON access for deep traversal
-                let json_value = expr.as_json();
-                let obj = json_value.as_object()?;
-                get_literal_value_complex(expr_type, obj, context)
-            }
-            "TemplateLiteral" => {
-                // Template literal with no expressions -> plain string
-                // Template literal with expressions -> try to fold each expression
-                let json_value = expr.as_json();
-                let obj = json_value.as_object()?;
-                let quasis = obj.get("quasis").and_then(|q| q.as_array())?;
-                let expressions = obj.get("expressions").and_then(|e| e.as_array())?;
-
-                if !expressions.is_empty() {
-                    return None; // Can't fold template literals with expressions here
-                }
-
-                let mut result = String::new();
-                for quasi in quasis {
-                    if let Some(cooked) = quasi
-                        .get("value")
-                        .and_then(|v| v.get("cooked"))
-                        .and_then(|c| c.as_str())
-                    {
-                        result.push_str(cooked);
-                    }
-                }
-                Some(Some(result))
-            }
-            _ => None,
-        }
+            | "TemplateLiteral"
+            | "MemberExpression"
+            | "SequenceExpression"
+            | "ChainExpression"
+    ) && has_call_json(jv, context)
+    {
+        return None;
     }
-}
 
-/// Format an `f64` the way JS `String(n)` would for a known constant fold:
-/// `NaN`, `Infinity`, `-Infinity`, an integer with no decimal point, or the
-/// shortest float representation. Mirrors the value upstream's `scope.evaluate`
-/// stringifies into the template quasi when folding an arithmetic chunk.
-fn format_js_number(n: f64) -> String {
-    if n.is_nan() {
-        "NaN".to_string()
-    } else if n.is_infinite() {
-        if n > 0.0 {
-            "Infinity".to_string()
-        } else {
-            "-Infinity".to_string()
-        }
-    } else if n.fract() == 0.0 && n.abs() < i64::MAX as f64 {
-        format!("{}", n as i64)
-    } else {
-        n.to_string()
+    // The template converter has already replaced this read. Evaluating its
+    // source binding would evaluate a different expression.
+    if expr_type == "Identifier"
+        && jv
+            .get("name")
+            .and_then(|name| name.as_str())
+            .is_some_and(|name| context.state.transform.contains_key(name))
+    {
+        return None;
     }
-}
 
-/// Handle complex expression types for get_literal_value that need JSON access.
-fn get_literal_value_complex(
-    expr_type: &str,
-    obj: &serde_json::Map<String, serde_json::Value>,
-    context: &ComponentContext,
-) -> Option<Option<String>> {
-    use crate::ast::js::Expression;
-
-    match expr_type {
-        "LogicalExpression" => {
-            // Handle ?? (nullish coalescing) operator
-            let operator = obj.get("operator").and_then(|v| v.as_str())?;
-            if operator != "??" {
-                return None;
-            }
-
-            let left = obj.get("left")?;
-            let left_expr = serde_json::from_value::<Expression>(left.clone()).ok()?;
-
-            match get_literal_value(&left_expr, context) {
-                Some(Some(val)) => {
-                    // Left side has non-null value, return it
-                    Some(Some(val))
-                }
-                Some(None) => {
-                    // Left side is null/undefined, evaluate right side
-                    let right = obj.get("right")?;
-                    let right_expr = serde_json::from_value::<Expression>(right.clone()).ok()?;
-                    get_literal_value(&right_expr, context)
-                }
-                None => {
-                    // Left side cannot be evaluated at compile time
-                    None
-                }
-            }
-        }
-        "CallExpression" => {
-            // Handle pure Math functions with constant arguments
-            let callee = obj.get("callee").and_then(|v| v.as_object())?;
-            let callee_type = callee.get("type").and_then(|t| t.as_str())?;
-
-            if callee_type == "MemberExpression" {
-                let obj_node = callee.get("object").and_then(|o| o.as_object())?;
-                let prop_node = callee.get("property").and_then(|p| p.as_object())?;
-
-                let obj_type = obj_node.get("type").and_then(|t| t.as_str())?;
-                let obj_name = obj_node.get("name").and_then(|n| n.as_str())?;
-                let prop_name = prop_node.get("name").and_then(|n| n.as_str())?;
-
-                if obj_type == "Identifier" && obj_name == "Math" {
-                    let args = obj.get("arguments").and_then(|a| a.as_array())?;
-
-                    // NOTE: a `Math.*(…)` whose argument references a runtime-reactive
-                    // State/RawState binding has already been rejected by the top-level
-                    // `has_call_json` bail in `get_literal_value` (upstream's Phase-2
-                    // adds every binding reference to `expression.dependencies`, so a
-                    // pure-callee call with such an argument still gets `has_call = true`).
-                    // Only genuinely-constant argument folds reach this point.
-
-                    // Evaluate all arguments
-                    let mut arg_values: Vec<f64> = Vec::new();
-                    for arg in args {
-                        let arg_expr = serde_json::from_value::<Expression>(arg.clone()).ok()?;
-                        let arg_val = get_literal_value(&arg_expr, context)??;
-                        let num = arg_val.parse::<f64>().ok()?;
-                        arg_values.push(num);
-                    }
-
-                    let result = match prop_name {
-                        "max" if !arg_values.is_empty() => {
-                            arg_values.iter().cloned().fold(f64::NEG_INFINITY, f64::max)
-                        }
-                        "min" if !arg_values.is_empty() => {
-                            arg_values.iter().cloned().fold(f64::INFINITY, f64::min)
-                        }
-                        "floor" if arg_values.len() == 1 => arg_values[0].floor(),
-                        "ceil" if arg_values.len() == 1 => arg_values[0].ceil(),
-                        "round" if arg_values.len() == 1 => arg_values[0].round(),
-                        "abs" if arg_values.len() == 1 => arg_values[0].abs(),
-                        "sqrt" if arg_values.len() == 1 => arg_values[0].sqrt(),
-                        "pow" if arg_values.len() == 2 => arg_values[0].powf(arg_values[1]),
-                        _ => return None,
-                    };
-
-                    // Format result
-                    if result.fract() == 0.0 && result.abs() < i64::MAX as f64 {
-                        return Some(Some(format!("{}", result as i64)));
-                    }
-                    return Some(Some(result.to_string()));
-                }
-
-                // Fix C: $state.raw(arg) — MemberExpression callee with object=$state, property=raw
-                if obj_type == "Identifier" && obj_name == "$state" && prop_name == "raw" {
-                    let args = obj.get("arguments").and_then(|a| a.as_array());
-                    if let Some(args) = args
-                        && let Some(first_arg) = args.first()
-                        && let Ok(arg_expr) =
-                            serde_json::from_value::<Expression>(first_arg.clone())
-                    {
-                        return get_literal_value(&arg_expr, context);
-                    }
-                    return Some(None); // no arg → undefined
-                }
-            }
-
-            // Fix C: $state(arg) / $derived(arg) — Identifier callee
-            // Mirrors upstream scope.js lines 465-481: recurse into the single argument.
-            let callee = obj.get("callee").and_then(|v| v.as_object())?;
-            let callee_type = callee.get("type").and_then(|t| t.as_str())?;
-            if callee_type == "Identifier" {
-                let rune_name = callee.get("name").and_then(|n| n.as_str()).unwrap_or("");
-                if matches!(rune_name, "$state" | "$derived") {
-                    let args = obj.get("arguments").and_then(|a| a.as_array());
-                    if let Some(args) = args
-                        && let Some(first_arg) = args.first()
-                        && let Ok(arg_expr) =
-                            serde_json::from_value::<Expression>(first_arg.clone())
-                    {
-                        return get_literal_value(&arg_expr, context);
-                    }
-                    return Some(None); // no arg → undefined
-                }
-            }
-            None
-        }
-        "BinaryExpression" => {
-            let operator = obj.get("operator").and_then(|v| v.as_str())?;
-            let left = obj.get("left")?;
-            let right = obj.get("right")?;
-            let left_expr = serde_json::from_value::<Expression>(left.clone()).ok()?;
-            let right_expr = serde_json::from_value::<Expression>(right.clone()).ok()?;
-
-            let left_val = get_literal_value(&left_expr, context)?;
-            let right_val = get_literal_value(&right_expr, context)?;
-
-            // Try numeric comparison first
-            let left_num = left_val.as_ref().and_then(|s| s.parse::<f64>().ok());
-            let right_num = right_val.as_ref().and_then(|s| s.parse::<f64>().ok());
-
-            if let (Some(l), Some(r)) = (left_num, right_num) {
-                let result: Option<String> = match operator {
-                    "===" | "==" => Some(format!("{}", l == r)),
-                    "!==" | "!=" => Some(format!("{}", l != r)),
-                    "<" => Some(format!("{}", l < r)),
-                    ">" => Some(format!("{}", l > r)),
-                    "<=" => Some(format!("{}", l <= r)),
-                    ">=" => Some(format!("{}", l >= r)),
-                    "+" => Some(format_js_number(l + r)),
-                    "-" => Some(format_js_number(l - r)),
-                    "*" => Some(format_js_number(l * r)),
-                    "/" => {
-                        // JS division never throws: `0/0` → NaN, `x/0` → ±Infinity.
-                        // Mirror upstream `binary['/'](a, b)` (plain JS `/`), which
-                        // returns a *known* number (NaN/Infinity) so the chunk folds
-                        // to that literal string instead of staying reactive.
-                        Some(format_js_number(l / r))
-                    }
-                    "%" => Some(format_js_number(l % r)),
-                    _ => None,
-                };
-                return result.map(Some);
-            }
-
-            // String comparison for === and !==
-            if let (Some(l), Some(r)) = (&left_val, &right_val) {
-                match operator {
-                    "===" => return Some(Some(format!("{}", l == r))),
-                    "!==" => return Some(Some(format!("{}", l != r))),
-                    "+" => return Some(Some(format!("{}{}", l, r))),
-                    _ => {}
-                }
-            }
-
-            // JavaScript coercion: arithmetic on non-numeric operands yields NaN.
-            // e.g. 'ab' / 2 → NaN, 'ab' * x → NaN (mirrors JS spec).
-            if let (Some(l), Some(r)) = (&left_val, &right_val)
-                && (l.parse::<f64>().is_err() || r.parse::<f64>().is_err())
-                && matches!(operator, "/" | "*" | "-" | "**" | "%")
-            {
-                return Some(Some("NaN".to_string()));
-            }
-
-            None
-        }
-        "UnaryExpression" => {
-            let operator = obj.get("operator").and_then(|v| v.as_str())?;
-            let argument = obj.get("argument")?;
-            let arg_expr = serde_json::from_value::<Expression>(argument.clone()).ok()?;
-            let arg_val = get_literal_value(&arg_expr, context)?;
-
-            match operator {
-                "!" => {
-                    // Logical NOT
-                    match arg_val.as_deref() {
-                        Some("true") => Some(Some("false".to_string())),
-                        Some("false") | Some("0") | Some("") | None => {
-                            Some(Some("true".to_string()))
-                        }
-                        Some(s) => {
-                            // Any non-empty, non-zero string is truthy
-                            if s.parse::<f64>().ok() != Some(0.0) {
-                                Some(Some("false".to_string()))
-                            } else {
-                                Some(Some("true".to_string()))
-                            }
-                        }
-                    }
-                }
-                "-" => {
-                    let val = arg_val?;
-                    let n = val.parse::<f64>().ok()?;
-                    let res = -n;
-                    if res.fract() == 0.0 {
-                        Some(Some(format!("{}", res as i64)))
-                    } else {
-                        Some(Some(res.to_string()))
-                    }
-                }
-                "+" => {
-                    let val = arg_val?;
-                    let n = val.parse::<f64>().ok()?;
-                    if n.fract() == 0.0 {
-                        Some(Some(format!("{}", n as i64)))
-                    } else {
-                        Some(Some(n.to_string()))
-                    }
-                }
-                "typeof" => match arg_val.as_deref() {
-                    None => Some(Some("undefined".to_string())),
-                    Some(s) => {
-                        if s == "true" || s == "false" {
-                            Some(Some("boolean".to_string()))
-                        } else if s.parse::<f64>().is_ok() {
-                            Some(Some("number".to_string()))
-                        } else {
-                            Some(Some("string".to_string()))
-                        }
-                    }
-                },
-                _ => None,
-            }
-        }
-        "ConditionalExpression" => {
-            // Fold a ternary when its test folds to a known constant, taking
-            // only the chosen branch (upstream scope.js `ConditionalExpression`
-            // case: evaluate the test; if known, use the matching branch).
-            let test = obj.get("test")?;
-            let test_expr = serde_json::from_value::<Expression>(test.clone()).ok()?;
-            let test_val = get_literal_value(&test_expr, context)?;
-            let truthy = match test_val.as_deref() {
-                None => false, // null / undefined
-                Some("") | Some("false") => false,
-                Some(s) => s
-                    .parse::<f64>()
-                    .map(|n| n != 0.0 && !n.is_nan())
-                    .unwrap_or(true),
-            };
-            let branch = if truthy {
-                obj.get("consequent")?
-            } else {
-                obj.get("alternate")?
-            };
-            let branch_expr = serde_json::from_value::<Expression>(branch.clone()).ok()?;
-            get_literal_value(&branch_expr, context)
-        }
-        _ => None,
-    }
+    evaluate_estree(&ClientEvalScope { context, converted: true }, jv, 0).known_value().cloned()
 }
 
 /// Check if a BUILT JsExpr is guaranteed to be defined (non-null/undefined).
@@ -4228,48 +3841,73 @@ fn get_literal_value_complex(
 /// Build the dotted keypath of a static `JsExpr` callee (`Math.round` →
 /// `"Math.round"`). Returns `None` for computed members, calls, or anything
 /// that isn't a plain identifier / identifier-member chain.
-fn js_expr_keypath(
+pub(crate) fn js_expr_keypath(
     expr: &JsExpr,
     arena: &crate::compiler::phases::phase3_transform::js_ast::arena::JsArena,
 ) -> Option<String> {
     match expr {
+        JsExpr::Spanned(inner, _, _) => js_expr_keypath(arena.get_expr(*inner), arena),
         JsExpr::Identifier(name) => Some(name.to_string()),
         JsExpr::Member(m) if !m.computed => {
-            if let crate::compiler::phases::phase3_transform::js_ast::nodes::JsMemberProperty::Identifier(prop) = &m.property {
+            let prop = match &m.property {
+                crate::compiler::phases::phase3_transform::js_ast::nodes::JsMemberProperty::Identifier(prop)
+                | crate::compiler::phases::phase3_transform::js_ast::nodes::JsMemberProperty::SpannedIdentifier {
+                    name: prop,
+                    ..
+                } => prop,
+                _ => return None,
+            };
+            {
                 let base = js_expr_keypath(arena.get_expr(m.object), arena)?;
                 Some(format!("{base}.{prop}"))
-            } else {
-                None
             }
         }
         _ => None,
     }
 }
 
-/// True for the global function keypaths whose results upstream `scope.evaluate`
-/// types as NUMBER or STRING (always defined): every `Math.*`, `Number` /
-/// `Number.*`, `String` / `String.from*`, and `BigInt`. Mirrors the `globals`
-/// table in `2-analyze/scope.js`.
-fn is_known_defined_global_call(keypath: &str) -> bool {
-    keypath.starts_with("Math.")
-        || keypath == "Number"
-        || keypath.starts_with("Number.")
-        || keypath == "String"
-        || keypath == "String.fromCharCode"
-        || keypath == "String.fromCodePoint"
-        || keypath == "BigInt"
+pub(crate) use crate::compiler::phases::phase2_analyze::scope::is_known_defined_global_call;
+/// Does the call carry a `...spread` argument? Upstream's `globals` branch
+/// requires it not to.
+pub(crate) fn js_call_has_spread(
+    call: &crate::compiler::phases::phase3_transform::js_ast::nodes::JsCallExpression,
+) -> bool {
+    call.arguments.iter().any(|arg| matches!(arg, JsExpr::Spread(_)))
+}
+
+/// Upstream `scope.evaluate`'s `global_constants` table.
+pub(crate) fn is_global_constant(keypath: &str) -> bool {
+    matches!(
+        keypath,
+        "Math.PI"
+            | "Math.E"
+            | "Math.LN10"
+            | "Math.LN2"
+            | "Math.LOG10E"
+            | "Math.LOG2E"
+            | "Math.SQRT2"
+            | "Math.SQRT1_2"
+    )
 }
 
 pub(crate) fn is_js_expr_defined(
     expr: &JsExpr,
     arena: &crate::compiler::phases::phase3_transform::js_ast::arena::JsArena,
+    context: &ComponentContext,
 ) -> bool {
     match expr {
+        JsExpr::Spanned(inner, _, _) => is_js_expr_defined(arena.get_expr(*inner), arena, context),
         JsExpr::Literal(lit) => match lit {
             JsLiteral::Null | JsLiteral::Undefined => false,
             _ => true, // String, Number, Boolean are always defined
         },
-        JsExpr::Identifier(_) => false, // Could be undefined
+        // Upstream `scope.evaluate` resolves identifiers through the scope even
+        // on the built (transformed) AST: a non-reactive binding that survives
+        // transformation as a bare identifier (reactive reads become `$.get(x)`
+        // CallExpressions instead) still resolves to its binding's evaluation.
+        // Mirror that so e.g. `cond ? iconAsc : iconDesc` (legacy string lets)
+        // reads bare. Synthetic memo ids (`$0`) have no binding → false.
+        JsExpr::Identifier(name) => identifier_is_defined(name, context),
         JsExpr::Call(call) => {
             // Upstream `scope.evaluate` knows the global `Math.*` / `Number` /
             // `Number.*` / `String` / `String.from*` / `BigInt` functions return
@@ -4277,21 +3915,22 @@ pub(crate) fn is_js_expr_defined(
             // `is_defined` and gets no `?? ''`. (A shadowing local binding would
             // have been wrapped — e.g. `$.get(Math).round(...)` — so the bare
             // global keypath only matches the real globals.)
-            js_expr_keypath(arena.get_expr(call.callee), arena)
-                .as_deref()
-                .is_some_and(is_known_defined_global_call)
+            js_expr_keypath(arena.get_expr(call.callee), arena).as_deref().is_some_and(|keypath| {
+                is_known_defined_global_call(keypath, js_call_has_spread(call))
+            })
         }
         JsExpr::TemplateLiteral(_) => true, // Always a string
-        JsExpr::Binary(_) => true,          // Always produces a result
+        JsExpr::Function(_) | JsExpr::Arrow(_) => true,
+        JsExpr::Binary(_) => true, // Always produces a result
         JsExpr::Unary(u) => !matches!(u.operator, JsUnaryOp::Void),
         JsExpr::Logical(log) => {
             // Check both sides
-            is_js_expr_defined(arena.get_expr(log.left), arena)
-                && is_js_expr_defined(arena.get_expr(log.right), arena)
+            is_js_expr_defined(arena.get_expr(log.left), arena, context)
+                && is_js_expr_defined(arena.get_expr(log.right), arena, context)
         }
         JsExpr::Conditional(cond) => {
-            is_js_expr_defined(arena.get_expr(cond.consequent), arena)
-                && is_js_expr_defined(arena.get_expr(cond.alternate), arena)
+            is_js_expr_defined(arena.get_expr(cond.consequent), arena, context)
+                && is_js_expr_defined(arena.get_expr(cond.alternate), arena, context)
         }
         JsExpr::Raw(s) => {
             // Raw expressions that are string/number literals are defined.
@@ -4303,14 +3942,137 @@ pub(crate) fn is_js_expr_defined(
                 || trimmed == "false"
                 || trimmed.parse::<f64>().is_ok()
         }
-        JsExpr::Sequence(seq) => {
-            // A sequence expression evaluates to its last element
-            seq.expressions
-                .last()
-                .is_some_and(|e| is_js_expr_defined(e, arena))
-        }
+        // Upstream's `scope.evaluate` has no `SequenceExpression` case, so it
+        // falls to `default` and adds UNKNOWN — never `is_defined`, whatever
+        // the last element evaluates to.
         _ => false,
     }
+}
+
+/// Resolve a bare identifier to its binding and decide whether upstream's
+/// `scope.evaluate(<identifier>).is_defined` would hold. Shared by the
+/// original-expression path (`is_expression_defined_json`) and the
+/// transformed-value path (`is_js_expr_defined`): upstream's `scope.evaluate`
+/// resolves identifiers through the scope in BOTH cases, so a non-reactive
+/// binding that survives transformation as a bare identifier (e.g. a legacy
+/// `let iconAsc = "↑"` inside a `cond ? iconAsc : iconDesc`) must resolve the
+/// same way whether it appears at the top level or nested in a built expression.
+fn identifier_is_defined(name: &str, context: &ComponentContext) -> bool {
+    use crate::compiler::phases::phase2_analyze::scope::BindingKind;
+
+    // Special identifiers
+    if name == "undefined" {
+        return false;
+    }
+
+    // First, check if there's a transform with is_defined flag
+    // This is how we track EachIndex within each block scope
+    if let Some(transform) = context.state.transform.get(name)
+        && transform.is_defined
+    {
+        return true;
+    }
+
+    // `const uid = $props.id()` always evaluates to a string.
+    // Upstream's scope.evaluate resolves the const binding's initial
+    // `$props.id()` to STRING (scope.js `case '$props.id'`), so
+    // `is_defined` is true and no `?? ''` is appended.
+    if context.state.analysis.props_id.as_deref() == Some(name) {
+        return true;
+    }
+
+    // Check the binding
+    if let Some(binding) = context.state.get_binding(name) {
+        // EachIndex is always a number, never null/undefined
+        if matches!(binding.kind, BindingKind::EachIndex) {
+            return true;
+        }
+        // A template-scoped DeclarationTag / ConstTag binding
+        // (`{const after_async = number + 1}`) is defined when its
+        // initializer is a statically-non-nullish shape. Upstream's
+        // `is_defined` walks `binding.initial`; mirror that with the
+        // recorded `initial_node_type` so e.g. `after_async`
+        // (BinaryExpression) reads bare while `number`
+        // (AwaitExpression) keeps `?? ''`.
+        if matches!(binding.kind, BindingKind::Template)
+            && binding.initial_is_defined
+            && let Some(ref ity) = binding.initial_node_type
+            && matches!(
+                ity.as_str(),
+                "BinaryExpression"
+                    | "UpdateExpression"
+                    | "ArrayExpression"
+                    | "ObjectExpression"
+                    | "TemplateLiteral"
+            )
+        {
+            return true;
+        }
+        // For Normal const bindings with defined initial value
+        if matches!(binding.kind, BindingKind::Normal)
+            && !binding.reassigned
+            && matches!(
+                binding.declaration_kind,
+                crate::compiler::phases::phase2_analyze::scope::DeclarationKind::Const
+            )
+            && binding.initial_is_defined
+        {
+            return true;
+        }
+
+        // For a Normal binding (any `let`/`var`/`const`) whose
+        // initializer is a `BinaryExpression` (`a + b`) or a
+        // `TemplateLiteral` — the only two non-mutable shapes upstream
+        // `scope.evaluate` types as a definite STRING/NUMBER (never
+        // null/undefined), so `is_defined` holds and no `?? ''` is
+        // added. (Notably NOT `UpdateExpression`: upstream's evaluate
+        // has no case for it, so `x++` falls through to UNKNOWN and
+        // keeps its `?? ''`.) A primitive result cannot be turned
+        // nullish by a later in-place mutation, so only reassignment
+        // (`!reassigned`) can invalidate it. Uses the recorded init
+        // node TYPE directly rather than the `initial_is_defined`
+        // flag, which is not populated for legacy (non-runes) `let`
+        // bindings. Fixes e.g. `let key = a.charAt(0) + a.slice(1)`
+        // reading bare.
+        if matches!(binding.kind, BindingKind::Normal)
+            && !binding.reassigned
+            && binding
+                .initial_node_type
+                .as_deref()
+                .is_some_and(|t| matches!(t, "BinaryExpression" | "TemplateLiteral"))
+        {
+            return true;
+        }
+
+        // A function declaration's binding carries the declaration itself as
+        // its initial, which upstream's evaluate types as FUNCTION — never
+        // null/undefined, so the interpolation reads bare.
+        if matches!(binding.kind, BindingKind::Normal)
+            && !binding.is_updated()
+            && matches!(
+                binding.declaration_kind,
+                crate::compiler::phases::phase2_analyze::scope::DeclarationKind::Function
+            )
+        {
+            return true;
+        }
+
+        // A non-updated `let`/`var`/`const x = <primitive literal>`
+        // (e.g. legacy `let iconAsc = "↑"`): upstream's scope.evaluate
+        // resolves the binding's Literal initial to a defined primitive
+        // (`!binding.updated && binding.initial !== null && !is_prop`),
+        // so a template `${x}` reads bare. Only a `null` literal is
+        // undefined (`undefined` is an Identifier, handled above).
+        if matches!(binding.kind, BindingKind::Normal)
+            && !binding.is_updated()
+            && binding.initial_node_type.as_deref() == Some("Literal")
+            && binding.initial.as_deref() != Some("null")
+            && binding.initial.is_some()
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// Check if an expression is guaranteed to be defined (non-null/undefined).
@@ -4325,182 +4087,11 @@ pub(crate) fn is_expression_defined(
     expr: &crate::ast::js::Expression,
     context: &ComponentContext,
 ) -> bool {
-    is_expression_defined_json(expr.as_json(), context)
-}
-
-/// Internal helper for checking if a JSON expression is defined.
-fn is_expression_defined_json(json_value: &serde_json::Value, context: &ComponentContext) -> bool {
-    use crate::compiler::phases::phase2_analyze::scope::BindingKind;
-
-    let Some(obj) = json_value.as_object() else {
-        return false;
-    };
-    let Some(expr_type) = obj.get("type").and_then(|v| v.as_str()) else {
-        return false;
-    };
-
-    match expr_type {
-        "Identifier" => {
-            if let Some(name) = obj.get("name").and_then(|v| v.as_str()) {
-                // Special identifiers
-                if name == "undefined" {
-                    return false;
-                }
-
-                // First, check if there's a transform with is_defined flag
-                // This is how we track EachIndex within each block scope
-                if let Some(transform) = context.state.transform.get(name)
-                    && transform.is_defined
-                {
-                    return true;
-                }
-
-                // `const uid = $props.id()` always evaluates to a string.
-                // Upstream's scope.evaluate resolves the const binding's initial
-                // `$props.id()` to STRING (scope.js `case '$props.id'`), so
-                // `is_defined` is true and no `?? ''` is appended.
-                if context.state.analysis.props_id.as_deref() == Some(name) {
-                    return true;
-                }
-
-                // Check the binding
-                if let Some(binding) = context.state.get_binding(name) {
-                    // EachIndex is always a number, never null/undefined
-                    if matches!(binding.kind, BindingKind::EachIndex) {
-                        return true;
-                    }
-                    // A template-scoped DeclarationTag / ConstTag binding
-                    // (`{const after_async = number + 1}`) is defined when its
-                    // initializer is a statically-non-nullish shape. Upstream's
-                    // `is_defined` walks `binding.initial`; mirror that with the
-                    // recorded `initial_node_type` so e.g. `after_async`
-                    // (BinaryExpression) reads bare while `number`
-                    // (AwaitExpression) keeps `?? ''`.
-                    if matches!(binding.kind, BindingKind::Template)
-                        && binding.initial_is_defined
-                        && let Some(ref ity) = binding.initial_node_type
-                        && matches!(
-                            ity.as_str(),
-                            "BinaryExpression"
-                                | "UpdateExpression"
-                                | "ArrayExpression"
-                                | "ObjectExpression"
-                                | "TemplateLiteral"
-                        )
-                    {
-                        return true;
-                    }
-                    // For Normal const bindings with defined initial value
-                    if matches!(binding.kind, BindingKind::Normal)
-                        && !binding.reassigned
-                        && matches!(
-                            binding.declaration_kind,
-                            crate::compiler::phases::phase2_analyze::scope::DeclarationKind::Const
-                        )
-                        && binding.initial_is_defined
-                    {
-                        return true;
-                    }
-
-                    // For a Normal binding (any `let`/`var`/`const`) whose
-                    // initializer is a `BinaryExpression` (`a + b`) or a
-                    // `TemplateLiteral` — the only two non-mutable shapes upstream
-                    // `scope.evaluate` types as a definite STRING/NUMBER (never
-                    // null/undefined), so `is_defined` holds and no `?? ''` is
-                    // added. (Notably NOT `UpdateExpression`: upstream's evaluate
-                    // has no case for it, so `x++` falls through to UNKNOWN and
-                    // keeps its `?? ''`.) A primitive result cannot be turned
-                    // nullish by a later in-place mutation, so only reassignment
-                    // (`!reassigned`) can invalidate it. Uses the recorded init
-                    // node TYPE directly rather than the `initial_is_defined`
-                    // flag, which is not populated for legacy (non-runes) `let`
-                    // bindings. Fixes e.g. `let key = a.charAt(0) + a.slice(1)`
-                    // reading bare.
-                    if matches!(binding.kind, BindingKind::Normal)
-                        && !binding.reassigned
-                        && binding
-                            .initial_node_type
-                            .as_deref()
-                            .is_some_and(|t| matches!(t, "BinaryExpression" | "TemplateLiteral"))
-                    {
-                        return true;
-                    }
-                }
-            }
-            false
-        }
-        "Literal" => {
-            // Literals are defined unless they're null/undefined
-            if let Some(value) = obj.get("value") {
-                return !value.is_null();
-            }
-            // If no value field but raw exists, it's likely a valid literal
-            obj.get("raw").is_some()
-        }
-        "BinaryExpression" => {
-            // Binary expressions always produce defined results (booleans, numbers, strings)
-            true
-        }
-        "UnaryExpression" => {
-            // Check the operator - most produce defined results
-            if let Some(op) = obj.get("operator").and_then(|v| v.as_str()) {
-                // void operator produces undefined
-                if op == "void" {
-                    return false;
-                }
-            }
-            true
-        }
-        "LogicalExpression" => {
-            // Logical expressions might return undefined if right side is undefined
-            // For safety, check both operands
-            if let (Some(left), Some(right)) = (obj.get("left"), obj.get("right")) {
-                return is_expression_defined_json(left, context)
-                    && is_expression_defined_json(right, context);
-            }
-            false
-        }
-        "ConditionalExpression" => {
-            // Ternary: check both consequent and alternate
-            if let (Some(consequent), Some(alternate)) =
-                (obj.get("consequent"), obj.get("alternate"))
-            {
-                return is_expression_defined_json(consequent, context)
-                    && is_expression_defined_json(alternate, context);
-            }
-            false
-        }
-        "TemplateLiteral" => {
-            // Template literals are always strings (defined)
-            true
-        }
-        "ArrayExpression" | "ObjectExpression" => {
-            // Array/object literals are always defined
-            true
-        }
-        "ArrowFunctionExpression" | "FunctionExpression" => {
-            // Functions are always defined
-            true
-        }
-        "CallExpression" => {
-            // A call to a known global (`Math.*` / `Number` / `String` /
-            // `BigInt`) returns a NUMBER/STRING — always defined — mirroring
-            // upstream `scope.evaluate`'s `globals` table.
-            obj.get("callee")
-                .and_then(json_callee_keypath)
-                .as_deref()
-                .is_some_and(is_known_defined_global_call)
-        }
-        "MemberExpression" => {
-            // Member access could be undefined; can't guarantee defined.
-            false
-        }
-        _ => false,
-    }
+    evaluate_estree(&ClientEvalScope { context, converted: false }, expr.as_json(), 0).is_defined()
 }
 
 /// Dotted keypath of a static estree-JSON callee (`Math.round` → `"Math.round"`).
-fn json_callee_keypath(node: &serde_json::Value) -> Option<String> {
+pub(crate) fn json_keypath(node: &serde_json::Value) -> Option<String> {
     let obj = node.as_object()?;
     match obj.get("type").and_then(|t| t.as_str())? {
         "Identifier" => obj.get("name").and_then(|n| n.as_str()).map(String::from),
@@ -4510,7 +4101,7 @@ fn json_callee_keypath(node: &serde_json::Value) -> Option<String> {
                 return None;
             }
             let prop_name = prop.get("name").and_then(|n| n.as_str())?;
-            let base = json_callee_keypath(obj.get("object")?)?;
+            let base = json_keypath(obj.get("object")?)?;
             Some(format!("{base}.{prop_name}"))
         }
         _ => None,
@@ -4520,25 +4111,22 @@ fn json_callee_keypath(node: &serde_json::Value) -> Option<String> {
 /// Result of analyzing multiple expression properties in a single AST walk.
 pub struct ExpressionProperties {
     pub has_state: bool,
-    pub has_call: bool,
     pub has_member: bool,
     pub has_await: bool,
     pub has_assignment: bool,
 }
 
-/// Analyze an expression for reactive state, calls, member expressions, and await
+/// Analyze an expression for reactive state, member expressions, and await
 /// expressions in a single pass over the JSON AST.
 ///
-/// This is equivalent to calling `expression_has_reactive_state`, `expression_has_call`,
-/// `expression_has_member`, and `expression_has_await` individually, but avoids
-/// walking the tree 4 times.
+/// This is equivalent to computing the reactive-state, member-expression, and
+/// await properties separately, but avoids walking the tree 3 times.
 pub fn analyze_expression_properties(
     expr: &crate::ast::js::Expression,
     context: &ComponentContext,
 ) -> ExpressionProperties {
     let mut props = ExpressionProperties {
         has_state: false,
-        has_call: false,
         has_member: false,
         has_await: false,
         has_assignment: false,
@@ -4554,7 +4142,7 @@ pub fn analyze_expression_properties(
 
 /// Internal recursive helper for `analyze_expression_properties`.
 ///
-/// Walks the JSON AST once, setting flags for reactive state, calls, member expressions,
+/// Walks the JSON AST once, setting flags for reactive state, member expressions,
 /// and await expressions. Once all flags are set to true, stops recursing (short-circuit).
 fn analyze_props_json(
     json_value: &serde_json::Value,
@@ -4562,12 +4150,7 @@ fn analyze_props_json(
     props: &mut ExpressionProperties,
 ) {
     // Short-circuit: if all flags are already true, no need to walk further
-    if props.has_state
-        && props.has_call
-        && props.has_member
-        && props.has_await
-        && props.has_assignment
-    {
+    if props.has_state && props.has_member && props.has_await && props.has_assignment {
         return;
     }
 
@@ -4582,7 +4165,6 @@ fn analyze_props_json(
         "Identifier" => {
             // has_member: no
             // has_await: no
-            // has_call: no (identifiers are not calls)
             // has_state: check bindings/transforms
             if !props.has_state && obj.get("name").and_then(|v| v.as_str()).is_some() {
                 props.has_state = has_reactive_state_json(json_value, context);
@@ -4597,13 +4179,6 @@ fn analyze_props_json(
                 props.has_state = has_reactive_state_json(json_value, context);
             }
 
-            // has_call: check object subtree
-            if !props.has_call
-                && let Some(object) = obj.get("object")
-            {
-                props.has_call = has_call_json(object, context);
-            }
-
             // has_await: check object subtree
             if !props.has_await
                 && let Some(object) = obj.get("object")
@@ -4612,11 +4187,6 @@ fn analyze_props_json(
             }
         }
         "CallExpression" | "TaggedTemplateExpression" => {
-            // has_call: use existing logic (involves is_pure + has_reactive_state checks)
-            if !props.has_call {
-                props.has_call = has_call_json(json_value, context);
-            }
-
             // has_state: use existing logic (complex CallExpression handling)
             if !props.has_state {
                 props.has_state = has_reactive_state_json(json_value, context);
@@ -4660,12 +4230,25 @@ fn analyze_props_json(
                 }
             }
         }
+        "NewExpression" => {
+            // Upstream's `NewExpression` visitor only calls `context.next()`, so a
+            // `new` contributes no flag of its own — every flag comes from the
+            // callee and the arguments.
+            if let Some(callee) = obj.get("callee") {
+                analyze_props_json(callee, context, props);
+            }
+            if let Some(args) = obj.get("arguments").and_then(|v| v.as_array()) {
+                for arg in args {
+                    analyze_props_json(arg, context, props);
+                }
+            }
+        }
         "AwaitExpression" => {
             // has_await: always true
             props.has_await = true;
             // has_state: AwaitExpression is always reactive
             props.has_state = true;
-            // has_member/has_call: not directly, but don't need to recurse for state/await
+            // has_member: not directly, but don't need to recurse for state/await
         }
         "BinaryExpression" | "LogicalExpression" => {
             if let Some(left) = obj.get("left") {
@@ -4735,12 +4318,6 @@ fn analyze_props_json(
                     }
                 }
             }
-            // has_call: check right side
-            if !props.has_call
-                && let Some(right) = obj.get("right")
-            {
-                props.has_call = has_call_json(right, context);
-            }
             // has_await: not checked for AssignmentExpression by has_await_json
         }
         "ArrayExpression" => {
@@ -4753,18 +4330,10 @@ fn analyze_props_json(
         "ObjectExpression" => {
             if let Some(properties) = obj.get("properties").and_then(|v| v.as_array()) {
                 for prop in properties {
-                    if let Some(prop_obj) = prop.as_object() {
-                        if let Some(value) = prop_obj.get("value") {
-                            analyze_props_json(value, context, props);
-                        }
-                        // has_call also checks computed keys
-                        if !props.has_call
-                            && prop_obj.get("computed").and_then(|v| v.as_bool()) == Some(true)
-                            && let Some(key) = prop_obj.get("key")
-                            && has_call_json(key, context)
-                        {
-                            props.has_call = true;
-                        }
+                    if let Some(prop_obj) = prop.as_object()
+                        && let Some(value) = prop_obj.get("value")
+                    {
+                        analyze_props_json(value, context, props);
                     }
                 }
             }
@@ -4783,6 +4352,22 @@ fn analyze_props_json(
         | "BigIntLiteral" | "RegExpLiteral" => {
             // No flags to set for literals
         }
+        "MetaProperty" | "ThisExpression" => {
+            // Leaves upstream: it has no visitor for either, and `is_reference`
+            // rejects both halves of `import.meta`, so nothing here is a read.
+            // A MEMBER of one is still dynamic — that is the `MemberExpression`
+            // arm, whose leftmost object is then not an `Identifier`.
+        }
+        "ImportExpression" => {
+            // Upstream has no visitor either, so `import(x)` is not a call —
+            // only what it is given can be reactive.
+            if let Some(source) = obj.get("source") {
+                analyze_props_json(source, context, props);
+            }
+            if let Some(options) = obj.get("options") {
+                analyze_props_json(options, context, props);
+            }
+        }
         "ArrowFunctionExpression" | "FunctionExpression" => {
             // Function definitions don't affect these flags
         }
@@ -4797,11 +4382,33 @@ fn analyze_props_json(
 ///
 /// Returns true if the expression contains identifiers that reference
 /// reactive bindings ($state, $derived, props, stores, etc.).
+///
+/// The answer is taken off the typed nodes whenever `typed_has_reactive_state`
+/// recognises every shape it meets, so the common case never materializes
+/// `as_json()`. Everything else falls through to the JSON walk.
 #[inline]
 pub fn expression_has_reactive_state(
     expr: &crate::ast::js::Expression,
     context: &ComponentContext,
 ) -> bool {
+    if let Some(node) = expr.try_as_node_ref() {
+        use crate::ast::typed_expr::JsNode;
+        let typed = match node {
+            // Leaves answer without an arena; every deeper shape needs one to
+            // resolve child ids.
+            JsNode::Identifier { name, start, .. } => {
+                Some(identifier_has_reactive_state(name.as_str(), Some(*start), context))
+            }
+            JsNode::Literal { .. } => Some(false),
+            _ => crate::ast::arena::try_with_current_serialize_arena(|arena| {
+                typed_has_reactive_state(node, arena, context)
+            })
+            .flatten(),
+        };
+        if let Some(answer) = typed {
+            return answer;
+        }
+    }
     has_reactive_state_json(expr.as_json(), context)
 }
 
@@ -4827,12 +4434,7 @@ pub fn is_effect_pending_expr(
     };
     let callee = arena.get_js_node(callee_id);
     match callee {
-        JsNode::MemberExpression {
-            object,
-            property,
-            computed,
-            ..
-        } => {
+        JsNode::MemberExpression { object, property, computed, .. } => {
             if *computed {
                 return false;
             }
@@ -4848,35 +4450,497 @@ pub fn is_effect_pending_expr(
     }
 }
 
-// Recursion-depth guard for `initial_is_non_reactive` so cyclic initializers
-// (`const a = `${b}`; const b = `${a}``) cannot loop forever.
-thread_local! {
-    static REACTIVE_INIT_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+/// True when a binding's stored initializer (`init_expr_json`, an interpolated
+/// template literal) is compile-time known.
+fn initial_is_non_reactive(binding: &Binding, context: &ComponentContext) -> bool {
+    is_binding_initial_known(binding, context)
 }
 
-/// True when a binding's stored initializer (`init_expr_json`, an interpolated
-/// template literal) contains NO reactive state — i.e. its value is compile-time
-/// "known" (approximates `scope.evaluate(node).is_known`, letting
-/// `const url = `…${KNOWN}…`` be treated as non-reactive). Depth-guarded.
-fn initial_is_non_reactive(init_expr_json: &Option<String>, context: &ComponentContext) -> bool {
-    let Some(s) = init_expr_json else {
-        return false;
+/// Resolve the binding a template identifier read actually refers to,
+/// correcting for `get_binding`'s root-scope pollution (see its own doc
+/// comment) when a block-local `{#snippet}` shadows a same-named outer
+/// binding that is NOT a prop — a plain script-level `function` / `let`, or a
+/// `$derived`. `shadow_snippet_declarations` (`client::utils`) already
+/// records every such shadowed name in `shadowed_prop_names` (despite the
+/// name, it covers ANY outer binding a fragment's snippets shadow, not just
+/// props) and strips it from `transform`, so a shadowed prop/store still
+/// resolves correctly here via the "always reactive" `BindingKind` branch
+/// below. A shadowed plain function does not: `get_binding` returns the
+/// outer function's binding, whose `is_function()` is `true`, so the read
+/// wrongly skips the `$.template_effect` wrap that the local snippet (whose
+/// `is_function()` is always `false`, matching upstream's
+/// `Binding#is_function`) requires.
+///
+/// `ScopeRoot::binding_at_reference` (added for #2060/#2143) covers this same
+/// class of bug more precisely, by replaying Phase 2's scope-correct
+/// resolution for the exact reference position — prefer it wherever a source
+/// position is available (see `has_reactive_state_json` /
+/// `is_expression_known_json`). This name-based fallback remains the only
+/// option for `build_event_handler` (`shared/events.rs`, `attribute.rs`),
+/// which resolve an already-converted `JsExpr::Identifier` that carries no
+/// source position.
+pub fn resolve_shadowing_snippet_binding<'a>(
+    name: &str,
+    context: &'a ComponentContext,
+) -> Option<&'a Binding> {
+    let direct = context.state.get_binding(name);
+    let is_snippet_binding = |b: &Binding| {
+        matches!(b.kind, BindingKind::Normal)
+            && b.initial_node_type.as_deref() == Some("SnippetBlock")
     };
-    let Ok(json) = serde_json::from_str::<serde_json::Value>(s) else {
-        return false;
-    };
-    REACTIVE_INIT_DEPTH.with(|d| {
-        if d.get() >= 8 {
+    if direct.is_some_and(is_snippet_binding) || !context.state.shadowed_prop_names.contains(name) {
+        return direct;
+    }
+    context
+        .state
+        .scope_root
+        .bindings_by_name
+        .get(name)
+        .and_then(|idxs| {
+            idxs.iter().rev().find_map(|&i| {
+                let b = context.state.scope_root.bindings.get(i as usize)?;
+                is_snippet_binding(b).then_some(b)
+            })
+        })
+        .or(direct)
+}
+
+/// The `"Identifier"` case of `has_reactive_state_json`, lifted out so the typed
+/// front end of `expression_has_reactive_state` can answer a bare identifier
+/// without materializing the expression as JSON. `start` is the identifier's
+/// source offset, used only to replay Phase 2's scope-correct resolution.
+fn identifier_has_reactive_state(
+    name: &str,
+    start: Option<u32>,
+    context: &ComponentContext,
+) -> bool {
+    // An enclosing `{#each … as <item>[, <index>]}` loop variable shadows
+    // any outer binding of the same name; inside the block it is the loop
+    // variable, not the outer constant. `get_binding` below walks
+    // `self.scope`, which is NOT switched to the each scope during the body
+    // transform, so a shadowed name would resolve to the outer (possibly
+    // non-reactive) binding and wrongly report the text as static. Mirror the
+    // `get_literal_value` each-shadow guard: an each ITEM is always reactive
+    // (matching the `BindingKind::EachItem` rule below); an each INDEX uses
+    // its analyzer-computed reactivity. Innermost context wins (rev()).
+    //
+    // A `{@const}` or snippet parameter in the block being visited shadows the
+    // loop variable in the other direction, and this loop is keyed by name too.
+    if !context.state.each_shadowing_names.contains_key(name) {
+        for c in context.state.each_binding_context.iter().rev() {
+            if c.item_name == name {
+                return true;
+            }
+            if !c.index_name.is_empty() && c.index_name == name {
+                return c.index_reactive;
+            }
+        }
+    }
+
+    // A name assigned after a top-level `await` is written inside the `$.run`
+    // block, so it holds nothing at first render however constant its
+    // initializer is. Upstream models this as `binding.blocker` and keeps the
+    // `template_effect` (with the `$$promises[n]` dependency) rather than
+    // folding the read into a one-shot write.
+    if context.state.blocker_map.borrow().contains_key(name)
+        || context.state.const_blocker_map.borrow().contains_key(name)
+    {
+        return true;
+    }
+
+    // Replay Phase 2's scope-correct resolution for this reference.
+    // A template declaration (`{@const}` / `{#await}`) that shadows a
+    // component-scope binding is invisible to the name-based lookups
+    // below, which would report the outer (reactive) binding and
+    // force an unnecessary template_effect. `let:` bindings are
+    // excluded: their reactivity is decided by whether the directive's
+    // transform is installed (see the `BindingKind::Let` arm below),
+    // not by the binding itself.
+    let by_position =
+        start.and_then(|start| context.state.scope_root.binding_at_reference(name, start)).filter(
+            |b| !matches!(b.kind, crate::compiler::phases::phase2_analyze::scope::BindingKind::Let),
+        );
+
+    // Check if identifier has a transform registered (e.g., @const, snippet parameter)
+    // Identifiers with transforms are derived values that need reactive tracking,
+    // BUT only if the transform has is_reactive=true.
+    // This check comes FIRST because @const creates both a binding (Normal) and a transform,
+    // but the transform indicates it's a derived value needing reactive tracking.
+    //
+    // EXCEPTION: Derived bindings always have transforms (for $.get() wrapping),
+    // but their reactivity depends on whether their dependencies are known constants.
+    // For Derived bindings, skip this early return and fall through to the
+    // detailed binding kind check below. State/RawState are excepted for the
+    // same reason: upstream decides the READ from `scope.evaluate`, never from
+    // the lowered declaration form, so `accessors` (which `customElement` turns
+    // on) must not make a never-written `$state(1)` read reactive.
+    if let Some(transform) = context.state.transform.get(name) {
+        use crate::compiler::phases::phase2_analyze::scope::BindingKind;
+
+        // Resolve the binding this reference actually refers to. `get_binding`
+        // walks the root-scope-polluted map, which prefers an OUTER same-named
+        // binding; when an in-scope `{@const}` shadows it, that resolves to the
+        // outer binding instead of the `{@const}`.
+        let resolved = by_position.or_else(|| context.state.get_binding(name));
+
+        // Check if this is a Derived/State binding - if so, skip the early
+        // return and fall through to the detailed binding kind check below.
+        let is_derived = resolved.is_some_and(|b| {
+            matches!(b.kind, BindingKind::Derived | BindingKind::State | BindingKind::RawState)
+        });
+        if !is_derived {
+            // For Template bindings (@const), check if the initial value is known
+            // instead of blindly using transform.is_reactive.
+            // This matches the official Svelte compiler's scope.evaluate() behavior.
+            if let Some(binding) = resolved
+                && matches!(binding.kind, BindingKind::Template)
+            {
+                // A function-valued `{@const}` (`{@const f = (e) => …}`)
+                // mirrors upstream's `!binding.is_function()` term in
+                // Identifier.js: reading it is not reactive state, so a
+                // component prop `onclick={f}` is emitted as a plain
+                // `onclick: $.get(f)` value rather than a getter.
+                if binding.is_function() {
+                    return false;
+                }
+                if let Some(initial_json) = binding.initial_json() {
+                    return !is_expression_known_json(initial_json, context);
+                }
+                // No initial stored → conservatively treat as reactive
+                return true;
+            }
+            // Use the is_reactive flag from the transform
+            // Non-reactive transforms (like unkeyed each block index) should not be treated as reactive
+            return transform.is_reactive;
+        }
+    }
+    if let Some(binding) = by_position.or_else(|| context.state.get_binding(name)) {
+        use crate::compiler::phases::phase2_analyze::scope::BindingKind;
+
+        // Match Svelte's logic from Identifier.js (lines 95-101):
+        // has_state ||= binding.kind !== 'static' &&
+        //     (binding.kind === 'prop' || ... || !binding.is_function()) &&
+        //     !context.state.scope.evaluate(node).is_known;
+
+        // Static bindings are never reactive
+        if matches!(binding.kind, BindingKind::Static) {
             return false;
         }
-        d.set(d.get() + 1);
-        // `is_expression_known_json` is the proper compile-time-known check: it
-        // returns false for calls / awaits / reactive reads, so a template with
-        // an impure or reactive interpolation stays reactive (memoized).
-        let known = is_expression_known_json(&json, context);
-        d.set(d.get() - 1);
-        known
-    })
+
+        // Bindings that are always reactive (props, stores, each items, etc.)
+        // These don't go through the is_known check because their values
+        // are inherently dynamic/external.
+        if matches!(
+            binding.kind,
+            BindingKind::Prop
+                | BindingKind::BindableProp
+                | BindingKind::RestProp
+                | BindingKind::Store
+                | BindingKind::StoreSub
+                | BindingKind::EachItem
+                | BindingKind::SnippetParam
+        ) {
+            return true;
+        }
+
+        // Let directive bindings (let:thing) are only reactive when
+        // they have a corresponding transform registered. If there's
+        // no transform, it means we're in a context where the let
+        // directive doesn't apply (e.g., a named slot), so the binding
+        // is effectively an undefined/static reference.
+        if matches!(binding.kind, BindingKind::Let) {
+            return context.state.transform.contains_key(name);
+        }
+
+        // For Derived bindings, check if the derived value is "known"
+        // (i.e., its dependencies are all non-reactive constants).
+        // This matches the official Svelte compiler's scope.evaluate() behavior
+        // where $derived(expr) is known if `expr` only depends on known values.
+        if matches!(binding.kind, BindingKind::Derived) {
+            if binding.reassigned || binding.mutated {
+                return true;
+            }
+            // The stored `$derived` argument approximates scope.evaluate().is_known:
+            // a known value is effectively constant → not reactive.
+            return !is_binding_initial_known(binding, context);
+        }
+
+        // For Template bindings (@const tag), apply the same scope.evaluate()
+        // logic as Derived bindings. @const values are wrapped in
+        // $.derived_safe_equal() and accessed via $.get(), but their reactivity
+        // depends on whether their initial expression depends on reactive state.
+        // E.g., `@const bar = 'world'` → is_known=true (non-reactive)
+        //        `@const doubled = count * 2` → is_known depends on `count`
+        if matches!(binding.kind, BindingKind::Template) {
+            // Function-valued `{@const}` mirrors upstream's
+            // `!binding.is_function()` term (see the Template branch
+            // above): a read of it is not reactive state.
+            if binding.is_function() {
+                return false;
+            }
+            if let Some(initial_json) = binding.initial_json() {
+                return !is_expression_known_json(initial_json, context);
+            }
+            // If no initial or couldn't parse, conservatively treat as reactive
+            return true;
+        }
+
+        // For State/RawState bindings in runes mode (immutable=true) with no initial
+        // value AT ALL (i.e., `$state()` called with no args):
+        // - is_state_source = false (not reassigned)
+        // - initial_node_type = None (no arg expression → compiles to `void 0`)
+        // - The binding effectively compiles to `undefined`, which is a known constant.
+        // → treat as non-reactive (is_known = true).
+        //
+        // IMPORTANT: Only apply when initial_node_type is None (no argument),
+        // NOT when initial_is_defined is false. The latter can be false for
+        // `$state(member.expr)` where the arg might evaluate to undefined at
+        // runtime, but the binding is still reactive via $.proxy() wrapping.
+        // A `$state()` with no argument compiles to `void 0`, which
+        // `scope.evaluate` reports as a known value, so its read is not reactive
+        // state unless the binding is written. Reading `is_state_source` here
+        // instead makes the answer depend on how the DECLARATION was lowered,
+        // and `accessors` — which `customElement` forces on — sets it for every
+        // `$state`. Only `initial_node_type == None` qualifies, not
+        // `initial_is_defined == false`, which also holds for `$state(m.x)`.
+        if matches!(binding.kind, BindingKind::State | BindingKind::RawState)
+            && binding.initial_node_type.is_none()
+            && !binding.reassigned
+            && !binding.mutated
+        {
+            return false;
+        }
+
+        // For State, RawState, Derived, and Normal bindings:
+        // Match Svelte's logic: has_state is true when:
+        //   binding.kind !== 'static' &&
+        //   (binding.kind === 'prop' || ... || !binding.is_function()) &&
+        //   !context.state.scope.evaluate(node).is_known
+        //
+        // The official compiler uses scope.evaluate() to determine if a
+        // binding's value is "known" at compile time. Even $state bindings
+        // can be "known" if they're never updated (reassigned/mutated) and
+        // their initial value is a known literal. For example:
+        //   let y = $state('y1')  // never reassigned -> is_known = true
+        //   let x = $state('x1')  // reassigned via x = 'x2' -> is_known = false
+        //
+        // We approximate scope.evaluate().is_known by checking:
+        // 1. For const/let declarations with literal initial values -> is_known = true if never reassigned/mutated
+        // 2. For imports -> is_known = false (we don't know what they'll return)
+        if !binding.is_function() {
+            use crate::compiler::phases::phase2_analyze::scope::DeclarationKind;
+
+            // Check if this is a declaration with a known value
+            // (approximation of scope.evaluate().is_known)
+            // Both const and let declarations can be "known" if they:
+            // - Are never reassigned
+            // - Are never mutated
+            // - Have an initial value that's a literal or known value
+            //   (includes undefined identifier: `let x = undefined`)
+            //   Note: initial_is_defined is NOT required here because
+            //   `undefined` is a compile-time constant even if it's falsy.
+            //   The shared evaluator handles a missing initializer as unknown.
+            let decl_known_eligible =
+                matches!(binding.declaration_kind, DeclarationKind::Const | DeclarationKind::Let)
+                    && !binding.reassigned
+                    && !binding.mutated;
+            let is_known = decl_known_eligible && initial_is_non_reactive(binding, context);
+
+            // has_state is true when the value is NOT known at compile time
+            return !is_known;
+        }
+
+        return false;
+    }
+    // $$props and $$restProps are always reactive - they change when props change.
+    // They don't have bindings or transforms because they are generated variables,
+    // but they reference reactive state (component props).
+    if name == "$$props" || name == "$$restProps" {
+        return true;
+    }
+
+    // Unknown identifier - conservatively assume non-reactive
+    // (could be a global or module-level binding)
+    false
+}
+
+/// Global functions whose result depends only on their arguments.
+const PURE_GLOBALS: &[&str] = &[
+    "encodeURIComponent",
+    "decodeURIComponent",
+    "encodeURI",
+    "decodeURI",
+    "parseInt",
+    "parseFloat",
+    "isNaN",
+    "isFinite",
+    "String",
+    "Number",
+    "Boolean",
+    "Array",
+    "Object",
+    "JSON",
+];
+
+/// Objects whose methods depend only on their arguments (`Math.max(…)`).
+const PURE_OBJECTS: &[&str] = &["Math", "JSON", "Object", "Array", "String", "Number"];
+
+/// Typed counterpart of `has_reactive_state_json`, arm for arm, so the answer
+/// can be given without materializing the expression as JSON.
+///
+/// `None` means the walk met a shape it has no typed answer for — the caller
+/// falls back to the JSON walk for the whole expression rather than guessing.
+fn typed_has_reactive_state(
+    node: &crate::ast::typed_expr::JsNode,
+    arena: &crate::ast::arena::ParseArena,
+    context: &ComponentContext,
+) -> Option<bool> {
+    use crate::ast::typed_expr::JsNode;
+
+    match node {
+        JsNode::Identifier { name, start, .. } => {
+            Some(identifier_has_reactive_state(name.as_str(), Some(*start), context))
+        }
+        JsNode::Literal { .. } => Some(false),
+        // Serializes to a bare JSON `null`, which the JSON walk rejects before
+        // it reads a type.
+        JsNode::Null => Some(false),
+        // `this` is a pure, non-reactive leaf; a member read rooted at it is
+        // therefore governed by the property expression alone.
+        JsNode::ThisExpression { .. } => Some(false),
+        JsNode::MemberExpression { object, property, computed, .. } => {
+            // Upstream's MemberExpression visitor is `has_state ||= !is_pure(node)`.
+            if !typed_is_pure(node, arena, context) {
+                return Some(true);
+            }
+            let object = arena.get_js_node(*object);
+            if typed_has_reactive_state(object, arena, context)? {
+                return Some(true);
+            }
+            // A property of a local variable may be reactive itself (a class
+            // instance with `$state` fields), which is not visible from here.
+            if let JsNode::Identifier { name, .. } = object
+                && context.state.get_binding(name.as_str()).is_some()
+            {
+                return Some(true);
+            }
+            if *computed && typed_has_reactive_state(arena.get_js_node(*property), arena, context)?
+            {
+                return Some(true);
+            }
+            Some(false)
+        }
+        JsNode::CallExpression { callee, arguments, .. } => {
+            let callee = arena.get_js_node(*callee);
+            let arguments = arena.get_js_children(*arguments);
+            match callee {
+                JsNode::Identifier { name, .. } => {
+                    let name = name.as_str();
+                    if PURE_GLOBALS.contains(&name) {
+                        return typed_any_has_reactive_state(arguments, arena, context);
+                    }
+                    if let Some(binding) = context.state.get_binding(name) {
+                        if binding.kind.is_reactive() {
+                            return Some(true);
+                        }
+                    } else if context.state.transform.contains_key(name) {
+                        return Some(true);
+                    } else {
+                        return typed_any_has_reactive_state(arguments, arena, context);
+                    }
+                }
+                JsNode::MemberExpression { object, .. } => {
+                    if let JsNode::Identifier { name, .. } = arena.get_js_node(*object)
+                        && PURE_OBJECTS.contains(&name.as_str())
+                    {
+                        return typed_any_has_reactive_state(arguments, arena, context);
+                    }
+                }
+                _ => {}
+            }
+            if typed_has_reactive_state(callee, arena, context)? {
+                return Some(true);
+            }
+            typed_any_has_reactive_state(arguments, arena, context)
+        }
+        JsNode::NewExpression { callee, arguments, .. } => {
+            if typed_has_reactive_state(arena.get_js_node(*callee), arena, context)? {
+                return Some(true);
+            }
+            typed_any_has_reactive_state(arena.get_js_children(*arguments), arena, context)
+        }
+        JsNode::BinaryExpression { left, right, .. }
+        | JsNode::LogicalExpression { left, right, .. } => {
+            if typed_has_reactive_state(arena.get_js_node(*left), arena, context)? {
+                return Some(true);
+            }
+            typed_has_reactive_state(arena.get_js_node(*right), arena, context)
+        }
+        JsNode::UnaryExpression { argument, .. } => {
+            typed_has_reactive_state(arena.get_js_node(*argument), arena, context)
+        }
+        JsNode::ConditionalExpression { test, consequent, alternate, .. } => {
+            for id in [test, consequent, alternate] {
+                if typed_has_reactive_state(arena.get_js_node(*id), arena, context)? {
+                    return Some(true);
+                }
+            }
+            Some(false)
+        }
+        JsNode::TemplateLiteral { expressions, .. }
+        | JsNode::SequenceExpression { expressions, .. } => {
+            typed_any_has_reactive_state(arena.get_js_children(*expressions), arena, context)
+        }
+        JsNode::ChainExpression { expression, .. } => {
+            typed_has_reactive_state(arena.get_js_node(*expression), arena, context)
+        }
+        // Only the right-hand side, matching the JSON walk.
+        JsNode::AssignmentExpression { right, .. } => {
+            typed_has_reactive_state(arena.get_js_node(*right), arena, context)
+        }
+        JsNode::ObjectExpression { properties, .. } => {
+            for property in arena.get_js_children(*properties) {
+                match property {
+                    JsNode::SpreadElement { .. } => return Some(true),
+                    JsNode::Property { value, .. } => {
+                        if typed_has_reactive_state(arena.get_js_node(*value), arena, context)? {
+                            return Some(true);
+                        }
+                    }
+                    _ => return None,
+                }
+            }
+            Some(false)
+        }
+        JsNode::ArrayExpression { elements, .. } => {
+            for element in elements.iter().flatten() {
+                if typed_has_reactive_state(element, arena, context)? {
+                    return Some(true);
+                }
+            }
+            Some(false)
+        }
+        JsNode::AwaitExpression { .. }
+        | JsNode::UpdateExpression { .. }
+        | JsNode::SpreadElement { .. } => Some(true),
+        JsNode::ArrowFunctionExpression { .. } | JsNode::FunctionExpression { .. } => Some(false),
+        _ => None,
+    }
+}
+
+/// True as soon as any of `nodes` references reactive state; `None` propagates
+/// the first shape the typed walk could not answer.
+fn typed_any_has_reactive_state(
+    nodes: &[crate::ast::typed_expr::JsNode],
+    arena: &crate::ast::arena::ParseArena,
+    context: &ComponentContext,
+) -> Option<bool> {
+    for node in nodes {
+        if typed_has_reactive_state(node, arena, context)? {
+            return Some(true);
+        }
+    }
+    Some(false)
 }
 
 /// Internal helper that processes JSON values directly, avoiding serde_json::from_value overhead.
@@ -4893,227 +4957,18 @@ fn has_reactive_state_json(json_value: &serde_json::Value, context: &ComponentCo
         "Identifier" => {
             // Check if identifier is a reactive binding
             if let Some(name) = obj.get("name").and_then(|v| v.as_str()) {
-                // An enclosing `{#each … as <item>[, <index>]}` loop variable shadows
-                // any outer binding of the same name; inside the block it is the loop
-                // variable, not the outer constant. `get_binding` below walks
-                // `self.scope`, which is NOT switched to the each scope during the body
-                // transform, so a shadowed name would resolve to the outer (possibly
-                // non-reactive) binding and wrongly report the text as static. Mirror the
-                // `get_literal_value` each-shadow guard: an each ITEM is always reactive
-                // (matching the `BindingKind::EachItem` rule below); an each INDEX uses
-                // its analyzer-computed reactivity. Innermost context wins (rev()).
-                for c in context.state.each_binding_context.iter().rev() {
-                    if c.item_name == name {
-                        return true;
-                    }
-                    if !c.index_name.is_empty() && c.index_name == name {
-                        return c.index_reactive;
-                    }
-                }
-
-                // Check if identifier has a transform registered (e.g., @const, snippet parameter)
-                // Identifiers with transforms are derived values that need reactive tracking,
-                // BUT only if the transform has is_reactive=true.
-                // This check comes FIRST because @const creates both a binding (Normal) and a transform,
-                // but the transform indicates it's a derived value needing reactive tracking.
-                //
-                // EXCEPTION: Derived bindings always have transforms (for $.get() wrapping),
-                // but their reactivity depends on whether their dependencies are known constants.
-                // For Derived bindings, skip this early return and fall through to the
-                // detailed binding kind check below.
-                if let Some(transform) = context.state.transform.get(name) {
-                    // Check if this is a Derived binding - if so, skip the early return
-                    // and fall through to the detailed binding kind check below.
-                    let is_derived = context.state.get_binding(name).is_some_and(|b| {
-                        matches!(
-                            b.kind,
-                            crate::compiler::phases::phase2_analyze::scope::BindingKind::Derived
-                        )
-                    });
-                    if !is_derived {
-                        // For Template bindings (@const), check if the initial value is known
-                        // instead of blindly using transform.is_reactive.
-                        // This matches the official Svelte compiler's scope.evaluate() behavior.
-                        if let Some(binding) = context.state.get_binding(name)
-                            && matches!(
-                                binding.kind,
-                                crate::compiler::phases::phase2_analyze::scope::BindingKind::Template
-                            )
-                        {
-                            if let Some(ref initial_str) = binding.initial
-                                && let Ok(initial_json) =
-                                    serde_json::from_str::<serde_json::Value>(initial_str)
-                            {
-                                return !is_expression_known_json(&initial_json, context);
-                            }
-                            // No initial stored → conservatively treat as reactive
-                            return true;
-                        }
-                        // Use the is_reactive flag from the transform
-                        // Non-reactive transforms (like unkeyed each block index) should not be treated as reactive
-                        return transform.is_reactive;
-                    }
-                }
-                if let Some(binding) = context.state.get_binding(name) {
-                    use crate::compiler::phases::phase2_analyze::scope::BindingKind;
-
-                    // Match Svelte's logic from Identifier.js (lines 95-101):
-                    // has_state ||= binding.kind !== 'static' &&
-                    //     (binding.kind === 'prop' || ... || !binding.is_function()) &&
-                    //     !context.state.scope.evaluate(node).is_known;
-
-                    // Static bindings are never reactive
-                    if matches!(binding.kind, BindingKind::Static) {
-                        return false;
-                    }
-
-                    // Bindings that are always reactive (props, stores, each items, etc.)
-                    // These don't go through the is_known check because their values
-                    // are inherently dynamic/external.
-                    if matches!(
-                        binding.kind,
-                        BindingKind::Prop
-                            | BindingKind::BindableProp
-                            | BindingKind::RestProp
-                            | BindingKind::Store
-                            | BindingKind::StoreSub
-                            | BindingKind::EachItem
-                            | BindingKind::SnippetParam
-                    ) {
-                        return true;
-                    }
-
-                    // Let directive bindings (let:thing) are only reactive when
-                    // they have a corresponding transform registered. If there's
-                    // no transform, it means we're in a context where the let
-                    // directive doesn't apply (e.g., a named slot), so the binding
-                    // is effectively an undefined/static reference.
-                    if matches!(binding.kind, BindingKind::Let) {
-                        return context.state.transform.contains_key(name);
-                    }
-
-                    // For Derived bindings, check if the derived value is "known"
-                    // (i.e., its dependencies are all non-reactive constants).
-                    // This matches the official Svelte compiler's scope.evaluate() behavior
-                    // where $derived(expr) is known if `expr` only depends on known values.
-                    if matches!(binding.kind, BindingKind::Derived) {
-                        if binding.reassigned || binding.mutated {
-                            return true;
-                        }
-                        // If the binding has a stored initial expression (the $derived argument),
-                        // parse it as JSON and check if it can be evaluated at compile time.
-                        // This approximates scope.evaluate().is_known from the official compiler.
-                        if let Some(ref initial_str) = binding.initial
-                            && let Ok(initial_json) =
-                                serde_json::from_str::<serde_json::Value>(initial_str)
-                        {
-                            // Check if the expression is "known" (compile-time evaluable)
-                            // If known, the derived value is effectively constant → not reactive
-                            return !is_expression_known_json(&initial_json, context);
-                        }
-                        // If no initial or couldn't parse, conservatively treat as reactive
-                        return true;
-                    }
-
-                    // For Template bindings (@const tag), apply the same scope.evaluate()
-                    // logic as Derived bindings. @const values are wrapped in
-                    // $.derived_safe_equal() and accessed via $.get(), but their reactivity
-                    // depends on whether their initial expression depends on reactive state.
-                    // E.g., `@const bar = 'world'` → is_known=true (non-reactive)
-                    //        `@const doubled = count * 2` → is_known depends on `count`
-                    if matches!(binding.kind, BindingKind::Template) {
-                        if let Some(ref initial_str) = binding.initial
-                            && let Ok(initial_json) =
-                                serde_json::from_str::<serde_json::Value>(initial_str)
-                        {
-                            return !is_expression_known_json(&initial_json, context);
-                        }
-                        // If no initial or couldn't parse, conservatively treat as reactive
-                        return true;
-                    }
-
-                    // For State/RawState bindings in runes mode (immutable=true) with no initial
-                    // value AT ALL (i.e., `$state()` called with no args):
-                    // - is_state_source = false (not reassigned)
-                    // - initial_node_type = None (no arg expression → compiles to `void 0`)
-                    // - The binding effectively compiles to `undefined`, which is a known constant.
-                    // → treat as non-reactive (is_known = true).
-                    //
-                    // IMPORTANT: Only apply when initial_node_type is None (no argument),
-                    // NOT when initial_is_defined is false. The latter can be false for
-                    // `$state(member.expr)` where the arg might evaluate to undefined at
-                    // runtime, but the binding is still reactive via $.proxy() wrapping.
-                    if matches!(binding.kind, BindingKind::State | BindingKind::RawState)
-                        && binding.initial_node_type.is_none()
-                    {
-                        use crate::compiler::phases::phase3_transform::client::utils::is_state_source;
-                        if !is_state_source(binding, context.state.analysis) {
-                            return false;
-                        }
-                    }
-
-                    // For State, RawState, Derived, and Normal bindings:
-                    // Match Svelte's logic: has_state is true when:
-                    //   binding.kind !== 'static' &&
-                    //   (binding.kind === 'prop' || ... || !binding.is_function()) &&
-                    //   !context.state.scope.evaluate(node).is_known
-                    //
-                    // The official compiler uses scope.evaluate() to determine if a
-                    // binding's value is "known" at compile time. Even $state bindings
-                    // can be "known" if they're never updated (reassigned/mutated) and
-                    // their initial value is a known literal. For example:
-                    //   let y = $state('y1')  // never reassigned -> is_known = true
-                    //   let x = $state('x1')  // reassigned via x = 'x2' -> is_known = false
-                    //
-                    // We approximate scope.evaluate().is_known by checking:
-                    // 1. For const/let declarations with literal initial values -> is_known = true if never reassigned/mutated
-                    // 2. For imports -> is_known = false (we don't know what they'll return)
-                    if !binding.is_function() {
-                        use crate::compiler::phases::phase2_analyze::scope::DeclarationKind;
-
-                        // Check if this is a declaration with a known value
-                        // (approximation of scope.evaluate().is_known)
-                        // Both const and let declarations can be "known" if they:
-                        // - Are never reassigned
-                        // - Are never mutated
-                        // - Have an initial value that's a literal or known value
-                        //   (includes undefined identifier: `let x = undefined`)
-                        //   Note: initial_is_defined is NOT required here because
-                        //   `undefined` is a compile-time constant even if it's falsy.
-                        //   is_initial_value_literal_or_known handles None → false.
-                        let decl_known_eligible = matches!(
-                            binding.declaration_kind,
-                            DeclarationKind::Const | DeclarationKind::Let
-                        ) && !binding.reassigned
-                            && !binding.mutated;
-                        let is_known = decl_known_eligible
-                            && (is_initial_value_literal_or_known(&binding.initial)
-                                // Recursive `scope.evaluate`-style fallback for an
-                                // interpolated-template-literal initializer whose
-                                // interpolations are themselves non-reactive
-                                // (e.g. `const url = `…${KNOWN_CONST}…``). Depth-guarded.
-                                || initial_is_non_reactive(&binding.init_expr_json, context));
-
-                        // has_state is true when the value is NOT known at compile time
-                        return !is_known;
-                    }
-
-                    return false;
-                }
-                // $$props and $$restProps are always reactive - they change when props change.
-                // They don't have bindings or transforms because they are generated variables,
-                // but they reference reactive state (component props).
-                if name == "$$props" || name == "$$restProps" {
-                    return true;
-                }
-
-                // Unknown identifier - conservatively assume non-reactive
-                // (could be a global or module-level binding)
-                return false;
+                let start = obj.get("start").and_then(|v| v.as_u64()).map(|v| v as u32);
+                return identifier_has_reactive_state(name, start, context);
             }
             false
         }
         "MemberExpression" => {
+            // Upstream's MemberExpression visitor is `has_state ||= !is_pure(node)`,
+            // so a member read whose leftmost object is neither a literal nor an
+            // unbound global (`[1, 2].length`, `({ a: 1 }).a`) is reactive.
+            if !is_pure_json(json_value, context) {
+                return true;
+            }
             // Check the object part - recurse directly with JSON reference
             if let Some(object) = obj.get("object") {
                 // First check if the object itself references reactive state
@@ -5159,23 +5014,6 @@ fn has_reactive_state_json(json_value: &serde_json::Value, context: &ComponentCo
                 if callee_type == Some("Identifier")
                     && let Some(name) = callee.get("name").and_then(|n| n.as_str())
                 {
-                    // List of known pure global functions
-                    const PURE_GLOBALS: &[&str] = &[
-                        "encodeURIComponent",
-                        "decodeURIComponent",
-                        "encodeURI",
-                        "decodeURI",
-                        "parseInt",
-                        "parseFloat",
-                        "isNaN",
-                        "isFinite",
-                        "String",
-                        "Number",
-                        "Boolean",
-                        "Array",
-                        "Object",
-                        "JSON",
-                    ];
                     if PURE_GLOBALS.contains(&name) {
                         // Check if any arguments are reactive - recurse with JSON reference
                         if let Some(args) = obj.get("arguments").and_then(|v| v.as_array()) {
@@ -5214,20 +5052,17 @@ fn has_reactive_state_json(json_value: &serde_json::Value, context: &ComponentCo
                     && let Some(object) = callee.get("object").and_then(|o| o.as_object())
                     && let Some("Identifier") = object.get("type").and_then(|t| t.as_str())
                     && let Some(obj_name) = object.get("name").and_then(|n| n.as_str())
+                    && PURE_OBJECTS.contains(&obj_name)
                 {
-                    const PURE_OBJECTS: &[&str] =
-                        &["Math", "JSON", "Object", "Array", "String", "Number"];
-                    if PURE_OBJECTS.contains(&obj_name) {
-                        // Check if any arguments are reactive - recurse with JSON reference
-                        if let Some(args) = obj.get("arguments").and_then(|v| v.as_array()) {
-                            for arg in args {
-                                if has_reactive_state_json(arg, context) {
-                                    return true;
-                                }
+                    // Check if any arguments are reactive - recurse with JSON reference
+                    if let Some(args) = obj.get("arguments").and_then(|v| v.as_array()) {
+                        for arg in args {
+                            if has_reactive_state_json(arg, context) {
+                                return true;
                             }
                         }
-                        return false;
                     }
+                    return false;
                 }
             }
 
@@ -5384,6 +5219,25 @@ fn has_reactive_state_json(json_value: &serde_json::Value, context: &ComponentCo
             // like `[...x.values()]`, whose result is unknown at compile time.
             true
         }
+        "MetaProperty" | "ThisExpression" => {
+            // Leaves upstream: `is_reference` rejects both halves of
+            // `import.meta`, and `this` is not a reference at all.
+            false
+        }
+        "ImportExpression" => {
+            // Not a call upstream — only its operands can be reactive.
+            if let Some(source) = obj.get("source")
+                && has_reactive_state_json(source, context)
+            {
+                return true;
+            }
+            if let Some(options) = obj.get("options")
+                && has_reactive_state_json(options, context)
+            {
+                return true;
+            }
+            false
+        }
         _ => {
             // Unknown expression type - conservatively assume reactive
             // (using set_text for a static expression is safe but slower,
@@ -5391,25 +5245,6 @@ fn has_reactive_state_json(json_value: &serde_json::Value, context: &ComponentCo
             true
         }
     }
-}
-
-/// Check if an expression contains a non-pure function call.
-///
-/// Matches the official Svelte compiler's behavior: a call is only considered
-/// "has_call" if the callee is NOT pure. Pure callees are global identifiers
-/// (no local binding) like console.log, Math.max, and literals.
-/// Pure calls with only pure arguments are not counted.
-#[inline]
-pub fn expression_has_call(expr: &crate::ast::js::Expression, context: &ComponentContext) -> bool {
-    // Fast path: a leaf expression (Identifier, Literal, …) trivially
-    // contains no call. Returning early here avoids the `as_json()`
-    // serialization for `Expression::Typed` inputs, which would
-    // otherwise lower the whole JsNode into a `serde_json::Value`
-    // just to discover there's no CallExpression to find.
-    if is_call_member_await_free_leaf(expr) {
-        return false;
-    }
-    has_call_json(expr.as_json(), context)
 }
 
 /// Check if an expression (or its callee) is "pure" in the Svelte sense.
@@ -5449,19 +5284,15 @@ fn is_pure_json(json_value: &serde_json::Value, context: &ComponentContext) -> b
             // check in is_pure(). This ensures $effect.tracking() gets has_call=true.
             if obj.get("computed").and_then(|v| v.as_bool()) != Some(true) {
                 let is_tracking =
-                    obj.get("property")
-                        .and_then(|p| p.as_object())
-                        .is_some_and(|p_obj| {
-                            p_obj.get("type").and_then(|t| t.as_str()) == Some("Identifier")
-                                && p_obj.get("name").and_then(|n| n.as_str()) == Some("tracking")
-                        });
+                    obj.get("property").and_then(|p| p.as_object()).is_some_and(|p_obj| {
+                        p_obj.get("type").and_then(|t| t.as_str()) == Some("Identifier")
+                            && p_obj.get("name").and_then(|n| n.as_str()) == Some("tracking")
+                    });
                 let is_effect_obj =
-                    obj.get("object")
-                        .and_then(|o| o.as_object())
-                        .is_some_and(|o_obj| {
-                            o_obj.get("type").and_then(|t| t.as_str()) == Some("Identifier")
-                                && o_obj.get("name").and_then(|n| n.as_str()) == Some("$effect")
-                        });
+                    obj.get("object").and_then(|o| o.as_object()).is_some_and(|o_obj| {
+                        o_obj.get("type").and_then(|t| t.as_str()) == Some("Identifier")
+                            && o_obj.get("name").and_then(|n| n.as_str()) == Some("$effect")
+                    });
                 if is_tracking && is_effect_obj {
                     return false;
                 }
@@ -5504,14 +5335,60 @@ fn is_pure_json(json_value: &serde_json::Value, context: &ComponentContext) -> b
     }
 }
 
+/// Typed counterpart of [`is_pure_json`], arm for arm, so a member read's purity
+/// can be decided without materializing the expression as JSON.
+fn typed_is_pure(
+    node: &crate::ast::typed_expr::JsNode,
+    arena: &crate::ast::arena::ParseArena,
+    context: &ComponentContext,
+) -> bool {
+    use crate::ast::typed_expr::JsNode;
+
+    match node {
+        JsNode::Literal { .. } | JsNode::Null => true,
+        JsNode::Identifier { name, .. } => {
+            context.state.get_binding(name.as_str()).is_none()
+                && !context.state.transform.contains_key(name.as_str())
+        }
+        JsNode::MemberExpression { object, property, computed, .. } => {
+            if !*computed
+                && let JsNode::Identifier { name: prop, .. } = arena.get_js_node(*property)
+                && prop.as_str() == "tracking"
+                && let JsNode::Identifier { name: base, .. } = arena.get_js_node(*object)
+                && base.as_str() == "$effect"
+            {
+                return false;
+            }
+            let mut left = arena.get_js_node(*object);
+            while let JsNode::MemberExpression { object, .. } = left {
+                left = arena.get_js_node(*object);
+            }
+            typed_is_pure(left, arena, context)
+        }
+        JsNode::CallExpression { callee, arguments, .. } => {
+            if !typed_is_pure(arena.get_js_node(*callee), arena, context) {
+                return false;
+            }
+            arena.get_js_children(*arguments).iter().all(|argument| {
+                let argument = match argument {
+                    JsNode::SpreadElement { argument, .. } => arena.get_js_node(*argument),
+                    other => other,
+                };
+                typed_is_pure(argument, arena, context)
+            })
+        }
+        _ => false,
+    }
+}
+
 /// Returns true if the JSON expression tree contains any Identifier that resolves to
 /// a `State` or `RawState` binding.
 ///
-/// Used by `get_literal_value_complex` and `has_call_json` to prevent compile-time
-/// folding of calls like `Math.round(y)` where `y = $state(0)`.  Although the binding
-/// has a known literal initial value, it is runtime-reactive (e.g. updated via
-/// `bind:scrollY={y}`).  Upstream avoids the fold because Phase-2 adds every binding
-/// to `expression.dependencies`, so `dependencies.size > 0` → `has_call = true`.
+/// Used by `has_call_json` to prevent compile-time folding of calls like
+/// `Math.round(y)` where `y = $state(0)`. Although the binding has a known literal
+/// initial value, it is runtime-reactive (e.g. updated via `bind:scrollY={y}`).
+/// Upstream avoids the fold because Phase-2 adds every binding to
+/// `expression.dependencies`, so `dependencies.size > 0` → `has_call = true`.
 fn arg_contains_state_or_raw_state_binding(
     json_value: &serde_json::Value,
     context: &ComponentContext,
@@ -5555,6 +5432,54 @@ fn arg_contains_state_or_raw_state_binding(
     }
 }
 
+/// Upstream's `dependencies.size > 0` term of the `has_call` rule: Phase 2 adds
+/// every resolved identifier reference to `expression.dependencies`, so a call
+/// with a pure callee is still reactive when the expression reads any binding —
+/// even one whose value is a compile-time-known constant.
+fn references_any_binding_json(json_value: &serde_json::Value, context: &ComponentContext) -> bool {
+    let Some(obj) = json_value.as_object() else {
+        return false;
+    };
+    let Some(expr_type) = obj.get("type").and_then(|v| v.as_str()) else {
+        return false;
+    };
+
+    match expr_type {
+        "Identifier" => obj
+            .get("name")
+            .and_then(|v| v.as_str())
+            .is_some_and(|name| context.state.get_binding(name).is_some()),
+        // A non-computed member/key names a property, not a reference.
+        "MemberExpression" | "Property" => {
+            let (value_key, name_key) = if expr_type == "MemberExpression" {
+                ("object", "property")
+            } else {
+                ("value", "key")
+            };
+            if let Some(value) = obj.get(value_key)
+                && references_any_binding_json(value, context)
+            {
+                return true;
+            }
+            obj.get("computed").and_then(|v| v.as_bool()) == Some(true)
+                && obj.get(name_key).is_some_and(|name| references_any_binding_json(name, context))
+        }
+        _ => {
+            for (_key, val) in obj {
+                if val.is_object() && references_any_binding_json(val, context) {
+                    return true;
+                }
+                if let Some(arr) = val.as_array()
+                    && arr.iter().any(|item| references_any_binding_json(item, context))
+                {
+                    return true;
+                }
+            }
+            false
+        }
+    }
+}
+
 /// Internal helper that processes JSON values directly, avoiding serde_json::from_value overhead.
 /// Returns true for calls that have reactive dependencies, matching the official Svelte compiler
 /// behavior from CallExpression.js:
@@ -5571,7 +5496,23 @@ fn has_call_json(json_value: &serde_json::Value, context: &ComponentContext) -> 
     };
 
     match expr_type {
-        "CallExpression" | "TaggedTemplateExpression" => {
+        "TaggedTemplateExpression" => {
+            // Upstream TaggedTemplateExpression.js: has_call iff the TAG is not
+            // pure — unlike CallExpression there is NO dependencies term, so
+            // `String.raw`…${state}…`` stays unmemoized.
+            if let Some(tag) = obj.get("tag")
+                && !is_pure_json(tag, context)
+            {
+                return true;
+            }
+            if let Some(quasi) = obj.get("quasi")
+                && has_call_json(quasi, context)
+            {
+                return true;
+            }
+            false
+        }
+        "CallExpression" => {
             // Match official Svelte compiler (CallExpression.js lines 264-273):
             //   if (!is_pure(node.callee, context) || context.state.expression.dependencies.size > 0) {
             //       context.state.expression.has_call = true;
@@ -5593,6 +5534,7 @@ fn has_call_json(json_value: &serde_json::Value, context: &ComponentContext) -> 
             // argument is a $state variable still gets has_call=true upstream.
             has_reactive_state_json(json_value, context)
                 || arg_contains_state_or_raw_state_binding(json_value, context)
+                || references_any_binding_json(json_value, context)
         }
         "MemberExpression" => {
             if let Some(object) = obj.get("object")
@@ -5697,6 +5639,23 @@ fn has_call_json(json_value: &serde_json::Value, context: &ComponentContext) -> 
             }
             false
         }
+        "NewExpression" => {
+            // A `new` is not itself a call upstream, but its callee and arguments
+            // are still walked, so `new Foo(bar())` does carry `has_call`.
+            if let Some(callee) = obj.get("callee")
+                && has_call_json(callee, context)
+            {
+                return true;
+            }
+            if let Some(args) = obj.get("arguments").and_then(|v| v.as_array()) {
+                for arg in args {
+                    if has_call_json(arg, context) {
+                        return true;
+                    }
+                }
+            }
+            false
+        }
         "AssignmentExpression" => {
             if let Some(right) = obj.get("right") {
                 return has_call_json(right, context);
@@ -5718,18 +5677,6 @@ fn has_call_json(json_value: &serde_json::Value, context: &ComponentContext) -> 
     }
 }
 
-/// Check if an expression contains a member expression.
-///
-/// Returns true if the expression contains a MemberExpression at any level.
-#[inline]
-pub fn expression_has_member(expr: &crate::ast::js::Expression) -> bool {
-    // Leaf short-circuit — see `expression_has_call` for the rationale.
-    if is_call_member_await_free_leaf(expr) {
-        return false;
-    }
-    has_member_json(expr.as_json())
-}
-
 /// Internal helper that checks for MemberExpression in JSON values.
 #[inline]
 fn has_member_json(json_value: &serde_json::Value) -> bool {
@@ -5742,7 +5689,7 @@ fn has_member_json(json_value: &serde_json::Value) -> bool {
 
     match expr_type {
         "MemberExpression" => true,
-        "CallExpression" => {
+        "CallExpression" | "NewExpression" => {
             if let Some(callee) = obj.get("callee")
                 && has_member_json(callee)
             {
@@ -5847,15 +5794,14 @@ fn has_member_json(json_value: &serde_json::Value) -> bool {
 /// Returns true if the expression contains an AwaitExpression at any level.
 #[inline]
 pub fn expression_has_await(expr: &crate::ast::js::Expression) -> bool {
-    // Leaf short-circuit — see `expression_has_call` for the rationale.
+    // Leaf short-circuit avoids materializing a typed leaf as JSON.
     if is_call_member_await_free_leaf(expr) {
         return false;
     }
     has_await_json(expr.as_json())
 }
 
-/// Type-dispatch fast path used by `expression_has_call` /
-/// `expression_has_member` / `expression_has_await` to skip the
+/// Type-dispatch fast path used by expression-property queries to skip the
 /// full `as_json()` serialization for expressions that can't
 /// possibly contain a CallExpression / MemberExpression /
 /// AwaitExpression.
@@ -5894,7 +5840,7 @@ fn has_await_json(json_value: &serde_json::Value) -> bool {
 
     match expr_type {
         "AwaitExpression" => true,
-        "CallExpression" => {
+        "CallExpression" | "NewExpression" => {
             if let Some(callee) = obj.get("callee")
                 && has_await_json(callee)
             {
@@ -5990,339 +5936,137 @@ fn has_await_json(json_value: &serde_json::Value) -> bool {
     }
 }
 
-/// Check if a binding's initial value is a literal or known compile-time constant.
+/// Is a binding's stored initializer a compile-time known value — upstream's
+/// `scope.evaluate(binding.initial).is_known`?
 ///
-/// This approximates Svelte's `scope.evaluate(node).is_known` by checking
-/// if the initial value string represents a literal value like:
-/// - Number literals: "5", "3.14"
-/// - String literals: "'hello'", "\"world\""
-/// - Boolean literals: "true", "false"
-/// - null literal: "null"
-/// - Array/Object literals: "[]", "{}"
-///
-/// This is a heuristic since we only have the string representation.
-#[inline]
-fn is_initial_value_literal_or_known(initial: &Option<String>) -> bool {
-    let Some(s) = initial else {
-        return false;
-    };
-
-    // The initial string can be either:
-    // 1. A raw literal value like "'world'", "42", "true", "null"
-    // 2. An AST JSON string containing "Literal" type
-
-    // Check for AST JSON format (contains "Literal" type)
-    if memchr::memmem::find(s.as_bytes(), b"Literal").is_some()
-        && memchr::memmem::find(s.as_bytes(), b"TemplateLiteral").is_none()
-    {
-        // Literal types (NumericLiteral, StringLiteral, BooleanLiteral, NullLiteral)
-        return true;
-    }
-
-    // Check for `undefined` identifier in AST JSON form:
-    // {"type":"Identifier","name":"undefined",...}
-    if memchr::memmem::find(s.as_bytes(), b"Identifier").is_some()
-        && memchr::memmem::find(s.as_bytes(), b"\"undefined\"").is_some()
-    {
-        return true;
-    }
-
-    // Check for TemplateLiteral without expressions (pure string template)
-    // A TemplateLiteral with no expressions is a known value at compile time
-    if memchr::memmem::find(s.as_bytes(), b"TemplateLiteral").is_some()
-        && memchr::memmem::find(s.as_bytes(), b"\"expressions\":[]").is_some()
-    {
-        return true;
-    }
-
-    // Check for raw literal formats
-    let trimmed = s.trim();
-
-    // String literal: starts and ends with quotes
-    if (trimmed.starts_with('\'') && trimmed.ends_with('\''))
-        || (trimmed.starts_with('"') && trimmed.ends_with('"'))
-    {
-        return true;
-    }
-
-    // Number literal: all digits (possibly with decimal)
-    if trimmed.parse::<f64>().is_ok() {
-        return true;
-    }
-
-    // Boolean/null literals
-    if matches!(trimmed, "true" | "false" | "null" | "undefined") {
-        return true;
-    }
-
-    // Empty array/object literals from AST format
-    if memchr::memmem::find(s.as_bytes(), b"ArrayExpression").is_some()
-        || memchr::memmem::find(s.as_bytes(), b"ObjectExpression").is_some()
-    {
-        // These are known but might contain reactive values - be conservative
-        // Only treat empty ones as known
-        if memchr::memmem::find(s.as_bytes(), b"\"elements\":[]").is_some()
-            || memchr::memmem::find(s.as_bytes(), b"\"properties\":[]").is_some()
-        {
-            return true;
-        }
-    }
-
-    false
+/// `Binding::initial` carries two encodings: the initializer node's JSON, or —
+/// when that initializer is a literal — the literal's own source text. A parse
+/// that does not yield an object is therefore the literal form, not a failure,
+/// and a literal is known by construction (#3228).
+fn is_binding_initial_known(
+    binding: &crate::compiler::phases::phase2_analyze::scope::Binding,
+    context: &ComponentContext,
+) -> bool {
+    evaluate_binding_initial(&ClientEvalScope { context, converted: false }, binding, 0).is_known()
 }
 
-/// Check if a JSON expression is "known" (can be evaluated at compile time).
-///
-/// This approximates the official Svelte compiler's `scope.evaluate().is_known` check.
-/// An expression is "known" if it evaluates to exactly one concrete value at compile time.
-///
-/// Key differences from `has_reactive_state_json`:
-/// - `has_reactive_state_json` checks if identifiers reference reactive bindings
-/// - `is_expression_known_json` checks if the expression can be compile-time evaluated
-///   (e.g., function calls to local functions are UNKNOWN even if the callee is non-reactive)
-fn is_expression_known_json(json_value: &serde_json::Value, context: &ComponentContext) -> bool {
-    let Some(obj) = json_value.as_object() else {
-        return false;
-    };
-    let Some(expr_type) = obj.get("type").and_then(|v| v.as_str()) else {
-        return false;
-    };
+/// `EvalScope` for the client transform: the same `scope.evaluate` walk the
+/// server runs, with Phase 2's reference-position resolution in place of the
+/// server's scope-index chain.
+struct ClientEvalScope<'a, 'b> {
+    context: &'a ComponentContext<'b>,
+    converted: bool,
+}
 
-    match expr_type {
-        "Literal" => true,
-
-        "Identifier" => {
-            if let Some(name) = obj.get("name").and_then(|v| v.as_str()) {
-                if name == "undefined" {
-                    return true;
-                }
-                if let Some(binding) = context.state.get_binding(name) {
-                    use crate::compiler::phases::phase2_analyze::scope::BindingKind;
-
-                    // Props are never known (external values)
-                    if matches!(
-                        binding.kind,
-                        BindingKind::Prop
-                            | BindingKind::BindableProp
-                            | BindingKind::RestProp
-                            | BindingKind::Store
-                            | BindingKind::StoreSub
-                            | BindingKind::EachItem
-                            | BindingKind::SnippetParam
-                    ) {
-                        return false;
-                    }
-
-                    // Updated bindings are not known
-                    if binding.reassigned || binding.mutated {
-                        return false;
-                    }
-
-                    // For State bindings, check if state source
-                    if matches!(binding.kind, BindingKind::State | BindingKind::RawState) {
-                        use crate::compiler::phases::phase3_transform::client::utils::is_state_source;
-                        if is_state_source(binding, context.state.analysis) {
-                            return false;
-                        }
-                        // Non-state-source with known initial → known
-                        return is_initial_value_literal_or_known(&binding.initial);
-                    }
-
-                    // For Derived bindings, recursively check the initial
-                    if matches!(binding.kind, BindingKind::Derived) {
-                        if let Some(ref initial_str) = binding.initial
-                            && let Ok(initial_json) =
-                                serde_json::from_str::<serde_json::Value>(initial_str)
-                        {
-                            return is_expression_known_json(&initial_json, context);
-                        }
-                        return false;
-                    }
-
-                    // For Template bindings (@const), recursively check the initial
-                    if matches!(binding.kind, BindingKind::Template) {
-                        if let Some(ref initial_str) = binding.initial
-                            && let Ok(initial_json) =
-                                serde_json::from_str::<serde_json::Value>(initial_str)
-                        {
-                            return is_expression_known_json(&initial_json, context);
-                        }
-                        return false;
-                    }
-
-                    // For Normal bindings: known if never updated with known initial
-                    // Functions are always "known" (they're defined)
-                    if binding.is_function() {
-                        return true;
-                    }
-                    return is_initial_value_literal_or_known(&binding.initial);
-                }
-                // Unknown identifier - not known (could be a global)
-                false
-            } else {
-                false
-            }
+impl EvalScope for ClientEvalScope<'_, '_> {
+    fn evaluate_override(&self, node: &serde_json::Value, _depth: u8) -> Option<Evaluation> {
+        if self.converted
+            && self.context.state.options.dev
+            && node.get("type").and_then(|ty| ty.as_str()) == Some("BinaryExpression")
+            && node
+                .get("operator")
+                .and_then(|operator| operator.as_str())
+                .is_some_and(|operator| matches!(operator, "===" | "!==" | "==" | "!="))
+        {
+            // The client visitor has already lowered a dev equality to a
+            // runtime helper call, which upstream's evaluator cannot fold.
+            return Some(Evaluation::unknown());
         }
-
-        "BinaryExpression" => {
-            // Both operands must be known
-            if let (Some(left), Some(right)) = (obj.get("left"), obj.get("right")) {
-                is_expression_known_json(left, context) && is_expression_known_json(right, context)
-            } else {
-                false
-            }
-        }
-
-        "UnaryExpression" => {
-            if let Some(arg) = obj.get("argument") {
-                is_expression_known_json(arg, context)
-            } else {
-                false
-            }
-        }
-
-        "ConditionalExpression" => {
-            // Port of upstream scope.js ConditionalExpression case (lines 374-393):
-            //
-            // If the test evaluates to a known constant, prune to only the taken
-            // branch — e.g. `pin ? pin.replace(…) : 'enter your pin'` where
-            // `pin = $state('')` (non-state-source, known `""`) folds to the
-            // alternate `'enter your pin'`, which is known.
-            //
-            // If the test is unknown, the result is known only when BOTH branches
-            // evaluate to the SAME single known value (upstream: values.size === 1).
-            // e.g. `der1 ? "1" : "0"` → two different values → not known.
-            let (Some(test), Some(consequent), Some(alternate)) =
-                (obj.get("test"), obj.get("consequent"), obj.get("alternate"))
-            else {
-                return false;
-            };
-            // Try to fold the test to a constant via get_literal_value.
-            use crate::ast::js::Expression;
-            let test_known = serde_json::from_value::<Expression>(test.clone())
-                .ok()
-                .and_then(|test_expr| get_literal_value(&test_expr, context));
-            match test_known {
-                Some(test_val) => {
-                    // Test is a known constant — only the taken branch needs to be known.
-                    let truthy = match test_val.as_deref() {
-                        None => false, // null / undefined
-                        Some("") | Some("false") | Some("0") => false,
-                        Some(s) => s
-                            .parse::<f64>()
-                            .map(|n| n != 0.0 && !n.is_nan())
-                            .unwrap_or(true),
-                    };
-                    if truthy {
-                        is_expression_known_json(consequent, context)
-                    } else {
-                        is_expression_known_json(alternate, context)
-                    }
-                }
-                None => {
-                    // Test is unknown — result is known only if both branches yield the
-                    // SAME single compile-time value (mirrors upstream values.size === 1
-                    // after adding both branches' values to the set).
-                    let c_val = serde_json::from_value::<Expression>(consequent.clone())
-                        .ok()
-                        .and_then(|e| get_literal_value(&e, context));
-                    let a_val = serde_json::from_value::<Expression>(alternate.clone())
-                        .ok()
-                        .and_then(|e| get_literal_value(&e, context));
-                    match (c_val, a_val) {
-                        (Some(c), Some(a)) => c == a,
-                        _ => false,
-                    }
-                }
-            }
-        }
-
-        "TemplateLiteral" => {
-            // Known only if all expressions are known
-            if let Some(expressions) = obj.get("expressions").and_then(|e| e.as_array()) {
-                expressions
-                    .iter()
-                    .all(|e| is_expression_known_json(e, context))
-            } else {
-                true // No expressions = just a string
-            }
-        }
-
-        // Function calls are generally NOT known (can't evaluate at compile time)
-        // except for rune calls $state / $state.raw / $derived whose argument IS known.
-        // Mirrors upstream scope.js lines 465-507.
-        "CallExpression" => {
-            let callee = obj.get("callee").and_then(|v| v.as_object());
-            if let Some(callee) = callee {
-                let callee_type = callee.get("type").and_then(|t| t.as_str());
-                // $state(arg) / $derived(arg)
-                if callee_type == Some("Identifier") {
-                    let rune_name = callee.get("name").and_then(|n| n.as_str()).unwrap_or("");
-                    if matches!(rune_name, "$state" | "$derived") {
-                        if let Some(args) = obj.get("arguments").and_then(|a| a.as_array())
-                            && let Some(first_arg) = args.first()
-                        {
-                            return is_expression_known_json(first_arg, context);
-                        }
-                        return true; // no arg → undefined (known)
-                    }
-                }
-                // $state.raw(arg)
-                if callee_type == Some("MemberExpression") {
-                    let obj_name = callee
-                        .get("object")
-                        .and_then(|o| o.as_object())
-                        .and_then(|o| o.get("name"))
-                        .and_then(|n| n.as_str())
-                        .unwrap_or("");
-                    let prop_name = callee
-                        .get("property")
-                        .and_then(|p| p.as_object())
-                        .and_then(|p| p.get("name"))
-                        .and_then(|n| n.as_str())
-                        .unwrap_or("");
-                    if obj_name == "$state" && prop_name == "raw" {
-                        if let Some(args) = obj.get("arguments").and_then(|a| a.as_array())
-                            && let Some(first_arg) = args.first()
-                        {
-                            return is_expression_known_json(first_arg, context);
-                        }
-                        return true; // no arg → undefined (known)
-                    }
-                }
-            }
-            false
-        }
-
-        // Arrow/function expressions are "known" (they evaluate to a function)
-        "ArrowFunctionExpression" | "FunctionExpression" => true,
-
-        // Member expressions are generally not known, EXCEPT a non-computed
-        // member of a pure global namespace whose members are compile-time
-        // constants — `Math.PI`, `Math.E`, `Number.MAX_VALUE`, etc. (mirrors the
-        // globals table in upstream `scope.evaluate`). This lets a derived like
-        // `$derived(2 * Math.PI * r)` fold to a known constant (no reactive deps).
-        "MemberExpression" => {
-            if obj.get("computed").and_then(|c| c.as_bool()) == Some(true) {
-                return false;
-            }
-            let Some(object) = obj.get("object") else {
-                return false;
-            };
-            if object.get("type").and_then(|t| t.as_str()) != Some("Identifier") {
-                return false;
-            }
-            object
-                .get("name")
-                .and_then(|n| n.as_str())
-                .is_some_and(|name| {
-                    matches!(name, "Math" | "Number") && context.state.get_binding(name).is_none()
-                })
-        }
-
-        // Default: not known
-        _ => false,
+        None
     }
+
+    fn identifier_has_binding(&self, name: &str) -> bool {
+        self.context.state.get_binding(name).is_some()
+            || self.context.state.transform.contains_key(name)
+    }
+
+    fn evaluate_identifier(&self, node: &serde_json::Value, name: &str, depth: u8) -> Evaluation {
+        // The converted template expression reads the transform's runtime
+        // value, not the source binding's initializer. Keep this guard inside
+        // the evaluator so it also covers transformed identifiers nested in a
+        // unary, binary or template expression. Initializers are evaluated
+        // with `converted: false` below and therefore still recurse normally.
+        if self.converted && self.context.state.transform.contains_key(name) {
+            return Evaluation::unknown();
+        }
+
+        // An enclosing `{#each … as item, index}` shadows any outer binding of
+        // the same name, and the loop scope is not on `state.scope`.
+        for c in self.context.state.each_binding_context.iter().rev() {
+            if c.item_name == name {
+                return Evaluation::unknown();
+            }
+            if !c.index_name.is_empty() && c.index_name == name {
+                return Evaluation::single(EvalValue::NumberMarker);
+            }
+        }
+        let reference_binding = node.get("start").and_then(|v| v.as_u64()).and_then(|start| {
+            self.context.state.scope_root.binding_at_reference(name, start as u32)
+        });
+        let binding = match reference_binding {
+            // Phase 2 resolves children of a component against its `let:`
+            // scope before Phase 3 separates those children by slot. A named
+            // slot does not inherit the component's `let:` binding, which the
+            // client visitor represents by omitting its transform. In that
+            // case the active client scope (typically the instance binding
+            // shadowed by the default slot) is the same scope upstream
+            // evaluates. Keep position-based resolution for active `let:`
+            // transforms and every other template-local binding.
+            Some(binding)
+                if self.converted
+                    && binding.kind
+                        == crate::compiler::phases::phase2_analyze::scope::BindingKind::Let
+                    && !self.context.state.transform.contains_key(name) =>
+            {
+                self.context
+                    .state
+                    .get_binding(name)
+                    .filter(|candidate| {
+                        candidate.kind
+                            != crate::compiler::phases::phase2_analyze::scope::BindingKind::Let
+                    })
+                    .or(Some(binding))
+            }
+            Some(binding) => Some(binding),
+            None => {
+                // A converted/synthesized identifier may have lost its source
+                // position. Name lookup is safe only when there is one binding:
+                // `get_binding` deliberately falls back across every scope and
+                // can otherwise substitute an outer constant for a `let:` or
+                // another same-named template-local binding.
+                self.context
+                    .state
+                    .scope_root
+                    .bindings_by_name
+                    .get(name)
+                    .filter(|bindings| bindings.len() == 1)
+                    .and_then(|_| self.context.state.get_binding(name))
+                    .filter(|binding| self.context.state.scope_chain_contains(binding.scope_index))
+            }
+        };
+        match binding {
+            // `build_expression` converts the template expression, but an
+            // initializer reached through scope resolution is still its source
+            // AST. In particular, dev equality lowering does not apply inside
+            // that initializer (#3570).
+            Some(b) => evaluate_binding_initial(
+                &ClientEvalScope { context: self.context, converted: false },
+                b,
+                depth,
+            ),
+            None if name == "undefined" => Evaluation::single(EvalValue::Undefined),
+            None => Evaluation::unknown(),
+        }
+    }
+
+    fn binding_initial_is_props_id(&self, name: &str) -> bool {
+        self.context.state.analysis.props_id.as_deref() == Some(name)
+    }
+}
+
+/// Upstream's `scope.evaluate(node).is_known`.
+fn is_expression_known_json(json_value: &serde_json::Value, context: &ComponentContext) -> bool {
+    evaluate_estree(&ClientEvalScope { context, converted: false }, json_value, 0).is_known()
 }
 
 /// Sanitize a template string by escaping special characters.
@@ -6380,17 +6124,15 @@ mod tests {
     #[test]
     fn test_build_template_effect_simple() {
         let arena = JsArena::new();
-        let statements = vec![b::stmt(
-            &arena,
-            b::call(&arena, b::id("console.log"), vec![b::string("test")]),
-        )];
+        let statements =
+            vec![b::stmt(&arena, b::call(&arena, b::id("console.log"), vec![b::string("test")]))];
 
         let effect = build_template_effect(&arena, statements, None);
 
         // Should generate $.template_effect(() => { ... })
         match effect {
             JsStatement::Expression(expr) => {
-                let JsExpressionStatement { expression } = expr;
+                let JsExpressionStatement { expression, .. } = expr;
                 match arena.get_expr(expression) {
                     JsExpr::Call(_) => {
                         // Success - generated a call expression
@@ -6405,10 +6147,8 @@ mod tests {
     #[test]
     fn test_build_template_effect_with_deps() {
         let arena = JsArena::new();
-        let statements = vec![b::stmt(
-            &arena,
-            b::call(&arena, b::id("console.log"), vec![b::id("count")]),
-        )];
+        let statements =
+            vec![b::stmt(&arena, b::call(&arena, b::id("console.log"), vec![b::id("count")]))];
 
         let deps = vec![b::id("count")];
 
@@ -6417,7 +6157,7 @@ mod tests {
         // Should generate $.template_effect_with_values(() => { ... }, [count])
         match effect {
             JsStatement::Expression(expr) => {
-                let JsExpressionStatement { expression } = expr;
+                let JsExpressionStatement { expression, .. } = expr;
                 match arena.get_expr(expression) {
                     JsExpr::Call(_) => {
                         // Success - generated a call expression
@@ -6429,48 +6169,240 @@ mod tests {
         }
     }
 
+    /// A reactive `count`, a compile-time-known `konst`, and a `Static` binding —
+    /// enough for the identifier fast path to return both answers rather than a
+    /// constant.
+    fn reactive_state_bindings() -> Vec<Binding> {
+        use crate::compiler::phases::phase2_analyze::scope::DeclarationKind;
+
+        let mut count = Binding::with_declaration_kind(
+            "count".to_string(),
+            BindingKind::State,
+            DeclarationKind::Let,
+            0,
+        );
+        // A `$state` with an initial node skips the "no argument at all" branch;
+        // being reassigned makes it not compile-time known → reactive.
+        count.initial_node_type = Some("Literal".to_string());
+        count.reassigned = true;
+
+        let mut konst = Binding::with_declaration_kind(
+            "konst".to_string(),
+            BindingKind::Normal,
+            DeclarationKind::Const,
+            0,
+        );
+        konst.initial = Some("42".to_string());
+
+        let stat = Binding::new("stat".to_string(), BindingKind::Static, 0);
+
+        vec![count, konst, stat]
+    }
+
+    /// Run `f` on the expression in `<Test a={…} />` with a context carrying
+    /// `reactive_state_bindings`, under the serialize arena both walks resolve
+    /// child ids through.
+    fn with_reactive_state_context<R>(
+        expr_src: &str,
+        f: impl FnOnce(&crate::ast::js::Expression, &ComponentContext) -> R,
+    ) -> R {
+        use crate::compiler::ComponentAnalysis;
+        use crate::compiler::phases::phase2_analyze::scope::{Scope, ScopeRoot};
+        use std::rc::Rc;
+
+        let input = format!("<Test a={{{expr_src}}} />");
+        let allocator = oxc_allocator::Allocator::default();
+        let mut result = crate::parse(&input, &allocator, Default::default()).unwrap();
+        // `parse()` may leave attribute expressions deferred; both paths need a
+        // resolved `Expression::Typed`.
+        assert!(
+            crate::compiler::phases::phase1_parse::resolve_lazy::resolve_lazy_expressions(
+                &mut result,
+                &input,
+            )
+            .is_none(),
+            "`{expr_src}` should parse"
+        );
+
+        let expr = result
+            .fragment
+            .nodes
+            .iter()
+            .find_map(|node| match node {
+                crate::ast::template::TemplateNode::Component(comp) => {
+                    comp.attributes.iter().find_map(|attr| match attr {
+                        crate::ast::template::Attribute::Attribute(a) => match &a.value {
+                            crate::ast::template::AttributeValue::Expression(tag) => {
+                                Some(&tag.expression)
+                            }
+                            _ => None,
+                        },
+                        _ => None,
+                    })
+                }
+                _ => None,
+            })
+            .expect("expression attribute");
+
+        let analysis = ComponentAnalysis::new("", &Default::default());
+        let scope = Scope::new(None);
+        let mut scope_root = ScopeRoot::new();
+        for binding in reactive_state_bindings() {
+            let name = binding.name.clone();
+            let idx = scope_root.push_binding(binding);
+            scope_root.scope.declarations.insert(name, idx);
+        }
+        let state = ComponentClientTransformState::new(
+            &result.arena,
+            &scope,
+            &scope_root,
+            &analysis,
+            b::id("node"),
+            Rc::new(TransformOptions::default()),
+        );
+        let context = ComponentContext::new(state, |_, _, _| TransformResult::None);
+
+        crate::ast::arena::with_serialize_arena(&result.arena, || f(expr, &context))
+    }
+
+    /// `(typed, json)` answers of `expression_has_reactive_state` /
+    /// `has_reactive_state_json`.
+    fn both_has_reactive_state(expr_src: &str) -> (bool, bool) {
+        with_reactive_state_context(expr_src, |expr, context| {
+            (
+                expression_has_reactive_state(expr, context),
+                has_reactive_state_json(expr.as_json(), context),
+            )
+        })
+    }
+
+    /// Whether answering `expression_has_reactive_state` materialized the
+    /// expression as JSON — i.e. whether it fell back to the JSON walk.
+    fn typed_walk_materialized_json(expr_src: &str) -> bool {
+        with_reactive_state_context(expr_src, |expr, context| {
+            expression_has_reactive_state(expr, context);
+            expr.json_is_materialized()
+        })
+    }
+
     #[test]
-    fn test_is_initial_value_literal_or_known() {
-        // Test string literal
-        assert!(is_initial_value_literal_or_known(&Some(
-            "'hello'".to_string()
-        )));
-        assert!(is_initial_value_literal_or_known(&Some(
-            "\"world\"".to_string()
-        )));
+    fn typed_reactive_state_front_end_agrees_with_the_json_walk() {
+        // (expression, expected answer) — expectations are spelled out as well
+        // as compared, so a front end that always says `false` can't pass by
+        // agreeing with an equally broken oracle.
+        let cases: &[(&str, bool)] = &[
+            // Identifier fast path — reactive binding.
+            ("count", true),
+            // Identifier fast path — compile-time-known binding.
+            ("konst", false),
+            // Identifier fast path — `Static` binding and unknown global.
+            ("stat", false),
+            ("Math", false),
+            // Identifier fast path — the generated props objects.
+            ("$$props", true),
+            ("$$restProps", true),
+            // Literal fast path (string / number / boolean / null).
+            ("5", false),
+            ("'text'", false),
+            ("true", false),
+            ("null", false),
+            // MemberExpression — reactive object.
+            ("count.foo", true),
+            // MemberExpression — a non-reactive local binding, whose property
+            // may still be reactive.
+            ("konst.foo", true),
+            ("stat.foo", true),
+            // MemberExpression — no local binding at all.
+            ("Math.PI", false),
+            ("unknown.foo", false),
+            // A member read whose leftmost object is an object / array /
+            // function literal is impure, so upstream's `!is_pure(node)` makes
+            // it reactive whatever the property is.
+            ("({ a: 1 })[count]", true),
+            ("({ a: 1 })[konst]", true),
+            ("({ a: 1 }).count", true),
+            ("[1, 2].length", true),
+            ("(() => 1).name", true),
+            // A LITERAL leftmost object is pure — the other side of that rule.
+            ("'ab'.length", false),
+            ("(1).toFixed", false),
+            // Optional chaining wraps the member.
+            ("count?.foo", true),
+            // CallExpression — pure global / pure object callee, reactive only
+            // through its arguments.
+            ("String(count)", true),
+            ("parseInt(konst)", false),
+            ("Math.max(count, 1)", true),
+            ("Math.max(1, 2)", false),
+            // CallExpression — reactive binding as callee.
+            ("count(1)", true),
+            // CallExpression — non-reactive binding / unknown global callee.
+            ("konst(1)", false),
+            ("unknownFn(count)", true),
+            ("unknownFn(1)", false),
+            // NewExpression.
+            ("new Foo(count)", true),
+            ("new Foo(1)", false),
+            // Operators and groupings.
+            ("count + konst", true),
+            ("konst + konst", false),
+            ("!count", true),
+            ("count ? 1 : 2", true),
+            ("konst ? 1 : 2", false),
+            ("(konst, count)", true),
+            ("`${count}`", true),
+            ("`${konst}`", false),
+            // Only the right-hand side of an assignment is read.
+            ("(count = 1)", false),
+            ("(konst = count)", true),
+            ("count++", true),
+            ("await count", true),
+            // Function bodies are not read.
+            ("() => count", false),
+            ("(function () { return count; })", false),
+            // Object / array literals, including a spread and an array hole.
+            ("({ a: count })", true),
+            ("({ a: konst })", false),
+            ("({ ...konst })", true),
+            ("[konst, konst]", false),
+            ("[, count]", true),
+            ("[...konst]", true),
+            // The leaf is non-reactive, but a member rooted at `this` is not
+            // pure and therefore follows the dynamic member-expression path.
+            ("this.foo", true),
+            // Shapes the typed walk deliberately does NOT answer — these reach
+            // the JSON fallback, so they agree by construction.
+            ("tag`x`", true),
+            ("(class {})", true),
+        ];
 
-        // Test number literal
-        assert!(is_initial_value_literal_or_known(&Some("42".to_string())));
-        assert!(is_initial_value_literal_or_known(&Some("3.14".to_string())));
+        for (src, expected) in cases {
+            let (typed, json) = both_has_reactive_state(src);
+            assert_eq!(typed, json, "typed and JSON paths disagree on `{src}`");
+            assert_eq!(&typed, expected, "unexpected has_reactive_state for `{src}`");
+        }
+    }
 
-        // Test boolean literal
-        assert!(is_initial_value_literal_or_known(&Some("true".to_string())));
-        assert!(is_initial_value_literal_or_known(&Some(
-            "false".to_string()
-        )));
-
-        // Test null/undefined
-        assert!(is_initial_value_literal_or_known(&Some("null".to_string())));
-        assert!(is_initial_value_literal_or_known(&Some(
-            "undefined".to_string()
-        )));
-
-        // Test TemplateLiteral without expressions (JSON format)
-        let template_literal_json = r#"{"type":"TemplateLiteral","expressions":[],"quasis":[{"type":"TemplateElement","value":{"raw":"hello","cooked":"hello"}}]}"#;
-        assert!(is_initial_value_literal_or_known(&Some(
-            template_literal_json.to_string()
-        )));
-
-        // Test TemplateLiteral WITH expressions - should be false
-        let template_literal_with_expr = r#"{"type":"TemplateLiteral","expressions":[{"type":"Identifier","name":"foo"}],"quasis":[]}"#;
-        assert!(!is_initial_value_literal_or_known(&Some(
-            template_literal_with_expr.to_string()
-        )));
-
-        // Test None
-        assert!(!is_initial_value_literal_or_known(&None));
-
-        // Test regular identifier - should be false
-        assert!(!is_initial_value_literal_or_known(&Some("foo".to_string())));
+    #[test]
+    fn the_typed_walk_answers_covered_shapes_without_materializing_json() {
+        for src in [
+            "count",
+            "5",
+            "count.foo",
+            "Math.max(count, 1)",
+            "`${konst}`",
+            "({ a: count })",
+            "konst ? 1 : 2",
+        ] {
+            assert!(
+                !typed_walk_materialized_json(src),
+                "`{src}` should be answered off the typed AST"
+            );
+        }
+        // Negative control: a shape the typed walk does not cover still
+        // materializes, so the assertions above are measuring something.
+        for src in ["tag`x`", "(class {})"] {
+            assert!(typed_walk_materialized_json(src), "`{src}` should fall back to the JSON walk");
+        }
     }
 }

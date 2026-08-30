@@ -11,7 +11,7 @@ use crate::compiler::phases::phase2_analyze::warnings;
 
 /// Visit a labeled statement (typed JsNode path).
 pub fn visit_typed(node: &JsNode, context: &mut VisitorContext) -> Result<(), AnalysisError> {
-    if let JsNode::LabeledStatement { label, body, .. } = node {
+    if let JsNode::LabeledStatement { label, body, start, end, .. } = node {
         let arena = context.parse_arena;
         let label_node = arena.get_js_node(*label);
         let body_node = arena.get_js_node(*body);
@@ -22,34 +22,35 @@ pub fn visit_typed(node: &JsNode, context: &mut VisitorContext) -> Result<(), An
             None
         };
 
-        if label_name == Some("$") {
-            // Check if at top level
-            let is_at_top_level = context.js_path.len() >= 2
-                && context.js_path[context.js_path.len() - 2].get_type_str() == Some("Program");
+        let is_at_top_level = context.js_path.len() >= 2
+            && context.js_path[context.js_path.len() - 2].get_type_str() == Some("Program");
+        let is_reactive_statement =
+            label_name == Some("$") && context.ast_type == AstType::Instance && is_at_top_level;
 
+        if label_name == Some("$") {
             let is_instance_script = context.ast_type == AstType::Instance;
-            let is_reactive_statement = is_instance_script && is_at_top_level;
 
             // In runes mode, a top-level `$:` reactive statement is a hard
             // error (upstream LabeledStatement.js `legacy_reactive_statement_invalid`).
             if is_reactive_statement && context.analysis.runes {
-                return Err(super::super::errors::legacy_reactive_statement_invalid());
+                return Err(
+                    super::super::errors::legacy_reactive_statement_invalid().at(*start, *end)
+                );
             }
 
             if !context.analysis.runes
                 && !is_reactive_statement
                 && (is_instance_script || context.ast_type == AstType::Module)
             {
-                context.emit_warning(warnings::reactive_declaration_invalid_placement());
+                context.emit_warning(
+                    warnings::reactive_declaration_invalid_placement().at(*start, *end),
+                );
             }
         }
 
         // Visit the body
         let prev_in_reactive = context.in_reactive_declaration;
-        if label_name == Some("$")
-            && !context.analysis.runes
-            && context.ast_type == AstType::Instance
-        {
+        if is_reactive_statement && !context.analysis.runes {
             context.in_reactive_declaration = true;
         }
         super::script::walk_js_node_typed(body_node, context)?;

@@ -69,19 +69,7 @@ function addEvent(context: Context, event: string) {
  */
 function getEvents(path: string): string {
   const dirname = path.split(pathSep).at(-2)!;
-  const dir = events.get(dirname)!;
-  return JSON.stringify(
-    Object.fromEntries(
-      Object.entries(dir).map(([filename, fileEvents]) => [
-        filename,
-        fileEvents
-          .filter((event) => dirname !== "throwInVisit" || event !== "visit: before-and-after-late")
-          .toSorted(),
-      ]),
-    ),
-    null,
-    2,
-  );
+  return JSON.stringify(events.get(dirname)!, null, 2);
 }
 
 // Rule which throws in `before` hook

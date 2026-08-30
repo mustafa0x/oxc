@@ -5,8 +5,12 @@
 //! to keep the visitor files focused on their specific AST node handling.
 
 use crate::ast::template::Script;
+use crate::compiler::phases::phase3_transform::server::evaluate::EvalValue;
+use crate::compiler::phases::phase3_transform::shared::js_scan::{
+    code_bytes, code_bytes_from, skip_opaque,
+};
 use memchr::memmem;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::fmt::Write as _;
 
 /// The SSR constant-folding inputs that the pure-AST server pipeline needs:
@@ -14,8 +18,39 @@ use std::fmt::Write as _;
 /// their literal value) and the top-level async blocker map (`use_async`).
 /// Extracted from the now-removed text `ServerCodeGenerator::new`.
 pub(crate) struct EvalInputsRaw {
-    pub(crate) constant_vars: FxHashMap<String, String>,
+    pub(crate) constant_vars: FxHashMap<String, EvalValue>,
     pub(crate) top_level_blocker_map: FxHashMap<String, usize>,
+}
+
+fn top_level_binding_names(
+    analysis: &crate::compiler::phases::phase2_analyze::ComponentAnalysis,
+    scope_index: usize,
+) -> FxHashSet<String> {
+    analysis
+        .root
+        .bindings
+        .iter()
+        .filter(|binding| binding.scope_index == scope_index)
+        .map(|binding| binding.name.clone())
+        .collect()
+}
+
+fn top_level_excluded_names(
+    analysis: &crate::compiler::phases::phase2_analyze::ComponentAnalysis,
+    scope_index: usize,
+) -> FxHashSet<String> {
+    use crate::compiler::phases::phase2_analyze::scope::BindingKind;
+
+    analysis
+        .root
+        .bindings
+        .iter()
+        .filter(|binding| {
+            binding.scope_index == scope_index
+                && (matches!(binding.kind, BindingKind::BindableProp) || binding.is_updated())
+        })
+        .map(|binding| binding.name.clone())
+        .collect()
 }
 
 /// Compute the SSR constant-folding inputs (`constant_vars`,
@@ -33,23 +68,46 @@ pub(crate) fn compute_eval_inputs(
     // Extract constant variables from script
     let mut constant_vars = FxHashMap::default();
 
+    // A name with no knowable value has to be excluded before anything reads it,
+    // not removed afterwards — see `extract_constant_vars`.
+    let module_excluded =
+        analysis.map(|analysis| top_level_excluded_names(analysis, 0)).unwrap_or_default();
+    let instance_scope_index = analysis.map_or(0, |analysis| analysis.root.instance_scope_index);
+    let instance_names = if instance_script.is_some() {
+        analysis
+            .map(|analysis| top_level_binding_names(analysis, instance_scope_index))
+            .unwrap_or_default()
+    } else {
+        FxHashSet::default()
+    };
+
     // Extract constants from module script first (only const declarations)
     if let Some(script) = module_script {
         let start = script.content.start().unwrap_or(0) as usize;
         let end = script.content.end().unwrap_or(0) as usize;
         if end > start && end <= source.len() {
-            for (k, v) in extract_constant_vars(&source[start..end], source) {
+            for (k, v) in extract_constant_vars(&source[start..end], source, &module_excluded) {
                 constant_vars.insert(k, v);
             }
         }
     }
 
+    let instance_excluded = analysis
+        .map(|analysis| top_level_excluded_names(analysis, instance_scope_index))
+        .unwrap_or_default();
+
     // Then from instance script (both let and const)
     if let Some(script) = instance_script {
+        // An instance declaration shadows a module declaration even when its value is
+        // not constant. Remove the module value before harvesting the instance script.
+        for name in &instance_names {
+            constant_vars.remove(name);
+        }
+
         let start = script.content.start().unwrap_or(0) as usize;
         let end = script.content.end().unwrap_or(0) as usize;
         if end > start && end <= source.len() {
-            for (k, v) in extract_constant_vars(&source[start..end], source) {
+            for (k, v) in extract_constant_vars(&source[start..end], source, &instance_excluded) {
                 constant_vars.insert(k, v);
             }
         }
@@ -62,41 +120,29 @@ pub(crate) fn compute_eval_inputs(
     // function body (e.g. within a `$derived.by` arrow) must not be folded
     // into template reads of a same-named outer binding.
     if let Some(analysis) = analysis {
-        let template_scopes: rustc_hash::FxHashSet<usize> =
-            analysis.root.template_scope_map.values().copied().collect();
+        let template_scopes: rustc_hash::FxHashSet<usize> = analysis
+            .root
+            .template_scope_map
+            .values()
+            .chain(analysis.root.if_alternate_scope_map.values())
+            .chain(analysis.root.each_fallback_scope_map.values())
+            .copied()
+            .collect();
         for binding in &analysis.root.bindings {
             if matches!(binding.kind, BindingKind::State | BindingKind::RawState)
                 && (binding.scope_index == 0
                     || binding.scope_index == analysis.root.instance_scope_index
+                    || binding.scope_index == analysis.root.root_fragment_scope_index
                     || template_scopes.contains(&binding.scope_index))
+                && !(binding.scope_index == 0 && instance_names.contains(&binding.name))
                 && !binding.is_updated()
                 && !constant_vars.contains_key(&binding.name)
                 && let Some(ref init) = binding.initial
             {
                 let trimmed = init.trim();
                 // Parse the initial value as a constant
-                if (trimmed.starts_with('\'') && trimmed.ends_with('\''))
-                    || (trimmed.starts_with('"') && trimmed.ends_with('"'))
-                {
-                    if trimmed.len() >= 2 {
-                        constant_vars.insert(
-                            binding.name.clone(),
-                            trimmed[1..trimmed.len() - 1].to_string(),
-                        );
-                    }
-                } else if let Ok(n) = trimmed.parse::<i64>() {
-                    constant_vars.insert(binding.name.clone(), n.to_string());
-                } else if let Ok(n) = trimmed.parse::<f64>() {
-                    if n.is_finite() {
-                        constant_vars.insert(binding.name.clone(), n.to_string());
-                    }
-                } else {
-                    match trimmed {
-                        "true" | "false" | "null" | "undefined" => {
-                            constant_vars.insert(binding.name.clone(), trimmed.to_string());
-                        }
-                        _ => {}
-                    }
+                if let Some(value) = literal_eval_value(trimmed) {
+                    constant_vars.insert(binding.name.clone(), value);
                 }
             }
         }
@@ -109,7 +155,11 @@ pub(crate) fn compute_eval_inputs(
     // After we have both text-based and scope-based constants, try to fold
     // $derived() expressions whose inner value can be evaluated with known constants.
     // $derived values are readonly by definition, so they're safe to fold.
-    if let Some(script) = instance_script {
+    // Only in runes mode: in legacy mode `$derived` is a store subscription, so the
+    // declared value is the call's RESULT, not its argument.
+    if analysis.is_some_and(|a| a.runes)
+        && let Some(script) = instance_script
+    {
         let start = script.content.start().unwrap_or(0) as usize;
         let end = script.content.end().unwrap_or(0) as usize;
         if end > start && end <= source.len() {
@@ -140,6 +190,7 @@ pub(crate) fn compute_eval_inputs(
                         let name = rest[..eq_idx].trim();
                         if name.contains('{')
                             || name.contains('[')
+                            || instance_excluded.contains(name)
                             || constant_vars.contains_key(name)
                         {
                             continue;
@@ -156,20 +207,6 @@ pub(crate) fn compute_eval_inputs(
                         }
                     }
                 }
-            }
-        }
-    }
-
-    // Remove BindableProp variables from constant_vars.
-    // Variables exported via `export { x }` are props and can receive values from parents,
-    // so they should NOT be treated as constants even if they have literal initial values.
-    // Also remove any binding that the scope analysis marks as updated (reassigned or mutated),
-    // to handle cases that the text-based reassignment check misses (e.g. destructuring
-    // assignments like `({ x } = { x: 1 })`).
-    if let Some(analysis) = analysis {
-        for binding in &analysis.root.bindings {
-            if matches!(binding.kind, BindingKind::BindableProp) || binding.is_updated() {
-                constant_vars.remove(&binding.name);
             }
         }
     }
@@ -195,10 +232,7 @@ pub(crate) fn compute_eval_inputs(
         }
     }
 
-    EvalInputsRaw {
-        constant_vars,
-        top_level_blocker_map,
-    }
+    EvalInputsRaw { constant_vars, top_level_blocker_map }
 }
 
 /// Check if a JavaScript expression string contains `await` at the expression level
@@ -359,24 +393,17 @@ pub(crate) fn skip_string_literal(bytes: &[u8], start: usize) -> usize {
 /// Skip a matched brace pair `{...}` starting at position of `{`.
 fn skip_braces(bytes: &[u8], start: usize) -> usize {
     let mut depth = 1i32;
-    let mut i = start + 1;
-    let len = bytes.len();
-
-    while i < len && depth > 0 {
-        let c = bytes[i];
-        if matches!(c, b'\'' | b'"' | b'`') {
-            i = skip_string_literal(bytes, i);
-            continue;
-        }
+    for (i, c) in code_bytes_from(bytes, start + 1) {
         if c == b'{' {
             depth += 1;
         } else if c == b'}' {
             depth -= 1;
+            if depth == 0 {
+                return i + 1;
+            }
         }
-        i += 1;
     }
-
-    i
+    bytes.len()
 }
 
 /// Transform `await expr` patterns inside an expression to use `$.save()`.
@@ -654,9 +681,8 @@ pub(crate) fn is_valid_js_identifier(name: &str) -> bool {
 fn extract_param_default(rest: &str) -> Option<String> {
     let bytes = rest.as_bytes();
     let mut depth = 0i32;
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
+    for (i, c) in code_bytes(bytes) {
+        match c {
             b'(' | b'[' | b'{' | b'<' => depth += 1,
             b')' | b']' | b'}' | b'>' => depth -= 1,
             b'=' if depth == 0 => {
@@ -669,7 +695,6 @@ fn extract_param_default(rest: &str) -> Option<String> {
             }
             _ => {}
         }
-        i += 1;
     }
     None
 }
@@ -679,14 +704,14 @@ pub(crate) fn strip_ts_type_annotation(param: &str) -> String {
 
     // Handle destructured parameters: { ... }: Type or [ ... ]: Type
     if trimmed.starts_with('{') || trimmed.starts_with('[') {
-        let close_char = if trimmed.starts_with('{') { '}' } else { ']' };
+        let close_char = if trimmed.starts_with('{') { b'}' } else { b']' };
         // Find the matching closing bracket
         let mut depth = 0;
         let mut close_pos = None;
-        for (i, c) in trimmed.char_indices() {
+        for (i, c) in code_bytes(trimmed.as_bytes()) {
             match c {
-                '{' | '[' => depth += 1,
-                '}' | ']' if c == close_char => {
+                b'{' | b'[' => depth += 1,
+                b'}' | b']' if c == close_char => {
                     depth -= 1;
                     if depth == 0 {
                         close_pos = Some(i);
@@ -862,6 +887,40 @@ pub(crate) fn sanitize_identifier(name: &str) -> String {
 /// an open-paren / `=` with no value yet) we replace it with a single space
 /// so the next pass sees a complete declaration. Lines inside strings /
 /// template literals are left untouched.
+/// Drop every `\<line break>` from a quoted literal. `cook_string_literal` maps
+/// the same sequence to nothing, so the cooked value is unchanged.
+fn strip_line_continuations(literal: &str) -> std::borrow::Cow<'_, str> {
+    let bytes = literal.as_bytes();
+    if !bytes.windows(2).any(|w| w[0] == b'\\' && (w[1] == b'\n' || w[1] == b'\r')) {
+        return std::borrow::Cow::Borrowed(literal);
+    }
+    let mut out = String::with_capacity(literal.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 1 < bytes.len() {
+            match bytes[i + 1] {
+                b'\n' => {
+                    i += 2;
+                    continue;
+                }
+                b'\r' => {
+                    i += if bytes.get(i + 2) == Some(&b'\n') { 3 } else { 2 };
+                    continue;
+                }
+                _ => {
+                    out.push_str(&literal[i..i + 2]);
+                    i += 2;
+                    continue;
+                }
+            }
+        }
+        let ch = literal[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    std::borrow::Cow::Owned(out)
+}
+
 fn join_continuation_lines(script: &str) -> String {
     let bytes = script.as_bytes();
     let mut out = String::with_capacity(script.len());
@@ -871,17 +930,21 @@ fn join_continuation_lines(script: &str) -> String {
     let mut i = 0;
     while i < bytes.len() {
         let b = bytes[i];
-        // Line / block comments — copy as-is.
+        // A comment becomes one space. The sole consumer is the constant
+        // extractor below, which reads declarator values, and a comment carries
+        // none — while keeping the text puts it exactly where that extractor's
+        // `starts_with` tests look, and leaves the continuation rule reading the
+        // comment's last character (`= /* c */` ends in `/` and joins the next
+        // line; `= // c` ends in `c` and does not, and joining anyway would let
+        // the `//` swallow the value).
         if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
-            let s = i;
             while i < bytes.len() && bytes[i] != b'\n' {
                 i += 1;
             }
-            out.push_str(&script[s..i]);
+            out.push(' ');
             continue;
         }
         if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
-            let s = i;
             i += 2;
             while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
                 i += 1;
@@ -889,7 +952,7 @@ fn join_continuation_lines(script: &str) -> String {
             if i + 1 < bytes.len() {
                 i += 2;
             }
-            out.push_str(&script[s..i]);
+            out.push(' ');
             continue;
         }
         // String / template literals — copy verbatim. Newlines inside
@@ -909,7 +972,14 @@ fn join_continuation_lines(script: &str) -> String {
                 }
                 i += 1;
             }
-            out.push_str(&script[s..i]);
+            // A backtick's newlines are content; a `'…'` / `"…"` only reaches a
+            // newline through a line continuation, which contributes nothing to
+            // the value and would otherwise re-split this logical line.
+            if quote == b'`' {
+                out.push_str(&script[s..i]);
+            } else {
+                out.push_str(&strip_line_continuations(&script[s..i]));
+            }
             continue;
         }
         if b == b'(' {
@@ -981,40 +1051,100 @@ fn join_continuation_lines(script: &str) -> String {
 /// Extract constant variable bindings from script content.
 /// Try to parse a value as a constant literal and insert into the constants map.
 /// Returns true if the value was successfully inserted.
+/// Is the whole expression one string literal? `starts_with` + `ends_with` is
+/// not that question: `'a' + 'b'` answers yes to both and is two literals with
+/// an operator between them.
+fn is_whole_string_literal(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let Some(&quote) = bytes.first() else {
+        return false;
+    };
+    if !matches!(quote, b'\'' | b'"' | b'`') || bytes.len() < 2 {
+        return false;
+    }
+    if quote == b'`' && value.contains("${") {
+        return false;
+    }
+    let mut i = 1;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 1 < bytes.len() {
+            i += 2;
+            continue;
+        }
+        if bytes[i] == quote {
+            return i == bytes.len() - 1;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// ECMA-262 TV/TRV line-terminator normalisation for a template literal body.
+fn normalize_template_line_terminators(body: &str) -> std::borrow::Cow<'_, str> {
+    if memchr::memchr(b'\r', body.as_bytes()).is_none() {
+        return std::borrow::Cow::Borrowed(body);
+    }
+    let mut out = String::with_capacity(body.len());
+    let mut rest = body;
+    while let Some(i) = memchr::memchr(b'\r', rest.as_bytes()) {
+        out.push_str(&rest[..i]);
+        out.push('\n');
+        rest = if rest.as_bytes().get(i + 1) == Some(&b'\n') {
+            &rest[i + 2..]
+        } else {
+            &rest[i + 1..]
+        };
+    }
+    out.push_str(rest);
+    std::borrow::Cow::Owned(out)
+}
+
+/// A literal's source text as the JS VALUE it denotes. `'1'` and `1` are two
+/// different values that render as the same text, and `+` is the operator that
+/// can tell them apart.
+fn literal_eval_value(value: &str) -> Option<EvalValue> {
+    if is_whole_string_literal(value) {
+        // The cooked string, matching upstream's `scope.evaluate`; the emitter
+        // re-escapes it for the quasi.
+        let content = &value[1..value.len() - 1];
+        let content = if value.as_bytes()[0] == b'`' {
+            normalize_template_line_terminators(content)
+        } else {
+            std::borrow::Cow::Borrowed(content)
+        };
+        return Some(EvalValue::Str(
+            crate::compiler::phases::phase3_transform::client::visitors::shared::utils::cook_string_literal(&content),
+        ));
+    }
+    match value {
+        "true" => return Some(EvalValue::Bool(true)),
+        "false" => return Some(EvalValue::Bool(false)),
+        "null" => return Some(EvalValue::Null),
+        "undefined" => return Some(EvalValue::Undefined),
+        _ => {}
+    }
+    if let Ok(n) = value.parse::<i64>() {
+        return Some(EvalValue::Num(n as f64));
+    }
+    if let Ok(n) = value.parse::<f64>()
+        && n.is_finite()
+    {
+        return Some(EvalValue::Num(n));
+    }
+    None
+}
+
 fn try_insert_constant_value(
     value: &str,
     name: &str,
-    constants: &mut FxHashMap<String, String>,
+    constants: &mut FxHashMap<String, EvalValue>,
 ) -> bool {
-    if value.len() >= 2
-        && ((value.starts_with('\'') && value.ends_with('\''))
-            || (value.starts_with('"') && value.ends_with('"'))
-            || (value.starts_with('`') && value.ends_with('`') && !value.contains("${")))
-    {
-        // Decode `\uXXXX` / `\u{...}` / `\xHH` escapes to their actual characters so
-        // a known-const string folds to the cooked value (matching upstream's
-        // `scope.evaluate`), e.g. a bidirectional-control-character string emits the
-        // literal characters rather than the raw source escapes. Other escapes
-        // (`\n`, `\\`, ...) are left intact by `decode_unicode_escapes`.
-        let content = &value[1..value.len() - 1];
-        let decoded = crate::compiler::phases::phase3_transform::client::visitors::shared::utils::decode_unicode_escapes(content);
-        constants.insert(name.to_string(), decoded);
-        true
-    } else if value == "true" || value == "false" || value == "null" || value == "undefined" {
-        constants.insert(name.to_string(), value.to_string());
-        true
-    } else if let Ok(n) = value.parse::<i64>() {
-        constants.insert(name.to_string(), n.to_string());
-        true
-    } else if let Ok(n) = value.parse::<f64>() {
-        if n.is_finite() {
-            constants.insert(name.to_string(), n.to_string());
+    match literal_eval_value(value) {
+        Some(v) => {
+            constants.insert(name.to_string(), v);
             true
-        } else {
-            false
         }
-    } else {
-        false
+        None => false,
     }
 }
 
@@ -1022,169 +1152,74 @@ fn try_insert_constant_value(
 /// Returns Some(value) if the expression can be fully evaluated.
 pub(crate) fn try_evaluate_with_constants(
     expr: &str,
-    constants: &FxHashMap<String, String>,
-) -> Option<String> {
+    constants: &FxHashMap<String, EvalValue>,
+) -> Option<EvalValue> {
     let trimmed = expr.trim();
 
-    // Simple variable lookup
     if let Some(value) = constants.get(trimmed) {
         return Some(value.clone());
     }
-
-    // Literal values
-    if let Ok(n) = trimmed.parse::<i64>() {
-        return Some(n.to_string());
-    }
-    if let Ok(n) = trimmed.parse::<f64>()
-        && n.is_finite()
+    if !trimmed.starts_with('`')
+        && let Some(value) = literal_eval_value(trimmed)
     {
-        return Some(n.to_string());
-    }
-    if (trimmed.starts_with('\'') && trimmed.ends_with('\''))
-        || (trimmed.starts_with('"') && trimmed.ends_with('"'))
-    {
-        return Some(trimmed[1..trimmed.len() - 1].to_string());
+        return Some(value);
     }
 
-    // Handle binary operators: *, +, -
-    // Try * first (higher precedence)
-    if let Some(idx) = memchr::memmem::find(trimmed.as_bytes(), b" * ") {
-        let left = trimmed[..idx].trim();
-        let right = trimmed[idx + 3..].trim();
-        if let (Some(l), Some(r)) = (
-            try_evaluate_with_constants(left, constants),
-            try_evaluate_with_constants(right, constants),
-        ) {
-            if let (Ok(ln), Ok(rn)) = (l.parse::<i64>(), r.parse::<i64>()) {
-                return Some((ln * rn).to_string());
-            }
-            if let (Ok(ln), Ok(rn)) = (l.parse::<f64>(), r.parse::<f64>())
-                && (ln * rn).is_finite()
-            {
-                let result = ln * rn;
-                if result == (result as i64) as f64 {
-                    return Some((result as i64).to_string());
-                }
-                return Some(result.to_string());
-            }
-        }
+    // Each operand is a VALUE, and `eval_binary` is the one place that knows JS
+    // coercion — the same function the template-expression evaluator folds
+    // through.
+    let (idx, op) = find_binary_split(trimmed)?;
+    let l = try_evaluate_with_constants(trimmed[..idx].trim(), constants)?;
+    let r = try_evaluate_with_constants(trimmed[idx + 1..].trim(), constants)?;
+    let folded =
+        crate::compiler::phases::phase3_transform::server::evaluate::eval_binary(op, &l, &r);
+    if folded.is_marker() {
+        return None;
     }
-
-    // Handle + (addition or string concatenation)
-    // Find the + that's not inside quotes
-    if let Some(idx) = find_binary_plus(trimmed) {
-        let left = trimmed[..idx].trim();
-        let right = trimmed[idx + 1..].trim();
-        if let (Some(l), Some(r)) = (
-            try_evaluate_with_constants(left, constants),
-            try_evaluate_with_constants(right, constants),
-        ) {
-            // Try numeric addition first
-            if let (Ok(ln), Ok(rn)) = (l.parse::<i64>(), r.parse::<i64>()) {
-                return Some((ln + rn).to_string());
-            }
-            if let (Ok(ln), Ok(rn)) = (l.parse::<f64>(), r.parse::<f64>())
-                && (ln + rn).is_finite()
-            {
-                let result = ln + rn;
-                if result == (result as i64) as f64 {
-                    return Some((result as i64).to_string());
-                }
-                return Some(result.to_string());
-            }
-            // String concatenation
-            return Some(format!("{}{}", l, r));
-        }
-    }
-
-    // Handle - (subtraction)
-    // Find - that's a binary operator (not unary minus)
-    if let Some(idx) = find_binary_minus(trimmed) {
-        let left = trimmed[..idx].trim();
-        let right = trimmed[idx + 1..].trim();
-        if let (Some(l), Some(r)) = (
-            try_evaluate_with_constants(left, constants),
-            try_evaluate_with_constants(right, constants),
-        ) && let (Ok(ln), Ok(rn)) = (l.parse::<i64>(), r.parse::<i64>())
-        {
-            return Some((ln - rn).to_string());
-        }
-    }
-
-    None
+    Some(folded)
 }
 
-/// Find the index of a binary + operator (not inside quotes or after another operator).
-fn find_binary_plus(expr: &str) -> Option<usize> {
+/// The split point of a foldable binary expression: the RIGHTMOST operator of
+/// the LOWEST precedence present. That operator binds last, so it is the tree's
+/// root — splitting on `*` first made `1 + 2 * 3` nine, and splitting on the
+/// leftmost `-` made `10 - 3 - 2` nine.
+fn find_binary_split(expr: &str) -> Option<(usize, &'static str)> {
     let bytes = expr.as_bytes();
-    let mut in_single_quote = false;
-    let mut in_double_quote = false;
-    let mut paren_depth = 0;
+    let mut depth: i32 = 0;
+    let mut additive: Option<(usize, &'static str)> = None;
+    let mut multiplicative: Option<usize> = None;
 
-    for i in 0..bytes.len() {
-        match bytes[i] {
-            b'\'' if !in_double_quote => in_single_quote = !in_single_quote,
-            b'"' if !in_single_quote => in_double_quote = !in_double_quote,
-            b'(' if !in_single_quote && !in_double_quote => paren_depth += 1,
-            b')' if !in_single_quote && !in_double_quote => paren_depth -= 1,
-            b'+' if !in_single_quote && !in_double_quote && paren_depth == 0 => {
-                // Make sure it's a binary +, not unary
-                // Check that there's a non-whitespace token before it
+    for (i, c) in code_bytes(bytes) {
+        match c {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            b'+' | b'-' | b'*' if depth == 0 => {
+                // A binary operator has an operand before it, and is not the
+                // second character of `++` / `--` / `**` / `+=`.
                 let before = expr[..i].trim_end();
-                if !before.is_empty()
-                    && !before.ends_with('+')
-                    && !before.ends_with('-')
-                    && !before.ends_with('*')
-                    && !before.ends_with('/')
-                    && !before.ends_with('=')
-                    && !before.ends_with('(')
+                if before.is_empty()
+                    || before.ends_with(['+', '-', '*', '/', '=', '('])
+                    || (i + 1 < bytes.len() && (bytes[i + 1] == c || bytes[i + 1] == b'='))
                 {
-                    // Make sure it's not ++ or +=
-                    if i + 1 < bytes.len() && (bytes[i + 1] == b'+' || bytes[i + 1] == b'=') {
-                        continue;
+                    continue;
+                }
+                match c {
+                    // An unspaced `*` was never a split point here, and widening
+                    // that is a separate question from precedence.
+                    b'*' => {
+                        if i > 0 && bytes[i - 1] == b' ' && bytes.get(i + 1) == Some(&b' ') {
+                            multiplicative = Some(i);
+                        }
                     }
-                    return Some(i);
+                    b'+' => additive = Some((i, "+")),
+                    _ => additive = Some((i, "-")),
                 }
             }
             _ => {}
         }
     }
-    None
-}
 
-/// Find the index of a binary - operator (not unary minus).
-fn find_binary_minus(expr: &str) -> Option<usize> {
-    let bytes = expr.as_bytes();
-    let mut in_single_quote = false;
-    let mut in_double_quote = false;
-    let mut paren_depth = 0;
-
-    for i in 0..bytes.len() {
-        match bytes[i] {
-            b'\'' if !in_double_quote => in_single_quote = !in_single_quote,
-            b'"' if !in_single_quote => in_double_quote = !in_double_quote,
-            b'(' if !in_single_quote && !in_double_quote => paren_depth += 1,
-            b')' if !in_single_quote && !in_double_quote => paren_depth -= 1,
-            b'-' if !in_single_quote && !in_double_quote && paren_depth == 0 => {
-                let before = expr[..i].trim_end();
-                if !before.is_empty()
-                    && !before.ends_with('+')
-                    && !before.ends_with('-')
-                    && !before.ends_with('*')
-                    && !before.ends_with('/')
-                    && !before.ends_with('=')
-                    && !before.ends_with('(')
-                {
-                    if i + 1 < bytes.len() && (bytes[i + 1] == b'-' || bytes[i + 1] == b'=') {
-                        continue;
-                    }
-                    return Some(i);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
+    additive.or_else(|| multiplicative.map(|i| (i, "*")))
 }
 
 /// Strip TypeScript syntax from a $derived inner expression for constant folding.
@@ -1215,26 +1250,10 @@ pub(crate) fn extract_rune_inner(value: &str, prefix: &str) -> Option<String> {
     let after_prefix = &trimmed[prefix.len()..];
     // Find matching closing paren
     let mut depth = 1i32;
-    let mut in_string = false;
-    let mut string_char = ' ';
-    for (i, c) in after_prefix.char_indices() {
-        if (c == '"' || c == '\'' || c == '`')
-            && (i == 0 || after_prefix.as_bytes()[i - 1] != b'\\')
-        {
-            if !in_string {
-                in_string = true;
-                string_char = c;
-            } else if c == string_char {
-                in_string = false;
-            }
-            continue;
-        }
-        if in_string {
-            continue;
-        }
+    for (i, c) in code_bytes(after_prefix.as_bytes()) {
         match c {
-            '(' | '[' | '{' => depth += 1,
-            ')' | ']' | '}' => {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => {
                 depth -= 1;
                 if depth == 0 {
                     let inner = after_prefix[..i].trim().to_string();
@@ -1250,7 +1269,16 @@ pub(crate) fn extract_rune_inner(value: &str, prefix: &str) -> Option<String> {
     None
 }
 
-pub(crate) fn extract_constant_vars(script: &str, full_source: &str) -> FxHashMap<String, String> {
+/// `excluded` holds the names whose value is not knowable — a bindable prop, or
+/// a binding phase 2 saw written. They must be gone *before* the second pass:
+/// upstream's `scope.evaluate` recurses into a binding's initializer and stops at
+/// `!binding.updated`, so a declaration reading one of these has no folded value
+/// either, and removing the name afterwards leaves behind the value it leaked.
+pub(crate) fn extract_constant_vars(
+    script: &str,
+    full_source: &str,
+    excluded: &rustc_hash::FxHashSet<String>,
+) -> FxHashMap<String, EvalValue> {
     let mut constants = FxHashMap::default();
     let mut let_vars: Vec<String> = Vec::new();
     // Collect unresolved expressions for a second pass
@@ -1303,6 +1331,10 @@ pub(crate) fn extract_constant_vars(script: &str, full_source: &str) -> FxHashMa
                 if let Some(eq_idx) = decl.find('=') {
                     let name = decl[..eq_idx].trim();
                     let value = decl[eq_idx + 1..].trim();
+
+                    if excluded.contains(name) {
+                        continue;
+                    }
 
                     if try_insert_constant_value(value, name, &mut constants) {
                         if !is_const {
@@ -1384,7 +1416,10 @@ pub(crate) fn extract_constant_vars(script: &str, full_source: &str) -> FxHashMa
                     }
                 }
 
-                search_start = abs_pos + 1;
+                // Step one *character*: `abs_pos + 1` lands inside a multi-byte
+                // `var_name` and the next `trimmed[search_start..]` panics.
+                search_start =
+                    abs_pos + trimmed[abs_pos..].chars().next().map_or(1, char::len_utf8);
                 if search_start >= trimmed.len() {
                     break;
                 }
@@ -1412,20 +1447,26 @@ fn split_declarators(s: &str) -> Vec<&str> {
     let mut i = 0;
     let len = bytes.len();
 
+    let mut prev: Option<u8> = None;
     while i < len {
+        // A `,` or a bracket inside a comment or a regex literal is text; the
+        // template-literal branch below is kept because `skip_opaque` treats an
+        // interpolation as part of the opaque run.
+        if bytes[i] != b'`'
+            && let Some((next, is_comment)) = skip_opaque(bytes, i, prev)
+        {
+            if !is_comment {
+                prev = Some(b'x');
+            }
+            i = next;
+            continue;
+        }
+        if !bytes[i].is_ascii_whitespace() {
+            prev = Some(bytes[i]);
+        }
         match bytes[i] {
             b'(' | b'[' | b'{' => depth += 1,
             b')' | b']' | b'}' => depth -= 1,
-            b'\'' | b'"' => {
-                let quote = bytes[i];
-                i += 1;
-                while i < len && bytes[i] != quote {
-                    if bytes[i] == b'\\' {
-                        i += 1; // skip escaped char
-                    }
-                    i += 1;
-                }
-            }
             b'`' => {
                 // Template literal - skip to matching backtick
                 i += 1;
@@ -1568,7 +1609,7 @@ fn extract_identifiers_from_js(expr: &str) -> Vec<String> {
             if !in_string {
                 in_string = true;
                 string_char = c;
-            } else if c == string_char && (i == 0 || chars[i - 1] != '\\') {
+            } else if c == string_char && !crate::compiler::utils::is_escaped_char(&chars, i) {
                 in_string = false;
             }
             i += 1;
@@ -1642,16 +1683,6 @@ fn is_js_keyword_or_builtin(s: &str) -> bool {
             | "as"
             | "escape"
     )
-}
-
-/// Track whether we're inside a template literal by counting unescaped backticks on a line.
-///
-/// Used to avoid adding indentation to content inside template literals.
-/// Track template literal state across lines.
-/// `state` is (in_template, brace_depth) where brace_depth > 0 means inside ${...}.
-pub fn update_template_literal_state_for_indent(line: &str, currently_in_template: bool) -> bool {
-    let (result, _) = update_template_literal_state_full(line, currently_in_template, 0);
-    result
 }
 
 /// Full template literal state tracking with brace depth for ${...} expressions.
@@ -1748,10 +1779,7 @@ mod ts_strip_tests {
         // M-024: the trailing `= default` after a destructured TS snippet param
         // must survive type stripping.
         assert_eq!(strip_ts_type_annotation("{ a, b }: Props"), "{ a, b }");
-        assert_eq!(
-            strip_ts_type_annotation("{ a, b }: Props = {}"),
-            "{ a, b } = {}"
-        );
+        assert_eq!(strip_ts_type_annotation("{ a, b }: Props = {}"), "{ a, b } = {}");
         assert_eq!(strip_ts_type_annotation("{ a, b } = {}"), "{ a, b } = {}");
         assert_eq!(
             strip_ts_type_annotation("{ a, b }: Map<string, number> = new Map()"),
@@ -1760,9 +1788,122 @@ mod ts_strip_tests {
         // A `=` inside a generic type arg is not the default separator.
         assert_eq!(strip_ts_type_annotation("{ a }: Foo<T = string>"), "{ a }");
         // Array pattern with default.
+        assert_eq!(strip_ts_type_annotation("[a, b]: number[] = []"), "[a, b] = []");
+    }
+}
+
+#[cfg(test)]
+mod js_scan_tests {
+    use super::{extract_rune_inner, split_declarators, strip_ts_type_annotation};
+
+    #[test]
+    fn scans_ignore_delimiters_in_comments_and_strings() {
+        // A `}` in a comment or a string does not close the destructured pattern.
+        assert_eq!(strip_ts_type_annotation("{ a /* } */, b }: Props"), "{ a /* } */, b }");
+        assert_eq!(strip_ts_type_annotation("{ a = '}' }: Props"), "{ a = '}' }");
+
+        // A `)` in a comment or a string does not close the rune call.
         assert_eq!(
-            strip_ts_type_annotation("[a, b]: number[] = []"),
-            "[a, b] = []"
+            extract_rune_inner("$state(/* ) */ 1)", "$state("),
+            Some("/* ) */ 1".to_string())
         );
+        assert_eq!(extract_rune_inner("$state(')')", "$state("), Some("')'".to_string()));
+
+        // A `,` in a comment does not split the declarator list.
+        assert_eq!(split_declarators("a = 1 /* , */ , b = 2").len(), 2);
+        assert_eq!(split_declarators("a = 1 // x, y\n, b = 2").len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod eval_input_scope_tests {
+    use super::{compute_eval_inputs, top_level_excluded_names};
+    use crate::compiler::CompileOptions;
+    use crate::compiler::phases::{phase1_parse, phase2_analyze};
+
+    fn analyze(source: &str) -> phase2_analyze::ComponentAnalysis {
+        let mut ast = phase1_parse::parse(
+            source,
+            &oxc_allocator::Allocator::default(),
+            phase1_parse::ParseOptions::default(),
+        )
+        .expect("parse");
+
+        // SAFETY: `ast` (and therefore its arena) outlives analysis.
+        let _guard = unsafe { crate::ast::arena::SerializeArenaGuard::new(&ast.arena as *const _) };
+        phase2_analyze::analyze_component(&mut ast, source, &CompileOptions::default())
+            .expect("analyze")
+    }
+
+    #[test]
+    fn an_updated_shadow_does_not_exclude_the_outer_binding() {
+        let source = r#"<script>
+            let w = 1;
+            function f(w) {
+                w = 2;
+            }
+            const r = w;
+        </script>
+        <b>{r}</b>"#;
+        let analysis = analyze(source);
+        let excluded = top_level_excluded_names(&analysis, analysis.root.instance_scope_index);
+
+        assert!(
+            analysis.root.bindings.iter().any(|binding| {
+                binding.name == "w"
+                    && binding.scope_index != analysis.root.instance_scope_index
+                    && binding.is_updated()
+            }),
+            "the fixture must contain an updated inner binding"
+        );
+        assert!(!excluded.contains("w"), "an inner write must not exclude the top-level w");
+    }
+
+    #[test]
+    fn module_and_instance_exclusions_are_independent() {
+        let source = r#"<script module>
+            let w = 1;
+            w = 2;
+        </script>
+        <script>
+            const w = 3;
+        </script>
+        <b>{w}</b>"#;
+        let analysis = analyze(source);
+
+        assert!(top_level_excluded_names(&analysis, 0).contains("w"));
+        assert!(
+            !top_level_excluded_names(&analysis, analysis.root.instance_scope_index).contains("w")
+        );
+    }
+
+    #[test]
+    fn an_updated_derived_is_not_harvested_after_exclusions() {
+        let source = r#"<script>
+            let count = $derived(0);
+            count++;
+        </script>
+        <b>{count}</b>"#;
+        let mut ast = phase1_parse::parse(
+            source,
+            &oxc_allocator::Allocator::default(),
+            phase1_parse::ParseOptions::default(),
+        )
+        .expect("parse");
+
+        // SAFETY: `ast` (and therefore its arena) outlives analysis and evaluation.
+        let _guard = unsafe { crate::ast::arena::SerializeArenaGuard::new(&ast.arena as *const _) };
+        let analysis =
+            phase2_analyze::analyze_component(&mut ast, source, &CompileOptions::default())
+                .expect("analyze");
+        let inputs = compute_eval_inputs(
+            Some(&analysis),
+            ast.instance.as_deref(),
+            ast.module.as_deref(),
+            source,
+            false,
+        );
+
+        assert!(!inputs.constant_vars.contains_key("count"));
     }
 }

@@ -22,6 +22,7 @@ use crate::compiler::phases::phase3_transform::client::visitors::expression_conv
 use crate::compiler::phases::phase3_transform::js_ast::JsArena;
 use crate::compiler::phases::phase3_transform::js_ast::builders as b;
 use crate::compiler::phases::phase3_transform::js_ast::nodes::*;
+use crate::compiler::phases::phase3_transform::js_ast::to_oxc::SINGLE_TARGET_DESTRUCTURE_SEQUENCE_MARKER;
 
 // Note: We implement bind_this directly here rather than using shared/utils
 // to avoid complex borrow checker issues with the context
@@ -59,17 +60,11 @@ pub fn unified_build_bind_this(
         apply_transforms_to_expression, apply_transforms_to_expression_with_shadowed,
     };
 
-    let saved_in_bind = context.state.in_bind_directive;
-    context.state.in_bind_directive = true;
     let raw_expr = convert_expression(expression, context);
-    context.state.in_bind_directive = saved_in_bind;
 
     let (getter_expr, setter_expr) = if let JsExpr::Sequence(ref seq) = raw_expr {
         if seq.expressions.len() == 2 {
-            (
-                Some(seq.expressions[0].clone()),
-                Some(seq.expressions[1].clone()),
-            )
+            (Some(seq.expressions[0].clone()), Some(seq.expressions[1].clone()))
         } else {
             (None, None)
         }
@@ -107,7 +102,7 @@ pub fn unified_build_bind_this(
     // prevents the proxy flag from being added.
     // For bind:this on components, the value may need proxy (e.g., bind-this-proxy test).
     let binding_name_for_skip = if is_element_binding {
-        if let JsExpr::Identifier(name) = &raw_expr {
+        if let JsExpr::Identifier(name) = unspanned_expr(&raw_expr, &context.arena) {
             Some(name.clone())
         } else {
             None
@@ -131,9 +126,25 @@ pub fn unified_build_bind_this(
 
     let mut set = apply_transforms_to_expression_with_shadowed(&setter_raw, context, &local_scope);
 
-    // In legacy mode, when bind:this is inside an each block AND the expression's root
-    // object is an each item variable (e.g., bind:this={item.ref}), the setter needs to
-    // include $.invalidate_inner_signals() to properly propagate changes.
+    // A synthesized `bind:this={item.ref}` setter mutates the each item. Upstream's
+    // each-item `mutate` transform therefore marks the render callback as using its
+    // index in both legacy and runes mode. Our local scope deliberately shadows that
+    // transform while building the setter, so record the mutation explicitly.
+    let expr_root = get_expression_root_identifier(&raw_expr, &context.arena);
+    let mutated_each_item = expr_root.as_ref().and_then(|root_name| {
+        context
+            .state
+            .each_binding_context
+            .iter()
+            .rev()
+            .find(|each_ctx| each_ctx.item_name == *root_name)
+    });
+    if mutated_each_item.is_some() {
+        context.state.each_item_assign_or_mutate.set(true);
+    }
+
+    // In legacy mode the setter also needs $.invalidate_inner_signals() to
+    // propagate the member assignment.
     //
     // This does NOT apply when the root object is a different variable (e.g.,
     // bind:this={items1[item.id]} where items1 is a state variable - item is only used
@@ -144,39 +155,21 @@ pub fn unified_build_bind_this(
     // invalidation wrapping directly here.
     //
     // Expected output: ($$value, item) => (item.ref = $$value, $.invalidate_inner_signals(() => (items())))
-    if !context.state.analysis.runes && !each_ids.is_empty() {
-        // Check if the bind:this expression's root object is an each item variable
-        let expr_root = get_expression_root_identifier(&raw_expr, &context.arena);
-        if let Some(ref root_name) = expr_root
-            && let Some(each_ctx) = context
-                .state
-                .each_binding_context
-                .iter()
-                .rev()
-                .find(|ctx| ctx.item_name == *root_name)
-            && !each_ctx.invalidation_exprs.is_empty()
-        {
-            // Mark that an each item was mutated. In the official compiler, this
-            // happens via the `mutate` transform callback which sets `uses_index = true`.
-            // Since our local_scope shadows the each item transforms, the mutation
-            // isn't detected by apply_transforms_to_expression_with_shadowed.
-            // We must set this flag here so that the each block callback includes
-            // the $$index and $$array parameters.
-            context.state.each_item_assign_or_mutate.set(true);
-
-            let invalidation_exprs = each_ctx.invalidation_exprs.clone();
-            let invalidation_inner_exprs: Vec<JsExpr> = invalidation_exprs
-                .iter()
-                .map(|s| JsExpr::Raw(s.clone().into()))
-                .collect();
-            let inner = b::sequence(invalidation_inner_exprs);
-            let invalidate_call = b::call(
-                &context.arena,
-                b::member_path(&context.arena, "$.invalidate_inner_signals"),
-                vec![b::thunk(&context.arena, inner)],
-            );
-            set = b::sequence(vec![set, invalidate_call]);
-        }
+    if !context.state.analysis.runes
+        && !each_ids.is_empty()
+        && let Some(each_ctx) = mutated_each_item
+        && !each_ctx.invalidation_exprs.is_empty()
+    {
+        let invalidation_exprs = each_ctx.invalidation_exprs.clone();
+        let invalidation_inner_exprs: Vec<JsExpr> =
+            invalidation_exprs.iter().map(|s| JsExpr::Raw(s.clone().into())).collect();
+        let inner = b::sequence(invalidation_inner_exprs);
+        let invalidate_call = b::call(
+            &context.arena,
+            b::member_path(&context.arena, "$.invalidate_inner_signals"),
+            vec![b::thunk(&context.arena, inner)],
+        );
+        set = b::sequence(vec![set, invalidate_call]);
     }
 
     // Restore the original skip_proxy value
@@ -187,6 +180,12 @@ pub fn unified_build_bind_this(
         let mut t = transform.clone();
         t.skip_proxy = old;
         context.state.transform.insert(name.to_string(), t);
+    }
+
+    // Upstream builds the `bind:this` setter by visiting a synthesized `expr = $$value`
+    // assignment, so it passes through `validate_mutation()`; rsvelte builds it directly.
+    if context.state.dev && setter_expr.is_none() {
+        set = validate_bind_this_mutation(expression, set, context);
     }
 
     // Apply optional chaining to getter MemberExpression nodes only
@@ -266,18 +265,12 @@ pub fn unified_build_bind_this(
         let values_thunk = b::arrow(
             &context.arena,
             vec![],
-            JsExpr::Array(JsArrayExpression {
-                elements: values.into_iter().map(Some).collect(),
-            }),
+            JsExpr::Array(JsArrayExpression { elements: values.into_iter().map(Some).collect() }),
         );
         args.push(values_thunk);
     }
 
-    b::call(
-        &context.arena,
-        b::member_path(&context.arena, "$.bind_this"),
-        args,
-    )
+    b::call(&context.arena, b::member_path(&context.arena, "$.bind_this"), args)
 }
 
 /// Get binding property configuration for a given binding name.
@@ -293,17 +286,13 @@ fn get_binding_property(name: &str) -> Option<BindingProperty> {
             ..Default::default()
         }),
         // Video dimensions
-        "videoHeight" | "videoWidth" => Some(BindingProperty {
-            event: Some("resize"),
-            omit_in_ssr: true,
-            ..Default::default()
-        }),
+        "videoHeight" | "videoWidth" => {
+            Some(BindingProperty { event: Some("resize"), omit_in_ssr: true, ..Default::default() })
+        }
         // Image dimensions
-        "naturalWidth" | "naturalHeight" => Some(BindingProperty {
-            event: Some("load"),
-            omit_in_ssr: true,
-            ..Default::default()
-        }),
+        "naturalWidth" | "naturalHeight" => {
+            Some(BindingProperty { event: Some("load"), omit_in_ssr: true, ..Default::default() })
+        }
         // Document bindings
         "fullscreenElement" => Some(BindingProperty {
             event: Some("fullscreenchange"),
@@ -321,23 +310,17 @@ fn get_binding_property(name: &str) -> Option<BindingProperty> {
             ..Default::default()
         }),
         // Window size (with event)
-        "devicePixelRatio" => Some(BindingProperty {
-            event: Some("resize"),
-            omit_in_ssr: true,
-            ..Default::default()
-        }),
+        "devicePixelRatio" => {
+            Some(BindingProperty { event: Some("resize"), omit_in_ssr: true, ..Default::default() })
+        }
         // Checkbox indeterminate
-        "indeterminate" => Some(BindingProperty {
-            event: Some("change"),
-            bidirectional: true,
-            omit_in_ssr: true,
-        }),
+        "indeterminate" => {
+            Some(BindingProperty { event: Some("change"), bidirectional: true, omit_in_ssr: true })
+        }
         // Details open
-        "open" => Some(BindingProperty {
-            event: Some("toggle"),
-            bidirectional: true,
-            omit_in_ssr: false,
-        }),
+        "open" => {
+            Some(BindingProperty { event: Some("toggle"), bidirectional: true, omit_in_ssr: false })
+        }
         // Default: no special event handling, use switch-based logic
         _ => None,
     }
@@ -383,7 +366,11 @@ fn bind_directive_inner(
 
     // Visit the expression to transform it using the full expression converter
     // (supports ArrowFunctionExpression, MemberExpression, etc.)
-    let expression = convert_expression(&node.expression, context);
+    let expression = match convert_expression(&node.expression, context) {
+        JsExpr::Spanned(inner, _, _) => context.arena.get_expr(inner).clone(),
+        expression => expression,
+    };
+    let has_custom_accessors = is_sequence_expression(&expression);
 
     // In dev mode with runes, validate binding to non-reactive properties.
     // Reference: BindDirective.js lines 26-41
@@ -391,9 +378,7 @@ fn bind_directive_inner(
         && context.state.analysis.runes
         && !is_sequence_expression(&expression)
         && node.expression.is_member_expression()
-        && !ignored_codes
-            .iter()
-            .any(|c| c == "binding_property_non_reactive")
+        && !ignored_codes.iter().any(|c| c == "binding_property_non_reactive")
     {
         // For bind:this, only validate when inside a control flow block (if/each/await/key)
         // since at the top level the binding is static and doesn't need validation.
@@ -419,18 +404,14 @@ fn bind_directive_inner(
     {
         let expr_root = get_expression_root_identifier(&expression, &context.arena);
         if let Some(ref root_name) = expr_root
-            && context
-                .state
-                .each_item_names
-                .iter()
-                .any(|n| n.as_str() == root_name.as_str())
+            && context.state.each_item_names.iter().any(|n| n.as_str() == root_name.as_str())
         {
             context.state.each_item_assign_or_mutate.set(true);
         }
     }
 
     // Check if it's a sequence expression (getter/setter pair)
-    let (get, set) = if is_sequence_expression(&expression) {
+    let (get, set) = if has_custom_accessors {
         let (raw_get, raw_set) = extract_getter_setter(&expression);
         // For a user-provided getter/setter pair, BOTH bodies need read transforms
         // (e.g. wrapping $state/each-item/`@const` reads with `$.get()`). The setter
@@ -445,11 +426,25 @@ fn bind_directive_inner(
     } else if binding_name == "this" {
         // bind:this is handled specially below in build_special_binding_call
         build_getter_setter(&node.expression, &expression, context)
-    } else if let Some(each_result) =
-        build_each_block_getter_setter(&node.expression, &expression, context)
+    } else if let Some((get, get_body, setter_body)) =
+        build_each_block_accessor_parts(&node.expression, &expression, context)
     {
         // Inside an each block - use the each-block-aware getter/setter
-        each_result
+        if context.state.dev {
+            // dev emits named accessors so `$inspect(...)` stack traces stay useful
+            let get_src = crate::compiler::phases::phase3_transform::js_ast::codegen::generate_expr(
+                &get_body,
+                &context.arena,
+            );
+            (
+                JsExpr::Raw(format!("function get() {{\n\treturn {};\n}}", get_src).into()),
+                Some(JsExpr::Raw(
+                    format!("function set($$value) {{\n\t{};\n}}", setter_body).into(),
+                )),
+            )
+        } else {
+            (get, Some(JsExpr::Raw(format!("($$value) => (\n\t{}\n)", setter_body).into())))
+        }
     } else {
         // Build getter and setter from the expression
         // Pass is_primitive=true for regular element bindings to skip proxy flag
@@ -469,12 +464,7 @@ fn bind_directive_inner(
     // bind:this uses the unified implementation that handles each-block context properly
     let call = if binding_name == "this" {
         let is_element = is_regular_element(&parent);
-        unified_build_bind_this(
-            &node.expression,
-            context.state.node.clone(),
-            context,
-            is_element,
-        )
+        unified_build_bind_this(&node.expression, context.state.node.clone(), context, is_element)
     } else if let Some(prop) = property {
         if let Some(event) = prop.event {
             // Use bind_property for bindings with events
@@ -510,6 +500,41 @@ fn bind_directive_inner(
         )
     };
 
+    let call = if let Some(element) = parent.as_regular_element() {
+        let mut call = call;
+        let element_end = element.start.saturating_add(1).saturating_add(element.name.len() as u32);
+        if let (JsExpr::Call(binding), JsExpr::Identifier(node_id)) =
+            (&mut call, &context.state.node)
+        {
+            for argument in &mut binding.arguments {
+                if matches!(argument, JsExpr::Identifier(name) if name == node_id) {
+                    *argument = JsExpr::Spanned(
+                        context.arena.alloc_expr(argument.clone()),
+                        element.start,
+                        element_end,
+                    );
+                }
+            }
+        }
+        call
+    } else {
+        call
+    };
+
+    let call_id = context.arena.alloc_expr(call);
+    if !has_custom_accessors
+        && binding_name == "value"
+        && parent.as_regular_element().is_some_and(|element| element.name != "select")
+        && let Some((name, start, end)) = get_ast_root_identifier_span(&node.expression)
+    {
+        context.arena.note_expression_identifier_span(call_id, &name, start, end);
+    }
+    let call = JsExpr::Spanned(
+        call_id,
+        parent.as_regular_element().map_or(node.start, |element| element.start),
+        node.end,
+    );
+
     // Check if we need to defer the binding (when element has use: directive)
     let defer = binding_name != "this" && is_regular_element(&parent) && has_use_directive(&parent);
 
@@ -536,9 +561,8 @@ fn bind_directive_inner(
     {
         let ast_names = collect_ast_identifiers(&node.expression);
         let name_refs: Vec<&str> = ast_names.iter().map(|s| s.as_str()).collect();
-        let blocker_exprs = context
-            .state
-            .get_blockers_for_names_with_duplicates(&name_refs, &context.arena);
+        let blocker_exprs =
+            context.state.get_blockers_for_names_with_duplicates(&name_refs, &context.arena);
 
         if !blocker_exprs.is_empty() {
             let blockers_array = b::array(blocker_exprs);
@@ -591,11 +615,7 @@ fn build_special_binding_call(
             if let Some(s) = set {
                 args.push(s.clone());
             }
-            b::call(
-                &context.arena,
-                b::member_path(&context.arena, "$.bind_window_scroll"),
-                args,
-            )
+            b::call(&context.arena, b::member_path(&context.arena, "$.bind_window_scroll"), args)
         }
 
         "innerWidth" | "innerHeight" | "outerWidth" | "outerHeight" => b::call(
@@ -617,11 +637,7 @@ fn build_special_binding_call(
             if let Some(s) = set {
                 args.push(s.clone());
             }
-            b::call(
-                &context.arena,
-                b::member_path(&context.arena, "$.bind_muted"),
-                args,
-            )
+            b::call(&context.arena, b::member_path(&context.arena, "$.bind_muted"), args)
         }
 
         "paused" => {
@@ -629,11 +645,7 @@ fn build_special_binding_call(
             if let Some(s) = set {
                 args.push(s.clone());
             }
-            b::call(
-                &context.arena,
-                b::member_path(&context.arena, "$.bind_paused"),
-                args,
-            )
+            b::call(&context.arena, b::member_path(&context.arena, "$.bind_paused"), args)
         }
 
         "volume" => {
@@ -641,11 +653,7 @@ fn build_special_binding_call(
             if let Some(s) = set {
                 args.push(s.clone());
             }
-            b::call(
-                &context.arena,
-                b::member_path(&context.arena, "$.bind_volume"),
-                args,
-            )
+            b::call(&context.arena, b::member_path(&context.arena, "$.bind_volume"), args)
         }
 
         "playbackRate" => {
@@ -653,11 +661,7 @@ fn build_special_binding_call(
             if let Some(s) = set {
                 args.push(s.clone());
             }
-            b::call(
-                &context.arena,
-                b::member_path(&context.arena, "$.bind_playback_rate"),
-                args,
-            )
+            b::call(&context.arena, b::member_path(&context.arena, "$.bind_playback_rate"), args)
         }
 
         "currentTime" => {
@@ -665,11 +669,7 @@ fn build_special_binding_call(
             if let Some(s) = set {
                 args.push(s.clone());
             }
-            b::call(
-                &context.arena,
-                b::member_path(&context.arena, "$.bind_current_time"),
-                args,
-            )
+            b::call(&context.arena, b::member_path(&context.arena, "$.bind_current_time"), args)
         }
 
         "buffered" => b::call(
@@ -740,11 +740,7 @@ fn build_special_binding_call(
                         args.push(s.clone());
                     }
                 }
-                b::call(
-                    &context.arena,
-                    b::member_path(&context.arena, "$.bind_select_value"),
-                    args,
-                )
+                b::call(&context.arena, b::member_path(&context.arena, "$.bind_select_value"), args)
             } else {
                 let mut args = vec![node_expr.clone(), get.clone()];
                 let store_name = get_store_to_invalidate_from_context(context);
@@ -756,11 +752,7 @@ fn build_special_binding_call(
                         args.push(s.clone());
                     }
                 }
-                b::call(
-                    &context.arena,
-                    b::member_path(&context.arena, "$.bind_value"),
-                    args,
-                )
+                b::call(&context.arena, b::member_path(&context.arena, "$.bind_value"), args)
             }
         }
 
@@ -770,11 +762,7 @@ fn build_special_binding_call(
             if let Some(s) = set {
                 args.push(s.clone());
             }
-            b::call(
-                &context.arena,
-                b::member_path(&context.arena, "$.bind_files"),
-                args,
-            )
+            b::call(&context.arena, b::member_path(&context.arena, "$.bind_files"), args)
         }
 
         // bind:this
@@ -786,11 +774,7 @@ fn build_special_binding_call(
             if let Some(s) = set {
                 args.push(s.clone());
             }
-            b::call(
-                &context.arena,
-                b::member_path(&context.arena, "$.bind_content_editable"),
-                args,
-            )
+            b::call(&context.arena, b::member_path(&context.arena, "$.bind_content_editable"), args)
         }
 
         // Checkbox checked binding
@@ -799,11 +783,7 @@ fn build_special_binding_call(
             if let Some(s) = set {
                 args.push(s.clone());
             }
-            b::call(
-                &context.arena,
-                b::member_path(&context.arena, "$.bind_checked"),
-                args,
-            )
+            b::call(&context.arena, b::member_path(&context.arena, "$.bind_checked"), args)
         }
 
         // Focus binding
@@ -823,11 +803,7 @@ fn build_special_binding_call(
             if let Some(s) = set {
                 args.push(s.clone());
             }
-            b::call(
-                &context.arena,
-                b::member_path(&context.arena, "$.bind_property"),
-                args,
-            )
+            b::call(&context.arena, b::member_path(&context.arena, "$.bind_property"), args)
         }
     }
 }
@@ -885,10 +861,7 @@ fn build_group_keypath_parts(expr: &serde_json::Value, parts: &mut Vec<String>) 
             if let Some(object) = obj.get("object") {
                 build_group_keypath_parts(object, parts);
             }
-            let computed = obj
-                .get("computed")
-                .and_then(|c| c.as_bool())
-                .unwrap_or(false);
+            let computed = obj.get("computed").and_then(|c| c.as_bool()).unwrap_or(false);
             if computed {
                 if let Some(property) = obj.get("property") {
                     let prop_str = build_group_binding_keypath(property);
@@ -926,17 +899,27 @@ fn build_group_binding_call(
     // Reference: svelte/packages/svelte/src/compiler/phases/3-transform/client/visitors/BindDirective.js L248
     let binding_group_name;
     {
+        // Strategy 0: the name analysis resolved for THIS directive. An each
+        // block carries one name, so two directives under it whose expressions
+        // key to different groups can only be told apart here.
+        let own_group = directive_expr
+            .and_then(|expr| expr.as_node().start())
+            .and_then(|start| context.state.analysis.binding_group_names.get(&start))
+            .cloned();
+
         // Strategy 1: For EachItem-based bind:group, look up via the innermost ancestor
         // EachBindingContext that has contains_group_binding=true and a binding_group_name.
         // This covers cases like bind:group={selected} inside {#each items as selected}.
-        let each_group = context
-            .state
-            .each_binding_context
-            .iter()
-            .rev()
-            .find(|ctx| ctx.contains_group_binding && ctx.binding_group_name.is_some())
-            .and_then(|ctx| ctx.binding_group_name.as_ref())
-            .cloned();
+        let each_group = own_group.or_else(|| {
+            context
+                .state
+                .each_binding_context
+                .iter()
+                .rev()
+                .find(|ctx| ctx.contains_group_binding && ctx.binding_group_name.is_some())
+                .and_then(|ctx| ctx.binding_group_name.as_ref())
+                .cloned()
+        });
 
         if let Some(group_name) = each_group {
             binding_group_name = b::id(&group_name);
@@ -996,11 +979,7 @@ fn build_group_binding_call(
                 }
             }
         }
-        if idx_exprs.is_empty() {
-            b::empty_array()
-        } else {
-            b::array(idx_exprs)
-        }
+        if idx_exprs.is_empty() { b::empty_array() } else { b::array(idx_exprs) }
     };
 
     // We need to additionally invoke the value attribute signal to register it as a dependency,
@@ -1057,13 +1036,7 @@ fn build_group_binding_call(
     b::call(
         &context.arena,
         b::member_path(&context.arena, "$.bind_group"),
-        vec![
-            binding_group_name,
-            indexes,
-            node.clone(),
-            group_getter,
-            set_or_get,
-        ],
+        vec![binding_group_name, indexes, node.clone(), group_getter, set_or_get],
     )
 }
 
@@ -1198,6 +1171,9 @@ fn collect_each_block_ids(
     seen: &mut FxHashSet<String>,
 ) {
     match expr {
+        JsExpr::Spanned(inner, _, _) => {
+            collect_each_block_ids(arena, arena.get_expr(*inner), context, result, seen);
+        }
         JsExpr::Identifier(name) => {
             if seen.contains(name.as_str()) {
                 return;
@@ -1223,16 +1199,10 @@ fn collect_each_block_ids(
                 // For `{#each data as {id, text}}`, `id` and `text` are each-block
                 // context variables that need to be captured in bind_this.
                 // These are tracked in destructured_update_paths.
-                if each_ctx
-                    .destructured_update_paths
-                    .contains_key(name.as_str())
-                {
+                if each_ctx.destructured_update_paths.contains_key(name.as_str()) {
                     seen.insert(name.to_string());
                     // Destructured each vars are always reactive (they have read transforms)
-                    result.push(EachBlockId {
-                        name: name.to_string(),
-                        reactive: true,
-                    });
+                    result.push(EachBlockId { name: name.to_string(), reactive: true });
                     return;
                 }
             }
@@ -1271,13 +1241,7 @@ fn collect_each_block_ids(
         }
         JsExpr::Conditional(cond) => {
             collect_each_block_ids(arena, arena.get_expr(cond.test), context, result, seen);
-            collect_each_block_ids(
-                arena,
-                arena.get_expr(cond.consequent),
-                context,
-                result,
-                seen,
-            );
+            collect_each_block_ids(arena, arena.get_expr(cond.consequent), context, result, seen);
             collect_each_block_ids(arena, arena.get_expr(cond.alternate), context, result, seen);
         }
         JsExpr::Sequence(seq) => {
@@ -1359,20 +1323,14 @@ fn build_bind_this_with_each_ids(
                 JsArrowBody::Expression(body) => {
                     let body_expr = context.arena.get_expr(body).clone();
                     JsArrowBody::Expression(
-                        context
-                            .arena
-                            .alloc_expr(make_optional_chain(&context.arena, &body_expr)),
+                        context.arena.alloc_expr(make_optional_chain(&context.arena, &body_expr)),
                     )
                 }
                 other => other,
             };
             let mut params = arrow.params;
             params.extend(id_params.clone());
-            JsExpr::Arrow(JsArrowFunction {
-                params,
-                body: optional_body,
-                is_async: arrow.is_async,
-            })
+            JsExpr::Arrow(JsArrowFunction { params, body: optional_body, is_async: arrow.is_async })
         }
         other => {
             let optional = make_optional_chain(&context.arena, &other);
@@ -1424,9 +1382,7 @@ fn build_bind_this_with_each_ids(
     let values_thunk = b::arrow(
         &context.arena,
         vec![],
-        JsExpr::Array(JsArrayExpression {
-            elements: values.into_iter().map(Some).collect(),
-        }),
+        JsExpr::Array(JsArrayExpression { elements: values.into_iter().map(Some).collect() }),
     );
 
     b::call(
@@ -1506,11 +1462,8 @@ fn build_bind_this_call_for_context(
         };
 
         if is_prop {
-            let getter = b::arrow(
-                &context.arena,
-                vec![],
-                b::call(&context.arena, get.clone(), vec![]),
-            );
+            let getter =
+                b::arrow(&context.arena, vec![], b::call(&context.arena, get.clone(), vec![]));
             let setter = b::arrow(
                 &context.arena,
                 vec![b::id_pattern("$$value")],
@@ -1525,11 +1478,7 @@ fn build_bind_this_call_for_context(
             let getter = b::arrow(
                 &context.arena,
                 vec![],
-                b::call(
-                    &context.arena,
-                    b::member_path(&context.arena, "$.get"),
-                    vec![get.clone()],
-                ),
+                b::call(&context.arena, b::member_path(&context.arena, "$.get"), vec![get.clone()]),
             );
             let mut set_args = vec![get.clone(), b::id("$$value")];
             if needs_proxy {
@@ -1538,11 +1487,7 @@ fn build_bind_this_call_for_context(
             let setter = b::arrow(
                 &context.arena,
                 vec![b::id_pattern("$$value")],
-                b::call(
-                    &context.arena,
-                    b::member_path(&context.arena, "$.set"),
-                    set_args,
-                ),
+                b::call(&context.arena, b::member_path(&context.arena, "$.set"), set_args),
             );
             b::call(
                 &context.arena,
@@ -1659,7 +1604,7 @@ fn extract_getter_setter(expr: &JsExpr) -> (JsExpr, Option<JsExpr>) {
 fn build_getter_setter(
     original_expr: &Expression,
     expr: &JsExpr,
-    context: &ComponentContext,
+    context: &mut ComponentContext,
 ) -> (JsExpr, Option<JsExpr>) {
     build_getter_setter_with_primitive(original_expr, expr, context, false)
 }
@@ -1667,7 +1612,7 @@ fn build_getter_setter(
 fn build_getter_setter_with_primitive(
     original_expr: &Expression,
     expr: &JsExpr,
-    context: &ComponentContext,
+    context: &mut ComponentContext,
     is_primitive: bool,
 ) -> (JsExpr, Option<JsExpr>) {
     // Check if this is a simple identifier that's a state variable
@@ -1685,11 +1630,8 @@ fn build_getter_setter_with_primitive(
         // For state variables, use $.get() in getter and $.set() in setter
         // get = () => $.get(expr)
         // set = ($$value) => $.set(expr, $$value)
-        let get_call = b::call(
-            &context.arena,
-            b::member_path(&context.arena, "$.get"),
-            vec![expr.clone()],
-        );
+        let get_call =
+            b::call(&context.arena, b::member_path(&context.arena, "$.get"), vec![expr.clone()]);
         let get = if dev {
             b::function_expr(
                 Some("get".into()),
@@ -1728,11 +1670,7 @@ fn build_getter_setter_with_primitive(
         if needs_proxy {
             set_args.push(b::boolean(true));
         }
-        let set_call = b::call(
-            &context.arena,
-            b::member_path(&context.arena, "$.set"),
-            set_args,
-        );
+        let set_call = b::call(&context.arena, b::member_path(&context.arena, "$.set"), set_args);
         let set = if dev {
             b::function_expr(
                 Some("set".into()),
@@ -1784,11 +1722,7 @@ fn build_getter_setter_with_primitive(
             (JsExpr::Identifier(get_name), JsExpr::Identifier(set_name)) => get_name == set_name,
             _ => false,
         };
-        if !dev && same_identifier {
-            (get, None)
-        } else {
-            (get, Some(set))
-        }
+        if !dev && same_identifier { (get, None) } else { (get, Some(set)) }
     } else {
         // For non-state, non-prop expressions (e.g., each-block items, store member access),
         // apply transforms to get $.get() wrappers and store mutate handling.
@@ -1805,67 +1739,31 @@ fn build_getter_setter_with_primitive(
         // like `bind:group={selected[0]}` to use `selected[0]` instead of `selected()[0]`.
         let transformed_read = apply_transforms_to_expression(expr, context);
 
-        // Build the setter by creating an assignment expression and applying transforms.
+        // Build the setter through the same assignment transform as source assignments, retaining
+        // the source AST's root name. The converted member base may already be a getter call
+        // (`selected` -> `selected()`), from which the binding cannot be recovered.
         // This allows store_sub mutate transforms to kick in for patterns like:
         //   $obj.a = $$value -> $.store_mutate(obj, $.untrack($obj).a = $$value, $.untrack($obj))
         // Also applies prop mutation transforms in legacy mode:
         //   selected[0] = $$value -> selected(selected()[0] = $$value, true)
-        let assignment_expr = b::assign(&context.arena, expr.clone(), b::id("$$value"));
-        let transformed_set = apply_transforms_to_expression(&assignment_expr, context);
+        let original_root_name = get_ast_root_identifier(original_expr);
+        let transformed_set = super::expression_converter::transform_synthesized_assignment(
+            expr,
+            &b::id("$$value"),
+            original_root_name.as_deref(),
+            context,
+        );
 
-        // Check if the root identifier has legacy_indirect_bindings.
-        // If so, wrap the setter in a sequence with $.invalidate_inner_signals().
-        // This corresponds to AssignmentExpression.js lines 159-173 in the official compiler.
-        let transformed_set = if !context.state.analysis.runes {
-            // Extract root identifier from the original expression
-            let root_name = get_expression_root_identifier(expr, &context.arena);
-            if let Some(ref root_name) = root_name {
-                // Look up the binding
-                let binding = context.state.get_binding(root_name);
-                if let Some(binding) = binding {
-                    if !binding.legacy_indirect_bindings.is_empty() {
-                        // Build getter calls for each indirect binding
-                        let mut getter_stmts = Vec::new();
-                        for indirect_name in &binding.legacy_indirect_bindings {
-                            // Build the getter by looking up the transform
-                            let getter = if let Some(transform) =
-                                context.state.transform.get(indirect_name)
-                            {
-                                if let Some(read_fn) = transform.read {
-                                    read_fn(
-                                        &context.arena,
-                                        JsExpr::Identifier(indirect_name.clone().into()),
-                                    )
-                                } else {
-                                    JsExpr::Identifier(indirect_name.clone().into())
-                                }
-                            } else {
-                                JsExpr::Identifier(indirect_name.clone().into())
-                            };
-                            getter_stmts.push(b::stmt(&context.arena, getter));
-                        }
-
-                        // Build: $.invalidate_inner_signals(() => { getter1(); getter2(); ... })
-                        let invalidate_call = b::call(
-                            &context.arena,
-                            b::member_path(&context.arena, "$.invalidate_inner_signals"),
-                            vec![b::arrow_block(vec![], getter_stmts)],
-                        );
-
-                        // Wrap: (mutation, $.invalidate_inner_signals(...))
-                        b::sequence(vec![transformed_set, invalidate_call])
-                    } else {
-                        transformed_set
-                    }
-                } else {
-                    transformed_set
-                }
-            } else {
-                transformed_set
-            }
-        } else {
-            transformed_set
-        };
+        // EachBlock's mutate transform always returns a SequenceExpression,
+        // even when there are no legacy/store invalidations to append. The
+        // binding path constructs its setter independently of the expression
+        // visitor, so preserve that one-element sequence here as well.
+        let transformed_set = super::expression_converter::preserve_each_mutation_sequence(
+            transformed_set,
+            get_ast_root_identifier(original_expr).as_deref(),
+            original_expr.is_member_expression(),
+            context,
+        );
 
         // In dev mode, apply ownership mutation validation for member expressions on props.
         // This wraps the setter with $$ownership_validator.mutation() when the root of the
@@ -1879,18 +1777,36 @@ fn build_getter_setter_with_primitive(
                 let binding = context.state.get_binding(root_name);
                 if let Some(binding) = binding {
                     use crate::compiler::phases::phase2_analyze::scope::BindingKind;
-                    if matches!(binding.kind, BindingKind::Prop | BindingKind::BindableProp) {
-                        context.state.needs_mutation_validation.set(true);
-                        let prop_alias =
-                            binding.prop_alias.as_ref().unwrap_or(&binding.name).clone();
-                        let path = build_ast_member_path(original_expr);
-                        let mut args =
-                            vec![b::string(&prop_alias), b::array(path), transformed_set];
+                    // build_ast_member_path returns None when a property along the chain
+                    // (e.g. `obj[a.b]`) is neither a Literal nor an Identifier, mirroring
+                    // validate_mutation()'s bail-out (`else { return expression; }`).
+                    let path =
+                        if matches!(binding.kind, BindingKind::Prop | BindingKind::BindableProp) {
+                            // Official sets this before building the path, so an unbuildable
+                            // path still emits the `$$ownership_validator` preamble.
+                            context.state.needs_mutation_validation.set(true);
+                            build_ast_member_path(original_expr, &|name: &str| {
+                                read_computed_path_element(name, context)
+                            })
+                        } else {
+                            None
+                        };
+                    if let Some(path) = path {
+                        let mut args = vec![
+                            crate::compiler::phases::phase3_transform::client::visitors::expression_converter::ownership_alias_literal(
+                                binding.prop_alias.clone(),
+                            ),
+                            b::array(path),
+                            transformed_set,
+                        ];
                         // Add source location (line, column) if available
                         let start_pos = original_expr.start().map(|v| v as usize);
                         if let Some(start) = start_pos {
                             let source = &context.state.analysis.source;
-                            let (line, col) = offset_to_line_col(source, start);
+                            let (line, col) =
+                                crate::compiler::phases::phase3_transform::utils::locate_in_source(
+                                    source, start,
+                                );
                             args.push(b::number(line as f64));
                             args.push(b::number(col as f64));
                         }
@@ -1926,11 +1842,7 @@ fn build_getter_setter_with_primitive(
             (get, Some(set))
         } else {
             let get = b::thunk(&context.arena, transformed_read);
-            let set = b::arrow(
-                &context.arena,
-                vec![b::id_pattern("$$value")],
-                transformed_set,
-            );
+            let set = b::arrow(&context.arena, vec![b::id_pattern("$$value")], transformed_set);
 
             // Apply unthunk optimization: if get and set are the same identifier, omit set
             let same_identifier = match (&get, &set) {
@@ -1939,11 +1851,7 @@ fn build_getter_setter_with_primitive(
                 }
                 _ => false,
             };
-            if same_identifier {
-                (get, None)
-            } else {
-                (get, Some(set))
-            }
+            if same_identifier { (get, None) } else { (get, Some(set)) }
         }
     }
 }
@@ -1999,10 +1907,7 @@ fn has_use_directive(
     parent: &crate::compiler::phases::phase3_transform::utils::ParentRef<'_>,
 ) -> bool {
     match parent.as_regular_element() {
-        Some(elem) => elem
-            .attributes
-            .iter()
-            .any(|attr| matches!(attr, Attribute::UseDirective(_))),
+        Some(elem) => elem.attributes.iter().any(|attr| matches!(attr, Attribute::UseDirective(_))),
         None => false,
     }
 }
@@ -2018,9 +1923,20 @@ fn has_use_directive(
 /// an each item variable.
 pub fn build_each_block_getter_setter(
     original_expr: &Expression,
-    _converted_expr: &JsExpr,
+    converted_expr: &JsExpr,
     context: &mut ComponentContext,
 ) -> Option<(JsExpr, Option<JsExpr>)> {
+    let (get, _, setter_body) =
+        build_each_block_accessor_parts(original_expr, converted_expr, context)?;
+    let set = JsExpr::Raw(format!("($$value) => (\n\t{}\n)", setter_body).into());
+    Some((get, Some(set)))
+}
+
+fn build_each_block_accessor_parts(
+    original_expr: &Expression,
+    _converted_expr: &JsExpr,
+    context: &mut ComponentContext,
+) -> Option<(JsExpr, JsExpr, String)> {
     // Only applies in legacy mode (not runes)
     if context.state.analysis.runes {
         return None;
@@ -2045,65 +1961,40 @@ pub fn build_each_block_getter_setter(
     // Build the invalidation sequence
     let invalidation = build_invalidation_expr(&each_ctx);
 
-    match expr_info {
-        EachBindingExprInfo::DirectItem { item_name: _ } => {
+    // `get_body` is the expression the getter returns; dev needs it unthunked so the
+    // accessors can be emitted as named functions (useful `$inspect` stack traces).
+    let (get, get_body, setter_body) = match expr_info {
+        EachBindingExprInfo::DirectItem => {
             // Direct item reference: bind:value={item}
             // Official Svelte uses collection[$$index] for both getter and setter
             // (not $.get(item)) because the item is considered "reassigned" via the bind.
             // Getter: () => collection[$$index]
             // Setter: ($$value) => (collection[$$index] = $$value, invalidation)
 
-            // Build collection access as a proper AST node so unwrap_thunk can work on
+            // Build collection[index] as a proper AST node so unwrap_thunk can work on
             // the resulting arrow function (b::thunk requires a structured JsExpr::Arrow).
-            let collection_expr = if let Some(ref coll_id) = each_ctx.collection_id {
-                // collection is a prop (function call): selected_array()
-                b::call(&context.arena, b::id(coll_id), vec![])
-            } else {
-                // collection is a raw expression (e.g., component prop or literal)
-                JsExpr::Raw(each_ctx.collection_expr.clone().into())
-            };
-            let index_expr = if each_ctx.index_reactive {
-                b::call(
-                    &context.arena,
-                    b::member_path(&context.arena, "$.get"),
-                    vec![b::id(&each_ctx.index_name)],
-                )
-            } else {
-                b::id(&each_ctx.index_name)
-            };
-
-            // Build collection[index] as a computed member expression
             let member_expr =
-                b::member_computed(&context.arena, collection_expr.clone(), index_expr.clone());
+                super::shared::utils::build_reassigned_item_read(&each_ctx, &context.arena);
 
             // Getter: () => collection[index]  (structured arrow, unwrap_thunk-compatible)
             let get = b::thunk(&context.arena, member_expr.clone());
 
             // Setter: ($$value) => (collection[index] = $$value, invalidation)
-            // Build as a raw string since assignment and sequence expressions need special handling
-            let collection_access = if let Some(ref coll_id) = each_ctx.collection_id {
-                format!("{}()", coll_id)
-            } else {
-                each_ctx.collection_expr.clone()
-            };
-            let index_access = if each_ctx.index_reactive {
-                format!("$.get({})", each_ctx.index_name)
-            } else {
-                each_ctx.index_name.clone()
-            };
+            // Printed from the member AST so the collection keeps any parentheses it needs.
+            let member_access =
+                crate::compiler::phases::phase3_transform::js_ast::codegen::generate_expr(
+                    &member_expr,
+                    &context.arena,
+                );
             let setter_body = if let Some(ref inv) = invalidation {
-                format!("{}[{}] = $$value, {}", collection_access, index_access, inv)
+                format!("{} = $$value, {}", member_access, inv)
             } else {
-                format!("{}[{}] = $$value", collection_access, index_access)
+                format!("{} = $$value", member_access)
             };
 
-            let set = JsExpr::Raw(format!("($$value) => ({})", setter_body).into());
-            Some((get, Some(set)))
+            (get, member_expr, setter_body)
         }
-        EachBindingExprInfo::ItemProperty {
-            item_name,
-            property_path,
-        } => {
+        EachBindingExprInfo::ItemProperty { item_name, property_path } => {
             // Property of each item: bind:value={item.prop} or bind:value={item.a.b} or bind:value={item[expr]}
             // Getter: () => $.get(item).prop  OR  () => $.get(item)[$.get(expr)]
             // Setter: ($$value) => ($.get(item).prop = $$value, invalidation)
@@ -2147,36 +2038,30 @@ pub fn build_each_block_getter_setter(
             let get = b::thunk(&context.arena, JsExpr::Raw(get_expr_str.clone().into()));
 
             let setter_body = if let Some(ref inv) = invalidation {
-                format!(
-                    "{} = $$value, {}",
-                    access_prop(&get_base, &transformed_prop_path),
-                    inv
-                )
+                format!("{} = $$value, {}", access_prop(&get_base, &transformed_prop_path), inv)
             } else {
-                format!(
-                    "{} = $$value",
-                    access_prop(&get_base, &transformed_prop_path)
-                )
+                format!("{} = $$value", access_prop(&get_base, &transformed_prop_path))
             };
 
-            let set = JsExpr::Raw(format!("($$value) => (\n\t{}\n)", setter_body).into());
-            Some((get, Some(set)))
+            (get, JsExpr::Raw(get_expr_str.into()), setter_body)
         }
-        EachBindingExprInfo::DestructuredVar {
-            var_name,
-            update_path,
-        } => {
+        EachBindingExprInfo::DestructuredVar { var_name, update_path } => {
             // Destructured variable: bind:value={f} where f comes from {#each items as { f }}
             // Getter: apply the read transform to get the proper getter expression,
             //         then wrap in thunk. b::thunk(&context.arena, f()) => f (via unthunk optimization)
             //         b::thunk(&context.arena, $.get(f)) => () => $.get(f)
             // Setter: ($$value) => (update_path = $$value, invalidation)
-            let get = if let Some(transform) = context.state.transform.get(&var_name)
+            let read_body = if let Some(transform) = context.state.transform.get(&var_name)
                 && let Some(read_fn) = &transform.read
             {
-                b::thunk(&context.arena, read_fn(&context.arena, b::id(&var_name)))
+                Some(read_fn(&context.arena, b::id(&var_name)))
             } else {
-                b::id(&var_name)
+                None
+            };
+            let get_body = read_body.clone().unwrap_or_else(|| b::id(&var_name));
+            let get = match read_body {
+                Some(body) => b::thunk(&context.arena, body),
+                None => b::id(&var_name),
             };
 
             let setter_body = if let Some(ref inv) = invalidation {
@@ -2185,13 +2070,9 @@ pub fn build_each_block_getter_setter(
                 format!("{} = $$value", update_path)
             };
 
-            let set = JsExpr::Raw(format!("($$value) => (\n\t{}\n)", setter_body).into());
-            Some((get, Some(set)))
+            (get, get_body, setter_body)
         }
-        EachBindingExprInfo::ComputedAccess {
-            access_expr,
-            assign_expr,
-        } => {
+        EachBindingExprInfo::ComputedAccess { access_expr, assign_expr } => {
             // Computed access like item[index] or a()[key()]
             // Getter: () => access_expr
             // Setter: ($$value) => (assign_expr = $$value, invalidation)
@@ -2203,33 +2084,24 @@ pub fn build_each_block_getter_setter(
                 format!("{} = $$value", assign_expr)
             };
 
-            let set = JsExpr::Raw(format!("($$value) => (\n\t{}\n)", setter_body).into());
-            Some((get, Some(set)))
+            (get, JsExpr::Raw(access_expr.into()), setter_body)
         }
-    }
+    };
+
+    Some((get, get_body, setter_body))
 }
 
 /// Information about how a binding expression references an each block item.
 #[derive(Debug)]
-#[allow(dead_code)]
 enum EachBindingExprInfo {
     /// Direct reference to the each item (bind:value={item})
-    DirectItem { item_name: String },
+    DirectItem,
     /// Property access on the each item (bind:value={item.prop})
-    ItemProperty {
-        item_name: String,
-        property_path: String,
-    },
+    ItemProperty { item_name: String, property_path: String },
     /// Reference to a destructured variable (bind:value={f})
-    DestructuredVar {
-        var_name: String,
-        update_path: String,
-    },
+    DestructuredVar { var_name: String, update_path: String },
     /// Computed access expression (bind:value={a()[key()]})
-    ComputedAccess {
-        access_expr: String,
-        assign_expr: String,
-    },
+    ComputedAccess { access_expr: String, assign_expr: String },
 }
 
 /// Analyze whether a binding expression references an each block item.
@@ -2253,12 +2125,7 @@ fn analyze_each_binding_expression(
             for (idx, each_ctx) in context.state.each_binding_context.iter().enumerate().rev() {
                 if name == each_ctx.item_name {
                     // Direct reference to this each block's item
-                    return Some((
-                        EachBindingExprInfo::DirectItem {
-                            item_name: name.to_string(),
-                        },
-                        idx,
-                    ));
+                    return Some((EachBindingExprInfo::DirectItem, idx));
                 }
 
                 // Check if this is a destructured variable from the each block
@@ -2290,10 +2157,7 @@ fn analyze_each_binding_expression(
             for (idx, each_ctx) in context.state.each_binding_context.iter().enumerate().rev() {
                 if root_name == each_ctx.item_name {
                     return Some((
-                        EachBindingExprInfo::ItemProperty {
-                            item_name: root_name,
-                            property_path,
-                        },
+                        EachBindingExprInfo::ItemProperty { item_name: root_name, property_path },
                         idx,
                     ));
                 }
@@ -2318,11 +2182,7 @@ fn analyze_each_binding_expression(
                     let transformed_property_path = if property_path.starts_with('[') {
                         let inner = &property_path[1..property_path.len() - 1];
                         if each_ctx.destructured_update_paths.contains_key(inner)
-                            && context
-                                .state
-                                .transform
-                                .get(inner)
-                                .is_some_and(|t| t.is_reactive)
+                            && context.state.transform.get(inner).is_some_and(|t| t.is_reactive)
                         {
                             format!("[{}()]", inner)
                         } else {
@@ -2341,10 +2201,7 @@ fn analyze_each_binding_expression(
                     // through the getter functions (e.g., a()[key()] = $$value).
                     let assign_expr = access_expr.clone();
                     return Some((
-                        EachBindingExprInfo::ComputedAccess {
-                            access_expr,
-                            assign_expr,
-                        },
+                        EachBindingExprInfo::ComputedAccess { access_expr, assign_expr },
                         idx,
                     ));
                 }
@@ -2363,10 +2220,7 @@ fn extract_member_path(
 ) -> Option<(String, String)> {
     let object = obj.get("object")?.as_object()?;
     let property = obj.get("property")?.as_object()?;
-    let computed = obj
-        .get("computed")
-        .and_then(|c| c.as_bool())
-        .unwrap_or(false);
+    let computed = obj.get("computed").and_then(|c| c.as_bool()).unwrap_or(false);
 
     let prop_name = if computed {
         // Computed property: item[expr]
@@ -2400,11 +2254,7 @@ fn format_json_expr(val: &serde_json::Value) -> String {
         serde_json::Value::Object(obj) => {
             let expr_type = obj.get("type").and_then(|t| t.as_str()).unwrap_or("");
             match expr_type {
-                "Identifier" => obj
-                    .get("name")
-                    .and_then(|n| n.as_str())
-                    .unwrap_or("?")
-                    .to_string(),
+                "Identifier" => obj.get("name").and_then(|n| n.as_str()).unwrap_or("?").to_string(),
                 "Literal" | "NumericLiteral" => {
                     if let Some(raw) = obj.get("raw").and_then(|r| r.as_str()) {
                         raw.to_string()
@@ -2445,7 +2295,14 @@ fn build_invalidation_expr(
 
     // Build: $.invalidate_inner_signals(() => (expr1, expr2, ...))
     if !each_ctx.invalidation_exprs.is_empty() {
-        let inner = each_ctx.invalidation_exprs.join(", ");
+        let inner = if each_ctx.invalidation_exprs.len() == 1 {
+            format!(
+                "{}({})",
+                SINGLE_TARGET_DESTRUCTURE_SEQUENCE_MARKER, each_ctx.invalidation_exprs[0]
+            )
+        } else {
+            each_ctx.invalidation_exprs.join(", ")
+        };
         parts.push(format!("$.invalidate_inner_signals(() => ({}))", inner));
     }
 
@@ -2454,11 +2311,7 @@ fn build_invalidation_expr(
         parts.push(format!("$.invalidate_store($$stores, '{}')", store_name));
     }
 
-    if parts.is_empty() {
-        None
-    } else {
-        Some(parts.join(", "))
-    }
+    if parts.is_empty() { None } else { Some(parts.join(", ")) }
 }
 
 /// Merge `$.invalidate_store($$stores, '$storeName')` into a setter expression.
@@ -2551,11 +2404,7 @@ fn get_store_to_invalidate_from_context(context: &ComponentContext) -> Option<St
     if !context.state.analysis.runes {
         return None;
     }
-    context
-        .state
-        .each_binding_context
-        .last()
-        .and_then(|ctx| ctx.store_to_invalidate.clone())
+    context.state.each_binding_context.last().and_then(|ctx| ctx.store_to_invalidate.clone())
 }
 
 /// Extract the root identifier name from a JsExpr.
@@ -2565,12 +2414,22 @@ fn get_store_to_invalidate_from_context(context: &ComponentContext) -> Option<St
 /// Corresponds to the `object()` function call in the official compiler.
 pub fn get_expression_root_identifier(expr: &JsExpr, arena: &JsArena) -> Option<String> {
     match expr {
+        JsExpr::Spanned(inner, _, _) => {
+            get_expression_root_identifier(arena.get_expr(*inner), arena)
+        }
         JsExpr::Identifier(name) => Some(name.to_string()),
         JsExpr::Member(member) => {
             get_expression_root_identifier(arena.get_expr(member.object), arena)
         }
         _ => None,
     }
+}
+
+fn unspanned_expr<'a>(mut expr: &'a JsExpr, arena: &'a JsArena) -> &'a JsExpr {
+    while let JsExpr::Spanned(inner, _, _) = expr {
+        expr = arena.get_expr(*inner);
+    }
+    expr
 }
 
 /// Collect all identifier names from a raw AST Expression (JSON-based).
@@ -2628,7 +2487,7 @@ pub fn emit_validate_binding(
     use crate::compiler::phases::phase2_analyze::scope::BindingKind;
 
     // Extract the root object name from the original AST expression
-    let root_name = extract_root_name_from_json(node.expression.as_json());
+    let root_name = get_ast_root_identifier(&node.expression);
     let root_name = match root_name {
         Some(n) => n,
         None => return,
@@ -2662,13 +2521,15 @@ pub fn emit_validate_binding(
             let prop = if m.computed {
                 match &m.property {
                     JsMemberProperty::Expression(expr) => context.arena.get_expr(*expr).clone(),
-                    JsMemberProperty::Identifier(name) => b::id(name.as_str()),
+                    JsMemberProperty::Identifier(name)
+                    | JsMemberProperty::SpannedIdentifier { name, .. } => b::id(name.as_str()),
                     JsMemberProperty::PrivateIdentifier(name) => b::string(name.clone()),
                 }
             } else {
                 // Non-computed: property is an identifier, use it as a string literal
                 match &m.property {
-                    JsMemberProperty::Identifier(name) => b::string(name.clone()),
+                    JsMemberProperty::Identifier(name)
+                    | JsMemberProperty::SpannedIdentifier { name, .. } => b::string(name.clone()),
                     JsMemberProperty::Expression(expr) => context.arena.get_expr(*expr).clone(),
                     JsMemberProperty::PrivateIdentifier(name) => b::string(name.clone()),
                 }
@@ -2680,9 +2541,7 @@ pub fn emit_validate_binding(
 
     // Get line/column for the binding
     let (line, col) =
-        crate::compiler::phases::phase3_transform::client::visitors::attribute::locate_in_source(
-            source, start,
-        );
+        crate::compiler::phases::phase3_transform::utils::locate_in_source(source, start);
 
     // If inside a store-backed each block, wrap with $.mark_store_binding()
     // Reference: validate_binding() in shared/utils.js - `state.store_to_invalidate`
@@ -2729,97 +2588,163 @@ pub fn emit_validate_binding(
 }
 
 /// Extract the root identifier name from a JSON expression.
-fn extract_root_name_from_json(val: &serde_json::Value) -> Option<String> {
+fn extract_root_identifier_span_from_json(val: &serde_json::Value) -> Option<(String, u32, u32)> {
     let obj = val.as_object()?;
     match obj.get("type")?.as_str()? {
-        "Identifier" => obj.get("name")?.as_str().map(|s| s.to_string()),
-        "MemberExpression" => extract_root_name_from_json(obj.get("object")?),
+        "Identifier" => Some((
+            obj.get("name")?.as_str()?.to_string(),
+            u32::try_from(obj.get("start")?.as_u64()?).ok()?,
+            u32::try_from(obj.get("end")?.as_u64()?).ok()?,
+        )),
+        "MemberExpression" => extract_root_identifier_span_from_json(obj.get("object")?),
         _ => None,
     }
 }
 
-/// Convert a byte offset to 1-based line and 0-based column.
-fn offset_to_line_col(source: &str, offset: usize) -> (usize, usize) {
-    let mut line = 1;
-    let mut col = 0;
-    for (i, ch) in source.char_indices() {
-        if i >= offset {
-            break;
-        }
-        if ch == '\n' {
-            line += 1;
-            col = 0;
-        } else {
-            col += 1;
-        }
-    }
-    (line, col)
+fn get_ast_root_identifier_span(expr: &Expression) -> Option<(String, u32, u32)> {
+    extract_root_identifier_span_from_json(expr.as_json())
 }
 
 /// Get the root identifier name from an AST Expression (JSON-based).
 /// For `form.count` returns `Some("form")`.
 fn get_ast_root_identifier(expr: &Expression) -> Option<String> {
-    extract_root_name_from_json(expr.as_json())
+    get_ast_root_identifier_span(expr).map(|(name, _, _)| name)
 }
 
 /// Build the member property path from an AST Expression (JSON-based).
 /// For `form.count` returns `[b::string("form"), b::string("count")]`.
 /// This walks the member expression chain and collects all property names as literals.
-fn build_ast_member_path(expr: &Expression) -> Vec<JsExpr> {
+// Mirrors validate_mutation()'s path-building while-loop (shared/utils.js): any property that
+// isn't a plain Literal/Identifier (e.g. `obj[a.b]`) aborts the whole wrap rather than skipping
+// just that segment, so we return None here and the caller must leave the mutation unwrapped.
+fn build_ast_member_path(
+    expr: &Expression,
+    read_computed: &dyn Fn(&str) -> JsExpr,
+) -> Option<Vec<JsExpr>> {
     let mut path = Vec::new();
-    build_ast_member_path_recursive(expr.as_json(), &mut path);
-    path
+    build_ast_member_path_recursive(expr.as_json(), &mut path, read_computed).then_some(path)
 }
 
-fn build_ast_member_path_recursive(val: &serde_json::Value, path: &mut Vec<JsExpr>) {
+/// `validate_mutation()` applied to the setter synthesized for `bind:this={obj.foo}`.
+fn validate_bind_this_mutation(
+    expression: &Expression,
+    set: JsExpr,
+    context: &mut ComponentContext,
+) -> JsExpr {
+    use crate::compiler::phases::phase2_analyze::scope::BindingKind;
+
+    if !expression.is_member_expression() {
+        return set;
+    }
+    let Some(root_name) = get_ast_root_identifier(expression) else {
+        return set;
+    };
+    let Some(binding) = context.state.get_binding(&root_name) else {
+        return set;
+    };
+    if !matches!(binding.kind, BindingKind::Prop | BindingKind::BindableProp) {
+        return set;
+    }
+    let alias = crate::compiler::phases::phase3_transform::client::visitors::expression_converter::ownership_alias_literal(
+        binding.prop_alias.clone(),
+    );
+
+    // Official sets this before building the path, so an unbuildable path still
+    // emits the `$$ownership_validator` preamble.
+    context.state.needs_mutation_validation.set(true);
+    // Identity, not `read_computed_path_element`: `build_bind_this` hands the
+    // setter its own parameters, so an each-block index reaches this path as a
+    // plain binding rather than through its outer signal transform.
+    let Some(path) = build_ast_member_path(expression, &|name| JsExpr::Identifier(name.into()))
+    else {
+        return set;
+    };
+
+    let mut args = vec![alias, b::array(path), set];
+    if let Some(start) = expression.start() {
+        let (line, col) = crate::compiler::phases::phase3_transform::utils::locate_in_source(
+            &context.state.analysis.source,
+            start as usize,
+        );
+        args.push(b::number(line as f64));
+        args.push(b::number(col as f64));
+    }
+    b::call(&context.arena, b::member_path(&context.arena, "$$ownership_validator.mutation"), args)
+}
+
+/// A computed path element is a *read* of that binding, so it carries the same
+/// transform an ordinary reference would (`$.get(i)` for an each-block index,
+/// `store()` for a store).
+fn read_computed_path_element(name: &str, context: &ComponentContext) -> JsExpr {
+    let id = JsExpr::Identifier(name.into());
+    match context.state.transform.get(name) {
+        Some(transform) => match transform.read {
+            Some(read_fn) => read_fn(&context.arena, id),
+            None => id,
+        },
+        None => id,
+    }
+}
+
+fn build_ast_member_path_recursive(
+    val: &serde_json::Value,
+    path: &mut Vec<JsExpr>,
+    read_computed: &dyn Fn(&str) -> JsExpr,
+) -> bool {
     let obj = match val.as_object() {
         Some(o) => o,
-        None => return,
+        None => return true,
     };
     match obj.get("type").and_then(|t| t.as_str()) {
         Some("MemberExpression") => {
             // Recurse into object first
-            if let Some(object) = obj.get("object") {
-                build_ast_member_path_recursive(object, path);
+            if let Some(object) = obj.get("object")
+                && !build_ast_member_path_recursive(object, path, read_computed)
+            {
+                return false;
             }
             // Add current property
-            let computed = obj
-                .get("computed")
-                .and_then(|c| c.as_bool())
-                .unwrap_or(false);
-            if let Some(property) = obj.get("property")
-                && let Some(prop_obj) = property.as_object()
-                && let Some(prop_type) = prop_obj.get("type").and_then(|t| t.as_str())
-            {
-                match prop_type {
-                    "Identifier" => {
-                        if let Some(name) = prop_obj.get("name").and_then(|n| n.as_str()) {
-                            if computed {
-                                path.push(b::id(name));
-                            } else {
-                                path.push(b::string(name));
-                            }
+            let computed = obj.get("computed").and_then(|c| c.as_bool()).unwrap_or(false);
+            let Some(property) = obj.get("property") else {
+                return true;
+            };
+            let Some(prop_obj) = property.as_object() else {
+                return true;
+            };
+            let Some(prop_type) = prop_obj.get("type").and_then(|t| t.as_str()) else {
+                return true;
+            };
+            match prop_type {
+                "Identifier" => {
+                    if let Some(name) = prop_obj.get("name").and_then(|n| n.as_str()) {
+                        if computed {
+                            path.push(read_computed(name));
+                        } else {
+                            path.push(b::string(name));
                         }
                     }
-                    "Literal" => {
-                        if let Some(value) = prop_obj.get("value") {
-                            if let Some(s) = value.as_str() {
-                                path.push(b::string(s));
-                            } else if let Some(n) = value.as_f64() {
-                                path.push(b::number(n));
-                            }
-                        }
-                    }
-                    _ => {}
+                    true
                 }
+                "Literal" => {
+                    if let Some(value) = prop_obj.get("value") {
+                        if let Some(s) = value.as_str() {
+                            path.push(b::string(s));
+                        } else if let Some(n) = value.as_f64() {
+                            path.push(b::number(n));
+                        }
+                    }
+                    true
+                }
+                _ => false,
             }
         }
         Some("Identifier") => {
             if let Some(name) = obj.get("name").and_then(|n| n.as_str()) {
                 path.push(b::string(name));
             }
+            true
         }
-        _ => {}
+        _ => true,
     }
 }
 

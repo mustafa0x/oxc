@@ -11,14 +11,8 @@ use crate::compiler::phases::phase3_transform::client::visitors::shared::events:
 use crate::compiler::phases::phase3_transform::js_ast::builders as b;
 use crate::compiler::phases::phase3_transform::js_ast::nodes::JsExpr;
 
-const MODIFIERS: &[&str] = &[
-    "stopPropagation",
-    "stopImmediatePropagation",
-    "preventDefault",
-    "self",
-    "trusted",
-    "once",
-];
+const MODIFIERS: &[&str] =
+    &["stopPropagation", "stopImmediatePropagation", "preventDefault", "self", "trusted", "once"];
 
 /// Visit an OnDirective node and generate event handler code.
 ///
@@ -83,8 +77,11 @@ pub fn on_directive(node: &OnDirective, context: &mut ComponentContext) -> JsExp
         None
     };
 
-    // In dev mode, convert arrow function handlers to named functions for better stack traces
-    let handler = if context.state.options.dev {
+    // In dev mode, convert arrow function handlers to named functions for better
+    // stack traces. Naming only an arrow matters beyond the shape: upstream's
+    // `dev && handler.type === 'ArrowFunctionExpression'` guard means a bubble
+    // handler never consumes a name, so the next arrow keeps the lower suffix.
+    let handler = if context.state.options.dev && matches!(handler, JsExpr::Arrow(_)) {
         let name = context.state.memoizer.generate_id(&node.name);
         crate::compiler::phases::phase3_transform::client::visitors::shared::events::convert_arrow_to_named_function(handler, name.into())
     } else {
@@ -92,13 +89,5 @@ pub fn on_directive(node: &OnDirective, context: &mut ComponentContext) -> JsExp
     };
 
     // Build the $.event() call
-    build_event(
-        &context.arena,
-        &node.name,
-        &context.state.node,
-        handler,
-        capture,
-        passive,
-        false,
-    )
+    build_event(&context.arena, &node.name, &context.state.node, handler, capture, passive, false)
 }

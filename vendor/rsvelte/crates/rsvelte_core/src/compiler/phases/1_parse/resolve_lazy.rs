@@ -5,7 +5,7 @@
 //! the AST and resolves them into `Expression::Typed` by invoking OXC.
 
 use crate::ast::arena::ParseArena;
-use crate::ast::js::Expression;
+use crate::ast::js::{Expression, LazyKind};
 use crate::ast::template::{
     Attribute, AttributeValue, AttributeValuePart, Fragment, Root, TemplateNode,
 };
@@ -13,35 +13,34 @@ use crate::ast::template::{
 /// Resolve all lazy expressions and deferred CSS in the AST.
 /// Must be called before analysis.
 /// Returns the first JS parse error encountered, if any.
-pub fn resolve_lazy_expressions(ast: &mut Root, source: &str) -> Option<crate::error::ParseError> {
+pub fn resolve_lazy_expressions<'a>(
+    ast: &mut Root<'a>,
+    source: &str,
+) -> Option<crate::error::ParseError> {
     let line_offsets = super::compute_line_offsets(source, false);
+    resolve_lazy_expressions_with_line_offsets(ast, source, &line_offsets)
+}
+
+pub(crate) fn resolve_lazy_expressions_with_line_offsets<'a>(
+    ast: &mut Root<'a>,
+    source: &str,
+    line_offsets: &[usize],
+) -> Option<crate::error::ParseError> {
     let mut first_error = None;
-    resolve_fragment(
-        &ast.arena,
-        &mut ast.fragment,
-        &line_offsets,
-        source,
-        &mut first_error,
-    );
+    resolve_fragment(&ast.arena, &mut ast.fragment, line_offsets, source, &mut first_error);
 
     // Resolve in instance/module scripts (unlikely to have Lazy, but be safe)
     if let Some(ref mut instance) = ast.instance {
         resolve_expression(
             &ast.arena,
             &mut instance.content,
-            &line_offsets,
+            line_offsets,
             source,
             &mut first_error,
         );
     }
     if let Some(ref mut module) = ast.module {
-        resolve_expression(
-            &ast.arena,
-            &mut module.content,
-            &line_offsets,
-            source,
-            &mut first_error,
-        );
+        resolve_expression(&ast.arena, &mut module.content, line_offsets, source, &mut first_error);
     }
 
     // Resolve deferred CSS parsing. Use the strict variant so that errors
@@ -88,40 +87,16 @@ fn resolve_template_node(
 ) {
     match node {
         TemplateNode::ExpressionTag(tag) => {
-            resolve_expression(
-                arena,
-                &mut tag.expression,
-                line_offsets,
-                source,
-                first_error,
-            );
+            resolve_expression(arena, &mut tag.expression, line_offsets, source, first_error);
         }
         TemplateNode::HtmlTag(tag) => {
-            resolve_expression(
-                arena,
-                &mut tag.expression,
-                line_offsets,
-                source,
-                first_error,
-            );
+            resolve_expression(arena, &mut tag.expression, line_offsets, source, first_error);
         }
         TemplateNode::ConstTag(tag) => {
-            resolve_expression(
-                arena,
-                &mut tag.declaration,
-                line_offsets,
-                source,
-                first_error,
-            );
+            resolve_expression(arena, &mut tag.declaration, line_offsets, source, first_error);
         }
         TemplateNode::DeclarationTag(tag) => {
-            resolve_expression(
-                arena,
-                &mut tag.declaration,
-                line_offsets,
-                source,
-                first_error,
-            );
+            resolve_expression(arena, &mut tag.declaration, line_offsets, source, first_error);
         }
         TemplateNode::DebugTag(tag) => {
             for expr in &mut tag.identifiers {
@@ -129,44 +104,33 @@ fn resolve_template_node(
             }
         }
         TemplateNode::RenderTag(tag) => {
-            resolve_expression(
-                arena,
-                &mut tag.expression,
-                line_offsets,
-                source,
-                first_error,
-            );
+            resolve_expression(arena, &mut tag.expression, line_offsets, source, first_error);
+            // The eager parse path rejects non-call render expressions inline;
+            // a deferred expression only becomes checkable here.
+            if !super::state::tag::is_render_tag_call_expression(arena, &tag.expression)
+                && first_error.is_none()
+            {
+                let err_start = tag.expression.start().unwrap_or(tag.start) as usize;
+                let err_end = tag.expression.end().unwrap_or(tag.end) as usize;
+                *first_error = Some(crate::error::ParseError::svelte(
+                    "render_tag_invalid_expression",
+                    "`{@render ...}` tags can only contain call expressions\nhttps://svelte.dev/e/render_tag_invalid_expression",
+                    (err_start, err_end),
+                ));
+            }
         }
         TemplateNode::AttachTag(tag) => {
-            resolve_expression(
-                arena,
-                &mut tag.expression,
-                line_offsets,
-                source,
-                first_error,
-            );
+            resolve_expression(arena, &mut tag.expression, line_offsets, source, first_error);
         }
         TemplateNode::IfBlock(block) => {
             resolve_expression(arena, &mut block.test, line_offsets, source, first_error);
-            resolve_fragment(
-                arena,
-                &mut block.consequent,
-                line_offsets,
-                source,
-                first_error,
-            );
+            resolve_fragment(arena, &mut block.consequent, line_offsets, source, first_error);
             if let Some(ref mut alt) = block.alternate {
                 resolve_fragment(arena, alt, line_offsets, source, first_error);
             }
         }
         TemplateNode::EachBlock(block) => {
-            resolve_expression(
-                arena,
-                &mut block.expression,
-                line_offsets,
-                source,
-                first_error,
-            );
+            resolve_expression(arena, &mut block.expression, line_offsets, source, first_error);
             if let Some(ref mut ctx) = block.context {
                 resolve_expression(arena, ctx, line_offsets, source, first_error);
             }
@@ -179,13 +143,7 @@ fn resolve_template_node(
             }
         }
         TemplateNode::AwaitBlock(block) => {
-            resolve_expression(
-                arena,
-                &mut block.expression,
-                line_offsets,
-                source,
-                first_error,
-            );
+            resolve_expression(arena, &mut block.expression, line_offsets, source, first_error);
             if let Some(ref mut val) = block.value {
                 resolve_expression(arena, val, line_offsets, source, first_error);
             }
@@ -203,29 +161,11 @@ fn resolve_template_node(
             }
         }
         TemplateNode::KeyBlock(block) => {
-            resolve_expression(
-                arena,
-                &mut block.expression,
-                line_offsets,
-                source,
-                first_error,
-            );
-            resolve_fragment(
-                arena,
-                &mut block.fragment,
-                line_offsets,
-                source,
-                first_error,
-            );
+            resolve_expression(arena, &mut block.expression, line_offsets, source, first_error);
+            resolve_fragment(arena, &mut block.fragment, line_offsets, source, first_error);
         }
         TemplateNode::SnippetBlock(block) => {
-            resolve_expression(
-                arena,
-                &mut block.expression,
-                line_offsets,
-                source,
-                first_error,
-            );
+            resolve_expression(arena, &mut block.expression, line_offsets, source, first_error);
             for param in &mut block.parameters {
                 resolve_expression(arena, param, line_offsets, source, first_error);
             }
@@ -347,7 +287,7 @@ fn resolve_attributes(
     }
 }
 
-fn resolve_attribute_value(
+pub(crate) fn resolve_attribute_value(
     arena: &ParseArena,
     value: &mut AttributeValue,
     line_offsets: &[usize],
@@ -356,13 +296,7 @@ fn resolve_attribute_value(
 ) {
     match value {
         AttributeValue::Expression(expr_tag) => {
-            resolve_expression(
-                arena,
-                &mut expr_tag.expression,
-                line_offsets,
-                source,
-                first_error,
-            );
+            resolve_expression(arena, &mut expr_tag.expression, line_offsets, source, first_error);
         }
         AttributeValue::Sequence(parts) => {
             for part in parts.iter_mut() {
@@ -390,57 +324,74 @@ fn resolve_expression(
     source: &str,
     first_error: &mut Option<crate::error::ParseError>,
 ) {
-    if let Expression::Lazy { start, end, ts } = expr {
-        let content = &source[*start as usize..*end as usize];
-        let result = super::read::expression::parse_expression(
-            arena,
-            content,
-            *start as usize,
-            line_offsets,
-            "",    // source not needed for loose/disallow_loose=false
-            false, // loose
-            false, // disallow_loose
-            '{',
-            *ts,
-        );
-        match result {
-            Ok(parsed) => {
-                *expr = parsed;
+    let Expression::Lazy { start, end, ts, kind } = *expr else {
+        return;
+    };
+    let start = start as usize;
+    let content = &source[start..end as usize];
+    // Only mustaches were ever resolved against a populated line-offset table.
+    // Every other kind replaces an eager call that ran with the compile
+    // pipeline's `skip_expression_loc`, i.e. an empty table and `loc: null`.
+    let line_offsets: &[usize] = if kind == LazyKind::Mustache { line_offsets } else { &[] };
+    let result = super::read::expression::parse_expression(
+        arena,
+        content,
+        start,
+        line_offsets,
+        "",    // source not needed for loose/disallow_loose=false
+        false, // loose
+        false, // disallow_loose
+        '{',
+        ts,
+    );
+    match result {
+        Ok(parsed) => {
+            *expr = parsed;
+        }
+        Err((msg, pos)) => {
+            // Store the first parse error encountered
+            if first_error.is_none() {
+                *first_error = lazy_parse_error(kind, msg, content, start, source, ts);
             }
-            Err((msg, pos)) => {
-                // Store the first parse error encountered
-                if first_error.is_none() {
-                    // Upstream's `read_expression` parses ONE maximal
-                    // expression with acorn and then `eat('}', true)`: a
-                    // complete leading expression followed by leftover tokens
-                    // (e.g. `{foo();}` — the `;` is left over) surfaces as
-                    // `expected_token` (Expected token }), while a malformed
-                    // expression (e.g. `{42 = nope}`, where the error is
-                    // *inside* the expression) is a `js_parse_error`. The
-                    // prefix re-parse guards against the probe mislabelling
-                    // an in-expression error as leftover input.
-                    let trailing =
-                        super::read::expression::trailing_token_offset(content).filter(|&off| {
-                            off > 0
-                                && content.get(..off).is_some_and(|prefix| {
-                                    super::read::expression::check_js_parse_error_with_pos(prefix)
-                                        .is_none()
-                                })
-                        });
-                    *first_error = Some(if let Some(offset) = trailing {
-                        crate::error::ParseError::expected_token("}", *start as usize + offset)
-                    } else {
-                        crate::error::ParseError::svelte(
-                            "js_parse_error",
-                            msg,
-                            (pos, pos + content.len()),
-                        )
-                    });
-                }
-                // Still set the expression to something valid to allow continued processing
-                *expr =
-                    super::read::expression::create_empty_identifier("", pos, pos + content.len());
-            }
+            // Still set the expression to something valid to allow continued processing
+            *expr = super::read::expression::create_empty_identifier("", pos, pos + content.len());
         }
     }
+}
+
+/// Rebuild the diagnostic the eager parse-time entry point behind `kind` would
+/// have raised for `content` at `start`. `None` when that entry point swallows
+/// the failure instead.
+fn lazy_parse_error(
+    kind: LazyKind,
+    msg: String,
+    content: &str,
+    start: usize,
+    source: &str,
+    ts: bool,
+) -> Option<crate::error::ParseError> {
+    Some(match kind {
+        LazyKind::Lenient => return None,
+        LazyKind::AwaitHead => super::state::tag::await_head_parse_error(source, start, msg, ts),
+        LazyKind::Mustache => {
+            super::read::expression::mustache_parse_error(msg, content, start, ts)
+        }
+        // `parse_js_expression_attribute`: leftover input after a complete
+        // expression is a missing `}`, anything else a point error at the byte
+        // where OXC stopped consuming input.
+        LazyKind::Attribute => {
+            if let Some(pos) = super::read::expression::trailing_token_offset(content, ts) {
+                return Some(crate::error::ParseError::expected_token("}", start + pos));
+            }
+            let abs_pos = super::read::expression::check_js_parse_error_with_pos(content, ts)
+                .map_or(start, |(_, content_pos)| start + content_pos);
+            crate::error::ParseError::svelte("js_parse_error", msg, (abs_pos, abs_pos))
+        }
+        // `parse_head_expression`: leftover input after a complete expression is
+        // a missing close token; anything else is a point `js_parse_error`.
+        LazyKind::HeadBrace | LazyKind::HeadParen => {
+            let close = if kind == LazyKind::HeadParen { ')' } else { '}' };
+            super::read::expression::close_token_or_parse_error(msg, content, start, close, ts)
+        }
+    })
 }

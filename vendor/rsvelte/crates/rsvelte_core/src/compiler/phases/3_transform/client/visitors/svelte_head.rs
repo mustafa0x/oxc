@@ -20,10 +20,7 @@ use crate::compiler::phases::phase3_transform::js_ast::builders as b;
 /// ```
 pub fn svelte_head(node: &SvelteElement, context: &mut ComponentContext) {
     // Generate the head content
-    let content_fragment = Fragment {
-        nodes: node.fragment.nodes.clone(),
-        ..Default::default()
-    };
+    let content_fragment = Fragment { nodes: node.fragment.nodes.clone(), ..Default::default() };
 
     // Save the current namespace and force HTML namespace for head content
     // Elements like <title> should use from_html, not from_svg, even though

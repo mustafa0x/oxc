@@ -1,73 +1,14 @@
 //! Thin wrapper around `oxc_semantic` for scope / shadowing queries.
 //!
-//! Future migrations of text helpers that currently scan for "is this
-//! identifier shadowed by a local declaration" (e.g.
-//! `state_transforms::is_in_function_param_or_shadowed`,
-//! `wrap_prop_source_reads`, `transform_state_assignments`) build on
-//! the primitives here. Keeping this module focused — it owns only
-//! the parse + `SemanticBuilder` plumbing and one query helper. The
-//! callers walk the AST themselves with their own `Visit`
-//! implementations and ask `is_locally_shadowed(...)` per
-//! `IdentifierReference` they care about.
-//!
-//! ## API shape
-//!
-//! Callers pass a closure to [`with_semantic`]. The semantic info is
-//! built and dropped within the call — the `Program` and `Semantic`
-//! are loaned via lifetime-erased borrowed references, so callers
-//! can't accidentally hold onto either past the call.
-//!
-//! ```text
-//! with_semantic(source, is_ts, |program, semantic| {
-//!     // walk `program` with your own visitor, query `semantic`
-//!     // for shadowing as you go.
-//! })
-//! ```
+//! Text helpers that need "is this identifier shadowed by a local
+//! declaration" build on the primitives here: the caller walks the AST
+//! with its own `Visit` implementation and asks
+//! `is_locally_shadowed(...)` per `IdentifierReference` it cares about.
 
-use oxc_allocator::Allocator;
-use oxc_ast::ast::{IdentifierReference, Program};
-use oxc_parser::{ParseOptions, Parser};
-use oxc_semantic::{Semantic, SemanticBuilder};
-use oxc_span::SourceType;
+use oxc_ast::ast::IdentifierReference;
+use oxc_semantic::Semantic;
 use oxc_syntax::symbol::SymbolId;
 use rustc_hash::FxHashSet;
-
-/// Run `f` with a fully-built `Semantic` over `source`. Returns
-/// `None` if the source fails to parse; semantic errors do *not*
-/// block the call (a partially-resolved semantic is still useful
-/// for shadowing queries).
-///
-/// Set `is_ts` for `.ts` / `.svelte.ts` inputs.
-///
-/// `allow_return_outside_function` is enabled so class-method body
-/// fragments and other partial-statement inputs parse cleanly —
-/// matches the existing AST helpers in this crate.
-#[allow(dead_code)] // wired by upcoming scope-aware migration PRs
-pub fn with_semantic<F, R>(source: &str, is_ts: bool, f: F) -> Option<R>
-where
-    F: for<'a> FnOnce(&'a Program<'a>, &Semantic<'a>) -> R,
-{
-    let allocator = Allocator::default();
-    let source_type = if is_ts {
-        SourceType::ts().with_module(true)
-    } else {
-        SourceType::mjs()
-    };
-    let parser_ret = Parser::new(&allocator, source, source_type)
-        .with_options(ParseOptions {
-            allow_return_outside_function: true,
-            ..ParseOptions::default()
-        })
-        .parse();
-    if !parser_ret.diagnostics.is_empty() {
-        return None;
-    }
-    // Move the program into the arena so both it and the Semantic
-    // can be borrowed for the closure lifetime.
-    let program: &Program = allocator.alloc(parser_ret.program);
-    let semantic_ret = SemanticBuilder::new().with_build_nodes(true).build(program);
-    Some(f(program, &semantic_ret.semantic))
-}
 
 /// Returns true if `ident` resolves to a symbol declared in a scope
 /// strictly inside the program (root) scope.
@@ -81,7 +22,6 @@ where
 /// This is the primitive that prop-source-reads and state-assignment
 /// migrations need: a reference is "safe to rewrite as a prop access"
 /// iff it is *not* locally shadowed in this sense.
-#[allow(dead_code)] // wired by upcoming scope-aware migration PRs
 pub fn is_locally_shadowed(semantic: &Semantic, ident: &IdentifierReference) -> bool {
     let Some(reference_id) = ident.reference_id.get() else {
         return false;
@@ -181,6 +121,15 @@ fn is_state_var_init_expression(expr: &oxc_ast::ast::Expression) -> bool {
     let Expression::CallExpression(call) = expr else {
         return false;
     };
+    // In dev the label wrap sits between the `=` and the rune call.
+    if let Expression::StaticMemberExpression(member) = &call.callee
+        && let Expression::Identifier(obj) = &member.object
+        && obj.name == "$"
+        && matches!(member.property.name.as_str(), "tag" | "tag_proxy")
+        && let Some(inner) = call.arguments.first().and_then(|arg| arg.as_expression())
+    {
+        return is_state_var_init_expression(inner);
+    }
     match &call.callee {
         // Raw rune forms: `$state(...)` / `$derived(...)`.
         Expression::Identifier(id) => matches!(id.name.as_str(), "$state" | "$derived"),
@@ -236,17 +185,44 @@ pub fn is_state_var_reference_or_unresolved(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use oxc_allocator::Allocator;
+    use oxc_ast::ast::Program;
     use oxc_ast_visit::Visit;
+    use oxc_parser::{ParseOptions, Parser};
+    use oxc_semantic::SemanticBuilder;
+    use oxc_span::SourceType;
+
+    /// Run `f` with a fully-built `Semantic` over `source`, or `None` if it
+    /// fails to parse. `allow_return_outside_function` matches how the
+    /// production callers parse statement fragments.
+    fn with_semantic<F, R>(source: &str, is_ts: bool, f: F) -> Option<R>
+    where
+        F: for<'a> FnOnce(&'a Program<'a>, &Semantic<'a>) -> R,
+    {
+        let allocator = Allocator::default();
+        let source_type =
+            if is_ts { SourceType::ts().with_module(true) } else { SourceType::mjs() };
+        let parser_ret = Parser::new(&allocator, source, source_type)
+            .with_options(ParseOptions {
+                allow_return_outside_function: true,
+                ..ParseOptions::default()
+            })
+            .parse();
+        if !parser_ret.diagnostics.is_empty() {
+            return None;
+        }
+        // Move the program into the arena so both it and the Semantic
+        // can be borrowed for the closure lifetime.
+        let program: &Program = allocator.alloc(parser_ret.program);
+        let semantic_ret = SemanticBuilder::new().with_build_nodes(true).build(program);
+        Some(f(program, &semantic_ret.semantic))
+    }
 
     /// Walk every `IdentifierReference` in `source` whose `.name` matches
     /// `target`, and return whether each is locally shadowed.
     fn shadow_status(source: &str, target: &str) -> Vec<bool> {
         with_semantic(source, false, |program, semantic| {
-            let mut c = Collector {
-                target,
-                semantic,
-                out: Vec::new(),
-            };
+            let mut c = Collector { target, semantic, out: Vec::new() };
             c.visit_program(program);
             c.out
         })
@@ -255,11 +231,7 @@ mod tests {
 
     fn shadow_status_ts(source: &str, target: &str) -> Vec<bool> {
         with_semantic(source, true, |program, semantic| {
-            let mut c = Collector {
-                target,
-                semantic,
-                out: Vec::new(),
-            };
+            let mut c = Collector { target, semantic, out: Vec::new() };
             c.visit_program(program);
             c.out
         })
@@ -390,11 +362,7 @@ mod tests {
         let r = shadow_status(src, "count");
         // We should have at least one shadowed and one not.
         assert!(r.contains(&true), "want at least one shadowed: {:?}", r);
-        assert!(
-            r.contains(&false),
-            "want at least one not-shadowed: {:?}",
-            r
-        );
+        assert!(r.contains(&false), "want at least one not-shadowed: {:?}", r);
     }
 
     /// Import binding is root-scope → references to it are NOT

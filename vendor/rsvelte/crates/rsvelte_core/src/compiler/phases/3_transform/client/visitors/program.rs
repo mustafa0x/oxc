@@ -18,7 +18,9 @@
 
 use crate::compiler::phases::phase2_analyze::scope::{BindingKind, DeclarationKind};
 use crate::compiler::phases::phase3_transform::client::types::*;
-use crate::compiler::phases::phase3_transform::client::visitors::shared::declarations::add_state_transformers;
+use crate::compiler::phases::phase3_transform::client::visitors::shared::declarations::{
+    add_state_transformers, resolve_store_sources, store_source,
+};
 use crate::compiler::phases::phase3_transform::js_ast::builders as b;
 use crate::compiler::phases::phase3_transform::js_ast::nodes::*;
 
@@ -59,21 +61,13 @@ pub fn visit_program(context: &mut ComponentContext) -> Option<JsProgram> {
                 is_defined: false,
                 is_reactive: true,
                 replacement_id: None,
+                store_source: None,
             };
-            context
-                .state
-                .transform
-                .insert("$$props".to_string(), transform);
+            context.state.transform.insert("$$props".to_string(), transform);
             // `$$props` is treated as template-kind in legacy reactivity:
             // reads must be wrapped in `$.deep_read_state()`.
-            context
-                .state
-                .transform_deep_read
-                .insert("$$props".to_string(), ());
-            context
-                .state
-                .transform_deep_read
-                .insert("$$restProps".to_string(), ());
+            context.state.transform_deep_read.insert("$$props".to_string(), ());
+            context.state.transform_deep_read.insert("$$restProps".to_string(), ());
         }
 
         // Handle mutated imports in instance scope.
@@ -123,6 +117,7 @@ pub fn visit_program(context: &mut ComponentContext) -> Option<JsProgram> {
                 is_defined: false,
                 is_reactive: true,
                 replacement_id: Some(import_id.clone()),
+                store_source: None,
             };
 
             context.state.transform.insert(name.clone(), transform);
@@ -148,114 +143,116 @@ pub fn visit_program(context: &mut ComponentContext) -> Option<JsProgram> {
     // This sets up read/assign/mutate/update transforms that wrap identifiers with $.get(), $.set(), etc.
     add_state_transformers(context);
 
-    // Handle store subscriptions, props, and state bindings for all modes
-    for (name, binding_idx) in context.state.scope.declarations.clone() {
+    let instance_scope =
+        context.state.scope_root.all_scopes.get(context.state.scope_root.instance_scope_index);
+    let transform_bindings: Vec<(String, usize)> = context
+        .state
+        .scope
+        .declarations
+        .iter()
+        .filter_map(|(name, &fallback_idx)| {
+            let binding_idx = instance_scope
+                .and_then(|scope| scope.declarations.get(name).copied())
+                .unwrap_or(fallback_idx);
+            context
+                .state
+                .scope_root
+                .bindings
+                .get(binding_idx)
+                .is_some_and(|binding| {
+                    matches!(
+                        binding.kind,
+                        BindingKind::StoreSub | BindingKind::Prop | BindingKind::BindableProp
+                    )
+                })
+                .then(|| (name.clone(), binding_idx))
+        })
+        .collect();
+
+    // Source props and stores were registered by add_state_transformers.
+    // Keep the missing-transform branches as a fallback for incomplete scopes.
+    for (name, binding_idx) in transform_bindings {
         if let Some(binding) = context.state.scope_root.bindings.get(binding_idx) {
-            // Mark different binding types for transformation
             match binding.kind {
-                BindingKind::StoreSub => {
-                    // Store subscriptions need special transformation
-                    // Corresponds to the store_sub handling in Program.js:
-                    //
-                    // context.state.transform[name] = {
-                    //     read: b.call,                           // $store → $store()
-                    //     assign: (_, value) => b.call('$.store_set', get_store(), value),
-                    //     mutate: (node, mutation) => b.call('$.store_mutate', ...),
-                    //     update: (node) => b.call(node.prefix ? '$.update_pre_store' : '$.update_store', ...)
-                    // };
-                    //
-                    // The store variable name starts with '$', e.g., '$count'
-                    // The underlying store is 'count' (without the '$')
-
-                    let transform = IdentifierTransform {
-                        read: Some(store_sub_read),
-                        read_source: None,
-                        assign: Some(store_sub_assign),
-                        mutate: Some(store_sub_mutate),
-                        update: Some(store_sub_update),
-                        skip_proxy: false,
-                        is_defined: false,
-                        // Store subscriptions are reactive
-                        is_reactive: true,
-                        replacement_id: None,
-                    };
-
-                    context.state.transform.insert(name.clone(), transform);
+                BindingKind::StoreSub if !context.state.transform.contains_key(&name) => {
+                    context.state.transform.insert(
+                        name,
+                        IdentifierTransform {
+                            read: Some(store_sub_read),
+                            read_source: None,
+                            assign: Some(store_sub_assign),
+                            mutate: Some(store_sub_mutate),
+                            update: Some(store_sub_update),
+                            skip_proxy: false,
+                            is_defined: false,
+                            is_reactive: true,
+                            replacement_id: None,
+                            store_source: None,
+                        },
+                    );
                 }
                 BindingKind::Prop | BindingKind::BindableProp => {
-                    // Props need special handling based on whether they're sources.
-                    // In legacy mode, props created with `export let` become getter functions
-                    // via $.prop(), so reading them should call the getter: foo -> foo()
-                    //
-                    // Corresponds to the prop handling in Program.js:
-                    // context.state.transform[name] = {
-                    //     read: b.call,  // foo -> foo()
-                    //     assign: (node, value) => b.call(node, value),
-                    //     mutate: (node, value) => {
-                    //         if (binding.kind === 'bindable_prop') return b.call(node, value, b.true);
-                    //         return value;
-                    //     }
-                    // };
-                    //
-                    // Check if this prop should be a source (needs transformation)
                     if is_prop_source_binding(binding, &context.state) {
-                        // For BindableProp, mutations must notify the parent: node(mutation, true)
-                        // For regular Prop, mutations are passed through unchanged.
-                        let mutate_fn = if matches!(binding.kind, BindingKind::BindableProp) {
-                            prop_bindable_mutate
-                        } else {
-                            prop_mutate
-                        };
-                        let transform = IdentifierTransform {
-                            read: Some(prop_read),
-                            read_source: None,
-                            assign: Some(prop_assign),
-                            mutate: Some(mutate_fn),
-                            update: Some(prop_update),
-                            skip_proxy: false,
-                            is_defined: false,
-                            is_reactive: true,
-                            replacement_id: None,
-                        };
-
-                        context.state.transform.insert(name.clone(), transform);
-                        // Bindable props are template-kind and require
-                        // deep_read_state wrapping in legacy reactivity.
-                        if matches!(binding.kind, BindingKind::BindableProp) {
-                            context.state.transform_deep_read.insert(name.clone(), ());
+                        if !context.state.transform.contains_key(&name) {
+                            context.state.transform.insert(
+                                name.clone(),
+                                IdentifierTransform {
+                                    read: Some(prop_read),
+                                    read_source: None,
+                                    assign: Some(prop_assign),
+                                    mutate: Some(
+                                        if matches!(binding.kind, BindingKind::BindableProp) {
+                                            prop_bindable_mutate
+                                        } else {
+                                            prop_mutate
+                                        },
+                                    ),
+                                    update: Some(prop_update),
+                                    skip_proxy: false,
+                                    is_defined: false,
+                                    is_reactive: true,
+                                    replacement_id: None,
+                                    store_source: None,
+                                },
+                            );
+                        }
+                        // Upstream represents a legacy `export let` as a
+                        // `bindable_prop`, while rsvelte keeps ordinary props
+                        // as `Prop` and reserves `BindableProp` for an explicit
+                        // `$bindable()`. Both are prop sources here and both
+                        // must establish a deep dependency when a legacy
+                        // template expression reads through a member chain.
+                        // Scoped template visitors remove and restore this
+                        // marker when a local binding shadows the prop.
+                        if matches!(binding.kind, BindingKind::Prop | BindingKind::BindableProp) {
+                            context.state.transform_deep_read.insert(name, ());
                         }
                     } else {
-                        // Non-source props: read from $$props.name
-                        // Corresponds to Program.js lines 125-134:
-                        // context.state.transform[name] = {
-                        //     read: (node) => b.member(b.id('$$props'), node)
-                        // };
-                        let transform = IdentifierTransform {
-                            read: Some(non_source_prop_read),
-                            read_source: None,
-                            assign: None,
-                            mutate: None,
-                            update: None,
-                            skip_proxy: false,
-                            is_defined: false,
-                            is_reactive: true,
-                            replacement_id: None,
-                        };
-
-                        context.state.transform.insert(name.clone(), transform);
+                        context.state.transform.insert(
+                            name,
+                            IdentifierTransform {
+                                read: Some(non_source_prop_read),
+                                read_source: None,
+                                assign: None,
+                                mutate: None,
+                                update: None,
+                                skip_proxy: false,
+                                is_defined: false,
+                                is_reactive: true,
+                                replacement_id: None,
+                                store_source: None,
+                            },
+                        );
                     }
-                }
-                BindingKind::State | BindingKind::RawState | BindingKind::Derived => {
-                    // State variables need $.get() wrapping
-                    // Transforms are set up by add_state_transformers above
-                }
-                BindingKind::LegacyReactive => {
-                    // Legacy reactive statements need special handling
                 }
                 _ => {}
             }
         }
     }
+
+    // The `$$props.x` fallback props above are registered after
+    // `add_state_transformers`, so re-resolve with the final map.
+    resolve_store_sources(context);
 
     // If this is the instance script, we might need async transformation
     // For now, we skip this as it requires complex AST traversal
@@ -315,7 +312,7 @@ fn store_sub_read(
     arena: &crate::compiler::phases::phase3_transform::js_ast::arena::JsArena,
     node: JsExpr,
 ) -> JsExpr {
-    b::call(arena, node, vec![])
+    b::getter_call(arena, node)
 }
 
 /// Transform a store subscription assignment.
@@ -328,22 +325,16 @@ fn store_sub_read(
 /// * `value` - The value being assigned
 /// * `_needs_proxy` - Whether the value needs to be proxified (not used for stores)
 fn store_sub_assign(
+    transform: &IdentifierTransform,
     arena: &crate::compiler::phases::phase3_transform::js_ast::arena::JsArena,
     node: JsExpr,
     value: JsExpr,
     _needs_proxy: bool,
 ) -> JsExpr {
-    // Extract store name from $store → store
-    let store_name = if let JsExpr::Identifier(ref name) = node {
-        name.strip_prefix('$').unwrap_or(name).to_string()
-    } else {
-        "unknown".to_string()
-    };
-
     b::call(
         arena,
         b::member_path(arena, "$.store_set"),
-        vec![b::id(&store_name), value],
+        vec![store_source(transform, arena, &node), value],
     )
 }
 
@@ -363,23 +354,13 @@ fn store_sub_assign(
 /// * `node` - The store subscription identifier (e.g., `$store`)
 /// * `mutation` - The mutation expression (e.g., `$store.prop = value`)
 fn store_sub_mutate(
+    transform: &IdentifierTransform,
     arena: &crate::compiler::phases::phase3_transform::js_ast::arena::JsArena,
     node: JsExpr,
     mutation: JsExpr,
 ) -> JsExpr {
-    // Extract store name from $store → store
-    let store_name = if let JsExpr::Identifier(ref name) = node {
-        name.strip_prefix('$').unwrap_or(name).to_string()
-    } else {
-        "unknown".to_string()
-    };
-
     // We need to untrack the store read, for consistency with Svelte 4
-    let untracked = b::call(
-        arena,
-        b::member_path(arena, "$.untrack"),
-        vec![node.clone()],
-    );
+    let untracked = b::call(arena, b::member_path(arena, "$.untrack"), vec![node.clone()]);
 
     // Replace $store with $.untrack($store) in the mutation expression
     // This follows the official Svelte compiler's replace() function
@@ -388,7 +369,7 @@ fn store_sub_mutate(
     b::call(
         arena,
         b::member_path(arena, "$.store_mutate"),
-        vec![b::id(&store_name), transformed_mutation, untracked],
+        vec![store_source(transform, arena, &node), transformed_mutation, untracked],
     )
 }
 
@@ -454,28 +435,20 @@ fn replace_store_with_untracked(
 /// * `argument` - The store subscription identifier (e.g., `$store`)
 /// * `prefix` - Whether the operator is prefix (++$store) or postfix ($store++)
 fn store_sub_update(
+    transform: &IdentifierTransform,
     arena: &crate::compiler::phases::phase3_transform::js_ast::arena::JsArena,
     operator: JsUpdateOp,
     argument: JsExpr,
     prefix: bool,
 ) -> JsExpr {
-    // Extract store name from $store → store
-    let store_name = if let JsExpr::Identifier(ref name) = argument {
-        name.strip_prefix('$').unwrap_or(name).to_string()
-    } else {
-        "unknown".to_string()
-    };
+    let store = store_source(transform, arena, &argument);
 
-    let method = if prefix {
-        "$.update_pre_store"
-    } else {
-        "$.update_store"
-    };
+    let method = if prefix { "$.update_pre_store" } else { "$.update_store" };
 
     // Build the current value accessor: $store()
     let current_value = b::call(arena, argument, vec![]);
 
-    let mut args = vec![b::id(&store_name), current_value];
+    let mut args = vec![store, current_value];
 
     // For decrement, pass -1 as the delta
     if operator == JsUpdateOp::Decrement {
@@ -504,12 +477,24 @@ fn non_source_prop_read(
     arena: &crate::compiler::phases::phase3_transform::js_ast::arena::JsArena,
     node: JsExpr,
 ) -> JsExpr {
+    // The read transform now receives the identifier inside its span wrapper,
+    // and a member property is chosen by variant: an unrecognised wrapper makes
+    // the property an expression, which prints as the computed `$$props[name]`.
+    let property = match &node {
+        JsExpr::Identifier(name) => Some(JsMemberProperty::Identifier(name.clone())),
+        JsExpr::Spanned(inner, start, end) => match arena.get_expr(*inner) {
+            JsExpr::Identifier(name) => Some(JsMemberProperty::SpannedIdentifier {
+                name: name.clone(),
+                start: *start,
+                end: *end,
+            }),
+            _ => None,
+        },
+        _ => None,
+    };
     JsExpr::Member(JsMemberExpression {
         object: arena.alloc_expr(b::id("$$props")),
-        property: match &node {
-            JsExpr::Identifier(name) => JsMemberProperty::Identifier(name.clone()),
-            _ => JsMemberProperty::Expression(arena.alloc_expr(node)),
-        },
+        property: property.unwrap_or_else(|| JsMemberProperty::Expression(arena.alloc_expr(node))),
         computed: false,
         optional: false,
     })
@@ -525,7 +510,7 @@ fn prop_read(
     arena: &crate::compiler::phases::phase3_transform::js_ast::arena::JsArena,
     node: JsExpr,
 ) -> JsExpr {
-    b::call(arena, node, vec![])
+    b::getter_call(arena, node)
 }
 
 /// Transform a prop assignment.
@@ -539,6 +524,7 @@ fn prop_read(
 /// * `value` - The value being assigned
 /// * `_needs_proxy` - Whether the value needs to be proxified (not used for props)
 fn prop_assign(
+    _transform: &IdentifierTransform,
     arena: &crate::compiler::phases::phase3_transform::js_ast::arena::JsArena,
     node: JsExpr,
     value: JsExpr,
@@ -558,16 +544,13 @@ fn prop_assign(
 /// Transforms `x++` to `$.update_prop(x)` or `++x` to `$.update_pre_prop(x)`.
 /// Transforms `x--` to `$.update_prop(x, -1)` or `--x` to `$.update_pre_prop(x, -1)`.
 fn prop_update(
+    _transform: &IdentifierTransform,
     arena: &crate::compiler::phases::phase3_transform::js_ast::arena::JsArena,
     operator: JsUpdateOp,
     argument: JsExpr,
     prefix: bool,
 ) -> JsExpr {
-    let method = if prefix {
-        "update_pre_prop"
-    } else {
-        "update_prop"
-    };
+    let method = if prefix { "update_pre_prop" } else { "update_prop" };
 
     let mut args = vec![argument];
 
@@ -596,6 +579,7 @@ fn prop_update(
 /// * `_node` - The prop identifier (unused for passthrough)
 /// * `mutation` - The mutation expression (returned as-is)
 fn prop_mutate(
+    _transform: &IdentifierTransform,
     _arena: &crate::compiler::phases::phase3_transform::js_ast::arena::JsArena,
     _node: JsExpr,
     mutation: JsExpr,
@@ -621,6 +605,7 @@ fn prop_mutate(
 /// * `node` - The prop identifier (e.g., `foo`)
 /// * `mutation` - The mutation expression (e.g., `foo()[0] = value`)
 fn prop_bindable_mutate(
+    _transform: &IdentifierTransform,
     arena: &crate::compiler::phases::phase3_transform::js_ast::arena::JsArena,
     node: JsExpr,
     mutation: JsExpr,
@@ -653,7 +638,7 @@ fn reactive_import_read(
     arena: &crate::compiler::phases::phase3_transform::js_ast::arena::JsArena,
     node: JsExpr,
 ) -> JsExpr {
-    b::call(arena, node, vec![])
+    b::getter_call(arena, node)
 }
 
 /// Transform a reactive import mutation.
@@ -667,6 +652,7 @@ fn reactive_import_read(
 /// mutate: (_, mutation) => b.call(id, mutation)
 /// ```
 fn reactive_import_mutate(
+    _transform: &IdentifierTransform,
     arena: &crate::compiler::phases::phase3_transform::js_ast::arena::JsArena,
     node: JsExpr,
     mutation: JsExpr,

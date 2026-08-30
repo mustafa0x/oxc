@@ -11,25 +11,37 @@ use super::shared::fragment;
 use crate::ast::template::SvelteElement;
 
 /// Visit a svelte:head.
-pub fn visit(head: &mut SvelteElement, context: &mut VisitorContext) -> Result<(), AnalysisError> {
+pub fn visit<'a, 'b: 'a>(
+    head: &mut SvelteElement<'b>,
+    context: &mut VisitorContext<'a>,
+) -> Result<(), AnalysisError> {
     // Check for illegal attributes - svelte:head cannot have any attributes or directives
-    if !head.attributes.is_empty() {
-        return Err(errors::svelte_head_illegal_attribute());
+    if let Some(attribute) = head.attributes.first() {
+        let (start, end) = attribute.span();
+        return Err(errors::svelte_head_illegal_attribute().at(start, end));
     }
 
     // Check for duplicate
     if context.has_svelte_head {
-        return Err(errors::svelte_meta_duplicate("svelte:head"));
+        return Err(errors::svelte_meta_duplicate("svelte:head").at(head.start, head.start));
     }
     context.has_svelte_head = true;
 
     // Validate placement (must be at top level)
-    if context.is_inside_element_or_block() {
-        return Err(errors::svelte_meta_invalid_placement("svelte:head"));
+    if !context.in_root_fragment {
+        return Err(errors::svelte_meta_invalid_placement("svelte:head").at(head.start, head.start));
     }
 
-    // Analyze children
-    fragment::analyze(&mut head.fragment, context)?;
+    // Analyze children in the head's own fragment scope, or a `{#snippet}`
+    // declared here reads as declared in a non-ancestor scope and every
+    // `{@render}` of it lowers to the dynamic form.
+    let old_scope = context.scope;
+    if let Some(&head_scope) = context.analysis.root.template_scope_map.get(&head.start) {
+        context.scope = head_scope;
+    }
+    let result = fragment::analyze(&mut head.fragment, context);
+    context.scope = old_scope;
+    result?;
 
     Ok(())
 }

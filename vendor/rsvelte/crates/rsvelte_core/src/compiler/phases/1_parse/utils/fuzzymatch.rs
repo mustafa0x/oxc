@@ -7,9 +7,6 @@
 //! It provides fuzzy matching capabilities for suggesting "did you mean X?" in error messages.
 //! The algorithm uses n-gram based similarity combined with Levenshtein distance.
 
-// Allow dead code for library functions that will be used by the validator
-#![allow(dead_code)]
-
 use rustc_hash::FxHashMap;
 
 /// Threshold score for considering a match valid (0.0 - 1.0)
@@ -42,10 +39,7 @@ pub fn fuzzymatch(name: &str, candidates: &[&str]) -> Option<String> {
     let fuzzy_set = FuzzySet::new(candidates);
     let matches = fuzzy_set.get(name);
 
-    matches
-        .into_iter()
-        .find(|(score, _)| *score > MATCH_THRESHOLD)
-        .map(|(_, matched)| matched)
+    matches.into_iter().find(|(score, _)| *score > MATCH_THRESHOLD).map(|(_, matched)| matched)
 }
 
 /// Calculate the edit distance similarity between two strings (0.0 - 1.0).
@@ -200,10 +194,7 @@ impl FuzzySet {
         let sum_of_squares: usize = gram_counts.values().map(|&c| c * c).sum();
 
         for (gram, count) in &gram_counts {
-            self.match_dict
-                .entry(gram.clone())
-                .or_default()
-                .push((index, *count));
+            self.match_dict.entry(gram.clone()).or_default().push((index, *count));
         }
 
         let vector_normal = (sum_of_squares as f64).sqrt();
@@ -254,9 +245,15 @@ impl FuzzySet {
 
         let vector_normal = (sum_of_squares as f64).sqrt();
 
-        // Build results list
+        // Build results list. Upstream keys `matches` by integer index and walks it with
+        // `for...in`, which visits integer-like keys in ascending order; both sorts below are
+        // stable, so this order is what breaks score ties.
+        let mut matched_indices: Vec<usize> = matches.keys().copied().collect();
+        matched_indices.sort_unstable();
+
         let mut results: Vec<(f64, String)> = Vec::new();
-        for (&index, &match_score) in &matches {
+        for index in matched_indices {
+            let match_score = matches[&index];
             if let Some((item_normal, item_value)) = items.get(index)
                 && *item_normal > 0.0
                 && vector_normal > 0.0
@@ -290,11 +287,8 @@ impl FuzzySet {
                 .filter(|(score, _)| (*score - best_score).abs() < f64::EPSILON)
                 .map(|(score, normalized_value)| {
                     // Return the original (non-normalized) value
-                    let original = self
-                        .exact_set
-                        .get(&normalized_value)
-                        .cloned()
-                        .unwrap_or(normalized_value);
+                    let original =
+                        self.exact_set.get(&normalized_value).cloned().unwrap_or(normalized_value);
                     (score, original)
                 })
                 .collect()
@@ -370,27 +364,14 @@ mod tests {
     fn test_fuzzymatch_similar_words() {
         // Test with longer words that have better n-gram overlap
         let directives = &["transition", "animate", "action", "bind", "class", "style"];
-        assert_eq!(
-            fuzzymatch("trnsition", directives),
-            Some("transition".to_string())
-        );
-        assert_eq!(
-            fuzzymatch("animte", directives),
-            Some("animate".to_string())
-        );
+        assert_eq!(fuzzymatch("trnsition", directives), Some("transition".to_string()));
+        assert_eq!(fuzzymatch("animte", directives), Some("animate".to_string()));
     }
 
     #[test]
     fn test_fuzzymatch_attribute_names() {
         // Test with event handlers (more realistic Svelte use case)
-        let events = &[
-            "onclick",
-            "onchange",
-            "onmouseover",
-            "onmouseout",
-            "onkeydown",
-            "onkeyup",
-        ];
+        let events = &["onclick", "onchange", "onmouseover", "onmouseout", "onkeydown", "onkeyup"];
         assert_eq!(fuzzymatch("onlcick", events), Some("onclick".to_string()));
         assert_eq!(fuzzymatch("onchagne", events), Some("onchange".to_string()));
     }

@@ -25,7 +25,7 @@
 //!   children with the same `context.state`, so they flow into `state.template`
 //!   exactly like a `RegularElement`'s children would (sans open/close literals).
 //!   In practice the analyzer FORBIDS children on `<svelte:body>`
-//!   (`svelte_meta_invalid_content`: "`<svelte:body>` cannot have children"), so
+//!   (`svelte_meta_invalid_content`: "<svelte:body> cannot have children"), so
 //!   the inline walk is almost always over an empty fragment and emits nothing;
 //!   we still port the inline-render semantics faithfully.
 //!
@@ -72,6 +72,6 @@ pub fn visit_svelte_options<'a>(_node: &SvelteElement, _state: &mut ServerTransf
 /// walked with NO `RegularElement` parent and the default `html` namespace, and
 /// `<svelte:body>` is NOT an `is_text_first` parent (it is absent from upstream's
 /// `is_text_first` parent list).
-pub fn visit_svelte_body<'a>(node: &SvelteElement, state: &mut ServerTransformState<'a>) {
+pub fn visit_svelte_body<'a>(node: &SvelteElement<'a>, state: &mut ServerTransformState<'a>) {
     process_children(&node.fragment.nodes, None, "html", state);
 }

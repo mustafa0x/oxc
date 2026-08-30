@@ -24,9 +24,10 @@ pub fn visit_typed(node: &JsNode, context: &mut VisitorContext) -> Result<(), An
         // fall back to Value-based logic
         let is_new_expr = matches!(expr_node, JsNode::NewExpression { .. });
         if is_new_expr {
+            let span = (expr_node.start().unwrap_or_default(), expr_node.end().unwrap_or_default());
             let value = node.to_value();
             if let Some(expr_val) = value.get("expression") {
-                check_legacy_component_creation(expr_val, context);
+                check_legacy_component_creation(expr_val, span, context);
             }
         }
     }
@@ -35,7 +36,11 @@ pub fn visit_typed(node: &JsNode, context: &mut VisitorContext) -> Result<(), An
 }
 
 /// Check for legacy `new Component({ target: ... })` pattern and emit warning.
-fn check_legacy_component_creation(expression: &Value, context: &mut VisitorContext) {
+fn check_legacy_component_creation(
+    expression: &Value,
+    span: (u32, u32),
+    context: &mut VisitorContext,
+) {
     if expression.get("type").and_then(|t| t.as_str()) != Some("NewExpression") {
         return;
     }
@@ -65,13 +70,9 @@ fn check_legacy_component_creation(expression: &Value, context: &mut VisitorCont
         .map(|props| {
             props.iter().any(|p| {
                 p.get("type").and_then(|t| t.as_str()) == Some("Property")
-                    && p.get("key")
-                        .and_then(|k| k.get("type"))
-                        .and_then(|t| t.as_str())
+                    && p.get("key").and_then(|k| k.get("type")).and_then(|t| t.as_str())
                         == Some("Identifier")
-                    && p.get("key")
-                        .and_then(|k| k.get("name"))
-                        .and_then(|n| n.as_str())
+                    && p.get("key").and_then(|k| k.get("name")).and_then(|n| n.as_str())
                         == Some("target")
             })
         })
@@ -107,10 +108,8 @@ fn check_legacy_component_creation(expression: &Value, context: &mut VisitorCont
             .is_some_and(|src| src.ends_with(".svelte"));
 
         if is_svelte_import {
-            let is_default_import = initial_json
-                .get("specifiers")
-                .and_then(|s| s.as_array())
-                .is_some_and(|specs| {
+            let is_default_import =
+                initial_json.get("specifiers").and_then(|s| s.as_array()).is_some_and(|specs| {
                     specs.iter().any(|spec| {
                         spec.get("type").and_then(|t| t.as_str()) == Some("ImportDefaultSpecifier")
                             && spec
@@ -124,7 +123,7 @@ fn check_legacy_component_creation(expression: &Value, context: &mut VisitorCont
             if is_default_import {
                 // Route through emit_warning so a `svelte-ignore` in scope can
                 // suppress it (H-118).
-                context.emit_warning(warnings::legacy_component_creation());
+                context.emit_warning(warnings::legacy_component_creation().at(span.0, span.1));
             }
         }
     }

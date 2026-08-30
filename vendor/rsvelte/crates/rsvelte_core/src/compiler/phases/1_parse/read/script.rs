@@ -8,6 +8,8 @@
 //! It provides script tag parsing for both instance (`<script>`) and module
 //! (`<script context="module">` or `<script module>`) scripts.
 
+use std::borrow::Cow;
+
 use compact_str::CompactString;
 
 use crate::ast::arena::ParseArena;
@@ -17,7 +19,7 @@ use crate::ast::template::{
 };
 use crate::error::ParseResult;
 
-use super::super::parser::Parser;
+use super::super::parser::{Parser, is_js_whitespace};
 
 /// Ensure a Script's content has been fully parsed from raw_content.
 /// This performs the deferred OXC parse. Call this before accessing script.content in analysis.
@@ -45,26 +47,62 @@ pub fn ensure_script_parsed(
 
     let (program, parse_error) = super::expression::parse_program_with_error(
         arena,
-        &raw,
-        offset,
-        line_offsets,
-        script.is_typescript,
-        &leading_comments,
-        script.start as usize,
-        script.end as usize,
+        super::expression::ProgramParseParams {
+            content: raw,
+            offset,
+            line_offsets,
+            is_typescript: script.is_typescript,
+            is_script: true,
+            leading_comments: &leading_comments,
+            script_tag_start: script.start as usize,
+            script_tag_end: script.end as usize,
+        },
     );
 
     script.content = program;
     parse_error
 }
 
-impl Parser<'_> {
+pub(crate) fn ensure_script_parsed_retained<'source>(
+    arena: &ParseArena,
+    script: &mut Script<'source>,
+    line_offsets: &[usize],
+) -> (Option<crate::error::ParseError>, Option<crate::ast::oxc_program::RetainedProgram<'source>>) {
+    if script.raw_content.is_empty() {
+        return (None, None);
+    }
+
+    let raw = std::mem::take(&mut script.raw_content);
+    let offset = script.content_offset as usize;
+    let leading_comments: Vec<String> = Vec::new();
+    let (program, parse_error, retained) = super::expression::parse_program_retained_with_error(
+        arena,
+        super::expression::ProgramParseParams {
+            content: raw,
+            offset,
+            line_offsets,
+            is_typescript: script.is_typescript,
+            is_script: true,
+            leading_comments: &leading_comments,
+            script_tag_start: script.start as usize,
+            script_tag_end: script.end as usize,
+        },
+    );
+
+    script.content = program;
+    (parse_error, Some(retained))
+}
+
+static SCRIPT_END_FINDER: std::sync::LazyLock<memchr::memmem::Finder<'static>> =
+    std::sync::LazyLock::new(|| memchr::memmem::Finder::new(b"</script"));
+
+impl<'a> Parser<'a> {
     /// Merge attribute value parts into a single Text for script/style tags.
     /// This is needed because {curly braces} in quoted attribute values are NOT expressions.
     pub fn merge_attribute_parts_to_text(
         &self,
-        parts: &[AttributeValuePart],
-    ) -> Vec<AttributeValuePart> {
+        parts: &[AttributeValuePart<'a>],
+    ) -> Vec<AttributeValuePart<'a>> {
         if parts.len() <= 1 {
             // No merging needed
             return parts.to_vec();
@@ -88,9 +126,19 @@ impl Parser<'_> {
         vec![AttributeValuePart::Text(Text {
             start: first_start,
             end: last_end,
-            raw: CompactString::from(raw),
-            data: CompactString::from(raw),
+            raw: Cow::Borrowed(raw),
+            data: Cow::Borrowed(raw),
         })]
+    }
+
+    /// Whether `/\s*>/` matches at `i` — upstream's closing-`<script>` regex
+    /// tail, which junk before the `>` fails.
+    fn script_closer_at(&self, i: usize) -> bool {
+        let mut i = i;
+        while self.is_js_whitespace_at(i) {
+            i += self.source[i..].chars().next().map_or(1, |c| c.len_utf8());
+        }
+        self.bytes.get(i) == Some(&b'>')
     }
 
     /// Parse a `<script>` tag and store it in instance_script or module_script.
@@ -102,17 +150,19 @@ impl Parser<'_> {
     pub fn parse_script_tag(
         &mut self,
         start: usize,
-        attributes: Vec<crate::ast::Attribute>,
+        attributes: Vec<crate::ast::Attribute<'a>>,
         self_closing: bool,
-    ) -> ParseResult<Option<TemplateNode>> {
+    ) -> ParseResult<Option<TemplateNode<'a>>> {
         let content_start = self.index;
 
         // Use SIMD-accelerated search for </script instead of byte-by-byte scanning
         if !self_closing {
             loop {
-                if let Some(offset) = memchr::memmem::find(&self.bytes[self.index..], b"</script") {
+                if let Some(offset) = SCRIPT_END_FINDER.find(&self.bytes[self.index..]) {
                     self.index += offset;
-                    if self.is_valid_closing_tag("</script") {
+                    // Upstream stops on `/<\/script\s*>/`: junk before the `>`
+                    // does not close the script, it runs to EOF instead.
+                    if self.script_closer_at(self.index + 8) {
                         break;
                     }
                     // Not a valid closing tag (e.g., </scripting), skip past it
@@ -132,29 +182,28 @@ impl Parser<'_> {
             // Nothing to consume — the self-closing `/>` was already eaten.
         } else if self.match_str("</script") {
             self.advance_by(8); // consume '</script'
-            // Skip whitespace before >
-            while !self.is_eof() && self.current_char() != '>' {
+            while !self.is_eof() && is_js_whitespace(self.current_char()) {
                 self.advance();
             }
             self.eat_optional(">"); // consume '>'
         } else if self.is_eof() {
-            // Script tag was not closed - check if there's actual content
-            // If there's HTML content in the script, it's element_unclosed
-            // If it's empty/only whitespace at EOF, it's unexpected_eof
-            let has_html_content = script_content.contains('<') || script_content.contains('{');
-            if has_html_content {
-                return Err(crate::error::ParseError::svelte(
-                    "element_unclosed",
-                    "`<script>` was left open",
-                    (self.index, self.index),
-                ));
-            } else {
+            // Upstream's `read_until` throws when it is *entered* at the end of
+            // the right-trimmed template — an empty body — while a body that ran
+            // out of input before `</script>` is the tag left open. Either way
+            // the point is the trimmed end, not the file's.
+            let at = self.content_end;
+            if content_start >= self.content_end {
                 return Err(crate::error::ParseError::svelte(
                     "unexpected_eof",
                     "Unexpected end of input",
-                    (self.index, self.index),
+                    (at, at),
                 ));
             }
+            return Err(crate::error::ParseError::svelte(
+                "element_unclosed",
+                "`<script>` was left open",
+                (at, at),
+            ));
         }
 
         let end = self.index;
@@ -189,21 +238,14 @@ impl Parser<'_> {
                 }
 
                 if attr_node.name.as_str() == "context" {
-                    if let AttributeValue::Sequence(parts) = &attr_node.value
+                    let keep = if let AttributeValue::Sequence(parts) = &attr_node.value
                         && let Some(AttributeValuePart::Text(t)) = parts.first()
                     {
-                        if t.data.as_str() == "module" {
+                        if t.data.as_ref() == "module" {
                             context = ScriptContext::Module;
-                            // The compiler drops the `context` attribute from the
-                            // script's attribute list (it only needs the
-                            // `ScriptContext`), and the snapshot tests expect that.
-                            // svelte-eslint-parser keeps it, so attribute-layout
-                            // lint rules count it — preserve it only in lenient
-                            // (lint) mode to match the oracle without changing
-                            // compiler output.
-                            if self.options.lenient_script {
-                                script_attributes.push(attr_node.clone());
-                            }
+                            // `read_script` keeps every attribute on the node, and
+                            // `script_context_deprecated` finds `context` there.
+                            true
                         } else {
                             // Invalid context value - only "module" is allowed
                             return Err(crate::error::ParseError::svelte(
@@ -212,24 +254,29 @@ impl Parser<'_> {
                                 (attr_node.start as usize, attr_node.end as usize),
                             ));
                         }
+                    } else {
+                        false
+                    };
+                    if keep {
+                        script_attributes.push(attr_node);
                     }
                 } else if attr_node.name.as_str() == "module" {
                     // `module` attribute (boolean or with value) indicates module context
                     context = ScriptContext::Module;
-                    script_attributes.push(attr_node.clone());
+                    script_attributes.push(attr_node);
                     continue;
                 } else if attr_node.name.as_str() == "lang" {
                     if let AttributeValue::Sequence(parts) = &attr_node.value
                         && let Some(AttributeValuePart::Text(t)) = parts.first()
                     {
-                        let lang = t.data.as_str();
+                        let lang = t.data.as_ref();
                         if lang == "ts" || lang == "typescript" {
                             is_typescript = true;
                         }
                     }
-                    script_attributes.push(attr_node.clone());
+                    script_attributes.push(attr_node);
                 } else {
-                    script_attributes.push(attr_node.clone());
+                    script_attributes.push(attr_node);
                 }
             }
         }
@@ -245,9 +292,7 @@ impl Parser<'_> {
                 loc: None,
                 body: crate::ast::arena::IdRange::empty(),
                 source_type: CompactString::from("module"),
-                leading_comments: None,
-                trailing_comments: None,
-                ignore_comment_map: Vec::new(),
+                metadata: Box::default(),
             });
             Script {
                 node_type: ScriptType::Script,
@@ -256,7 +301,7 @@ impl Parser<'_> {
                 context,
                 content: placeholder,
                 attributes: script_attributes,
-                raw_content: script_content.to_string(),
+                raw_content: script_content,
                 content_offset: content_start as u32,
                 is_typescript: use_typescript,
             }
@@ -264,13 +309,16 @@ impl Parser<'_> {
             // Eager parsing (default for tests and direct AST comparison)
             let (program, parse_error) = super::super::expression::parse_program_with_error(
                 &self.arena,
-                script_content,
-                content_start,
-                self.expression_line_offsets(),
-                use_typescript,
-                &leading_comments,
-                start,
-                end,
+                super::super::expression::ProgramParseParams {
+                    content: script_content,
+                    offset: content_start,
+                    line_offsets: self.expression_line_offsets(),
+                    is_typescript: use_typescript,
+                    is_script: true,
+                    leading_comments: &leading_comments,
+                    script_tag_start: start,
+                    script_tag_end: end,
+                },
             );
             // Upstream acorn throws on the first script parse error, even in
             // loose mode (read/script.js → acorn.js `handle_parse_error`). BUT
@@ -291,9 +339,7 @@ impl Parser<'_> {
                     loc: None,
                     body: crate::ast::arena::IdRange::empty(),
                     source_type: CompactString::from("module"),
-                    leading_comments: None,
-                    trailing_comments: None,
-                    ignore_comment_map: Vec::new(),
+                    metadata: Box::default(),
                 });
                 Script {
                     node_type: ScriptType::Script,
@@ -302,7 +348,7 @@ impl Parser<'_> {
                     context,
                     content: placeholder,
                     attributes: script_attributes,
-                    raw_content: script_content.to_string(),
+                    raw_content: script_content,
                     content_offset: content_start as u32,
                     is_typescript: use_typescript,
                 }
@@ -314,7 +360,7 @@ impl Parser<'_> {
                     context,
                     content: program,
                     attributes: script_attributes,
-                    raw_content: String::new(),
+                    raw_content: "",
                     content_offset: content_start as u32,
                     is_typescript: use_typescript,
                 }
@@ -327,8 +373,8 @@ impl Parser<'_> {
                 if self.instance_script.is_some() {
                     return Err(crate::error::ParseError::svelte(
                         "script_duplicate",
-                        "A component can only have one instance-level `<script>` element",
-                        (start, end),
+                        "A component can have a single top-level `<script>` element and/or a single top-level `<script module>` element",
+                        (start, start),
                     ));
                 }
                 self.instance_script = Some(script);
@@ -337,8 +383,8 @@ impl Parser<'_> {
                 if self.module_script.is_some() {
                     return Err(crate::error::ParseError::svelte(
                         "script_duplicate",
-                        "A component can only have one `<script module>` element",
-                        (start, end),
+                        "A component can have a single top-level `<script>` element and/or a single top-level `<script module>` element",
+                        (start, start),
                     ));
                 }
                 self.module_script = Some(script);

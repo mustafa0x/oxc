@@ -70,7 +70,7 @@ pub enum ParseError {
     #[error("{code}: {message}")]
     #[diagnostic()]
     SvelteError {
-        /// The Svelte error code (e.g., "element_unclosed", "void_element_invalid_content")
+        /// The Svelte error code (e.g., "`element_unclosed`", "`void_element_invalid_content`")
         code: String,
         /// The error message
         message: String,
@@ -82,21 +82,21 @@ pub enum ParseError {
 impl ParseError {
     /// Create a Svelte-compatible error with a specific error code.
     pub fn svelte(code: &str, message: impl Into<String>, span: (usize, usize)) -> Self {
-        ParseError::SvelteError {
-            code: code.to_string(),
-            message: message.into(),
-            span,
-        }
+        ParseError::SvelteError { code: code.to_string(), message: message.into(), span }
     }
 
     /// Create an expected token error.
     ///
     /// Corresponds to `expected_token()` in JavaScript errors.
+    ///
+    /// Upstream passes a bare index, and `errors.js`'s `e()` reads
+    /// `node.start ?? node` / `node.end ?? node`, so the span is a point.
+    #[must_use]
     pub fn expected_token(expected: &str, position: usize) -> Self {
         ParseError::svelte(
             "expected_token",
-            format!("Expected token {}", expected),
-            (position, position + 1),
+            format!("Expected token {expected}"),
+            (position, position),
         )
     }
 
@@ -121,6 +121,7 @@ impl ParseError {
     ///
     /// Every variant carries a `span` field (the `#[label]` source range used
     /// by miette); this accessor exposes it without exhaustive matching.
+    #[must_use]
     pub fn span(&self) -> (usize, usize) {
         match self {
             ParseError::UnexpectedEof { span }

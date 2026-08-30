@@ -21,14 +21,44 @@ use regex::Regex;
 use serde_json::{Map, Value, json};
 use std::sync::LazyLock;
 
+use crate::ast::js::Expression;
+use crate::ast::span::SourceLocation;
 use crate::ast::{
     AnimateDirective, AttachTag, Attribute, AttributeNode, AttributeValue, AttributeValuePart,
     AwaitBlock, BindDirective, ClassDirective, Comment, Component, ConstTag, DebugTag, EachBlock,
-    ExpressionTag, Fragment, HtmlTag, IfBlock, KeyBlock, LetDirective, OnDirective, RegularElement,
-    RenderTag, Root, Script, SlotElement, SnippetBlock, SpreadAttribute, StyleDirective,
-    SvelteComponentElement, SvelteDynamicElement, SvelteElement, TemplateNode, Text, TitleElement,
-    TransitionDirective, UseDirective,
+    ExpressionTag, Fragment, HtmlTag, IfBlock, JsComment, KeyBlock, LetDirective, OnDirective,
+    RegularElement, RenderTag, Root, Script, SlotElement, SnippetBlock, SpreadAttribute,
+    StyleDirective, SvelteComponentElement, SvelteDynamicElement, SvelteElement, TemplateNode,
+    Text, TitleElement, TransitionDirective, UseDirective,
 };
+
+/// Insert ESTree fields into an existing `Map`, in written order.
+///
+/// `serde_json` is built with `preserve_order`, so insertion order *is* the JSON
+/// key order and therefore part of the legacy AST's compatibility contract. The
+/// macro expands to plain sequential `insert` calls, keeping source order and
+/// wire order identical. `"key": value` wraps `value` in `json!`; `"key" =>
+/// value` inserts an existing `Value` verbatim.
+macro_rules! estree_fields {
+    ($obj:ident, $key:literal : $value:expr $(, $($rest:tt)*)?) => {
+        $obj.insert($key.to_string(), json!($value));
+        $( estree_fields!($obj, $($rest)*); )?
+    };
+    ($obj:ident, $key:literal => $value:expr $(, $($rest:tt)*)?) => {
+        $obj.insert($key.to_string(), $value);
+        $( estree_fields!($obj, $($rest)*); )?
+    };
+    ($obj:ident $(,)?) => {};
+}
+
+/// `estree_fields!` for a fresh object; evaluates to the built `Value::Object`.
+macro_rules! estree_obj {
+    ($($fields:tt)*) => {{
+        let mut obj = Map::new();
+        estree_fields!(obj, $($fields)*);
+        Value::Object(obj)
+    }};
+}
 
 // Regex patterns for whitespace handling
 static REGEX_STARTS_WITH_WHITESPACE: LazyLock<Regex> =
@@ -39,21 +69,29 @@ static REGEX_NOT_WHITESPACE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[^ 
 
 /// Converter from UTF-8 byte positions to UTF-16 code unit positions.
 ///
-/// `pub(crate)` so the modern parse output paths (`wasm::parse_svelte`,
-/// `napi::parse`, and the raw-transfer envelope encoder) can reuse the same
-/// remap the legacy path already applies, keeping every public AST surface on
-/// svelte/compiler's UTF-16 offsets (#793).
-pub(crate) struct Utf8ToUtf16 {
-    utf16_pos: Vec<usize>,
+/// Public so the modern parse output paths (`wasm::parse_svelte`, the
+/// `rsvelte_napi` bindings, and the raw-transfer envelope encoder) can reuse
+/// the same remap the legacy path already applies, keeping every public AST
+/// surface on svelte/compiler's UTF-16 offsets.
+pub struct Utf8ToUtf16 {
+    /// One UTF-16 offset per source byte (plus a trailing entry). `u32` rather
+    /// than `usize` because source positions are u32-bounded across the compiler
+    /// — this halves the per-byte table on 64-bit targets.
+    utf16_pos: Vec<u32>,
     /// (byte offset, utf16 offset) for each line start
     line_starts_byte: Vec<usize>,
     line_starts_utf16: Vec<usize>,
+    /// Compilation omits ESTree locations from the retained typed tree and
+    /// reconstructs them only when the legacy JSON result is requested.
+    /// Public `parse()` trees already carry the exact parser locations,
+    /// including intentional `loc` omissions on loose recovery nodes.
+    rebuild_missing_locs: bool,
 }
 
 impl Utf8ToUtf16 {
-    pub(crate) fn new(source: &str) -> Self {
+    pub fn new(source: &str) -> Self {
         let mut utf16_pos = Vec::with_capacity(source.len() + 1);
-        let mut utf16_idx = 0;
+        let mut utf16_idx = 0usize;
         let mut line_starts_byte = vec![0];
         let mut line_starts_utf16 = vec![0];
         let mut byte_idx = 0;
@@ -62,7 +100,7 @@ impl Utf8ToUtf16 {
             let utf8_len = c.len_utf8();
             let utf16_len = c.len_utf16();
             for _ in 0..utf8_len {
-                utf16_pos.push(utf16_idx);
+                utf16_pos.push(utf16_idx as u32);
             }
             utf16_idx += utf16_len;
             byte_idx += utf8_len;
@@ -72,25 +110,41 @@ impl Utf8ToUtf16 {
                 line_starts_utf16.push(utf16_idx);
             }
         }
-        utf16_pos.push(utf16_idx);
-        Self {
-            utf16_pos,
-            line_starts_byte,
-            line_starts_utf16,
+        utf16_pos.push(utf16_idx as u32);
+        Self { utf16_pos, line_starts_byte, line_starts_utf16, rebuild_missing_locs: false }
+    }
+
+    fn for_legacy(source: &str, rebuild_missing_locs: bool) -> Self {
+        Self { rebuild_missing_locs, ..Self::new(source) }
+    }
+
+    #[doc(hidden)]
+    pub fn convert(&self, utf8_pos: usize) -> usize {
+        if utf8_pos >= self.utf16_pos.len() {
+            self.utf16_pos.last().copied().unwrap_or(0) as usize
+        } else {
+            self.utf16_pos[utf8_pos] as usize
         }
     }
 
-    pub(crate) fn convert(&self, utf8_pos: usize) -> usize {
-        if utf8_pos >= self.utf16_pos.len() {
-            *self.utf16_pos.last().unwrap_or(&0)
-        } else {
-            self.utf16_pos[utf8_pos]
-        }
+    /// Resolve a UTF-8 byte offset to a `(line, column, character)` triple where
+    /// `line` is 1-based, and `column`/`character` are UTF-16 code-unit offsets
+    /// (column measured from the line start). The precomputed per-byte table +
+    /// binary search over line starts make this O(log lines), so converting many
+    /// warning positions costs O(warnings) rather than O(sum of byte offsets).
+    pub fn position(&self, byte_offset: usize) -> (usize, usize, usize) {
+        let character = self.convert(byte_offset);
+        // 1-based line = number of line starts at or before the offset; the
+        // first entry is 0, so this is always >= 1.
+        let line = self.line_starts_byte.partition_point(|&s| s <= byte_offset);
+        let column = character - self.line_starts_utf16[line - 1];
+        (line, column, character)
     }
 
     /// Convert a column from byte offset to UTF-16 code unit offset within a line.
     /// line is 1-based, column is 0-based byte offset from line start.
-    pub(crate) fn convert_column(&self, line: usize, byte_column: usize) -> usize {
+    #[doc(hidden)]
+    pub fn convert_column(&self, line: usize, byte_column: usize) -> usize {
         if line == 0 || line > self.line_starts_byte.len() {
             return byte_column;
         }
@@ -107,10 +161,282 @@ impl Utf8ToUtf16 {
         // Return column as offset from line start in UTF-16
         abs_utf16_pos.saturating_sub(line_start_utf16)
     }
+
+    /// Number of lines, counted the way JavaScript's `split('\n')` does — a
+    /// trailing newline yields a final empty line.
+    pub fn line_count(&self) -> usize {
+        self.line_starts_byte.len()
+    }
+
+    /// The 0-indexed `line` of `source`, without its terminator. `source` must
+    /// be the string this table was built from.
+    pub fn line_text<'s>(&self, source: &'s str, line: usize) -> &'s str {
+        let start = self.line_starts_byte[line];
+        let end = match self.line_starts_byte.get(line + 1) {
+            // The next line starts one byte past this line's `\n`.
+            Some(&next) => next - 1,
+            None => source.len(),
+        };
+        &source[start..end]
+    }
+
+    fn byte_line_column(&self, byte_offset: usize) -> (u32, u32) {
+        let line =
+            self.line_starts_byte.partition_point(|&start| start <= byte_offset).saturating_sub(1);
+        let line_start = self.line_starts_byte.get(line).copied().unwrap_or(0);
+        ((line + 1) as u32, (byte_offset - line_start) as u32)
+    }
+
+    fn byte_line_column_for_binding(&self, byte_offset: usize) -> (u32, u32) {
+        let line =
+            self.line_starts_byte.partition_point(|&start| start <= byte_offset).saturating_sub(1);
+        let line_start = self.line_starts_byte.get(line).copied().unwrap_or(0);
+        let adjusted_start = if line > 0
+            && line_start - self.line_starts_byte.get(line - 1).copied().unwrap_or(0) == 1
+        {
+            self.line_starts_byte[line - 1]
+        } else {
+            line_start
+        };
+        ((line + 1) as u32, (byte_offset - adjusted_start) as u32)
+    }
+}
+
+/// Materialize the ESTree locations which compilation deliberately omits at
+/// parse time. Keep this operation attached to each `as_json()` boundary in
+/// this file: converter-created ESTree nodes (notably `{@const}`'s synthesized
+/// `AssignmentExpression`) must pass through the same operation too.
+fn expression_json(expression: &Expression, positions: &Utf8ToUtf16) -> Value {
+    let mut value = expression.as_json().clone();
+    if positions.rebuild_missing_locs {
+        add_estree_locs(&mut value, positions);
+    }
+    value
+}
+
+fn binding_json(expression: &Expression, positions: &Utf8ToUtf16) -> Value {
+    let mut value = expression.as_json().clone();
+    if positions.rebuild_missing_locs {
+        add_binding_locs(&mut value, positions, true);
+    }
+    value
+}
+
+fn declaration_json(expression: &Expression, positions: &Utf8ToUtf16) -> Value {
+    let mut value = expression.as_json().clone();
+    if !positions.rebuild_missing_locs {
+        return value;
+    }
+    let Value::Object(declaration) = &mut value else {
+        add_estree_locs(&mut value, positions);
+        return value;
+    };
+
+    if let Some(Value::Array(declarators)) = declaration.get_mut("declarations") {
+        for declarator in declarators {
+            let Value::Object(declarator) = declarator else {
+                continue;
+            };
+            if let Some(id) = declarator.get_mut("id") {
+                add_binding_locs(id, positions, true);
+            }
+            if let Some(init) = declarator.get_mut("init") {
+                add_estree_locs(init, positions);
+            }
+            add_loc_to_estree_object(declarator, positions);
+        }
+    }
+    add_loc_to_estree_object(declaration, positions);
+    value
+}
+
+fn add_binding_locs(value: &mut Value, positions: &Utf8ToUtf16, top_level: bool) {
+    let Value::Object(object) = value else {
+        if let Value::Array(items) = value {
+            for item in items {
+                add_binding_locs(item, positions, false);
+            }
+        }
+        return;
+    };
+
+    let node_type = object.get("type").and_then(Value::as_str).unwrap_or("").to_string();
+    match node_type.as_str() {
+        "ObjectPattern" => {
+            add_binding_children(object, "properties", positions);
+            add_estree_child(object, "typeAnnotation", positions);
+        }
+        "ArrayPattern" => {
+            add_binding_children(object, "elements", positions);
+            add_estree_child(object, "typeAnnotation", positions);
+        }
+        "RestElement" => add_binding_child(object, "argument", positions),
+        "Property" => {
+            if object.get("computed").and_then(Value::as_bool).unwrap_or(false) {
+                add_estree_child(object, "key", positions);
+            } else {
+                add_binding_child(object, "key", positions);
+            }
+            add_binding_child(object, "value", positions);
+        }
+        "AssignmentPattern" => {
+            add_binding_child(object, "left", positions);
+            if let Some(right) = object.get_mut("right") {
+                add_estree_locs(right, positions);
+            }
+        }
+        "Identifier" => add_estree_child(object, "typeAnnotation", positions),
+        "PrivateIdentifier" | "Literal" => {}
+        _ => {
+            add_estree_locs(value, positions);
+            return;
+        }
+    }
+
+    if !object.contains_key("loc")
+        && let Some((start, end)) = object
+            .get("start")
+            .and_then(Value::as_u64)
+            .zip(object.get("end").and_then(Value::as_u64))
+    {
+        let loc = if top_level && node_type == "Identifier" {
+            estree_loc_with_character(start as usize, end as usize, positions)
+        } else {
+            binding_loc(start as usize, end as usize, positions)
+        };
+        insert_loc_after_end(object, loc);
+    }
+}
+
+fn add_binding_child(object: &mut Map<String, Value>, key: &str, positions: &Utf8ToUtf16) {
+    if let Some(child) = object.get_mut(key) {
+        add_binding_locs(child, positions, false);
+    }
+}
+
+fn add_binding_children(object: &mut Map<String, Value>, key: &str, positions: &Utf8ToUtf16) {
+    if let Some(Value::Array(children)) = object.get_mut(key) {
+        for child in children {
+            add_binding_locs(child, positions, false);
+        }
+    }
+}
+
+fn add_estree_child(object: &mut Map<String, Value>, key: &str, positions: &Utf8ToUtf16) {
+    if let Some(child) = object.get_mut(key) {
+        add_estree_locs(child, positions);
+    }
+}
+
+fn add_loc_to_estree_object(object: &mut Map<String, Value>, positions: &Utf8ToUtf16) {
+    if object.contains_key("loc") {
+        return;
+    }
+    if let Some((start, end)) =
+        object.get("start").and_then(Value::as_u64).zip(object.get("end").and_then(Value::as_u64))
+    {
+        insert_loc_after_end(object, estree_loc(start as usize, end as usize, positions));
+    }
+}
+
+fn script_json(script: &Script, positions: &Utf8ToUtf16) -> Value {
+    if !positions.rebuild_missing_locs {
+        return script.content.as_json().clone();
+    }
+    let mut value = expression_json(&script.content, positions);
+    if let Value::Object(program) = &mut value {
+        program.remove("loc");
+        let loc = estree_loc(script.start as usize, script.end as usize, positions);
+        insert_loc_after_end(program, loc);
+    }
+    value
+}
+
+fn estree_loc(start: usize, end: usize, positions: &Utf8ToUtf16) -> Value {
+    let (start_line, start_column) = positions.byte_line_column(start);
+    let (end_line, end_column) = positions.byte_line_column(end);
+    json!({
+        "start": { "line": start_line, "column": start_column },
+        "end": { "line": end_line, "column": end_column }
+    })
+}
+
+fn binding_loc(start: usize, end: usize, positions: &Utf8ToUtf16) -> Value {
+    let point = |offset| {
+        let (line, column) = positions.byte_line_column_for_binding(offset);
+        json!({ "line": line, "column": column })
+    };
+    json!({ "start": point(start), "end": point(end) })
+}
+
+fn estree_loc_with_character(start: usize, end: usize, positions: &Utf8ToUtf16) -> Value {
+    let point = |offset| {
+        let (line, column) = positions.byte_line_column(offset);
+        json!({ "line": line, "column": column, "character": offset })
+    };
+    json!({ "start": point(start), "end": point(end) })
+}
+
+fn comment_json(comment: &JsComment, positions: &Utf8ToUtf16) -> Value {
+    let mut value = serde_json::to_value(comment).unwrap_or(Value::Null);
+    if !positions.rebuild_missing_locs {
+        return value;
+    }
+    if let Value::Object(object) = &mut value {
+        let loc = if comment.loc_has_character {
+            estree_loc_with_character(comment.start as usize, comment.end as usize, positions)
+        } else {
+            estree_loc(comment.start as usize, comment.end as usize, positions)
+        };
+        object.insert("loc".to_string(), loc);
+    }
+    value
+}
+
+fn insert_loc_after_end(object: &mut Map<String, Value>, loc: Value) {
+    let previous = std::mem::take(object);
+    for (key, child) in previous {
+        let insert_after_end = key == "end";
+        object.insert(key, child);
+        if insert_after_end {
+            object.insert("loc".to_string(), loc.clone());
+        }
+    }
+}
+
+fn add_estree_locs(value: &mut Value, positions: &Utf8ToUtf16) {
+    match value {
+        Value::Object(object) => {
+            for child in object.values_mut() {
+                add_estree_locs(child, positions);
+            }
+
+            let span = object
+                .get("start")
+                .and_then(Value::as_u64)
+                .zip(object.get("end").and_then(Value::as_u64));
+            if object.contains_key("type")
+                && !object.contains_key("loc")
+                && let Some((start, end)) = span
+            {
+                let loc = estree_loc(start as usize, end as usize, positions);
+
+                // ESTree serializers place `loc` directly after `end`. JSON
+                // key order is observable on the legacy wire format.
+                insert_loc_after_end(object, loc);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                add_estree_locs(item, positions);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Recursively convert positions in JSON from UTF-8 to UTF-16.
-pub(crate) fn convert_positions_to_utf16(value: &mut Value, pos_conv: &Utf8ToUtf16) {
+pub fn convert_positions_to_utf16(value: &mut Value, pos_conv: &Utf8ToUtf16) {
     match value {
         Value::Object(map) => {
             if let Some(Value::Number(n)) = map.get("start")
@@ -126,10 +452,7 @@ pub(crate) fn convert_positions_to_utf16(value: &mut Value, pos_conv: &Utf8ToUtf
             if let Some(Value::Number(n)) = map.get("character")
                 && let Some(pos) = n.as_u64()
             {
-                map.insert(
-                    "character".to_string(),
-                    json!(pos_conv.convert(pos as usize)),
-                );
+                map.insert("character".to_string(), json!(pos_conv.convert(pos as usize)));
             }
 
             // Convert column in loc objects (loc has line and column fields)
@@ -158,18 +481,23 @@ pub(crate) fn convert_positions_to_utf16(value: &mut Value, pos_conv: &Utf8ToUtf
 
 /// Convert a modern AST to legacy AST format.
 pub fn convert_to_legacy(source: &str, ast: Root) -> Value {
+    convert_to_legacy_ref(source, &ast)
+}
+
+/// Convert a borrowed modern AST to legacy AST format. `compile()` needs this
+/// form: it still owns the `Root` when it fills the public `ast` field.
+pub fn convert_to_legacy_ref(source: &str, ast: &Root) -> Value {
     // RAII install of the serialize arena so as_json() calls can resolve
     // JsNodeIds. The guard restores the prior pointer on drop, preserving
     // any outer scope (e.g. when this is invoked from inside `compile()`).
     //
-    // SAFETY: `ast.arena` lives until `ast` is dropped at the end of
-    // `convert_to_legacy_inner`, which runs *before* the guard is
-    // dropped because `_guard` is declared first.
+    // SAFETY: `ast` outlives this call, so `ast.arena` outlives the guard.
     let _guard = unsafe { crate::ast::arena::SerializeArenaGuard::new(&ast.arena as *const _) };
     convert_to_legacy_inner(source, ast)
 }
 
-fn convert_to_legacy_inner(source: &str, ast: Root) -> Value {
+fn convert_to_legacy_inner(source: &str, ast: &Root) -> Value {
+    let pos_conv = Utf8ToUtf16::for_legacy(source, ast.skip_expression_loc);
     let mut result = Map::new();
 
     // Calculate html fragment start/end
@@ -183,17 +511,11 @@ fn convert_to_legacy_inner(source: &str, ast: Root) -> Value {
 
         let source_bytes = source.as_bytes();
         while start < source.len()
-            && source_bytes
-                .get(start)
-                .is_some_and(|&b| b.is_ascii_whitespace())
+            && source_bytes.get(start).is_some_and(|&b| b.is_ascii_whitespace())
         {
             start += 1;
         }
-        while end > 0
-            && source_bytes
-                .get(end - 1)
-                .is_some_and(|&b| b.is_ascii_whitespace())
-        {
+        while end > 0 && source_bytes.get(end - 1).is_some_and(|&b| b.is_ascii_whitespace()) {
             end -= 1;
         }
 
@@ -228,57 +550,45 @@ fn convert_to_legacy_inner(source: &str, ast: Root) -> Value {
     }
 
     // Build html fragment
-    let mut html = Map::new();
-    html.insert("type".to_string(), json!("Fragment"));
-    html.insert("start".to_string(), json!(start));
-    html.insert("end".to_string(), json!(end));
-    html.insert(
-        "children".to_string(),
-        json!(
-            fragment_nodes
-                .iter()
-                .map(|node| convert_node(source, node, &[]))
-                .collect::<Vec<_>>()
-        ),
-    );
-    result.insert("html".to_string(), Value::Object(html));
+    let html = estree_obj! {
+        "type": "Fragment",
+        "start": start,
+        "end": end,
+        "children" => children_json(source, &fragment_nodes, &[], &pos_conv),
+    };
+    estree_fields!(result, "html" => html);
 
     // Convert instance script
-    if let Some(instance) = ast.instance {
-        let mut script = convert_script(&instance);
+    if let Some(instance) = &ast.instance {
+        let mut script = convert_script(instance, &pos_conv);
         // Remove attributes field from instance
         script.remove("attributes");
         result.insert("instance".to_string(), Value::Object(script));
     }
 
     // Convert module script
-    if let Some(module) = ast.module {
-        let mut script = convert_script(&module);
+    if let Some(module) = &ast.module {
+        let mut script = convert_script(module, &pos_conv);
         // Remove attributes field from module
         script.remove("attributes");
         result.insert("module".to_string(), Value::Object(script));
     }
 
     // Convert CSS
-    if let Some(css) = ast.css {
-        result.insert("css".to_string(), convert_css(&css));
+    if let Some(css) = &ast.css {
+        result.insert("css".to_string(), convert_css(css));
     }
 
     // Emit `_comments` mirroring upstream `legacy.js`. The legacy AST uses
     // `_comments` (not `comments`) because the prettier plugin sniffs for
     // a top-level `comments` field. See upstream commit `92e2fc120`.
     if !ast.comments.is_empty() {
-        let comments_value: Vec<Value> = ast
-            .comments
-            .iter()
-            .map(serde_json::to_value)
-            .collect::<Result<_, _>>()
-            .unwrap_or_default();
+        let comments_value: Vec<Value> =
+            ast.comments.iter().map(|comment| comment_json(comment, &pos_conv)).collect();
         result.insert("_comments".to_string(), Value::Array(comments_value));
     }
 
     // Convert all positions from UTF-8 to UTF-16
-    let pos_conv = Utf8ToUtf16::new(source);
     let mut final_result = Value::Object(result);
     convert_positions_to_utf16(&mut final_result, &pos_conv);
 
@@ -290,13 +600,16 @@ fn convert_to_legacy_inner(source: &str, ast: Root) -> Value {
 /// Returns a `Map` (not a `Value::Object`) so callers can mutate fields
 /// directly — e.g. removing the `attributes` field for instance/module
 /// scripts — without round-tripping through `as_object_mut().unwrap()`.
-fn convert_script(script: &Script) -> Map<String, Value> {
+fn convert_script(script: &Script, positions: &Utf8ToUtf16) -> Map<String, Value> {
     let mut result = Map::new();
-    result.insert("type".to_string(), json!("Script"));
-    result.insert("start".to_string(), json!(script.start));
-    result.insert("end".to_string(), json!(script.end));
-    result.insert("context".to_string(), json!(script.context));
-    result.insert("content".to_string(), script.content.as_json().clone());
+    estree_fields!(
+        result,
+        "type": "Script",
+        "start": script.start,
+        "end": script.end,
+        "context": script.context,
+        "content" => script_json(script, positions),
+    );
     result
 }
 
@@ -365,36 +678,55 @@ fn convert_css_node(node: &mut Value) {
     }
 }
 
-fn convert_node(source: &str, node: &TemplateNode, path: &[&str]) -> Value {
+fn convert_node(
+    source: &str,
+    node: &TemplateNode,
+    path: &[&str],
+    positions: &Utf8ToUtf16,
+) -> Value {
     match node {
         TemplateNode::Text(text) => convert_text(text, path),
         TemplateNode::Comment(comment) => convert_comment(comment),
-        TemplateNode::ExpressionTag(expr_tag) => convert_expression_tag(expr_tag, path),
-        TemplateNode::HtmlTag(html_tag) => convert_html_tag(html_tag),
-        TemplateNode::ConstTag(const_tag) => convert_const_tag(const_tag),
-        TemplateNode::DeclarationTag(decl_tag) => convert_declaration_tag(decl_tag),
-        TemplateNode::DebugTag(debug_tag) => convert_debug_tag(debug_tag),
-        TemplateNode::RenderTag(render_tag) => convert_render_tag(render_tag),
-        TemplateNode::AttachTag(attach_tag) => convert_attach_tag(attach_tag),
-        TemplateNode::IfBlock(if_block) => convert_if_block(source, if_block),
-        TemplateNode::EachBlock(each_block) => convert_each_block(source, each_block),
-        TemplateNode::AwaitBlock(await_block) => convert_await_block(source, await_block),
-        TemplateNode::KeyBlock(key_block) => convert_key_block(source, key_block),
-        TemplateNode::SnippetBlock(snippet_block) => convert_snippet_block(source, snippet_block),
-        TemplateNode::RegularElement(element) => convert_regular_element(source, element),
-        TemplateNode::Component(component) => convert_component(source, component),
-        TemplateNode::TitleElement(title) => convert_title_element(source, title),
-        TemplateNode::SlotElement(slot) => convert_slot_element(source, slot),
-        TemplateNode::SvelteBody(element) => convert_svelte_body(source, element),
-        TemplateNode::SvelteComponent(element) => convert_svelte_component(source, element),
-        TemplateNode::SvelteDocument(element) => convert_svelte_document(source, element),
-        TemplateNode::SvelteElement(element) => convert_svelte_element(source, element),
-        TemplateNode::SvelteFragment(element) => convert_svelte_fragment(source, element),
-        TemplateNode::SvelteBoundary(element) => convert_svelte_boundary(source, element),
-        TemplateNode::SvelteHead(element) => convert_svelte_head(source, element),
-        TemplateNode::SvelteOptions(element) => convert_svelte_options(element),
-        TemplateNode::SvelteSelf(element) => convert_svelte_self(source, element),
-        TemplateNode::SvelteWindow(element) => convert_svelte_window(source, element),
+        TemplateNode::ExpressionTag(expr_tag) => convert_expression_tag(expr_tag, path, positions),
+        TemplateNode::HtmlTag(html_tag) => convert_html_tag(html_tag, positions),
+        TemplateNode::ConstTag(const_tag) => convert_const_tag(const_tag, positions),
+        TemplateNode::DeclarationTag(decl_tag) => convert_declaration_tag(decl_tag, positions),
+        TemplateNode::DebugTag(debug_tag) => convert_debug_tag(debug_tag, positions),
+        TemplateNode::RenderTag(render_tag) => convert_render_tag(render_tag, positions),
+        TemplateNode::AttachTag(attach_tag) => convert_attach_tag(attach_tag, positions),
+        TemplateNode::IfBlock(if_block) => convert_if_block(source, if_block, positions),
+        TemplateNode::EachBlock(each_block) => convert_each_block(source, each_block, positions),
+        TemplateNode::AwaitBlock(await_block) => {
+            convert_await_block(source, await_block, positions)
+        }
+        TemplateNode::KeyBlock(key_block) => convert_key_block(source, key_block, positions),
+        TemplateNode::SnippetBlock(snippet_block) => {
+            convert_snippet_block(source, snippet_block, positions)
+        }
+        TemplateNode::RegularElement(element) => {
+            convert_regular_element(source, element, positions)
+        }
+        TemplateNode::Component(component) => convert_component(source, component, positions),
+        TemplateNode::TitleElement(title) => convert_title_element(source, title, positions),
+        TemplateNode::SlotElement(slot) => convert_slot_element(source, slot, positions),
+        TemplateNode::SvelteBody(element) => convert_svelte_body(source, element, positions),
+        TemplateNode::SvelteComponent(element) => {
+            convert_svelte_component(source, element, positions)
+        }
+        TemplateNode::SvelteDocument(element) => {
+            convert_svelte_document(source, element, positions)
+        }
+        TemplateNode::SvelteElement(element) => convert_svelte_element(source, element, positions),
+        TemplateNode::SvelteFragment(element) => {
+            convert_svelte_fragment(source, element, positions)
+        }
+        TemplateNode::SvelteBoundary(element) => {
+            convert_svelte_boundary(source, element, positions)
+        }
+        TemplateNode::SvelteHead(element) => convert_svelte_head(source, element, positions),
+        TemplateNode::SvelteOptions(element) => convert_svelte_options(element, positions),
+        TemplateNode::SvelteSelf(element) => convert_svelte_self(source, element, positions),
+        TemplateNode::SvelteWindow(element) => convert_svelte_window(source, element, positions),
     }
 }
 
@@ -403,13 +735,11 @@ fn convert_text(text: &Text, path: &[&str]) -> Value {
     let in_style = path.last() == Some(&"style");
 
     let mut result = Map::new();
-    result.insert("type".to_string(), json!("Text"));
-    result.insert("start".to_string(), json!(text.start));
-    result.insert("end".to_string(), json!(text.end));
+    estree_fields!(result, "type": "Text", "start": text.start, "end": text.end);
     if !in_style {
-        result.insert("raw".to_string(), json!(text.raw.as_str()));
+        estree_fields!(result, "raw": text.raw.as_ref());
     }
-    result.insert("data".to_string(), json!(text.data.as_str()));
+    estree_fields!(result, "data": text.data.as_ref());
     Value::Object(result)
 }
 
@@ -417,13 +747,13 @@ fn convert_comment(comment: &Comment) -> Value {
     // Extract svelte-ignore directives
     let ignores = extract_svelte_ignore(&comment.data);
 
-    let mut result = Map::new();
-    result.insert("type".to_string(), json!("Comment"));
-    result.insert("start".to_string(), json!(comment.start));
-    result.insert("end".to_string(), json!(comment.end));
-    result.insert("data".to_string(), json!(comment.data.as_str()));
-    result.insert("ignores".to_string(), json!(ignores));
-    Value::Object(result)
+    estree_obj! {
+        "type": "Comment",
+        "start": comment.start,
+        "end": comment.end,
+        "data": comment.data.as_str(),
+        "ignores": ignores,
+    }
 }
 
 fn extract_svelte_ignore(data: &str) -> Vec<String> {
@@ -444,41 +774,34 @@ fn extract_svelte_ignore(data: &str) -> Vec<String> {
     }
 }
 
-fn convert_expression_tag(expr_tag: &ExpressionTag, path: &[&str]) -> Value {
-    // Check if parent is an Attribute and starts with {
-    let in_attribute = path.last() == Some(&"Attribute");
+fn convert_expression_tag(
+    expr_tag: &ExpressionTag,
+    path: &[&str],
+    positions: &Utf8ToUtf16,
+) -> Value {
+    // An expression tag whose parent is an Attribute is the `{id}` shorthand.
+    let ty = if path.last() == Some(&"Attribute") { "AttributeShorthand" } else { "MustacheTag" };
 
-    let mut result = Map::new();
-    if in_attribute {
-        // This is an AttributeShorthand
-        result.insert("type".to_string(), json!("AttributeShorthand"));
-    } else {
-        result.insert("type".to_string(), json!("MustacheTag"));
+    estree_obj! {
+        "type": ty,
+        "start": expr_tag.start,
+        "end": expr_tag.end,
+        "expression" => expression_json(&expr_tag.expression, positions),
     }
-    result.insert("start".to_string(), json!(expr_tag.start));
-    result.insert("end".to_string(), json!(expr_tag.end));
-    result.insert(
-        "expression".to_string(),
-        expr_tag.expression.as_json().clone(),
-    );
-    Value::Object(result)
 }
 
-fn convert_html_tag(html_tag: &HtmlTag) -> Value {
-    let mut result = Map::new();
-    result.insert("type".to_string(), json!("RawMustacheTag"));
-    result.insert("start".to_string(), json!(html_tag.start));
-    result.insert("end".to_string(), json!(html_tag.end));
-    result.insert(
-        "expression".to_string(),
-        html_tag.expression.as_json().clone(),
-    );
-    Value::Object(result)
+fn convert_html_tag(html_tag: &HtmlTag, positions: &Utf8ToUtf16) -> Value {
+    estree_obj! {
+        "type": "RawMustacheTag",
+        "start": html_tag.start,
+        "end": html_tag.end,
+        "expression" => expression_json(&html_tag.expression, positions),
+    }
 }
 
-fn convert_const_tag(const_tag: &ConstTag) -> Value {
+fn convert_const_tag(const_tag: &ConstTag, positions: &Utf8ToUtf16) -> Value {
     // Convert ConstTag to legacy format with AssignmentExpression
-    let declaration = &const_tag.declaration.as_json();
+    let declaration = declaration_json(&const_tag.declaration, positions);
 
     // Extract the declarator from the VariableDeclaration
     if let Some(declarations) = declaration.get("declarations").and_then(|d| d.as_array())
@@ -494,28 +817,25 @@ fn convert_const_tag(const_tag: &ConstTag) -> Value {
         }
 
         // Calculate start position (after 'const ')
-        let decl_start = declaration
-            .get("start")
-            .and_then(|s| s.as_u64())
-            .unwrap_or(0);
+        let decl_start = declaration.get("start").and_then(|s| s.as_u64()).unwrap_or(0);
         let decl_end = declaration.get("end").and_then(|s| s.as_u64()).unwrap_or(0);
 
-        let mut result = Map::new();
-        result.insert("type".to_string(), json!("ConstTag"));
-        result.insert("start".to_string(), json!(const_tag.start));
-        result.insert("end".to_string(), json!(const_tag.end));
-        result.insert(
-            "expression".to_string(),
-            json!({
-                "type": "AssignmentExpression",
-                "start": decl_start + 6, // Skip 'const '
-                "end": decl_end,
-                "operator": "=",
-                "left": id,
-                "right": init
-            }),
-        );
-        return Value::Object(result);
+        let mut expression = json!({
+            "type": "AssignmentExpression",
+            "start": decl_start + 6, // Skip 'const '
+            "end": decl_end,
+            "operator": "=",
+            "left": id,
+            "right": init
+        });
+        add_estree_locs(&mut expression, positions);
+
+        return estree_obj! {
+            "type": "ConstTag",
+            "start": const_tag.start,
+            "end": const_tag.end,
+            "expression" => expression,
+        };
     }
 
     // Fallback
@@ -523,7 +843,7 @@ fn convert_const_tag(const_tag: &ConstTag) -> Value {
         "type": "ConstTag",
         "start": const_tag.start,
         "end": const_tag.end,
-        "expression": const_tag.declaration.as_json()
+        "expression": declaration_json(&const_tag.declaration, positions)
     })
 }
 
@@ -534,96 +854,78 @@ fn convert_const_tag(const_tag: &ConstTag) -> Value {
 /// `AssignmentExpression` is intentionally NOT emitted because legacy
 /// consumers (svelte2tsx, etc.) expect the declaration kind (`let` / `const`)
 /// and may have multiple declarators.
-fn convert_declaration_tag(decl_tag: &crate::ast::template::DeclarationTag) -> Value {
-    let mut result = Map::new();
-    result.insert("type".to_string(), json!("DeclarationTag"));
-    result.insert("start".to_string(), json!(decl_tag.start));
-    result.insert("end".to_string(), json!(decl_tag.end));
-    result.insert(
-        "declaration".to_string(),
-        decl_tag.declaration.as_json().clone(),
-    );
-    Value::Object(result)
+fn convert_declaration_tag(
+    decl_tag: &crate::ast::template::DeclarationTag,
+    positions: &Utf8ToUtf16,
+) -> Value {
+    estree_obj! {
+        "type": "DeclarationTag",
+        "start": decl_tag.start,
+        "end": decl_tag.end,
+        "declaration" => declaration_json(&decl_tag.declaration, positions),
+    }
 }
 
-fn convert_debug_tag(debug_tag: &DebugTag) -> Value {
-    let mut result = Map::new();
-    result.insert("type".to_string(), json!("DebugTag"));
-    result.insert("start".to_string(), json!(debug_tag.start));
-    result.insert("end".to_string(), json!(debug_tag.end));
-    result.insert(
-        "identifiers".to_string(),
-        json!(
-            debug_tag
-                .identifiers
-                .iter()
-                .map(|e| e.as_json().clone())
-                .collect::<Vec<_>>()
-        ),
-    );
-    Value::Object(result)
+fn convert_debug_tag(debug_tag: &DebugTag, positions: &Utf8ToUtf16) -> Value {
+    estree_obj! {
+        "type": "DebugTag",
+        "start": debug_tag.start,
+        "end": debug_tag.end,
+        "identifiers": debug_tag
+            .identifiers
+            .iter()
+            .map(|e| expression_json(e, positions))
+            .collect::<Vec<_>>(),
+    }
 }
 
-fn convert_render_tag(render_tag: &RenderTag) -> Value {
-    let mut result = Map::new();
-    result.insert("type".to_string(), json!("RenderTag"));
-    result.insert("start".to_string(), json!(render_tag.start));
-    result.insert("end".to_string(), json!(render_tag.end));
-    result.insert(
-        "expression".to_string(),
-        render_tag.expression.as_json().clone(),
-    );
-    Value::Object(result)
+fn convert_render_tag(render_tag: &RenderTag, positions: &Utf8ToUtf16) -> Value {
+    estree_obj! {
+        "type": "RenderTag",
+        "start": render_tag.start,
+        "end": render_tag.end,
+        "expression" => expression_json(&render_tag.expression, positions),
+    }
 }
 
-fn convert_attach_tag(attach_tag: &AttachTag) -> Value {
-    let mut result = Map::new();
-    result.insert("type".to_string(), json!("AttachTag"));
-    result.insert("start".to_string(), json!(attach_tag.start));
-    result.insert("end".to_string(), json!(attach_tag.end));
-    result.insert(
-        "expression".to_string(),
-        attach_tag.expression.as_json().clone(),
-    );
-    Value::Object(result)
+fn convert_attach_tag(attach_tag: &AttachTag, positions: &Utf8ToUtf16) -> Value {
+    estree_obj! {
+        "type": "AttachTag",
+        "start": attach_tag.start,
+        "end": attach_tag.end,
+        "expression" => expression_json(&attach_tag.expression, positions),
+    }
 }
 
-fn convert_if_block(source: &str, if_block: &IfBlock) -> Value {
+fn convert_if_block(source: &str, if_block: &IfBlock, positions: &Utf8ToUtf16) -> Value {
     let mut else_block = None;
 
     if let Some(ref alternate) = if_block.alternate {
-        let mut nodes = alternate.nodes.clone();
-
-        // Check if this is an else-if chain
-        if nodes.len() == 1
-            && let TemplateNode::IfBlock(inner_if) = &nodes[0]
+        // The child list whose first node gives the ElseBlock start; an else-if
+        // chain unwraps to the inner if's consequent. Borrowed, not cloned — only
+        // the first node's start is read here.
+        let start_nodes: &[TemplateNode] = if alternate.nodes.len() == 1
+            && let TemplateNode::IfBlock(inner_if) = &alternate.nodes[0]
             && inner_if.elseif
         {
-            // Get children from the inner if block's consequent
-            nodes = inner_if.consequent.nodes.clone();
-        }
+            &inner_if.consequent.nodes
+        } else {
+            &alternate.nodes
+        };
 
         let end = find_last_brace_before(source, if_block.end as usize);
-        let start = nodes
-            .first()
-            .map(|n| get_node_start(n) as usize)
-            .unwrap_or(end);
+        let start = start_nodes.first().map(|n| get_node_start(n) as usize).unwrap_or(end);
 
         // Remove surrounding whitespace from nodes
-        let mut legacy_nodes: Vec<Value> = Vec::new();
         let mut alt_nodes = alternate.nodes.clone();
         remove_surrounding_whitespace_nodes(&mut alt_nodes);
 
-        for node in &alt_nodes {
-            legacy_nodes.push(convert_node(source, node, &[]));
-        }
-
-        else_block = Some(json!({
+        else_block = Some(estree_obj! {
             "type": "ElseBlock",
             "start": start,
             "end": end,
-            "children": legacy_nodes
-        }));
+            "children" => children_json(source, &alt_nodes, &[], positions),
+        });
     }
 
     // Calculate start position for elseif blocks
@@ -643,122 +945,90 @@ fn convert_if_block(source: &str, if_block: &IfBlock) -> Value {
     remove_surrounding_whitespace_nodes(&mut consequent_nodes);
 
     let mut result = Map::new();
-    result.insert("type".to_string(), json!("IfBlock"));
-    result.insert("start".to_string(), json!(start));
-    result.insert("end".to_string(), json!(if_block.end));
-    result.insert("expression".to_string(), if_block.test.as_json().clone());
-    result.insert(
-        "children".to_string(),
-        json!(
-            consequent_nodes
-                .iter()
-                .map(|n| convert_node(source, n, &[]))
-                .collect::<Vec<_>>()
-        ),
+    estree_fields!(
+        result,
+        "type": "IfBlock",
+        "start": start,
+        "end": if_block.end,
+        "expression" => expression_json(&if_block.test, positions),
+        "children" => children_json(source, &consequent_nodes, &[], positions),
     );
     if let Some(else_block) = else_block {
-        result.insert("else".to_string(), else_block);
+        estree_fields!(result, "else" => else_block);
     }
     if if_block.elseif {
-        result.insert("elseif".to_string(), json!(true));
+        estree_fields!(result, "elseif": true);
     }
     Value::Object(result)
 }
 
-fn convert_each_block(source: &str, each_block: &EachBlock) -> Value {
+fn convert_each_block(source: &str, each_block: &EachBlock, positions: &Utf8ToUtf16) -> Value {
     let mut else_block = None;
 
     if let Some(ref fallback) = each_block.fallback {
         let end = find_last_brace_before(source, each_block.end as usize);
-        let start = fallback
-            .nodes
-            .first()
-            .map(|n| get_node_start(n) as usize)
-            .unwrap_or(end);
+        let start = fallback.nodes.first().map(|n| get_node_start(n) as usize).unwrap_or(end);
 
         let mut fallback_nodes = fallback.nodes.clone();
         remove_surrounding_whitespace_nodes(&mut fallback_nodes);
 
-        else_block = Some(json!({
+        else_block = Some(estree_obj! {
             "type": "ElseBlock",
             "start": start,
             "end": end,
-            "children": fallback_nodes.iter().map(|n| convert_node(source, n, &[])).collect::<Vec<_>>()
-        }));
+            "children" => children_json(source, &fallback_nodes, &[], positions),
+        });
     }
 
     let mut body_nodes = each_block.body.nodes.clone();
     remove_surrounding_whitespace_nodes(&mut body_nodes);
 
     let mut result = Map::new();
-    result.insert("type".to_string(), json!("EachBlock"));
-    result.insert("start".to_string(), json!(each_block.start));
-    result.insert("end".to_string(), json!(each_block.end));
-    result.insert(
-        "children".to_string(),
-        json!(
-            body_nodes
-                .iter()
-                .map(|n| convert_node(source, n, &[]))
-                .collect::<Vec<_>>()
-        ),
-    );
-    result.insert(
-        "context".to_string(),
-        each_block
+    estree_fields!(
+        result,
+        "type": "EachBlock",
+        "start": each_block.start,
+        "end": each_block.end,
+        "children" => children_json(source, &body_nodes, &[], positions),
+        "context" => each_block
             .context
             .as_ref()
-            .map(|c| c.as_json().clone())
+            .map(|c| binding_json(c, positions))
             .unwrap_or(json!(null)),
-    );
-    result.insert(
-        "expression".to_string(),
-        each_block.expression.as_json().clone(),
+        "expression" => expression_json(&each_block.expression, positions),
     );
     if let Some(ref index) = each_block.index {
-        result.insert("index".to_string(), json!(index.as_str()));
+        estree_fields!(result, "index": index.as_str());
     }
     if let Some(ref key) = each_block.key {
-        result.insert("key".to_string(), key.as_json().clone());
+        estree_fields!(result, "key" => expression_json(key, positions));
     }
     if let Some(else_block) = else_block {
-        result.insert("else".to_string(), else_block);
+        estree_fields!(result, "else" => else_block);
     }
     Value::Object(result)
 }
 
-fn convert_await_block(source: &str, await_block: &AwaitBlock) -> Value {
+fn convert_await_block(source: &str, await_block: &AwaitBlock, positions: &Utf8ToUtf16) -> Value {
     // Get expression end position
-    let expr_end = await_block
-        .expression
-        .as_json()
-        .get("end")
-        .and_then(|e| e.as_u64())
-        .unwrap_or(await_block.start as u64) as usize;
+    let expression = expression_json(&await_block.expression, positions);
+    let expr_end =
+        expression.get("end").and_then(|e| e.as_u64()).unwrap_or(await_block.start as u64) as usize;
 
-    let mut pending_block = json!({
-        "type": "PendingBlock",
-        "start": null,
-        "end": null,
-        "children": [],
-        "skip": true
-    });
+    // A branch that is absent in the source is emitted as a skipped placeholder.
+    let skipped = |ty: &str| {
+        estree_obj! {
+            "type": ty,
+            "start": json!(null),
+            "end": json!(null),
+            "children": [] as [Value; 0],
+            "skip": true,
+        }
+    };
 
-    let mut then_block = json!({
-        "type": "ThenBlock",
-        "start": null,
-        "end": null,
-        "children": [],
-        "skip": true
-    });
-
-    let mut catch_block = json!({
-        "type": "CatchBlock",
-        "start": null,
-        "end": null,
-        "children": [],
-        "skip": true
-    });
+    let mut pending_block = skipped("PendingBlock");
+    let mut then_block = skipped("ThenBlock");
+    let mut catch_block = skipped("CatchBlock");
 
     if let Some(ref pending) = await_block.pending {
         let first_start = pending.nodes.first().map(|n| get_node_start(n) as usize);
@@ -767,19 +1037,16 @@ fn convert_await_block(source: &str, await_block: &AwaitBlock) -> Value {
         let start = first_start.unwrap_or_else(|| find_closing_brace_after(source, expr_end));
         let end = last_end.unwrap_or(start);
 
-        pending_block = json!({
+        pending_block = estree_obj! {
             "type": "PendingBlock",
             "start": start,
             "end": end,
-            "children": pending.nodes.iter().map(|n| convert_node(source, n, &[])).collect::<Vec<_>>(),
-            "skip": false
-        });
+            "children" => children_json(source, &pending.nodes, &[], positions),
+            "skip": false,
+        };
     }
 
-    let pending_end = pending_block
-        .get("end")
-        .and_then(|e| e.as_u64())
-        .map(|e| e as usize);
+    let pending_end = pending_block.get("end").and_then(|e| e.as_u64()).map(|e| e as usize);
 
     if let Some(ref then) = await_block.then {
         let first_start = then.nodes.first().map(|n| get_node_start(n) as usize);
@@ -799,19 +1066,16 @@ fn convert_await_block(source: &str, await_block: &AwaitBlock) -> Value {
             }
         });
 
-        then_block = json!({
+        then_block = estree_obj! {
             "type": "ThenBlock",
             "start": start,
             "end": end,
-            "children": then.nodes.iter().map(|n| convert_node(source, n, &[])).collect::<Vec<_>>(),
-            "skip": false
-        });
+            "children" => children_json(source, &then.nodes, &[], positions),
+            "skip": false,
+        };
     }
 
-    let then_end = then_block
-        .get("end")
-        .and_then(|e| e.as_u64())
-        .map(|e| e as usize);
+    let then_end = then_block.get("end").and_then(|e| e.as_u64()).map(|e| e as usize);
 
     if let Some(ref catch) = await_block.catch {
         let first_start = catch.nodes.first().map(|n| get_node_start(n) as usize);
@@ -832,588 +1096,381 @@ fn convert_await_block(source: &str, await_block: &AwaitBlock) -> Value {
             }
         });
 
-        catch_block = json!({
+        catch_block = estree_obj! {
             "type": "CatchBlock",
             "start": start,
             "end": end,
-            "children": catch.nodes.iter().map(|n| convert_node(source, n, &[])).collect::<Vec<_>>(),
-            "skip": false
-        });
+            "children" => children_json(source, &catch.nodes, &[], positions),
+            "skip": false,
+        };
     }
 
-    let mut result = Map::new();
-    result.insert("type".to_string(), json!("AwaitBlock"));
-    result.insert("start".to_string(), json!(await_block.start));
-    result.insert("end".to_string(), json!(await_block.end));
-    result.insert(
-        "expression".to_string(),
-        await_block.expression.as_json().clone(),
-    );
-    result.insert(
-        "value".to_string(),
-        await_block
+    estree_obj! {
+        "type": "AwaitBlock",
+        "start": await_block.start,
+        "end": await_block.end,
+        "expression" => expression,
+        "value" => await_block
             .value
             .as_ref()
-            .map(|v| v.as_json().clone())
+            .map(|v| binding_json(v, positions))
             .unwrap_or(json!(null)),
-    );
-    result.insert(
-        "error".to_string(),
-        await_block
+        "error" => await_block
             .error
             .as_ref()
-            .map(|e| e.as_json().clone())
+            .map(|e| binding_json(e, positions))
             .unwrap_or(json!(null)),
-    );
-    result.insert("pending".to_string(), pending_block);
-    result.insert("then".to_string(), then_block);
-    result.insert("catch".to_string(), catch_block);
-    Value::Object(result)
+        "pending" => pending_block,
+        "then" => then_block,
+        "catch" => catch_block,
+    }
 }
 
-fn convert_key_block(source: &str, key_block: &KeyBlock) -> Value {
+fn convert_key_block(source: &str, key_block: &KeyBlock, positions: &Utf8ToUtf16) -> Value {
     let mut fragment_nodes = key_block.fragment.nodes.clone();
     remove_surrounding_whitespace_nodes(&mut fragment_nodes);
 
-    let mut result = Map::new();
-    result.insert("type".to_string(), json!("KeyBlock"));
-    result.insert("start".to_string(), json!(key_block.start));
-    result.insert("end".to_string(), json!(key_block.end));
-    result.insert(
-        "expression".to_string(),
-        key_block.expression.as_json().clone(),
-    );
-    result.insert(
-        "children".to_string(),
-        json!(
-            fragment_nodes
-                .iter()
-                .map(|n| convert_node(source, n, &[]))
-                .collect::<Vec<_>>()
-        ),
-    );
-    Value::Object(result)
+    estree_obj! {
+        "type": "KeyBlock",
+        "start": key_block.start,
+        "end": key_block.end,
+        "expression" => expression_json(&key_block.expression, positions),
+        "children" => children_json(source, &fragment_nodes, &[], positions),
+    }
 }
 
-fn convert_snippet_block(source: &str, snippet_block: &SnippetBlock) -> Value {
+fn convert_snippet_block(
+    source: &str,
+    snippet_block: &SnippetBlock,
+    positions: &Utf8ToUtf16,
+) -> Value {
     let mut body_nodes = snippet_block.body.nodes.clone();
     remove_surrounding_whitespace_nodes(&mut body_nodes);
 
     let mut result = Map::new();
-    result.insert("type".to_string(), json!("SnippetBlock"));
-    result.insert("start".to_string(), json!(snippet_block.start));
-    result.insert("end".to_string(), json!(snippet_block.end));
-    result.insert(
-        "expression".to_string(),
-        snippet_block.expression.as_json().clone(),
-    );
-    result.insert(
-        "parameters".to_string(),
-        json!(
-            snippet_block
-                .parameters
-                .iter()
-                .map(|p| p.as_json().clone())
-                .collect::<Vec<_>>()
-        ),
-    );
-    result.insert(
-        "children".to_string(),
-        json!(
-            body_nodes
-                .iter()
-                .map(|n| convert_node(source, n, &[]))
-                .collect::<Vec<_>>()
-        ),
+    estree_fields!(
+        result,
+        "type": "SnippetBlock",
+        "start": snippet_block.start,
+        "end": snippet_block.end,
+        "expression" => binding_json(&snippet_block.expression, positions),
+        "parameters": snippet_block
+            .parameters
+            .iter()
+            .map(|p| expression_json(p, positions))
+            .collect::<Vec<_>>(),
+        "children" => children_json(source, &body_nodes, &[], positions),
     );
     if let Some(ref type_params) = snippet_block.type_params {
-        result.insert("typeParams".to_string(), json!(type_params.as_str()));
+        estree_fields!(result, "typeParams": type_params.as_str());
     }
     Value::Object(result)
 }
 
-fn convert_regular_element(source: &str, element: &RegularElement) -> Value {
-    let path = if element.name.as_str() == "style" {
-        vec!["style"]
-    } else {
-        vec![]
-    };
+// Element / InlineComponent / Slot (below) don't carry a `name_loc` in the
+// legacy format, unlike their modern-AST counterparts.
 
-    let mut result = Map::new();
-    result.insert("type".to_string(), json!("Element"));
-    result.insert("start".to_string(), json!(element.start));
-    result.insert("end".to_string(), json!(element.end));
-    result.insert("name".to_string(), json!(element.name.as_str()));
-    // Legacy format does not include name_loc for elements
-    result.insert(
-        "attributes".to_string(),
-        json!(
-            element
-                .attributes
-                .iter()
-                .map(|a| convert_attribute(source, a))
-                .collect::<Vec<_>>()
-        ),
-    );
-    result.insert(
-        "children".to_string(),
-        json!(
-            element
-                .fragment
-                .nodes
-                .iter()
-                .map(|n| convert_node(source, n, &path))
-                .collect::<Vec<_>>()
-        ),
-    );
-    Value::Object(result)
+/// `type`, `start`, `end`, `name`, `attributes`, `children` — the key order the
+/// legacy AST uses for elements whose tag name comes from the source.
+fn convert_element_like(
+    source: &str,
+    ty: &str,
+    name: &str,
+    start: u32,
+    end: u32,
+    attributes: &[Attribute],
+    nodes: &[TemplateNode],
+    path: &[&str],
+    positions: &Utf8ToUtf16,
+) -> Value {
+    estree_obj! {
+        "type": ty,
+        "start": start,
+        "end": end,
+        "name": name,
+        "attributes" => attrs_json(source, attributes, positions),
+        "children" => children_json(source, nodes, path, positions),
+    }
 }
 
-fn convert_component(source: &str, component: &Component) -> Value {
-    let mut result = Map::new();
-    result.insert("type".to_string(), json!("InlineComponent"));
-    result.insert("start".to_string(), json!(component.start));
-    result.insert("end".to_string(), json!(component.end));
-    result.insert("name".to_string(), json!(component.name.as_str()));
-    // Legacy format does not include name_loc for components
-    result.insert(
-        "attributes".to_string(),
-        json!(
-            component
-                .attributes
-                .iter()
-                .map(|a| convert_attribute(source, a))
-                .collect::<Vec<_>>()
-        ),
-    );
-    result.insert(
-        "children".to_string(),
-        json!(
-            component
-                .fragment
-                .nodes
-                .iter()
-                .map(|n| convert_node(source, n, &[]))
-                .collect::<Vec<_>>()
-        ),
-    );
-    Value::Object(result)
+/// `type`, `name`, `start`, `end`, `attributes`, `children` — the key order the
+/// legacy AST uses for `<svelte:*>` elements, whose name is a fixed literal.
+fn convert_svelte_element_like(
+    source: &str,
+    ty: &str,
+    name: &str,
+    element: &SvelteElement,
+    nodes: &[TemplateNode],
+    positions: &Utf8ToUtf16,
+) -> Value {
+    estree_obj! {
+        "type": ty,
+        "name": name,
+        "start": element.start,
+        "end": element.end,
+        "attributes" => attrs_json(source, &element.attributes, positions),
+        "children" => children_json(source, nodes, &[], positions),
+    }
 }
 
-fn convert_title_element(source: &str, title: &TitleElement) -> Value {
-    let mut result = Map::new();
-    result.insert("type".to_string(), json!("Title"));
-    result.insert("name".to_string(), json!("title"));
-    result.insert("start".to_string(), json!(title.start));
-    result.insert("end".to_string(), json!(title.end));
-    result.insert(
-        "attributes".to_string(),
-        json!(
-            title
-                .attributes
-                .iter()
-                .map(|a| convert_attribute(source, a))
-                .collect::<Vec<_>>()
-        ),
-    );
-    result.insert(
-        "children".to_string(),
-        json!(
-            title
-                .fragment
-                .nodes
-                .iter()
-                .map(|n| convert_node(source, n, &[]))
-                .collect::<Vec<_>>()
-        ),
-    );
-    Value::Object(result)
+fn convert_regular_element(
+    source: &str,
+    element: &RegularElement,
+    positions: &Utf8ToUtf16,
+) -> Value {
+    let path: &[&str] = if element.name.as_str() == "style" { &["style"] } else { &[] };
+
+    convert_element_like(
+        source,
+        "Element",
+        element.name.as_str(),
+        element.start,
+        element.end,
+        &element.attributes,
+        &element.fragment.nodes,
+        path,
+        positions,
+    )
 }
 
-fn convert_slot_element(source: &str, slot: &SlotElement) -> Value {
-    let mut result = Map::new();
-    result.insert("type".to_string(), json!("Slot"));
-    result.insert("start".to_string(), json!(slot.start));
-    result.insert("end".to_string(), json!(slot.end));
-    result.insert("name".to_string(), json!(slot.name.as_str()));
-    // Legacy format does not include name_loc for slots
-    result.insert(
-        "attributes".to_string(),
-        json!(
-            slot.attributes
-                .iter()
-                .map(|a| convert_attribute(source, a))
-                .collect::<Vec<_>>()
-        ),
-    );
-    result.insert(
-        "children".to_string(),
-        json!(
-            slot.fragment
-                .nodes
-                .iter()
-                .map(|n| convert_node(source, n, &[]))
-                .collect::<Vec<_>>()
-        ),
-    );
-    Value::Object(result)
+fn convert_component(source: &str, component: &Component, positions: &Utf8ToUtf16) -> Value {
+    convert_element_like(
+        source,
+        "InlineComponent",
+        component.name.as_str(),
+        component.start,
+        component.end,
+        &component.attributes,
+        &component.fragment.nodes,
+        &[],
+        positions,
+    )
 }
 
-fn convert_svelte_body(source: &str, element: &SvelteElement) -> Value {
-    let mut result = Map::new();
-    result.insert("type".to_string(), json!("Body"));
-    result.insert("name".to_string(), json!("svelte:body"));
-    result.insert("start".to_string(), json!(element.start));
-    result.insert("end".to_string(), json!(element.end));
-    result.insert(
-        "attributes".to_string(),
-        json!(
-            element
-                .attributes
-                .iter()
-                .map(|a| convert_attribute(source, a))
-                .collect::<Vec<_>>()
-        ),
-    );
-    result.insert(
-        "children".to_string(),
-        json!(
-            element
-                .fragment
-                .nodes
-                .iter()
-                .map(|n| convert_node(source, n, &[]))
-                .collect::<Vec<_>>()
-        ),
-    );
-    Value::Object(result)
+fn convert_title_element(source: &str, title: &TitleElement, positions: &Utf8ToUtf16) -> Value {
+    estree_obj! {
+        "type": "Title",
+        "name": "title",
+        "start": title.start,
+        "end": title.end,
+        "attributes" => attrs_json(source, &title.attributes, positions),
+        "children" => children_json(source, &title.fragment.nodes, &[], positions),
+    }
 }
 
-fn convert_svelte_component(source: &str, element: &SvelteComponentElement) -> Value {
-    let mut result = Map::new();
-    result.insert("type".to_string(), json!("InlineComponent"));
-    result.insert("name".to_string(), json!("svelte:component"));
-    result.insert("start".to_string(), json!(element.start));
-    result.insert("end".to_string(), json!(element.end));
-    result.insert(
-        "expression".to_string(),
-        element.expression.as_json().clone(),
-    );
-    result.insert(
-        "attributes".to_string(),
-        json!(
-            element
-                .attributes
-                .iter()
-                .map(|a| convert_attribute(source, a))
-                .collect::<Vec<_>>()
-        ),
-    );
-    result.insert(
-        "children".to_string(),
-        json!(
-            element
-                .fragment
-                .nodes
-                .iter()
-                .map(|n| convert_node(source, n, &[]))
-                .collect::<Vec<_>>()
-        ),
-    );
-    Value::Object(result)
+fn convert_slot_element(source: &str, slot: &SlotElement, positions: &Utf8ToUtf16) -> Value {
+    convert_element_like(
+        source,
+        "Slot",
+        slot.name.as_str(),
+        slot.start,
+        slot.end,
+        &slot.attributes,
+        &slot.fragment.nodes,
+        &[],
+        positions,
+    )
 }
 
-fn convert_svelte_document(source: &str, element: &SvelteElement) -> Value {
-    let mut result = Map::new();
-    result.insert("type".to_string(), json!("Document"));
-    result.insert("name".to_string(), json!("svelte:document"));
-    result.insert("start".to_string(), json!(element.start));
-    result.insert("end".to_string(), json!(element.end));
-    result.insert(
-        "attributes".to_string(),
-        json!(
-            element
-                .attributes
-                .iter()
-                .map(|a| convert_attribute(source, a))
-                .collect::<Vec<_>>()
-        ),
-    );
-    result.insert(
-        "children".to_string(),
-        json!(
-            element
-                .fragment
-                .nodes
-                .iter()
-                .map(|n| convert_node(source, n, &[]))
-                .collect::<Vec<_>>()
-        ),
-    );
-    Value::Object(result)
+fn convert_svelte_body(source: &str, element: &SvelteElement, positions: &Utf8ToUtf16) -> Value {
+    convert_svelte_element_like(
+        source,
+        "Body",
+        "svelte:body",
+        element,
+        &element.fragment.nodes,
+        positions,
+    )
 }
 
-fn convert_svelte_element(source: &str, element: &SvelteDynamicElement) -> Value {
+fn convert_svelte_component(
+    source: &str,
+    element: &SvelteComponentElement,
+    positions: &Utf8ToUtf16,
+) -> Value {
+    estree_obj! {
+        "type": "InlineComponent",
+        "name": "svelte:component",
+        "start": element.start,
+        "end": element.end,
+        "expression" => expression_json(&element.expression, positions),
+        "attributes" => attrs_json(source, &element.attributes, positions),
+        "children" => children_json(source, &element.fragment.nodes, &[], positions),
+    }
+}
+
+fn convert_svelte_document(
+    source: &str,
+    element: &SvelteElement,
+    positions: &Utf8ToUtf16,
+) -> Value {
+    convert_svelte_element_like(
+        source,
+        "Document",
+        "svelte:document",
+        element,
+        &element.fragment.nodes,
+        positions,
+    )
+}
+
+fn convert_svelte_element(
+    source: &str,
+    element: &SvelteDynamicElement,
+    positions: &Utf8ToUtf16,
+) -> Value {
     // Check if tag is a literal string and source doesn't have braces
-    let tag_start = element
-        .tag
-        .as_json()
-        .get("start")
-        .and_then(|s| s.as_u64())
-        .unwrap_or(0) as usize;
+    let tag_expression = expression_json(&element.tag, positions);
+    let tag_start = tag_expression.get("start").and_then(|s| s.as_u64()).unwrap_or(0) as usize;
     let has_braces = tag_start > 0 && source.as_bytes().get(tag_start - 1) == Some(&b'{');
 
     let tag = if !has_braces {
-        if let Some(value) = element.tag.as_json().get("value").and_then(|v| v.as_str()) {
+        if let Some(value) = tag_expression.get("value").and_then(|v| v.as_str()) {
             json!(value)
         } else {
-            element.tag.as_json().clone()
+            tag_expression
         }
     } else {
-        element.tag.as_json().clone()
+        tag_expression
     };
 
-    let mut result = Map::new();
-    result.insert("type".to_string(), json!("Element"));
-    result.insert("name".to_string(), json!("svelte:element"));
-    result.insert("start".to_string(), json!(element.start));
-    result.insert("end".to_string(), json!(element.end));
-    result.insert("tag".to_string(), tag);
-    result.insert(
-        "attributes".to_string(),
-        json!(
-            element
-                .attributes
-                .iter()
-                .map(|a| convert_attribute(source, a))
-                .collect::<Vec<_>>()
-        ),
-    );
-    result.insert(
-        "children".to_string(),
-        json!(
-            element
-                .fragment
-                .nodes
-                .iter()
-                .map(|n| convert_node(source, n, &[]))
-                .collect::<Vec<_>>()
-        ),
-    );
-    Value::Object(result)
+    estree_obj! {
+        "type": "Element",
+        "name": "svelte:element",
+        "start": element.start,
+        "end": element.end,
+        "tag" => tag,
+        "attributes" => attrs_json(source, &element.attributes, positions),
+        "children" => children_json(source, &element.fragment.nodes, &[], positions),
+    }
 }
 
-fn convert_svelte_fragment(source: &str, element: &SvelteElement) -> Value {
-    let mut result = Map::new();
-    result.insert("type".to_string(), json!("SlotTemplate"));
-    result.insert("name".to_string(), json!("svelte:fragment"));
-    result.insert("start".to_string(), json!(element.start));
-    result.insert("end".to_string(), json!(element.end));
-    result.insert(
-        "attributes".to_string(),
-        json!(
-            element
-                .attributes
-                .iter()
-                .map(|a| convert_attribute(source, a))
-                .collect::<Vec<_>>()
-        ),
-    );
-    result.insert(
-        "children".to_string(),
-        json!(
-            element
-                .fragment
-                .nodes
-                .iter()
-                .map(|n| convert_node(source, n, &[]))
-                .collect::<Vec<_>>()
-        ),
-    );
-    Value::Object(result)
+fn convert_svelte_fragment(
+    source: &str,
+    element: &SvelteElement,
+    positions: &Utf8ToUtf16,
+) -> Value {
+    convert_svelte_element_like(
+        source,
+        "SlotTemplate",
+        "svelte:fragment",
+        element,
+        &element.fragment.nodes,
+        positions,
+    )
 }
 
-fn convert_svelte_boundary(source: &str, element: &SvelteElement) -> Value {
+fn convert_svelte_boundary(
+    source: &str,
+    element: &SvelteElement,
+    positions: &Utf8ToUtf16,
+) -> Value {
     let mut fragment_nodes = element.fragment.nodes.clone();
     remove_surrounding_whitespace_nodes(&mut fragment_nodes);
 
-    let mut result = Map::new();
-    result.insert("type".to_string(), json!("SvelteBoundary"));
-    result.insert("name".to_string(), json!("svelte:boundary"));
-    result.insert("start".to_string(), json!(element.start));
-    result.insert("end".to_string(), json!(element.end));
-    result.insert(
-        "attributes".to_string(),
-        json!(
-            element
-                .attributes
-                .iter()
-                .map(|a| convert_attribute(source, a))
-                .collect::<Vec<_>>()
-        ),
-    );
-    result.insert(
-        "children".to_string(),
-        json!(
-            fragment_nodes
-                .iter()
-                .map(|n| convert_node(source, n, &[]))
-                .collect::<Vec<_>>()
-        ),
-    );
-    Value::Object(result)
+    convert_svelte_element_like(
+        source,
+        "SvelteBoundary",
+        "svelte:boundary",
+        element,
+        &fragment_nodes,
+        positions,
+    )
 }
 
-fn convert_svelte_head(source: &str, element: &SvelteElement) -> Value {
-    let mut result = Map::new();
-    result.insert("type".to_string(), json!("Head"));
-    result.insert("name".to_string(), json!("svelte:head"));
-    result.insert("start".to_string(), json!(element.start));
-    result.insert("end".to_string(), json!(element.end));
-    result.insert(
-        "attributes".to_string(),
-        json!(
-            element
-                .attributes
-                .iter()
-                .map(|a| convert_attribute(source, a))
-                .collect::<Vec<_>>()
-        ),
-    );
-    result.insert(
-        "children".to_string(),
-        json!(
-            element
-                .fragment
-                .nodes
-                .iter()
-                .map(|n| convert_node(source, n, &[]))
-                .collect::<Vec<_>>()
-        ),
-    );
-    Value::Object(result)
+fn convert_svelte_head(source: &str, element: &SvelteElement, positions: &Utf8ToUtf16) -> Value {
+    convert_svelte_element_like(
+        source,
+        "Head",
+        "svelte:head",
+        element,
+        &element.fragment.nodes,
+        positions,
+    )
 }
 
-fn convert_svelte_options(element: &SvelteElement) -> Value {
-    let mut result = Map::new();
-    result.insert("type".to_string(), json!("Options"));
-    result.insert("name".to_string(), json!("svelte:options"));
-    result.insert("start".to_string(), json!(element.start));
-    result.insert("end".to_string(), json!(element.end));
-    result.insert(
-        "attributes".to_string(),
-        json!(
-            element
-                .attributes
-                .iter()
-                .filter_map(|a| {
-                    if let Attribute::Attribute(attr) = a {
-                        Some(convert_attribute_node(attr))
-                    } else {
-                        None
-                    }
-                })
-                .collect::<Vec<_>>()
-        ),
-    );
-    Value::Object(result)
+fn convert_svelte_options(element: &SvelteElement, positions: &Utf8ToUtf16) -> Value {
+    estree_obj! {
+        "type": "Options",
+        "name": "svelte:options",
+        "start": element.start,
+        "end": element.end,
+        "attributes": element
+            .attributes
+            .iter()
+            .filter_map(|a| {
+                if let Attribute::Attribute(attr) = a {
+                    Some(convert_attribute_node(attr, positions))
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>(),
+    }
 }
 
-fn convert_svelte_self(source: &str, element: &SvelteElement) -> Value {
-    let mut result = Map::new();
-    result.insert("type".to_string(), json!("InlineComponent"));
-    result.insert("name".to_string(), json!("svelte:self"));
-    result.insert("start".to_string(), json!(element.start));
-    result.insert("end".to_string(), json!(element.end));
-    result.insert(
-        "attributes".to_string(),
-        json!(
-            element
-                .attributes
-                .iter()
-                .map(|a| convert_attribute(source, a))
-                .collect::<Vec<_>>()
-        ),
-    );
-    result.insert(
-        "children".to_string(),
-        json!(
-            element
-                .fragment
-                .nodes
-                .iter()
-                .map(|n| convert_node(source, n, &[]))
-                .collect::<Vec<_>>()
-        ),
-    );
-    Value::Object(result)
+fn convert_svelte_self(source: &str, element: &SvelteElement, positions: &Utf8ToUtf16) -> Value {
+    convert_svelte_element_like(
+        source,
+        "InlineComponent",
+        "svelte:self",
+        element,
+        &element.fragment.nodes,
+        positions,
+    )
 }
 
-fn convert_svelte_window(source: &str, element: &SvelteElement) -> Value {
-    let mut result = Map::new();
-    result.insert("type".to_string(), json!("Window"));
-    result.insert("name".to_string(), json!("svelte:window"));
-    result.insert("start".to_string(), json!(element.start));
-    result.insert("end".to_string(), json!(element.end));
-    result.insert(
-        "attributes".to_string(),
-        json!(
-            element
-                .attributes
-                .iter()
-                .map(|a| convert_attribute(source, a))
-                .collect::<Vec<_>>()
-        ),
-    );
-    result.insert(
-        "children".to_string(),
-        json!(
-            element
-                .fragment
-                .nodes
-                .iter()
-                .map(|n| convert_node(source, n, &[]))
-                .collect::<Vec<_>>()
-        ),
-    );
-    Value::Object(result)
+fn convert_svelte_window(source: &str, element: &SvelteElement, positions: &Utf8ToUtf16) -> Value {
+    convert_svelte_element_like(
+        source,
+        "Window",
+        "svelte:window",
+        element,
+        &element.fragment.nodes,
+        positions,
+    )
 }
 
-fn convert_attribute(source: &str, attr: &Attribute) -> Value {
+fn convert_attribute(source: &str, attr: &Attribute, positions: &Utf8ToUtf16) -> Value {
     match attr {
-        Attribute::Attribute(node) => convert_attribute_node(node),
-        Attribute::SpreadAttribute(spread) => convert_spread_attribute(spread),
-        Attribute::AttachTag(attach) => convert_attach_tag(attach),
-        Attribute::BindDirective(bind) => convert_bind_directive(bind),
-        Attribute::OnDirective(on) => convert_on_directive(on),
-        Attribute::ClassDirective(class) => convert_class_directive(class),
-        Attribute::StyleDirective(style) => convert_style_directive(source, style),
-        Attribute::TransitionDirective(transition) => convert_transition_directive(transition),
-        Attribute::AnimateDirective(animate) => convert_animate_directive(animate),
-        Attribute::UseDirective(use_dir) => convert_use_directive(use_dir),
-        Attribute::LetDirective(let_dir) => convert_let_directive(let_dir),
+        Attribute::Attribute(node) => convert_attribute_node(node, positions),
+        Attribute::SpreadAttribute(spread) => convert_spread_attribute(spread, positions),
+        Attribute::AttachTag(attach) => convert_attach_tag(attach, positions),
+        Attribute::BindDirective(bind) => convert_bind_directive(bind, positions),
+        Attribute::OnDirective(on) => convert_on_directive(on, positions),
+        Attribute::ClassDirective(class) => convert_class_directive(class, positions),
+        Attribute::StyleDirective(style) => convert_style_directive(source, style, positions),
+        Attribute::TransitionDirective(transition) => {
+            convert_transition_directive(transition, positions)
+        }
+        Attribute::AnimateDirective(animate) => convert_animate_directive(animate, positions),
+        Attribute::UseDirective(use_dir) => convert_use_directive(use_dir, positions),
+        Attribute::LetDirective(let_dir) => convert_let_directive(let_dir, positions),
     }
 }
 
-fn convert_attribute_node(attr: &AttributeNode) -> Value {
-    let value = convert_attribute_value(&attr.value, attr.start, &attr.name);
+fn convert_attribute_node(attr: &AttributeNode, positions: &Utf8ToUtf16) -> Value {
+    let value = convert_attribute_value(&attr.value, attr.start, &attr.name, positions);
 
     let mut result = Map::new();
-    result.insert("type".to_string(), json!("Attribute"));
-    result.insert("start".to_string(), json!(attr.start));
-    result.insert("end".to_string(), json!(attr.end));
-    result.insert("name".to_string(), json!(attr.name.as_str()));
-    if let Some(ref name_loc) = attr.name_loc {
-        result.insert(
-            "name_loc".to_string(),
-            serde_json::to_value(name_loc).unwrap(),
-        );
-    }
-    result.insert("value".to_string(), value);
+    estree_fields!(
+        result,
+        "type": "Attribute",
+        "start": attr.start,
+        "end": attr.end,
+        "name": attr.name.as_str(),
+    );
+    push_name_loc(&mut result, attr.name_loc.as_ref());
+    estree_fields!(result, "value" => value);
     Value::Object(result)
 }
 
-fn convert_attribute_value(value: &AttributeValue, attr_start: u32, _attr_name: &str) -> Value {
+fn convert_attribute_value(
+    value: &AttributeValue,
+    attr_start: u32,
+    _attr_name: &str,
+    positions: &Utf8ToUtf16,
+) -> Value {
     match value {
         AttributeValue::True(true) => json!(true),
         AttributeValue::True(false) => json!(false),
@@ -1426,10 +1483,10 @@ fn convert_attribute_value(value: &AttributeValue, attr_start: u32, _attr_name: 
 
             if is_shorthand {
                 // Shorthand attribute: {id} -> AttributeShorthand
-                json!([convert_expression_tag(expr_tag, &["Attribute"])])
+                json!([convert_expression_tag(expr_tag, &["Attribute"], positions)])
             } else {
                 // Named attribute with expression value: b={''} -> MustacheTag
-                json!([convert_expression_tag(expr_tag, &[])])
+                json!([convert_expression_tag(expr_tag, &[], positions)])
             }
         }
         AttributeValue::Sequence(parts) => {
@@ -1439,7 +1496,7 @@ fn convert_attribute_value(value: &AttributeValue, attr_start: u32, _attr_name: 
                     .map(|part| match part {
                         AttributeValuePart::Text(text) => convert_text(text, &[]),
                         AttributeValuePart::ExpressionTag(expr_tag) => {
-                            convert_expression_tag(expr_tag, &[])
+                            convert_expression_tag(expr_tag, &[], positions)
                         }
                     })
                     .collect::<Vec<_>>()
@@ -1448,116 +1505,89 @@ fn convert_attribute_value(value: &AttributeValue, attr_start: u32, _attr_name: 
     }
 }
 
-fn convert_spread_attribute(spread: &SpreadAttribute) -> Value {
-    let mut result = Map::new();
-    result.insert("type".to_string(), json!("Spread"));
-    result.insert("start".to_string(), json!(spread.start));
-    result.insert("end".to_string(), json!(spread.end));
-    result.insert(
-        "expression".to_string(),
-        spread.expression.as_json().clone(),
-    );
-    Value::Object(result)
+fn convert_spread_attribute(spread: &SpreadAttribute, positions: &Utf8ToUtf16) -> Value {
+    estree_obj! {
+        "type": "Spread",
+        "start": spread.start,
+        "end": spread.end,
+        "expression" => expression_json(&spread.expression, positions),
+    }
 }
 
-fn convert_bind_directive(bind: &BindDirective) -> Value {
-    let mut result = Map::new();
-    result.insert("start".to_string(), json!(bind.start));
-    result.insert("end".to_string(), json!(bind.end));
-    result.insert("type".to_string(), json!("Binding"));
-    result.insert("name".to_string(), json!(bind.name.as_str()));
-    if let Some(ref name_loc) = bind.name_loc {
-        result.insert(
-            "name_loc".to_string(),
-            serde_json::to_value(name_loc).unwrap(),
-        );
-    }
+fn convert_bind_directive(bind: &BindDirective, positions: &Utf8ToUtf16) -> Value {
+    let mut result =
+        directive_head(bind.start, bind.end, "Binding", &bind.name, bind.name_loc.as_ref());
 
     // For shorthand bindings (bind:foo), strip the loc field from expression
-    let mut expression = bind.expression.as_json().clone();
+    let mut expression = expression_json(&bind.expression, positions);
     let is_shorthand = expression
         .get("type")
         .and_then(|t| t.as_str())
         .is_some_and(|t| t == "Identifier")
-        && expression
-            .get("name")
-            .and_then(|n| n.as_str())
-            .is_some_and(|n| n == bind.name.as_str());
+        && expression.get("name").and_then(|n| n.as_str()).is_some_and(|n| n == bind.name.as_str());
     if is_shorthand && let Value::Object(ref mut expr_map) = expression {
         expr_map.remove("loc");
     }
 
-    result.insert("expression".to_string(), expression);
-    result.insert("modifiers".to_string(), json!(bind.modifiers));
-    Value::Object(result)
-}
-
-fn convert_on_directive(on: &OnDirective) -> Value {
-    let mut result = Map::new();
-    result.insert("start".to_string(), json!(on.start));
-    result.insert("end".to_string(), json!(on.end));
-    result.insert("type".to_string(), json!("EventHandler"));
-    result.insert("name".to_string(), json!(on.name.as_str()));
-    if let Some(ref name_loc) = on.name_loc {
-        result.insert(
-            "name_loc".to_string(),
-            serde_json::to_value(name_loc).unwrap(),
-        );
-    }
-    result.insert(
-        "expression".to_string(),
-        on.expression
-            .as_ref()
-            .map(|e| e.as_json().clone())
-            .unwrap_or(json!(null)),
+    estree_fields!(
+        result,
+        "expression" => expression,
+        "modifiers": bind.modifiers,
     );
-    result.insert("modifiers".to_string(), json!(on.modifiers));
     Value::Object(result)
 }
 
-fn convert_class_directive(class: &ClassDirective) -> Value {
-    let mut result = Map::new();
-    result.insert("start".to_string(), json!(class.start));
-    result.insert("end".to_string(), json!(class.end));
-    result.insert("type".to_string(), json!("Class"));
-    result.insert("name".to_string(), json!(class.name.as_str()));
-    if let Some(ref name_loc) = class.name_loc {
-        result.insert(
-            "name_loc".to_string(),
-            serde_json::to_value(name_loc).unwrap(),
-        );
-    }
-    result.insert("expression".to_string(), class.expression.as_json().clone());
-    result.insert("modifiers".to_string(), json!([]));
+fn convert_on_directive(on: &OnDirective, positions: &Utf8ToUtf16) -> Value {
+    let mut result =
+        directive_head(on.start, on.end, "EventHandler", &on.name, on.name_loc.as_ref());
+    estree_fields!(
+        result,
+        "expression" => on
+            .expression
+            .as_ref()
+            .map(|e| expression_json(e, positions))
+            .unwrap_or(json!(null)),
+        "modifiers": on.modifiers,
+    );
     Value::Object(result)
 }
 
-fn convert_style_directive(_source: &str, style: &StyleDirective) -> Value {
+fn convert_class_directive(class: &ClassDirective, positions: &Utf8ToUtf16) -> Value {
+    let mut result =
+        directive_head(class.start, class.end, "Class", &class.name, class.name_loc.as_ref());
+    estree_fields!(
+        result,
+        "expression" => expression_json(&class.expression, positions),
+        "modifiers": [] as [Value; 0],
+    );
+    Value::Object(result)
+}
+
+fn convert_style_directive(
+    _source: &str,
+    style: &StyleDirective,
+    positions: &Utf8ToUtf16,
+) -> Value {
+    let mustache = |expr_tag: &ExpressionTag| {
+        estree_obj! {
+            "type": "MustacheTag",
+            "start": expr_tag.start,
+            "end": expr_tag.end,
+            "expression" => expression_json(&expr_tag.expression, positions),
+        }
+    };
+
     let value = match &style.value {
         AttributeValue::True(true) => json!(true),
         AttributeValue::True(false) => json!(false),
-        AttributeValue::Expression(expr_tag) => {
-            json!([{
-                "type": "MustacheTag",
-                "start": expr_tag.start,
-                "end": expr_tag.end,
-                "expression": expr_tag.expression.as_json().clone()
-            }])
-        }
+        AttributeValue::Expression(expr_tag) => json!([mustache(expr_tag)]),
         AttributeValue::Sequence(parts) => {
             json!(
                 parts
                     .iter()
                     .map(|part| match part {
                         AttributeValuePart::Text(text) => convert_text(text, &[]),
-                        AttributeValuePart::ExpressionTag(expr_tag) => {
-                            json!({
-                                "type": "MustacheTag",
-                                "start": expr_tag.start,
-                                "end": expr_tag.end,
-                                "expression": expr_tag.expression.as_json().clone()
-                            })
-                        }
+                        AttributeValuePart::ExpressionTag(expr_tag) => mustache(expr_tag),
                     })
                     .collect::<Vec<_>>()
             )
@@ -1565,172 +1595,211 @@ fn convert_style_directive(_source: &str, style: &StyleDirective) -> Value {
     };
 
     let mut result = Map::new();
-    result.insert("type".to_string(), json!("StyleDirective"));
-    result.insert("start".to_string(), json!(style.start));
-    result.insert("end".to_string(), json!(style.end));
-    result.insert("name".to_string(), json!(style.name.as_str()));
-    if let Some(ref name_loc) = style.name_loc {
-        result.insert(
-            "name_loc".to_string(),
-            serde_json::to_value(name_loc).unwrap(),
-        );
-    }
-    result.insert("value".to_string(), value);
-    result.insert("modifiers".to_string(), json!(style.modifiers));
+    estree_fields!(
+        result,
+        "type": "StyleDirective",
+        "start": style.start,
+        "end": style.end,
+        "name": style.name.as_str(),
+    );
+    push_name_loc(&mut result, style.name_loc.as_ref());
+    estree_fields!(
+        result,
+        "value" => value,
+        "modifiers": style.modifiers,
+    );
     Value::Object(result)
 }
 
-fn convert_transition_directive(transition: &TransitionDirective) -> Value {
-    let mut result = Map::new();
-    result.insert("start".to_string(), json!(transition.start));
-    result.insert("end".to_string(), json!(transition.end));
-    result.insert("type".to_string(), json!("Transition"));
-    result.insert("name".to_string(), json!(transition.name.as_str()));
-    if let Some(ref name_loc) = transition.name_loc {
-        result.insert(
-            "name_loc".to_string(),
-            serde_json::to_value(name_loc).unwrap(),
-        );
-    }
-    if let Some(ref expression) = transition.expression {
-        result.insert("expression".to_string(), expression.as_json().clone());
-    } else {
-        result.insert("expression".to_string(), json!(null));
-    }
-    result.insert("modifiers".to_string(), json!(transition.modifiers));
-    result.insert("intro".to_string(), json!(transition.intro));
-    result.insert("outro".to_string(), json!(transition.outro));
+fn convert_transition_directive(
+    transition: &TransitionDirective,
+    positions: &Utf8ToUtf16,
+) -> Value {
+    let mut result = directive_head(
+        transition.start,
+        transition.end,
+        "Transition",
+        &transition.name,
+        transition.name_loc.as_ref(),
+    );
+    estree_fields!(
+        result,
+        "expression" => optional_expression(transition.expression.as_ref(), positions),
+        "modifiers": transition.modifiers,
+        "intro": transition.intro,
+        "outro": transition.outro,
+    );
     Value::Object(result)
 }
 
-fn convert_animate_directive(animate: &AnimateDirective) -> Value {
-    let mut result = Map::new();
-    result.insert("start".to_string(), json!(animate.start));
-    result.insert("end".to_string(), json!(animate.end));
-    result.insert("type".to_string(), json!("Animation"));
-    result.insert("name".to_string(), json!(animate.name.as_str()));
-    if let Some(ref name_loc) = animate.name_loc {
-        result.insert(
-            "name_loc".to_string(),
-            serde_json::to_value(name_loc).unwrap(),
-        );
-    }
-    if let Some(ref expression) = animate.expression {
-        result.insert("expression".to_string(), expression.as_json().clone());
-    } else {
-        result.insert("expression".to_string(), json!(null));
-    }
-    result.insert("modifiers".to_string(), json!([]));
+fn convert_animate_directive(animate: &AnimateDirective, positions: &Utf8ToUtf16) -> Value {
+    let mut result = directive_head(
+        animate.start,
+        animate.end,
+        "Animation",
+        &animate.name,
+        animate.name_loc.as_ref(),
+    );
+    estree_fields!(
+        result,
+        "expression" => optional_expression(animate.expression.as_ref(), positions),
+        "modifiers": [] as [Value; 0],
+    );
     Value::Object(result)
 }
 
-fn convert_use_directive(use_dir: &UseDirective) -> Value {
-    let mut result = Map::new();
-    result.insert("start".to_string(), json!(use_dir.start));
-    result.insert("end".to_string(), json!(use_dir.end));
-    result.insert("type".to_string(), json!("Action"));
-    result.insert("name".to_string(), json!(use_dir.name.as_str()));
-    if let Some(ref name_loc) = use_dir.name_loc {
-        result.insert(
-            "name_loc".to_string(),
-            serde_json::to_value(name_loc).unwrap(),
-        );
-    }
-    if let Some(ref expression) = use_dir.expression {
-        result.insert("expression".to_string(), expression.as_json().clone());
-    } else {
-        result.insert("expression".to_string(), json!(null));
-    }
-    result.insert("modifiers".to_string(), json!([]));
+fn convert_use_directive(use_dir: &UseDirective, positions: &Utf8ToUtf16) -> Value {
+    let mut result = directive_head(
+        use_dir.start,
+        use_dir.end,
+        "Action",
+        &use_dir.name,
+        use_dir.name_loc.as_ref(),
+    );
+    estree_fields!(
+        result,
+        "expression" => optional_expression(use_dir.expression.as_ref(), positions),
+        "modifiers": [] as [Value; 0],
+    );
     Value::Object(result)
 }
 
-fn convert_let_directive(let_dir: &LetDirective) -> Value {
-    let mut result = Map::new();
-    result.insert("start".to_string(), json!(let_dir.start));
-    result.insert("end".to_string(), json!(let_dir.end));
-    result.insert("type".to_string(), json!("Let"));
-    result.insert("name".to_string(), json!(let_dir.name.as_str()));
-    if let Some(ref name_loc) = let_dir.name_loc {
-        result.insert(
-            "name_loc".to_string(),
-            serde_json::to_value(name_loc).unwrap(),
-        );
-    }
-    if let Some(ref expression) = let_dir.expression {
-        result.insert("expression".to_string(), expression.as_json().clone());
-    } else {
-        result.insert("expression".to_string(), json!(null));
-    }
+fn convert_let_directive(let_dir: &LetDirective, positions: &Utf8ToUtf16) -> Value {
+    let mut result =
+        directive_head(let_dir.start, let_dir.end, "Let", &let_dir.name, let_dir.name_loc.as_ref());
+    estree_fields!(
+        result,
+        "expression" => optional_expression(let_dir.expression.as_ref(), positions),
+    );
     Value::Object(result)
 }
 
 // Helper functions
 
-fn get_node_start(node: &TemplateNode) -> u32 {
-    match node {
-        TemplateNode::Text(n) => n.start,
-        TemplateNode::Comment(n) => n.start,
-        TemplateNode::ExpressionTag(n) => n.start,
-        TemplateNode::HtmlTag(n) => n.start,
-        TemplateNode::ConstTag(n) => n.start,
-        TemplateNode::DeclarationTag(n) => n.start,
-        TemplateNode::DebugTag(n) => n.start,
-        TemplateNode::RenderTag(n) => n.start,
-        TemplateNode::AttachTag(n) => n.start,
-        TemplateNode::IfBlock(n) => n.start,
-        TemplateNode::EachBlock(n) => n.start,
-        TemplateNode::AwaitBlock(n) => n.start,
-        TemplateNode::KeyBlock(n) => n.start,
-        TemplateNode::SnippetBlock(n) => n.start,
-        TemplateNode::RegularElement(n) => n.start,
-        TemplateNode::Component(n) => n.start,
-        TemplateNode::TitleElement(n) => n.start,
-        TemplateNode::SlotElement(n) => n.start,
-        TemplateNode::SvelteBody(n) => n.start,
-        TemplateNode::SvelteComponent(n) => n.start,
-        TemplateNode::SvelteDocument(n) => n.start,
-        TemplateNode::SvelteElement(n) => n.start,
-        TemplateNode::SvelteFragment(n) => n.start,
-        TemplateNode::SvelteBoundary(n) => n.start,
-        TemplateNode::SvelteHead(n) => n.start,
-        TemplateNode::SvelteOptions(n) => n.start,
-        TemplateNode::SvelteSelf(n) => n.start,
-        TemplateNode::SvelteWindow(n) => n.start,
+fn attrs_json(source: &str, attributes: &[Attribute], positions: &Utf8ToUtf16) -> Value {
+    json!(attributes.iter().map(|a| convert_attribute(source, a, positions)).collect::<Vec<_>>())
+}
+
+fn children_json(
+    source: &str,
+    nodes: &[TemplateNode],
+    path: &[&str],
+    positions: &Utf8ToUtf16,
+) -> Value {
+    json!(nodes.iter().map(|n| convert_node(source, n, path, positions)).collect::<Vec<_>>())
+}
+
+/// `name_loc` is emitted only when the modern AST carries one, and always
+/// directly after `name`.
+fn push_name_loc(obj: &mut Map<String, Value>, name_loc: Option<&SourceLocation>) {
+    if let Some(name_loc) = name_loc {
+        obj.insert("name_loc".to_string(), serde_json::to_value(name_loc).unwrap());
     }
 }
 
-fn get_node_end(node: &TemplateNode) -> u32 {
-    match node {
-        TemplateNode::Text(n) => n.end,
-        TemplateNode::Comment(n) => n.end,
-        TemplateNode::ExpressionTag(n) => n.end,
-        TemplateNode::HtmlTag(n) => n.end,
-        TemplateNode::ConstTag(n) => n.end,
-        TemplateNode::DeclarationTag(n) => n.end,
-        TemplateNode::DebugTag(n) => n.end,
-        TemplateNode::RenderTag(n) => n.end,
-        TemplateNode::AttachTag(n) => n.end,
-        TemplateNode::IfBlock(n) => n.end,
-        TemplateNode::EachBlock(n) => n.end,
-        TemplateNode::AwaitBlock(n) => n.end,
-        TemplateNode::KeyBlock(n) => n.end,
-        TemplateNode::SnippetBlock(n) => n.end,
-        TemplateNode::RegularElement(n) => n.end,
-        TemplateNode::Component(n) => n.end,
-        TemplateNode::TitleElement(n) => n.end,
-        TemplateNode::SlotElement(n) => n.end,
-        TemplateNode::SvelteBody(n) => n.end,
-        TemplateNode::SvelteComponent(n) => n.end,
-        TemplateNode::SvelteDocument(n) => n.end,
-        TemplateNode::SvelteElement(n) => n.end,
-        TemplateNode::SvelteFragment(n) => n.end,
-        TemplateNode::SvelteBoundary(n) => n.end,
-        TemplateNode::SvelteHead(n) => n.end,
-        TemplateNode::SvelteOptions(n) => n.end,
-        TemplateNode::SvelteSelf(n) => n.end,
-        TemplateNode::SvelteWindow(n) => n.end,
+/// The `start`, `end`, `type`, `name`, `name_loc` prefix shared by every legacy
+/// directive node. Callers append the node-specific fields.
+fn directive_head(
+    start: u32,
+    end: u32,
+    ty: &str,
+    name: &str,
+    name_loc: Option<&SourceLocation>,
+) -> Map<String, Value> {
+    let mut obj = Map::new();
+    estree_fields!(obj, "start": start, "end": end, "type": ty, "name": name);
+    push_name_loc(&mut obj, name_loc);
+    obj
+}
+
+fn optional_expression(expression: Option<&Expression>, positions: &Utf8ToUtf16) -> Value {
+    expression.map(|e| expression_json(e, positions)).unwrap_or(json!(null))
+}
+
+/// Common start/end span accessors for `TemplateNode` variants. Replaces a
+/// pair of 28-arm matches (one per accessor) with a single merged-arm
+/// implementation — every variant's inner node carries plain `start`/`end`
+/// fields, and the 8 `Svelte*` variants sharing the `SvelteElement` inner
+/// type merge into one arm each.
+trait Spanned {
+    fn start(&self) -> u32;
+    fn end(&self) -> u32;
+}
+
+impl Spanned for TemplateNode<'_> {
+    fn start(&self) -> u32 {
+        match self {
+            TemplateNode::Text(n) => n.start,
+            TemplateNode::Comment(n) => n.start,
+            TemplateNode::ExpressionTag(n) => n.start,
+            TemplateNode::HtmlTag(n) => n.start,
+            TemplateNode::ConstTag(n) => n.start,
+            TemplateNode::DeclarationTag(n) => n.start,
+            TemplateNode::DebugTag(n) => n.start,
+            TemplateNode::RenderTag(n) => n.start,
+            TemplateNode::AttachTag(n) => n.start,
+            TemplateNode::IfBlock(n) => n.start,
+            TemplateNode::EachBlock(n) => n.start,
+            TemplateNode::AwaitBlock(n) => n.start,
+            TemplateNode::KeyBlock(n) => n.start,
+            TemplateNode::SnippetBlock(n) => n.start,
+            TemplateNode::RegularElement(n) => n.start,
+            TemplateNode::Component(n) => n.start,
+            TemplateNode::TitleElement(n) => n.start,
+            TemplateNode::SlotElement(n) => n.start,
+            TemplateNode::SvelteComponent(n) => n.start,
+            TemplateNode::SvelteElement(n) => n.start,
+            TemplateNode::SvelteBody(n)
+            | TemplateNode::SvelteDocument(n)
+            | TemplateNode::SvelteFragment(n)
+            | TemplateNode::SvelteBoundary(n)
+            | TemplateNode::SvelteHead(n)
+            | TemplateNode::SvelteOptions(n)
+            | TemplateNode::SvelteSelf(n)
+            | TemplateNode::SvelteWindow(n) => n.start,
+        }
     }
+
+    fn end(&self) -> u32 {
+        match self {
+            TemplateNode::Text(n) => n.end,
+            TemplateNode::Comment(n) => n.end,
+            TemplateNode::ExpressionTag(n) => n.end,
+            TemplateNode::HtmlTag(n) => n.end,
+            TemplateNode::ConstTag(n) => n.end,
+            TemplateNode::DeclarationTag(n) => n.end,
+            TemplateNode::DebugTag(n) => n.end,
+            TemplateNode::RenderTag(n) => n.end,
+            TemplateNode::AttachTag(n) => n.end,
+            TemplateNode::IfBlock(n) => n.end,
+            TemplateNode::EachBlock(n) => n.end,
+            TemplateNode::AwaitBlock(n) => n.end,
+            TemplateNode::KeyBlock(n) => n.end,
+            TemplateNode::SnippetBlock(n) => n.end,
+            TemplateNode::RegularElement(n) => n.end,
+            TemplateNode::Component(n) => n.end,
+            TemplateNode::TitleElement(n) => n.end,
+            TemplateNode::SlotElement(n) => n.end,
+            TemplateNode::SvelteComponent(n) => n.end,
+            TemplateNode::SvelteElement(n) => n.end,
+            TemplateNode::SvelteBody(n)
+            | TemplateNode::SvelteDocument(n)
+            | TemplateNode::SvelteFragment(n)
+            | TemplateNode::SvelteBoundary(n)
+            | TemplateNode::SvelteHead(n)
+            | TemplateNode::SvelteOptions(n)
+            | TemplateNode::SvelteSelf(n)
+            | TemplateNode::SvelteWindow(n) => n.end,
+        }
+    }
+}
+
+fn get_node_start(node: &TemplateNode) -> u32 {
+    node.start()
+}
+
+fn get_node_end(node: &TemplateNode) -> u32 {
+    node.end()
 }
 
 fn find_last_brace_before(source: &str, pos: usize) -> usize {
@@ -1798,11 +1867,7 @@ mod utf16_offset_tests {
                     )
                 {
                     let (s, e) = (start as usize, end as usize);
-                    assert!(
-                        e <= utf16.len(),
-                        "end {e} out of bounds (len {})",
-                        utf16.len()
-                    );
+                    assert!(e <= utf16.len(), "end {e} out of bounds (len {})", utf16.len());
                     let slice = String::from_utf16(&utf16[s..e]).unwrap();
                     assert_eq!(
                         slice, name,
@@ -1831,10 +1896,8 @@ mod utf16_offset_tests {
         let src = "<script>\n  const あ = 1;\n  const target = あ;\n</script>\n<p>{target}</p>";
         let ast = parse(
             src,
-            ParseOptions {
-                modern: true,
-                ..Default::default()
-            },
+            &oxc_allocator::Allocator::default(),
+            ParseOptions { modern: true, ..Default::default() },
         )
         .unwrap();
         let mut value = with_serialize_arena(&ast.arena, || serde_json::to_value(&ast).unwrap());
@@ -1850,10 +1913,8 @@ mod utf16_offset_tests {
         let src = "<script>\n  const target = 1;\n</script>\n<p>{target}</p>";
         let ast = parse(
             src,
-            ParseOptions {
-                modern: true,
-                ..Default::default()
-            },
+            &oxc_allocator::Allocator::default(),
+            ParseOptions { modern: true, ..Default::default() },
         )
         .unwrap();
         let before = with_serialize_arena(&ast.arena, || serde_json::to_value(&ast).unwrap());

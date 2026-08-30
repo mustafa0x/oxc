@@ -3,12 +3,14 @@
 //! Corresponds to utilities in
 //! `svelte/packages/svelte/src/compiler/phases/3-transform/client/visitors/shared/component.js`.
 
+use crate::ast::arena::ParseArena;
 use crate::ast::js::Expression;
 use crate::ast::template::{
     Attribute, AttributeNode, AttributeValue, AttributeValuePart, BindDirective, Component,
     LetDirective, OnDirective, SnippetBlock, SpreadAttribute, SvelteComponentElement,
     SvelteElement, TemplateNode,
 };
+use crate::ast::typed_expr::JsNode;
 use crate::compiler::phases::phase3_transform::client::types::*;
 use crate::compiler::phases::phase3_transform::client::visitors::expression_converter::convert_expression;
 use crate::compiler::phases::phase3_transform::client::visitors::shared::element::build_attribute_value;
@@ -19,16 +21,16 @@ use indexmap::IndexMap;
 
 /// Component node types.
 #[derive(Debug, Clone)]
-pub enum ComponentNode {
+pub enum ComponentNode<'n, 'a> {
     /// Regular component (`<MyComponent>`)
-    Component(Component),
+    Component(&'n Component<'a>),
     /// Dynamic component (`<svelte:component this={...}>`)
-    SvelteComponent(SvelteComponentElement),
+    SvelteComponent(&'n SvelteComponentElement<'a>),
     /// Self-reference (`<svelte:self>`)
-    SvelteSelf(SvelteElement),
+    SvelteSelf(&'n SvelteElement<'a>),
 }
 
-impl ComponentNode {
+impl<'a> ComponentNode<'_, 'a> {
     /// Get the start position of the component node.
     pub fn start(&self) -> u32 {
         match self {
@@ -36,6 +38,19 @@ impl ComponentNode {
             ComponentNode::SvelteComponent(c) => c.start,
             ComponentNode::SvelteSelf(c) => c.start,
         }
+    }
+
+    /// Source range of a regular component's tag name.
+    ///
+    /// Upstream attaches this range to the callee identifier itself. Keeping it
+    /// off the surrounding call is important: esrap emits one segment at the
+    /// identifier start and another at its end, while a call span would claim
+    /// the generated anchor and props as source text too.
+    fn callee_name_span(&self) -> Option<(u32, u32)> {
+        let ComponentNode::Component(component) = self else {
+            return None;
+        };
+        component.name_loc.as_ref().map(|loc| (loc.start.character, loc.end.character))
     }
 }
 
@@ -67,7 +82,7 @@ struct DelayedProp {
 ///
 /// Returns a statement that instantiates the component.
 pub fn build_component(
-    node: ComponentNode,
+    node: ComponentNode<'_, '_>,
     component_name: String,
     context: &mut ComponentContext,
 ) -> JsStatement {
@@ -87,7 +102,7 @@ pub fn build_component(
     let mut let_names: Vec<(String, Option<String>)> = Vec::new();
     let mut events: IndexMap<String, Vec<JsExpr>> = IndexMap::new();
     let mut custom_css_props: Vec<JsObjectMember> = Vec::new();
-    let mut bind_this: Option<Expression> = None;
+    let mut bind_this: Option<Expression<'_>> = None;
     let mut binding_initializers: Vec<JsStatement> = Vec::new();
     let mut snippet_declarations: Vec<JsStatement> = Vec::new();
     let mut serialized_slots: Vec<JsObjectMember> = Vec::new();
@@ -103,6 +118,8 @@ pub fn build_component(
         ComponentNode::Component(comp) => comp.metadata.dynamic,
         ComponentNode::SvelteSelf(_) => false,
     };
+    let is_svelte_self = matches!(node, ComponentNode::SvelteSelf(_));
+    let callee_name_span = node.callee_name_span();
 
     // Generate intermediate name for dynamic components
     let intermediate_name = if let ComponentNode::Component(comp) = &node {
@@ -166,6 +183,7 @@ pub fn build_component(
                     is_defined: false,
                     is_reactive: true,
                     replacement_id: None,
+                    store_source: None,
                 },
             );
             // Let directive bindings are template-kind.
@@ -215,6 +233,7 @@ pub fn build_component(
                     &intermediate_name,
                     &component_name,
                     &ignored_codes,
+                    is_svelte_self,
                 );
             }
 
@@ -260,15 +279,12 @@ pub fn build_component(
                 })
                 .collect(),
         );
-        push_prop_immediate(
-            &mut props_and_spreads,
-            b::prop(arena, "$$events", events_obj),
-        );
+        push_prop_immediate(&mut props_and_spreads, b::prop(arena, "$$events", events_obj));
     }
 
     // Group children by slot and process snippets
     // Use IndexMap to preserve insertion order (matches JavaScript object key order)
-    let mut children: IndexMap<String, Vec<&TemplateNode>> = IndexMap::new();
+    let mut children: IndexMap<&str, Vec<&TemplateNode>> = IndexMap::new();
 
     for child in &fragment.nodes {
         if let TemplateNode::SnippetBlock(snippet) = child {
@@ -283,7 +299,9 @@ pub fn build_component(
             continue;
         }
 
-        let slot_name = determine_slot(child).unwrap_or_else(|| "default".to_string());
+        let slot_name = determine_slot(child).unwrap_or("default");
+        #[cfg(feature = "measure-slot-key")]
+        crate::measure_slot_key::record(slot_name);
         children.entry(slot_name).or_default().push(child);
     }
 
@@ -292,7 +310,7 @@ pub fn build_component(
         let slot_fn = build_slot_function(
             arena,
             &slot_children,
-            &slot_name,
+            slot_name,
             slot_scope_applies_to_itself,
             &lets,
             &let_names,
@@ -310,7 +328,7 @@ pub fn build_component(
 
                 if needs_slots_default {
                     // Use $$slots.default
-                    serialized_slots.push(b::prop(arena, &slot_name, fn_expr));
+                    serialized_slots.push(b::prop(arena, slot_name, fn_expr));
                     // Add children prop that errors
                     push_prop_immediate(
                         &mut props_and_spreads,
@@ -336,10 +354,10 @@ pub fn build_component(
                         b::prop(arena, "children", wrapped_fn),
                     );
                     // Add $$slots.default: true
-                    serialized_slots.push(b::prop(arena, &slot_name, b::boolean(true)));
+                    serialized_slots.push(b::prop(arena, slot_name, b::boolean(true)));
                 }
             } else {
-                serialized_slots.push(b::prop(arena, &slot_name, fn_expr));
+                serialized_slots.push(b::prop(arena, slot_name, fn_expr));
             }
         }
     }
@@ -354,14 +372,9 @@ pub fn build_component(
 
     // Add $$legacy flag if not in runes mode and has bindings
     if !context.state.analysis.runes
-        && attributes
-            .iter()
-            .any(|attr| matches!(attr, Attribute::BindDirective(_)))
+        && attributes.iter().any(|attr| matches!(attr, Attribute::BindDirective(_)))
     {
-        push_prop_immediate(
-            &mut props_and_spreads,
-            b::prop(arena, "$$legacy", b::boolean(true)),
-        );
+        push_prop_immediate(&mut props_and_spreads, b::prop(arena, "$$legacy", b::boolean(true)));
     }
 
     // Build props expression
@@ -425,30 +438,29 @@ pub fn build_component(
                 }
             }
         };
+        let callee = match (callee, callee_name_span) {
+            (JsExpr::Identifier(name), Some((start, end))) => {
+                JsExpr::Spanned(arena.alloc_expr(JsExpr::Identifier(name)), start, end)
+            }
+            (callee, _) => callee,
+        };
 
         let call = b::call(arena, callee, vec![anchor_expr, props.clone()]);
 
-        if let Some(bind_expr) = bind {
-            build_bind_this_call(bind_expr, call, ctx)
-        } else {
-            call
-        }
+        if let Some(bind_expr) = bind { build_bind_this_call(bind_expr, call, ctx) } else { call }
     };
 
     // If component is dynamic, wrap the call in $.component()
     // This wrapping happens BEFORE the CSS props check, matching the official behavior
     if is_component_dynamic {
-        statements.extend(binding_initializers.clone());
-
+        // The validator references the intermediate binding, which only exists inside
+        // the `$.component` callback.
         if !custom_css_props.is_empty() {
             // Handle custom CSS properties with wrapper element for dynamic component
             let is_svg = context.state.metadata.namespace == "svg";
             let wrapper_element = if is_svg { "g" } else { "svelte-css-wrapper" };
 
-            context
-                .state
-                .template
-                .push_element(wrapper_element.to_string(), node.start(), false);
+            context.state.template.push_element(wrapper_element.to_string(), node.start(), false);
 
             if !is_svg {
                 context
@@ -466,10 +478,7 @@ pub fn build_component(
                 b::call(
                     arena,
                     b::member_path(arena, "$.css_props"),
-                    vec![
-                        anchor.clone(),
-                        b::thunk(arena, b::object(custom_css_props.clone())),
-                    ],
+                    vec![anchor.clone(), b::thunk(arena, b::object(custom_css_props.clone()))],
                 ),
             ));
 
@@ -485,18 +494,18 @@ pub fn build_component(
                 context,
             );
 
+            let mut callback_body = binding_initializers.clone();
+            callback_body.push(b::stmt(arena, inner_call));
+
             let dynamic_call = b::call(
                 arena,
                 b::member_path(arena, "$.component"),
                 vec![
                     component_anchor,
-                    b::thunk(
-                        arena,
-                        build_component_expression(&node, &component_name, context),
-                    ),
+                    b::thunk(arena, build_component_expression(&node, &component_name, context)),
                     b::arrow_block(
                         vec![b::id_pattern("$$anchor"), b::id_pattern(&intermediate_name)],
-                        vec![b::stmt(arena, inner_call)],
+                        callback_body,
                     ),
                 ],
             );
@@ -506,11 +515,7 @@ pub fn build_component(
             // Add reset call
             statements.push(b::stmt(
                 arena,
-                b::call(
-                    arena,
-                    b::member_path(arena, "$.reset"),
-                    vec![anchor.clone()],
-                ),
+                b::call(arena, b::member_path(arena, "$.reset"), vec![anchor.clone()]),
             ));
         } else {
             // Normal dynamic component without CSS props
@@ -526,18 +531,18 @@ pub fn build_component(
                 context,
             );
 
+            let mut callback_body = binding_initializers.clone();
+            callback_body.push(b::stmt(arena, inner_call));
+
             let dynamic_call = b::call(
                 arena,
                 b::member_path(arena, "$.component"),
                 vec![
                     anchor.clone(),
-                    b::thunk(
-                        arena,
-                        build_component_expression(&node, &component_name, context),
-                    ),
+                    b::thunk(arena, build_component_expression(&node, &component_name, context)),
                     b::arrow_block(
                         vec![b::id_pattern("$$anchor"), b::id_pattern(&intermediate_name)],
-                        vec![b::stmt(arena, inner_call)],
+                        callback_body,
                     ),
                 ],
             );
@@ -601,10 +606,7 @@ pub fn build_component(
     if slot_scope_applies_to_itself {
         for (name, saved) in &saved_self_slot_transforms {
             if let Some(original_transform) = saved {
-                context
-                    .state
-                    .transform
-                    .insert(name.clone(), original_transform.clone());
+                context.state.transform.insert(name.clone(), original_transform.clone());
             } else {
                 context.state.transform.remove(name);
             }
@@ -651,6 +653,7 @@ pub fn build_component(
                                 super::super::fragment::collect_identifiers_from_statement_deep(
                                     &JsStatement::Expression(JsExpressionStatement {
                                         expression: init_expr,
+                                        comment_anchor: None,
                                     }),
                                     arena,
                                     &mut component_names,
@@ -714,10 +717,8 @@ pub fn build_component(
         // add $.next() after $.async() to advance the cursor past the async block.
         // Corresponds to official compiler component.js lines 530-532.
         if context.state.is_standalone {
-            statements.push(b::stmt(
-                arena,
-                b::call(arena, b::member_path(arena, "$.next"), vec![]),
-            ));
+            statements
+                .push(b::stmt(arena, b::call(arena, b::member_path(arena, "$.next"), vec![])));
         }
     }
 
@@ -733,7 +734,7 @@ pub fn build_component(
 /// Matches the official `determine_slot()` in `svelte/src/compiler/utils/slot.js`.
 /// This checks for `slot="name"` attribute on element-like nodes:
 /// SvelteElement, RegularElement, SvelteFragment, Component, SvelteComponent, SvelteSelf, SlotElement
-fn determine_slot(node: &TemplateNode) -> Option<String> {
+fn determine_slot<'n>(node: &'n TemplateNode<'_>) -> Option<&'n str> {
     let attributes = match node {
         TemplateNode::RegularElement(elem) => Some(&elem.attributes),
         TemplateNode::Component(comp) => Some(&comp.attributes),
@@ -752,7 +753,7 @@ fn determine_slot(node: &TemplateNode) -> Option<String> {
                 && let AttributeValue::Sequence(parts) = &a.value
                 && let Some(AttributeValuePart::Text(text)) = parts.first()
             {
-                return Some(text.data.to_string());
+                return Some(text.data.as_ref());
             }
         }
     }
@@ -763,11 +764,7 @@ fn determine_slot(node: &TemplateNode) -> Option<String> {
 /// Check if component has a slot attribute.
 fn determine_slot_from_attributes(attributes: &[Attribute]) -> bool {
     attributes.iter().any(|attr| {
-        if let Attribute::Attribute(a) = attr {
-            a.name.as_str() == "slot"
-        } else {
-            false
-        }
+        if let Attribute::Attribute(a) = attr { a.name.as_str() == "slot" } else { false }
     })
 }
 
@@ -792,6 +789,9 @@ fn process_let_directive(
     lets: &mut Vec<JsStatement>,
     let_names: &mut Vec<(String, Option<String>)>,
 ) {
+    let _tf = crate::compiler::phases::phase3_transform::profile::tf_guard(
+        crate::compiler::phases::phase3_transform::profile::TF_BC_LET,
+    );
     let prop_name = &let_dir.name;
 
     // Check if expression is an Identifier or null (simple case)
@@ -814,11 +814,8 @@ fn process_let_directive(
 
         // Generate: const name = $.derived_safe_equal(() => $$slotProps.prop_name)
         // or: const name = $.derived(() => $$slotProps.prop_name) in runes mode
-        let derived_fn = if context.state.analysis.runes {
-            "$.derived"
-        } else {
-            "$.derived_safe_equal"
-        };
+        let derived_fn =
+            if context.state.analysis.runes { "$.derived" } else { "$.derived_safe_equal" };
 
         lets.push(b::const_decl(
             &context.arena,
@@ -836,126 +833,222 @@ fn process_let_directive(
         // Destructured case: let:x={{y, z}} or let:x={[a, b]}
         // Generates: const derived_name = $.derived(() => { let {y, z} = $$slotProps.x; return {y, z}; })
         // And tracks binding names for transform registration
-        if let Some(expr) = &let_dir.expression {
-            {
-                let expr_type = expr.node_type().unwrap_or("");
+        if let Some(_expr) = &let_dir.expression
+            && let Some((derived_name, binding_names, const_stmt)) =
+                build_destructured_let_directive(let_dir, context)
+        {
+            // Track derived_name (no read_source, it's the source itself)
+            let_names.push((derived_name.clone(), None));
+            // Track each binding name with read_source pointing to the derived variable
+            for binding_name in &binding_names {
+                let_names.push((binding_name.to_string(), Some(derived_name.clone())));
+            }
+            lets.push(const_stmt);
+        }
+    }
+}
 
-                // Extract binding names from the expression
-                let mut binding_names: Vec<compact_str::CompactString> = Vec::new();
-                let node = expr.as_node();
-                match &*node {
-                    crate::ast::typed_expr::JsNode::ObjectExpression { properties, .. } => {
-                        for prop in context.state.parse_arena.get_js_children(*properties) {
-                            if let Some(key_id) = prop.key() {
-                                let key = context.state.parse_arena.get_js_node(key_id);
-                                if let Some(name) = key.name() {
-                                    binding_names.push(name.into());
-                                }
-                            }
-                        }
-                    }
-                    crate::ast::typed_expr::JsNode::ArrayExpression { elements, .. } => {
-                        for elem in elements.iter().flatten() {
-                            if let Some(name) = elem.name() {
-                                binding_names.push(name.into());
-                            }
-                        }
-                    }
-                    _ => {
-                        // Raw/other fallback
-                        let val = expr.as_json();
-                        if let serde_json::Value::Object(obj) = val {
-                            if expr_type == "ObjectExpression"
-                                && let Some(serde_json::Value::Array(props)) = obj.get("properties")
-                            {
-                                for prop in props {
-                                    if let Some(name) = prop
-                                        .get("key")
-                                        .and_then(|k| k.get("name"))
-                                        .and_then(|n| n.as_str())
-                                    {
-                                        binding_names.push(name.into());
-                                    }
-                                }
-                            } else if expr_type == "ArrayExpression"
-                                && let Some(serde_json::Value::Array(elements)) =
-                                    obj.get("elements")
-                            {
-                                for elem in elements {
-                                    if let Some(name) = elem.get("name").and_then(|n| n.as_str()) {
-                                        binding_names.push(name.into());
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+/// Build the `const <derived> = $.derived(() => { let <pattern> = $$slotProps.<name>;
+/// return { <bindings> }; })` statement for a DESTRUCTURED `let:` directive, and
+/// the binding names it introduces. Shared by the component path
+/// (`process_let_directive`) and the slotted-element path
+/// (`process_element_let_directives` in `regular_element.rs`).
+pub(in crate::compiler::phases::phase3_transform::client) fn build_destructured_let_directive(
+    let_dir: &LetDirective,
+    context: &mut ComponentContext,
+) -> Option<(String, Vec<compact_str::CompactString>, JsStatement)> {
+    let prop_name = &let_dir.name;
+    let expr = let_dir.expression.as_ref()?;
 
-                if !binding_names.is_empty() {
-                    // Generate unique name for the derived variable
-                    let derived_name = context.state.memoizer.generate_id(prop_name);
+    // Extract binding names 写经 upstream
+    // `extract_identifiers_from_destructuring`: recurse into object
+    // property VALUES (so `{ a: x }` binds `x`, nested patterns bind
+    // their leaves) and object REST arguments; an array-pattern rest
+    // (`SpreadElement`) and a default (`AssignmentExpression`) hit
+    // upstream's switch default and bind NOTHING — their reads stay
+    // raw in the slot body, exactly like official's output.
+    let expr_json = expr.as_json();
+    let mut binding_names: Vec<compact_str::CompactString> = Vec::new();
+    extract_let_binding_names(expr_json, &mut binding_names);
 
-                    // Track derived_name (no read_source, it's the source itself)
-                    let_names.push((derived_name.clone(), None));
-                    // Track each binding name with read_source pointing to the derived variable
-                    for binding_name in &binding_names {
-                        let_names.push((binding_name.to_string(), Some(derived_name.to_string())));
-                    }
+    // Generate unique name for the derived variable
+    let derived_name = context.state.memoizer.generate_id(prop_name);
 
-                    // Build the destructuring pattern
-                    let destructuring_pat = if expr_type == "ObjectExpression" {
-                        b::object_pattern(
-                            binding_names
-                                .iter()
-                                .map(|n| JsObjectPatternProperty::Property {
-                                    key: JsPropertyKey::Identifier(n.clone()),
-                                    value: b::id_pattern(n.clone()),
-                                    computed: false,
-                                    shorthand: true,
-                                })
-                                .collect(),
-                        )
+    // Build the destructuring pattern VERBATIM from the directive
+    // expression (rest elements, defaults, renames and nesting
+    // survive) — upstream emits `b.object_pattern(node.expression
+    // .properties)` / `b.array_pattern(node.expression.elements)`
+    // unvisited.
+    let destructuring_pat = expression_to_let_pattern(expr_json, context);
+
+    // Build the return object: { a, b }
+    let return_obj_expr = b::object(
+        binding_names
+            .iter()
+            .map(|n| b::prop(&context.arena, n.clone(), b::id(n.clone())))
+            .collect(),
+    );
+
+    // Note: destructured case always uses $.derived (not $.derived_safe_equal)
+    let inner_let = b::var_decl_pattern(
+        &context.arena,
+        JsVariableKind::Let,
+        destructuring_pat,
+        Some(b::member(&context.arena, b::id("$$slotProps"), prop_name.to_string())),
+    );
+    let inner_return = b::return_value(&context.arena, return_obj_expr);
+    let const_stmt = b::const_decl(
+        &context.arena,
+        &derived_name,
+        b::call(
+            &context.arena,
+            b::member_path(&context.arena, "$.derived"),
+            vec![b::arrow_block(vec![], vec![inner_let, inner_return])],
+        ),
+    );
+    Some((derived_name, binding_names, const_stmt))
+}
+
+/// 写经 upstream `extract_identifiers_from_destructuring`: the names a `let:`
+/// destructuring expression binds. Object property values and object rest
+/// arguments recurse; array rest (`SpreadElement`) and defaults
+/// (`AssignmentExpression`) deliberately bind nothing.
+fn extract_let_binding_names(json: &serde_json::Value, out: &mut Vec<compact_str::CompactString>) {
+    let Some(obj) = json.as_object() else { return };
+    match obj.get("type").and_then(|t| t.as_str()) {
+        Some("Identifier") => {
+            if let Some(name) = obj.get("name").and_then(|n| n.as_str()) {
+                out.push(name.into());
+            }
+        }
+        Some("ObjectExpression") => {
+            if let Some(props) = obj.get("properties").and_then(|p| p.as_array()) {
+                for prop in props {
+                    let target = if prop.get("type").and_then(|t| t.as_str()) == Some("Property") {
+                        prop.get("value")
                     } else {
-                        b::array_pattern(
-                            binding_names
-                                .iter()
-                                .map(|n| Some(b::id_pattern(n.clone())))
-                                .collect(),
-                        )
+                        prop.get("argument")
                     };
-
-                    // Build the return object: { a, b }
-                    let return_obj_expr = b::object(
-                        binding_names
-                            .iter()
-                            .map(|n| b::prop(&context.arena, n.clone(), b::id(n.clone())))
-                            .collect(),
-                    );
-
-                    // Note: destructured case always uses $.derived (not $.derived_safe_equal)
-                    let inner_let = b::var_decl_pattern(
-                        &context.arena,
-                        JsVariableKind::Let,
-                        destructuring_pat,
-                        Some(b::member(
-                            &context.arena,
-                            b::id("$$slotProps"),
-                            prop_name.to_string(),
-                        )),
-                    );
-                    let inner_return = b::return_value(&context.arena, return_obj_expr);
-                    lets.push(b::const_decl(
-                        &context.arena,
-                        &derived_name,
-                        b::call(
-                            &context.arena,
-                            b::member_path(&context.arena, "$.derived"),
-                            vec![b::arrow_block(vec![], vec![inner_let, inner_return])],
-                        ),
-                    ));
+                    if let Some(target) = target {
+                        extract_let_binding_names(target, out);
+                    }
                 }
             }
         }
+        Some("ArrayExpression") => {
+            if let Some(elements) = obj.get("elements").and_then(|e| e.as_array()) {
+                for el in elements {
+                    if !el.is_null() {
+                        extract_let_binding_names(el, out);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Convert a `let:` directive's destructuring EXPRESSION into the equivalent
+/// pattern, byte-preserving: defaults and computed keys are re-emitted from
+/// their source spans (upstream leaves the pattern unvisited).
+fn expression_to_let_pattern(
+    json: &serde_json::Value,
+    context: &mut ComponentContext,
+) -> JsPattern {
+    let source_slice = |o: &serde_json::Map<String, serde_json::Value>| -> Option<String> {
+        let s = o.get("start").and_then(|v| v.as_u64())? as usize;
+        let e = o.get("end").and_then(|v| v.as_u64())? as usize;
+        context.state.analysis.source.get(s..e).map(str::to_string)
+    };
+    let Some(obj) = json.as_object() else {
+        return b::id_pattern("$$unknown");
+    };
+    match obj.get("type").and_then(|t| t.as_str()) {
+        Some("Identifier") => {
+            b::id_pattern(obj.get("name").and_then(|n| n.as_str()).unwrap_or("$$unknown"))
+        }
+        // A nested default (`{ a: { b } = {} }`) parses its left as a PATTERN node,
+        // so the pattern spellings alias the expression ones here.
+        Some("ObjectExpression") | Some("ObjectPattern") => {
+            let mut properties = Vec::new();
+            if let Some(props) = obj.get("properties").and_then(|p| p.as_array()) {
+                for prop in props {
+                    let Some(p) = prop.as_object() else { continue };
+                    if p.get("type").and_then(|t| t.as_str()) != Some("Property") {
+                        if let Some(arg) = p.get("argument") {
+                            properties.push(JsObjectPatternProperty::Rest(Box::new(
+                                expression_to_let_pattern(arg, context),
+                            )));
+                        }
+                        continue;
+                    }
+                    let computed = p.get("computed").and_then(|c| c.as_bool()).unwrap_or(false);
+                    let shorthand = p.get("shorthand").and_then(|s| s.as_bool()).unwrap_or(false);
+                    let Some(key_obj) = p.get("key").and_then(|k| k.as_object()) else {
+                        continue;
+                    };
+                    let key = if computed {
+                        let raw = source_slice(key_obj).unwrap_or_default();
+                        JsPropertyKey::Computed(context.arena.alloc_expr(b::raw(raw)))
+                    } else if let Some(name) = key_obj.get("name").and_then(|n| n.as_str()) {
+                        JsPropertyKey::Identifier(name.into())
+                    } else {
+                        let raw = source_slice(key_obj).unwrap_or_default();
+                        let cooked =
+                            key_obj.get("value").and_then(|v| v.as_str()).unwrap_or("").into();
+                        JsPropertyKey::Literal(JsLiteral::RawString {
+                            value: cooked,
+                            raw: raw.into(),
+                        })
+                    };
+                    let value = p
+                        .get("value")
+                        .map(|v| expression_to_let_pattern(v, context))
+                        .unwrap_or_else(|| b::id_pattern("$$unknown"));
+                    properties.push(JsObjectPatternProperty::Property {
+                        key,
+                        value,
+                        computed,
+                        shorthand,
+                    });
+                }
+            }
+            b::object_pattern(properties)
+        }
+        Some("ArrayExpression") | Some("ArrayPattern") => {
+            let mut elements = Vec::new();
+            if let Some(els) = obj.get("elements").and_then(|e| e.as_array()) {
+                for el in els {
+                    if el.is_null() {
+                        elements.push(None);
+                    } else {
+                        elements.push(Some(expression_to_let_pattern(el, context)));
+                    }
+                }
+            }
+            b::array_pattern(elements)
+        }
+        Some("SpreadElement") | Some("RestElement") => JsPattern::Rest(Box::new(
+            obj.get("argument")
+                .map(|a| expression_to_let_pattern(a, context))
+                .unwrap_or_else(|| b::id_pattern("$$unknown")),
+        )),
+        Some("AssignmentExpression") | Some("AssignmentPattern") => {
+            let left = obj
+                .get("left")
+                .map(|l| expression_to_let_pattern(l, context))
+                .unwrap_or_else(|| b::id_pattern("$$unknown"));
+            let right_raw = obj
+                .get("right")
+                .and_then(|r| r.as_object())
+                .and_then(source_slice)
+                .unwrap_or_else(|| "undefined".to_string());
+            JsPattern::Assignment(JsAssignmentPattern {
+                left: Box::new(left),
+                right: context.arena.alloc_expr(b::raw(right_raw)),
+            })
+        }
+        _ => b::id_pattern("$$unknown"),
     }
 }
 
@@ -965,6 +1058,9 @@ fn process_on_directive(
     context: &mut ComponentContext,
     events: &mut IndexMap<String, Vec<JsExpr>>,
 ) {
+    let _tf = crate::compiler::phases::phase3_transform::profile::tf_guard(
+        crate::compiler::phases::phase3_transform::profile::TF_BC_ON,
+    );
     // If no expression, mark that component needs props for event bubbling
     // This is handled via build_event_handler which sets needs_props_from_events
 
@@ -974,27 +1070,16 @@ fn process_on_directive(
     // `context` is reborrowed mutably by `build_event_handler`. The arena
     // outlives this borrow and traversal is single-threaded (no aliasing).
     let arena_local = unsafe { &*(&context.arena as *const _) };
-    let mut handler = build_event_handler(
-        arena_local,
-        on_directive.expression.as_ref(),
-        on_directive,
-        context,
-    );
+    let mut handler =
+        build_event_handler(arena_local, on_directive.expression.as_ref(), on_directive, context);
 
     // Apply once modifier
     if on_directive.modifiers.iter().any(|m| m.as_str() == "once") {
-        handler = b::call(
-            &context.arena,
-            b::member_path(&context.arena, "$.once"),
-            vec![handler],
-        );
+        handler = b::call(&context.arena, b::member_path(&context.arena, "$.once"), vec![handler]);
     }
 
     // Add to events map
-    events
-        .entry(on_directive.name.to_string())
-        .or_default()
-        .push(handler);
+    events.entry(on_directive.name.to_string()).or_default().push(handler);
 }
 
 /// Process a SpreadAttribute ({...props}).
@@ -1004,6 +1089,9 @@ fn process_spread_attribute(
     props_and_spreads: &mut Vec<PropsEntry>,
     memoizer: &mut crate::compiler::phases::phase3_transform::client::types::Memoizer,
 ) {
+    let _tf = crate::compiler::phases::phase3_transform::profile::tf_guard(
+        crate::compiler::phases::phase3_transform::profile::TF_BC_SPREAD,
+    );
     let expression = convert_expression(&spread.expression, context);
 
     // Check if the expression has reactive state and function calls.
@@ -1015,18 +1103,21 @@ fn process_spread_attribute(
     //   } else {
     //       props_and_spreads.push(expression);
     //   }
-    let has_state = super::utils::expression_has_reactive_state(&spread.expression, context);
-    let has_call = super::utils::expression_has_call(&spread.expression, context);
+    let has_state = spread.metadata.expression.has_state();
+    let has_call = spread.metadata.expression.has_call();
     let has_await = crate::compiler::phases::phase3_transform::js_ast::builders::js_expr_has_await(
         &context.arena,
         &expression,
     );
 
-    if has_state {
+    // The memoizer memoizes when `has_call || has_await` (independent of state), so a
+    // dynamic call spread like `{...getGroupProps()}` must be lifted into a `$.derived`
+    // even when it references no reactive state.
+    if has_state || has_call || has_await {
         // Apply transforms to get the proper reactive expression (e.g., state -> $.get(state))
         let transformed = super::utils::apply_transforms_to_expression(&expression, context);
 
-        // Use memoizer to potentially wrap in $.derived_safe_equal
+        // Use memoizer to potentially wrap in $.derived / $.derived_safe_equal
         let memo_id = memoizer.add(
             transformed.clone(),
             has_call,
@@ -1046,18 +1137,14 @@ fn process_spread_attribute(
             // Wrap in thunk with $.get()
             props_and_spreads.push(PropsEntry::Spread(b::thunk(
                 &context.arena,
-                b::call(
-                    &context.arena,
-                    b::member_path(&context.arena, "$.get"),
-                    vec![memo_id],
-                ),
+                b::call(&context.arena, b::member_path(&context.arena, "$.get"), vec![memo_id]),
             )));
         } else {
             // Wrap in thunk for reactivity tracking
             props_and_spreads.push(PropsEntry::Spread(b::thunk(&context.arena, transformed)));
         }
     } else {
-        // No reactive state - push the expression directly without thunk wrapping
+        // No reactive state, call, or await - push the expression directly without thunk wrapping
         props_and_spreads.push(PropsEntry::Spread(expression));
     }
 }
@@ -1070,48 +1157,35 @@ fn process_regular_attribute(
     custom_css_props: &mut Vec<JsObjectMember>,
     memoizer: &mut crate::compiler::phases::phase3_transform::client::types::Memoizer,
 ) {
+    let _tf = crate::compiler::phases::phase3_transform::profile::tf_guard(
+        crate::compiler::phases::phase3_transform::profile::TF_BC_ATTR,
+    );
     // Handle custom CSS properties (--var)
     if attr.name.starts_with("--") {
-        // Build the attribute value with potential memoization
-        // This matches the official Svelte behavior where CSS prop values
-        // can be memoized if they contain function calls with state
-        let result = build_attribute_value(&attr.value, context, |value, _metadata| value);
-
-        // Check if this value needs memoization
-        let has_call =
-            super::utils::expression_has_call(&get_original_expression(&attr.value), context);
-        let _has_await = false; // TODO: detect await
-
-        // For CSS props, memoization happens when there's a call with state
-        let final_value = if has_call && result.has_state {
-            // Add to memoizer - this creates a derived variable
+        let arena_ptr = (&context.arena) as *const _;
+        let result = build_attribute_value(&attr.value, context, |value, metadata| {
             let memo_id = memoizer.add(
-                result.value.clone(),
-                true,  // has_call
-                false, // has_await
-                false, // memoize_if_state
-                true,  // has_state
+                value.clone(),
+                metadata.has_call(),
+                metadata.has_await(),
+                false,
+                metadata.has_state(),
             );
 
-            // If memoization happened (memo_id is $N), wrap in $.get()
             if let JsExpr::Identifier(name) = &memo_id {
                 if name.starts_with('$') && name.chars().skip(1).all(|c| c.is_ascii_digit()) {
-                    b::call(
-                        &context.arena,
-                        b::member_path(&context.arena, "$.get"),
-                        vec![memo_id],
-                    )
+                    // SAFETY: the arena outlives this `build_attribute_value` call.
+                    let arena = unsafe { &*arena_ptr };
+                    b::call(arena, b::member_path(arena, "$.get"), vec![memo_id])
                 } else {
-                    result.value
+                    value
                 }
             } else {
-                result.value
+                memo_id
             }
-        } else {
-            result.value
-        };
+        });
 
-        custom_css_props.push(b::prop(&context.arena, attr.name.as_str(), final_value));
+        custom_css_props.push(b::prop(&context.arena, attr.name.as_str(), result.value));
         return;
     }
 
@@ -1132,13 +1206,8 @@ fn process_regular_attribute(
         let has_state = metadata.has_state();
         let has_call = metadata.has_call();
         // Use memoizer.add to determine if this chunk should become a derived
-        let memo_id = memoizer.add(
-            value.clone(),
-            has_call,
-            has_await,
-            should_wrap_in_derived,
-            has_state,
-        );
+        let memo_id =
+            memoizer.add(value.clone(), has_call, has_await, should_wrap_in_derived, has_state);
         if let JsExpr::Identifier(name) = &memo_id {
             if name.starts_with('$') && name.chars().skip(1).all(|c| c.is_ascii_digit()) {
                 // SAFETY: arena reference is valid for the duration of this call
@@ -1204,31 +1273,6 @@ fn process_regular_attribute(
     }
 }
 
-/// Extract the original AST expression from an AttributeValue.
-fn get_original_expression(value: &AttributeValue) -> crate::ast::js::Expression {
-    match value {
-        AttributeValue::Expression(expr_tag) => expr_tag.expression.clone(),
-        AttributeValue::Sequence(parts) if parts.len() == 1 => {
-            if let AttributeValuePart::ExpressionTag(expr_tag) = &parts[0] {
-                expr_tag.expression.clone()
-            } else {
-                // Text - create a dummy literal expression
-                crate::ast::js::Expression::from_json(serde_json::json!({
-                    "type": "Literal",
-                    "value": ""
-                }))
-            }
-        }
-        _ => {
-            // Other cases - create a dummy literal expression
-            crate::ast::js::Expression::from_json(serde_json::json!({
-                "type": "Literal",
-                "value": ""
-            }))
-        }
-    }
-}
-
 /// Mirrors Svelte JS `should_wrap_in_derived` for component attribute values.
 /// Returns true if any chunk's expression is not a simple Identifier or MemberExpression.
 fn attribute_has_complex_chunk(value: &AttributeValue) -> bool {
@@ -1288,23 +1332,103 @@ fn is_snippet_identifier(value: &AttributeValue, context: &ComponentContext) -> 
 }
 
 /// Process a bind directive.
-fn process_bind_directive(
-    bind: &BindDirective,
+/// `validate_mutation` (`shared/utils.js:390`) for a `bind:` setter body — the
+/// directive never reaches the assignment visitor that normally applies it.
+fn validate_bind_setter_mutation(
+    expression: JsExpr,
+    bind: &BindDirective<'_>,
+    ignored_codes: &[String],
+    context: &mut ComponentContext,
+) -> JsExpr {
+    use crate::compiler::phases::phase3_transform::client::visitors::expression_converter::{
+        check_ownership_validation, ownership_alias_literal,
+    };
+
+    if !context.state.dev || ignored_codes.iter().any(|code| code == "ownership_invalid_mutation") {
+        return expression;
+    }
+    let Some((prop_alias, path, source_loc)) =
+        check_ownership_validation(Some(bind.expression.as_json()), context)
+    else {
+        return expression;
+    };
+    let mut args = vec![ownership_alias_literal(prop_alias), b::array(path), expression];
+    if let Some((line, col)) = source_loc {
+        args.push(b::literal_number(line as f64));
+        args.push(b::literal_number(col as f64));
+    }
+    b::call(&context.arena, b::member_path(&context.arena, "$$ownership_validator.mutation"), args)
+}
+
+fn synthesized_self_member_assign(
+    bind: &BindDirective<'_>,
+    raw: &JsExpr,
+    context: &ComponentContext,
+) -> Option<JsExpr> {
+    if !context.state.dev {
+        return None;
+    }
+    let JsExpr::Member(member) = raw else {
+        return None;
+    };
+    let (JsMemberProperty::Identifier(property)
+    | JsMemberProperty::SpannedIdentifier { name: property, .. }) = &member.property
+    else {
+        return None;
+    };
+    let start = bind.expression.start()? as usize;
+    let (line, col) = crate::compiler::phases::phase3_transform::utils::locate_in_source(
+        &context.state.analysis.source,
+        start,
+    );
+    let location = format!(
+        "{}:{line}:{col}",
+        context.state.analysis.location_filename.replace('/', "/\u{200b}")
+    );
+    Some(b::call(
+        &context.arena,
+        b::member_path(&context.arena, "$.assign"),
+        vec![
+            context.arena.get_expr(member.object).clone(),
+            b::string(property.as_str()),
+            b::string("="),
+            b::id("$$value"),
+            b::string(&location),
+        ],
+    ))
+}
+
+/// The store a `$.store_set` / `$.store_mutate` writes to is read like any other
+/// reference to its binding, so a prop reads as `store()` and a state source as
+/// `$.get(store)` (upstream visits `b.id(name.slice(1))` for the same reason).
+fn build_store_source(store_name: &str, context: &ComponentContext) -> JsExpr {
+    match context.state.transform.get(store_name).and_then(|t| t.read) {
+        Some(read_fn) => read_fn(&context.arena, b::id(store_name)),
+        None => b::id(store_name),
+    }
+}
+
+fn process_bind_directive<'a>(
+    bind: &BindDirective<'a>,
     context: &mut ComponentContext,
     props_and_spreads: &mut Vec<PropsEntry>,
     delayed_props: &mut Vec<DelayedProp>,
-    bind_this: &mut Option<Expression>,
+    bind_this: &mut Option<Expression<'a>>,
     binding_initializers: &mut Vec<JsStatement>,
     is_component_dynamic: bool,
     intermediate_name: &str,
     component_name: &str,
     ignored_codes: &[String],
+    is_svelte_self: bool,
 ) {
+    let _tf = crate::compiler::phases::phase3_transform::profile::tf_guard(
+        crate::compiler::phases::phase3_transform::profile::TF_BC_BIND,
+    );
     // Convert the expression without transforms first
-    let saved_in_bind = context.state.in_bind_directive;
-    context.state.in_bind_directive = true;
-    let raw_expression = convert_expression(&bind.expression, context);
-    context.state.in_bind_directive = saved_in_bind;
+    let raw_expression = match convert_expression(&bind.expression, context) {
+        JsExpr::Spanned(inner, _, _) => context.arena.get_expr(inner).clone(),
+        expression => expression,
+    };
 
     // Apply transforms to get the proper getter expression (e.g., $store.value -> $store().value)
     let transformed_expression =
@@ -1326,6 +1450,23 @@ fn process_bind_directive(
         return;
     }
 
+    // Upstream stamps both generated accessor keys with `attribute.name_loc`,
+    // whose range is the complete raw directive name (`bind:name|modifiers`).
+    // Parsed directives retain that exact range; the fallback only serves
+    // synthetic directives whose source location was deliberately omitted.
+    let (bind_key_start, bind_key_end) = bind.name_loc.as_ref().map_or_else(
+        || {
+            (
+                bind.start,
+                bind.start
+                    + "bind:".len() as u32
+                    + bind.name.len() as u32
+                    + bind.modifiers.iter().map(|modifier| 1 + modifier.len() as u32).sum::<u32>(),
+            )
+        },
+        |loc| (loc.start.character, loc.end.character),
+    );
+
     // In runes mode, when a bind directive's expression is rooted at an each block
     // item (e.g., bind:checked={partner.inTimeline}), flag the each block so it
     // emits the $$index parameter. This mirrors the official compiler's `mutate`
@@ -1334,11 +1475,7 @@ fn process_bind_directive(
         use crate::compiler::phases::phase3_transform::client::visitors::bind_directive::get_expression_root_identifier;
         let expr_root = get_expression_root_identifier(&raw_expression, &context.arena);
         if let Some(ref root_name) = expr_root
-            && context
-                .state
-                .each_item_names
-                .iter()
-                .any(|n| n.as_str() == root_name.as_str())
+            && context.state.each_item_names.iter().any(|n| n.as_str() == root_name.as_str())
         {
             context.state.each_item_assign_or_mutate.set(true);
         }
@@ -1384,9 +1521,13 @@ fn process_bind_directive(
                 use crate::compiler::phases::phase3_transform::js_ast::codegen::generate_expr;
                 generate_expr(&get_expr, &context.arena)
             };
-            let getter = b::getter(&context.arena,
-                bind.name.as_str(),
-                vec![b::return_value(&context.arena, JsExpr::Raw(get_body_str.into()))],
+            let getter = b::with_property_key_span(
+                b::getter(&context.arena,
+                    bind.name.as_str(),
+                    vec![b::return_value(&context.arena, JsExpr::Raw(get_body_str.into()))],
+                ),
+                bind_key_start,
+                bind_key_end,
             );
 
             if let Some(set_fn) = set_expr {
@@ -1410,10 +1551,14 @@ fn process_bind_directive(
                     use crate::compiler::phases::phase3_transform::js_ast::codegen::generate_expr;
                     format!("({})($$value)", generate_expr(&set_fn, &context.arena))
                 };
-                let setter = b::setter(&context.arena,
-                    bind.name.as_str(),
-                    "$$value",
-                    vec![b::stmt(&context.arena, JsExpr::Raw(set_body_str.into()))],
+                let setter = b::with_property_key_span(
+                    b::setter(&context.arena,
+                        bind.name.as_str(),
+                        "$$value",
+                        vec![b::stmt(&context.arena, JsExpr::Raw(set_body_str.into()))],
+                    ),
+                    bind_key_start,
+                    bind_key_end,
                 );
                 delayed_props.push(DelayedProp { prop: getter });
                 delayed_props.push(DelayedProp { prop: setter });
@@ -1438,14 +1583,8 @@ fn process_bind_directive(
         let get_name = context.state.memoizer.generate_id("bind_get");
         let set_name = context.state.memoizer.generate_id("bind_set");
 
-        context
-            .state
-            .init
-            .push(b::var_decl(&context.arena, get_name.clone(), Some(get)));
-        context
-            .state
-            .init
-            .push(b::var_decl(&context.arena, set_name.clone(), Some(set)));
+        context.state.init.push(b::var_decl(&context.arena, get_name.clone(), Some(get)));
+        context.state.init.push(b::var_decl(&context.arena, set_name.clone(), Some(set)));
 
         // An explicit get/set bind (`bind:x={() => a, b => …}` — a SequenceExpression)
         // is pushed in SOURCE position, NOT delayed. Upstream only delays the
@@ -1499,10 +1638,7 @@ fn process_bind_directive(
             crate::compiler::phases::phase3_transform::client::utils::is_state_source(
                 binding,
                 context.state.analysis,
-            ) || matches!(
-                binding.kind,
-                BindingKind::Derived | BindingKind::LegacyReactive
-            )
+            ) || matches!(binding.kind, BindingKind::Derived | BindingKind::LegacyReactive)
         } else {
             false
         }
@@ -1554,13 +1690,14 @@ fn process_bind_directive(
         )]
     } else {
         // Use transformed expression for other cases (includes store member expressions)
-        vec![b::return_value(
-            &context.arena,
-            transformed_expression.clone(),
-        )]
+        vec![b::return_value(&context.arena, transformed_expression.clone())]
     };
 
-    let getter = b::getter(&context.arena, bind.name.as_str(), getter_body);
+    let getter = b::with_property_key_span(
+        b::getter(&context.arena, bind.name.as_str(), getter_body),
+        bind_key_start,
+        bind_key_end,
+    );
 
     // Create setter
     // For store member expressions, we need to use $.store_mutate
@@ -1594,11 +1731,7 @@ fn process_bind_directive(
         if needs_proxy {
             set_args.push(b::boolean(true));
         }
-        let set_call = b::call(
-            &context.arena,
-            b::member_path(&context.arena, "$.set"),
-            set_args,
-        );
+        let set_call = b::call(&context.arena, b::member_path(&context.arena, "$.set"), set_args);
         // If the bound state variable is ALSO store-subscribed (`$store` is
         // referenced elsewhere), writing a new value to it must unsubscribe the
         // old store so subsequent `$store` reads re-subscribe. Upstream gets
@@ -1628,7 +1761,7 @@ fn process_bind_directive(
             b::call(
                 &context.arena,
                 b::member_path(&context.arena, "$.store_set"),
-                vec![b::id(&store_name), b::id("$$value")],
+                vec![build_store_source(&store_name, context), b::id("$$value")],
             ),
         )]
     } else if is_prop_binding {
@@ -1636,11 +1769,7 @@ fn process_bind_directive(
         // prop($$value) instead of prop = $$value
         vec![b::stmt(
             &context.arena,
-            b::call(
-                &context.arena,
-                raw_expression.clone(),
-                vec![b::id("$$value")],
-            ),
+            b::call(&context.arena, raw_expression.clone(), vec![b::id("$$value")]),
         )]
     } else if is_store_member {
         // For store member expressions like $store.value, we need:
@@ -1659,18 +1788,7 @@ fn process_bind_directive(
                 &store_prefix,
                 b::id("$$value"),
             );
-            // The store *source* (first arg) is read like any other reference to
-            // its binding: a prop reads as the getter call `store()`, a state /
-            // mutable_source reads as `$.get(store)`, and a plain store keeps the
-            // bare name. Apply the registered read transform (mirrors upstream's
-            // `context.state.transform[name].read`).
-            let store_source = match context.state.transform.get(&store_name) {
-                Some(transform) => match transform.read {
-                    Some(read_fn) => read_fn(&context.arena, b::id(&store_name)),
-                    None => b::id(&store_name),
-                },
-                None => b::id(&store_name),
-            };
+            let store_source = build_store_source(&store_name, context);
             vec![b::stmt(
                 &context.arena,
                 b::call(
@@ -1689,13 +1807,15 @@ fn process_bind_directive(
     } else {
         // Check if this is a member expression binding where the root is a prop or state
         let member_root_info = if let JsExpr::Member(_) = &raw_expression {
-            // Extract the root identifier from the member expression
-            let mut root = &raw_expression;
-            while let JsExpr::Member(m) = root {
-                root = context.arena.get_expr(m.object);
-            }
-            if let JsExpr::Identifier(name) = root {
-                context.state.get_binding(name).map(|binding| {
+            // Extract the root identifier from the member expression. Identifier
+            // nodes can carry source-map spans, so walking only bare Member and
+            // Identifier variants loses prop roots such as `data().pingEval`.
+            crate::compiler::phases::phase3_transform::client::visitors::bind_directive::get_expression_root_identifier(
+                &raw_expression,
+                &context.arena,
+            )
+            .and_then(|name| {
+                context.state.get_binding(&name).map(|binding| {
                     let is_state =
                         crate::compiler::phases::phase3_transform::client::utils::is_state_source(
                             binding,
@@ -1715,11 +1835,9 @@ fn process_bind_directive(
                                 binding.kind,
                                 crate::compiler::phases::phase2_analyze::scope::BindingKind::BindableProp
                             ));
-                    (name.clone(), is_state, is_prop)
+                    (name, is_state, is_prop)
                 })
-            } else {
-                None
-            }
+            })
         } else {
             None
         };
@@ -1743,7 +1861,7 @@ fn process_bind_directive(
                 {
                     vec![b::stmt(
                         &context.arena,
-                        mutate_fn(&context.arena, b::id(replacement), assignment),
+                        mutate_fn(t, &context.arena, b::id(replacement), assignment),
                     )]
                 } else {
                     vec![b::stmt(&context.arena, assignment)]
@@ -1771,17 +1889,37 @@ fn process_bind_directive(
                 let wrapped = crate::compiler::phases::phase3_transform::client::visitors::expression_converter::wrap_with_legacy_invalidate(
                     call, &root_name, context,
                 );
+                let wrapped = validate_bind_setter_mutation(wrapped, bind, ignored_codes, context);
                 vec![b::stmt(&context.arena, wrapped)]
-            } else if is_state {
+            } else if is_state
+                || (is_svelte_self
+                    && context.state.analysis.runes
+                    && context.state.get_binding(&root_name).is_some_and(|binding| {
+                        matches!(
+                            binding.kind,
+                            crate::compiler::phases::phase2_analyze::scope::BindingKind::State
+                                | crate::compiler::phases::phase2_analyze::scope::BindingKind::RawState
+                        )
+                    }))
+            {
                 if context.state.analysis.runes {
-                    // In runes mode, replace the root with $.get(root) in the assignment:
-                    // $.get(value).a = $$value
-                    let assignment = b::assign(
-                        &context.arena,
-                        transformed_expression.clone(),
-                        b::id("$$value"),
-                    );
-                    vec![b::stmt(&context.arena, assignment)]
+                    if is_svelte_self
+                        && let Some(assign) =
+                            synthesized_self_member_assign(bind, &raw_expression, context)
+                    {
+                        vec![b::stmt(&context.arena, assign)]
+                    } else {
+                        // In runes mode, replace the root with $.get(root) in the assignment:
+                        // $.get(value).a = $$value
+                        let assignment = b::assign(
+                            &context.arena,
+                            transformed_expression.clone(),
+                            b::id("$$value"),
+                        );
+                        let assignment =
+                            validate_bind_setter_mutation(assignment, bind, ignored_codes, context);
+                        vec![b::stmt(&context.arena, assignment)]
+                    }
                 } else {
                     // In legacy mode, wrap in $.mutate():
                     // $.mutate(value, $.get(value).a = $$value)
@@ -1800,21 +1938,17 @@ fn process_bind_directive(
                     )]
                 }
             } else {
-                // Root is not state or prop - check if it has a transform
-                let has_transform = transform.is_some_and(|t| t.read.is_some());
-                if has_transform {
-                    let assignment = b::assign(
-                        &context.arena,
-                        transformed_expression.clone(),
-                        b::id("$$value"),
-                    );
-                    vec![b::stmt(&context.arena, assignment)]
-                } else {
-                    vec![b::stmt(
-                        &context.arena,
-                        b::assign(&context.arena, raw_expression.clone(), b::id("$$value")),
-                    )]
-                }
+                // Upstream falls through to `context.next()`, which visits the whole
+                // assignment target — inner references (an each-block thunk in a
+                // computed key) carry read transforms even when the root has none.
+                let assignment = b::assign(
+                    &context.arena,
+                    transformed_expression.clone(),
+                    b::id("$$value"),
+                );
+                let assignment =
+                    validate_bind_setter_mutation(assignment, bind, ignored_codes, context);
+                vec![b::stmt(&context.arena, assignment)]
             }
         } else {
             vec![b::stmt(
@@ -1824,7 +1958,11 @@ fn process_bind_directive(
         }
     };
 
-    let setter = b::setter(&context.arena, bind.name.as_str(), "$$value", setter_body);
+    let setter = b::with_property_key_span(
+        b::setter(&context.arena, bind.name.as_str(), "$$value", setter_body),
+        bind_key_start,
+        bind_key_end,
+    );
 
     // Add as delayed props (bindings come at the end)
     delayed_props.push(DelayedProp { prop: getter });
@@ -1833,9 +1971,7 @@ fn process_bind_directive(
     // Dev mode: add ownership validation for bindable props
     // Reference: component.js lines 207-230
     let is_sequence_expression = bind.expression.node_type() == Some("SequenceExpression");
-    let binding_ignored = ignored_codes
-        .iter()
-        .any(|c| c == "ownership_invalid_binding");
+    let binding_ignored = ignored_codes.iter().any(|c| c == "ownership_invalid_binding");
     if context.state.dev
         && bind.name.as_str() != "this"
         && !is_sequence_expression
@@ -1849,11 +1985,8 @@ fn process_bind_directive(
                 use crate::compiler::phases::phase2_analyze::scope::BindingKind;
                 if matches!(binding.kind, BindingKind::Prop | BindingKind::BindableProp) {
                     context.state.needs_mutation_validation.set(true);
-                    let comp_name = if is_component_dynamic {
-                        intermediate_name
-                    } else {
-                        component_name
-                    };
+                    let comp_name =
+                        if is_component_dynamic { intermediate_name } else { component_name };
                     binding_initializers.push(b::stmt(
                         &context.arena,
                         b::call(
@@ -1875,7 +2008,47 @@ fn process_bind_directive(
 /// Check if expression is a member expression where the object is a store subscription.
 /// E.g., $store.value or $store.nested.value
 fn is_store_member_expression(expr: &Expression, context: &ComponentContext) -> bool {
-    let val = expr.as_json();
+    // The typed walk needs the serialize arena to resolve child ids; without one
+    // installed there is nothing to walk but the JSON.
+    if let Some(node) = expr.try_as_node_ref()
+        && let Some(answer) = crate::ast::arena::try_with_current_serialize_arena(|arena| {
+            typed_is_store_member_expression(node, arena, context)
+        })
+    {
+        return answer;
+    }
+    json_is_store_member_expression(expr.as_json(), context)
+}
+
+/// Typed counterpart of `json_is_store_member_expression`.
+fn typed_is_store_member_expression(
+    node: &JsNode,
+    arena: &ParseArena,
+    context: &ComponentContext,
+) -> bool {
+    let JsNode::MemberExpression { object, .. } = node else {
+        return false;
+    };
+
+    // Walk to the root of the member chain (the `object` side only).
+    let mut root = arena.get_js_node(*object);
+    while let JsNode::MemberExpression { object, .. } = root {
+        root = arena.get_js_node(*object);
+    }
+
+    if let JsNode::Identifier { name, .. } = root
+        && let Some(binding) = context.state.get_binding(name.as_str())
+    {
+        return binding.kind
+            == crate::compiler::phases::phase2_analyze::scope::BindingKind::StoreSub;
+    }
+    false
+}
+
+/// JSON form of `is_store_member_expression` — kept as the fallback for an
+/// expression reached without a serialize arena, and as the oracle the typed
+/// walk is checked against.
+fn json_is_store_member_expression(val: &serde_json::Value, context: &ComponentContext) -> bool {
     if let Some(obj) = val.as_object()
         && let Some("MemberExpression") = obj.get("type").and_then(|t| t.as_str())
     {
@@ -1947,11 +2120,9 @@ fn replace_store_with_untrack(
     store_prefix: &str,
 ) -> JsExpr {
     match expr {
-        JsExpr::Identifier(name) if name == store_prefix => b::call(
-            arena,
-            b::member_path(arena, "$.untrack"),
-            vec![b::id(store_prefix)],
-        ),
+        JsExpr::Identifier(name) if name == store_prefix => {
+            b::call(arena, b::member_path(arena, "$.untrack"), vec![b::id(store_prefix)])
+        }
         JsExpr::Member(member) => {
             let new_object =
                 replace_store_with_untrack(arena, arena.get_expr(member.object), store_prefix);
@@ -1972,14 +2143,16 @@ fn process_attach_tag(
     context: &mut ComponentContext,
     props_and_spreads: &mut Vec<PropsEntry>,
 ) {
+    let _tf = crate::compiler::phases::phase3_transform::profile::tf_guard(
+        crate::compiler::phases::phase3_transform::profile::TF_BC_ATTACH,
+    );
     let expression = convert_expression(&attach.expression, context);
 
-    // Check if expression has reactive state using the proper check.
-    // In the official Svelte compiler's phase 2 analysis (CallExpression.js lines 269-272),
-    // non-pure call expressions also set has_state=true. So we need to check both
-    // expression_has_reactive_state AND expression_has_call to match the official behavior.
-    let has_state = super::utils::expression_has_reactive_state(&attach.expression, context);
-    let has_call = super::utils::expression_has_call(&attach.expression, context);
+    // Phase 2's AttachTag visitor walks this expression with the same metadata
+    // object upstream passes to its visitor context. Consume that single source
+    // of truth instead of independently re-deriving the two flags in Phase 3.
+    let has_state = attach.metadata.expression.has_state();
+    let has_call = attach.metadata.expression.has_call();
 
     let final_expr = if has_state || has_call {
         // Apply transforms to the expression to convert state references to $.get() calls
@@ -2033,6 +2206,9 @@ fn process_snippet_block(
     props_and_spreads: &mut Vec<PropsEntry>,
     serialized_slots: &mut Vec<JsObjectMember>,
 ) {
+    let _tf = crate::compiler::phases::phase3_transform::profile::tf_guard(
+        crate::compiler::phases::phase3_transform::profile::TF_BC_SNIPPET,
+    );
     // Use the snippet_block visitor to generate the full snippet function
     // This properly handles the snippet body, parameters, and placement
     use crate::compiler::phases::phase3_transform::client::visitors::snippet_block::snippet_block;
@@ -2078,11 +2254,7 @@ fn process_snippet_block(
     );
 
     // Add to serialized slots for $$slots object
-    let slot_name = if snippet_name == "children" {
-        "default".to_string()
-    } else {
-        snippet_name
-    };
+    let slot_name = if snippet_name == "children" { "default".to_string() } else { snippet_name };
     serialized_slots.push(b::prop(&context.arena, &slot_name, b::boolean(true)));
 }
 
@@ -2101,6 +2273,9 @@ fn build_slot_function(
     let_names: &[(String, Option<String>)],
     context: &mut ComponentContext,
 ) -> Option<JsExpr> {
+    let _tf = crate::compiler::phases::phase3_transform::profile::tf_guard(
+        crate::compiler::phases::phase3_transform::profile::TF_BC_SLOT_FN,
+    );
     if children.is_empty() {
         return None;
     }
@@ -2145,6 +2320,7 @@ fn build_slot_function(
                     is_defined: false,
                     is_reactive: true,
                     replacement_id: None,
+                    store_source: None,
                 },
             );
             // Let directive bindings are template-kind.
@@ -2160,10 +2336,7 @@ fn build_slot_function(
     if should_apply_let_transforms {
         for (name, saved) in &saved_transforms {
             if let Some(original_transform) = saved {
-                context
-                    .state
-                    .transform
-                    .insert(name.clone(), original_transform.clone());
+                context.state.transform.insert(name.clone(), original_transform.clone());
             } else {
                 context.state.transform.remove(name);
             }
@@ -2189,18 +2362,7 @@ fn build_slot_function(
     // Add the visited children statements
     body.extend(child_statements);
 
-    Some(b::arrow_block(
-        vec![b::id_pattern("$$anchor"), b::id_pattern("$$slotProps")],
-        body,
-    ))
-}
-
-/// Public wrapper for visit_slot_children, used by SlotElement visitor.
-pub fn visit_slot_children_pub(
-    children: &[&TemplateNode],
-    context: &mut ComponentContext,
-) -> Vec<JsStatement> {
-    visit_slot_children(children, context)
+    Some(b::arrow_block(vec![b::id_pattern("$$anchor"), b::id_pattern("$$slotProps")], body))
 }
 
 /// Visit slot children and collect generated statements.
@@ -2219,8 +2381,11 @@ fn visit_slot_children(
     children: &[&TemplateNode],
     context: &mut ComponentContext,
 ) -> Vec<JsStatement> {
+    let _tf = crate::compiler::phases::phase3_transform::profile::tf_guard(
+        crate::compiler::phases::phase3_transform::profile::TF_BC_SLOT_CHILDREN,
+    );
     use crate::compiler::phases::phase3_transform::client::transform_template::Namespace;
-    use crate::compiler::phases::phase3_transform::utils::clean_nodes;
+    use crate::compiler::phases::phase3_transform::utils::clean_nodes_refs;
 
     // SAFETY: `JsArena` allocates via interior mutability (`UnsafeCell`) with
     // nodes behind stable `Box`es, so a shared `&JsArena` stays valid while
@@ -2228,9 +2393,6 @@ fn visit_slot_children(
     // and traversal is single-threaded (no aliasing).
     let arena_local2: &crate::compiler::phases::phase3_transform::js_ast::arena::JsArena =
         unsafe { &*(&context.arena as *const _) };
-
-    // Convert &[&TemplateNode] to Vec<TemplateNode> for clean_nodes
-    let nodes: Vec<TemplateNode> = children.iter().map(|n| (*n).clone()).collect();
 
     // Slot content is its own fragment, so its namespace is RE-INFERRED from the
     // children (a component is a namespace-reset boundary), NOT inherited from
@@ -2244,21 +2406,23 @@ fn visit_slot_children(
     let inferred_ns = crate::compiler::phases::phase3_transform::utils::infer_namespace(
         &context.state.metadata.namespace,
         crate::compiler::phases::phase3_transform::utils::ParentRef::None,
-        &nodes,
+        children,
         context.state.analysis,
         true,
     );
 
     // Clean the nodes (trim whitespace, etc.)
-    let cleaned = clean_nodes(
+    let cleaned = clean_nodes_refs(
         crate::compiler::phases::phase3_transform::utils::ParentRef::None, // No parent in slot context
-        &nodes,
+        children,
         &context.path,
+        context.state.metadata.in_text_element,
         inferred_ns,
         context.state.scope,
         context.state.analysis,
         context.state.preserve_whitespace,
         context.state.options.preserve_comments,
+        context.state.options.hmr,
     );
 
     // If no trimmed nodes and no hoisted nodes, return empty
@@ -2424,11 +2588,7 @@ fn visit_slot_children(
             // This is because is_text_first is true for single text nodes in slot context
             context.state.init.push(b::stmt(
                 &context.arena,
-                b::call(
-                    &context.arena,
-                    b::member_path(&context.arena, "$.next"),
-                    vec![],
-                ),
+                b::call(&context.arena, b::member_path(&context.arena, "$.next"), vec![]),
             ));
 
             // Generate unique id for the text node
@@ -2476,10 +2636,7 @@ fn visit_slot_children(
             .iter()
             .any(|node| matches!(node.as_ref(), TemplateNode::ExpressionTag(_)))
             && cleaned.trimmed.iter().all(|node| {
-                matches!(
-                    node.as_ref(),
-                    TemplateNode::Text(_) | TemplateNode::ExpressionTag(_)
-                )
+                matches!(node.as_ref(), TemplateNode::Text(_) | TemplateNode::ExpressionTag(_))
             });
 
         if use_space_template {
@@ -2502,11 +2659,7 @@ fn visit_slot_children(
                     0,
                     b::stmt(
                         &context.arena,
-                        b::call(
-                            &context.arena,
-                            b::member_path(&context.arena, "$.next"),
-                            vec![],
-                        ),
+                        b::call(&context.arena, b::member_path(&context.arena, "$.next"), vec![]),
                     ),
                 );
             }
@@ -2516,11 +2669,7 @@ fn visit_slot_children(
                 b::var_decl(
                     &context.arena,
                     &text_id_name,
-                    Some(b::call(
-                        &context.arena,
-                        b::member_path(&context.arena, "$.text"),
-                        vec![],
-                    )),
+                    Some(b::call(&context.arena, b::member_path(&context.arena, "$.text"), vec![])),
                 ),
             );
 
@@ -2657,11 +2806,7 @@ fn visit_slot_children(
                     0,
                     b::stmt(
                         &context.arena,
-                        b::call(
-                            &context.arena,
-                            b::member_path(&context.arena, "$.next"),
-                            vec![],
-                        ),
+                        b::call(&context.arena, b::member_path(&context.arena, "$.next"), vec![]),
                     ),
                 );
             }
@@ -2802,10 +2947,13 @@ fn visit_slot_children(
 
 /// Build the component expression for dynamic components.
 fn build_component_expression(
-    node: &ComponentNode,
+    node: &ComponentNode<'_, '_>,
     component_name: &str,
     context: &mut ComponentContext,
 ) -> JsExpr {
+    let _tf = crate::compiler::phases::phase3_transform::profile::tf_guard(
+        crate::compiler::phases::phase3_transform::profile::TF_BC_COMP_EXPR,
+    );
     match node {
         ComponentNode::Component(_) => {
             // For dynamic component identified by name
@@ -2823,9 +2971,7 @@ fn build_component_expression(
                     if !is_source {
                         let prop_name = binding.prop_alias.as_deref().unwrap_or(component_name);
                         return JsExpr::Member(JsMemberExpression {
-                            object: context
-                                .arena
-                                .alloc_expr(JsExpr::Identifier("$$props".into())),
+                            object: context.arena.alloc_expr(JsExpr::Identifier("$$props".into())),
                             property: JsMemberProperty::Identifier(prop_name.into()),
                             computed: false,
                             optional: false,
@@ -2874,9 +3020,12 @@ fn build_component_call(
     is_component_dynamic: bool,
     intermediate_name: &str,
     props_expression: &JsExpr,
-    bind_this: Option<&Expression>,
+    bind_this: Option<&Expression<'_>>,
     context: &mut ComponentContext,
 ) -> JsExpr {
+    let _tf = crate::compiler::phases::phase3_transform::profile::tf_guard(
+        crate::compiler::phases::phase3_transform::profile::TF_BC_COMP_CALL,
+    );
     let callee = if is_component_dynamic {
         b::id(intermediate_name)
     } else {
@@ -2909,11 +3058,7 @@ fn build_component_call(
         }
     };
 
-    let call = b::call(
-        &context.arena,
-        callee,
-        vec![anchor.clone(), props_expression.clone()],
-    );
+    let call = b::call(&context.arena, callee, vec![anchor.clone(), props_expression.clone()]);
 
     if let Some(bind_expr) = bind_this {
         build_bind_this_call(bind_expr, call, context)
@@ -2949,21 +3094,18 @@ fn build_with_css_props(
     bind_this: Option<&Expression>,
     component_start: u32,
 ) {
+    let _tf = crate::compiler::phases::phase3_transform::profile::tf_guard(
+        crate::compiler::phases::phase3_transform::profile::TF_BC_CSS_PROPS,
+    );
     // Determine wrapper element based on namespace
     let is_svg = context.state.metadata.namespace == "svg";
     let wrapper_element = if is_svg { "g" } else { "svelte-css-wrapper" };
 
     // Push wrapper element - use the component's start position for location tracking
-    context
-        .state
-        .template
-        .push_element(wrapper_element.to_string(), component_start, false);
+    context.state.template.push_element(wrapper_element.to_string(), component_start, false);
 
     if !is_svg {
-        context
-            .state
-            .template
-            .set_prop("style".to_string(), Some("display: contents".to_string()));
+        context.state.template.set_prop("style".to_string(), Some("display: contents".to_string()));
     }
 
     // Push comment for component anchor
@@ -2976,10 +3118,7 @@ fn build_with_css_props(
         b::call(
             &context.arena,
             b::member_path(&context.arena, "$.css_props"),
-            vec![
-                anchor.clone(),
-                b::thunk(&context.arena, b::object(custom_css_props.to_vec())),
-            ],
+            vec![anchor.clone(), b::thunk(&context.arena, b::object(custom_css_props.to_vec()))],
         ),
     ));
 
@@ -3001,11 +3140,7 @@ fn build_with_css_props(
     // Add reset call
     statements.push(b::stmt(
         &context.arena,
-        b::call(
-            &context.arena,
-            b::member_path(&context.arena, "$.reset"),
-            vec![anchor.clone()],
-        ),
+        b::call(&context.arena, b::member_path(&context.arena, "$.reset"), vec![anchor.clone()]),
     ));
 }
 
@@ -3024,14 +3159,15 @@ fn build_props_expression(
     arena: &crate::compiler::phases::phase3_transform::js_ast::arena::JsArena,
     props_and_spreads: Vec<PropsEntry>,
 ) -> JsExpr {
+    let _tf = crate::compiler::phases::phase3_transform::profile::tf_guard(
+        crate::compiler::phases::phase3_transform::profile::TF_BC_PROPS,
+    );
     if props_and_spreads.is_empty() {
         return b::object(vec![]);
     }
 
     // Check if we only have props (no spreads)
-    let all_props = props_and_spreads
-        .iter()
-        .all(|entry| matches!(entry, PropsEntry::Prop(_)));
+    let all_props = props_and_spreads.iter().all(|entry| matches!(entry, PropsEntry::Prop(_)));
 
     if all_props {
         // All entries are props, just build an object
@@ -3084,11 +3220,14 @@ fn build_component_meta_stmt(
     arena: &crate::compiler::phases::phase3_transform::js_ast::arena::JsArena,
 
     expression: JsExpr,
-    node: &ComponentNode,
+    node: &ComponentNode<'_, '_>,
     analysis_name: &str,
     dev: bool,
     source: &str,
 ) -> JsStatement {
+    let _tf = crate::compiler::phases::phase3_transform::profile::tf_guard(
+        crate::compiler::phases::phase3_transform::profile::TF_BC_META,
+    );
     if !dev {
         return b::stmt(arena, expression);
     }
@@ -3096,10 +3235,11 @@ fn build_component_meta_stmt(
     let (start, tag_name) = match node {
         ComponentNode::Component(comp) => (comp.start, comp.name.to_string()),
         ComponentNode::SvelteComponent(comp) => (comp.start, "svelte:component".to_string()),
-        ComponentNode::SvelteSelf(_) => (0, "svelte:self".to_string()),
+        ComponentNode::SvelteSelf(comp) => (comp.start, "svelte:self".to_string()),
     };
 
-    let (line, col) = super::super::attribute::locate_in_source(source, start as usize);
+    let (line, col) =
+        crate::compiler::phases::phase3_transform::utils::locate_in_source(source, start as usize);
 
     super::utils::add_svelte_meta_dev(
         arena,
@@ -3160,12 +3300,9 @@ fn is_store_subscription(expr: &Expression, context: &ComponentContext) -> bool 
 /// `$<name>`. Used to decide whether a `bind:` write to a store-holding state
 /// variable needs a `$.store_unsub(...)` wrap.
 fn is_var_store_subscribed(name: &str, context: &ComponentContext) -> bool {
-    context
-        .state
-        .get_binding(&format!("${}", name))
-        .is_some_and(|b| {
-            b.kind == crate::compiler::phases::phase2_analyze::scope::BindingKind::StoreSub
-        })
+    context.state.get_binding(&format!("${}", name)).is_some_and(|b| {
+        b.kind == crate::compiler::phases::phase2_analyze::scope::BindingKind::StoreSub
+    })
 }
 
 #[cfg(test)]
@@ -3217,6 +3354,107 @@ mod tests {
                 // Should be $.spread_props call
             }
             _ => panic!("Expected call expression"),
+        }
+    }
+
+    /// `(typed, json)` answers of `is_store_member_expression` for the
+    /// expression in `<Test a={…} />`, against a context holding one
+    /// `StoreSub` binding (`$store`) and one plain one (`plain`).
+    fn both_is_store_member(expr_src: &str) -> (bool, bool) {
+        use crate::compiler::ComponentAnalysis;
+        use crate::compiler::phases::phase2_analyze::scope::{
+            Binding, BindingKind, Scope, ScopeRoot,
+        };
+        use std::rc::Rc;
+
+        let input = format!("<Test a={{{expr_src}}} />");
+        let allocator = oxc_allocator::Allocator::default();
+        let mut result = crate::parse(&input, &allocator, Default::default()).unwrap();
+        // `parse()` may leave attribute expressions deferred; both paths need a
+        // resolved `Expression::Typed`.
+        assert!(
+            crate::compiler::phases::phase1_parse::resolve_lazy::resolve_lazy_expressions(
+                &mut result,
+                &input,
+            )
+            .is_none(),
+            "`{expr_src}` should parse"
+        );
+
+        let expr = result
+            .fragment
+            .nodes
+            .iter()
+            .find_map(|node| match node {
+                TemplateNode::Component(comp) => {
+                    comp.attributes.iter().find_map(|attr| match attr {
+                        Attribute::Attribute(a) => match &a.value {
+                            AttributeValue::Expression(tag) => Some(&tag.expression),
+                            _ => None,
+                        },
+                        _ => None,
+                    })
+                }
+                _ => None,
+            })
+            .expect("expression attribute");
+
+        let analysis = ComponentAnalysis::new("", &Default::default());
+        let scope = Scope::new(None);
+        let mut scope_root = ScopeRoot::new();
+        for binding in [
+            Binding::new("$store".to_string(), BindingKind::StoreSub, 0),
+            Binding::new("plain".to_string(), BindingKind::Normal, 0),
+        ] {
+            let name = binding.name.clone();
+            let idx = scope_root.push_binding(binding);
+            scope_root.scope.declarations.insert(name, idx);
+        }
+        let state = ComponentClientTransformState::new(
+            &result.arena,
+            &scope,
+            &scope_root,
+            &analysis,
+            b::id("node"),
+            Rc::new(TransformOptions::default()),
+        );
+        let context = ComponentContext::new(state, |_, _, _| TransformResult::None);
+
+        crate::ast::arena::with_serialize_arena(&result.arena, || {
+            (
+                is_store_member_expression(expr, &context),
+                json_is_store_member_expression(expr.as_json(), &context),
+            )
+        })
+    }
+
+    #[test]
+    fn typed_is_store_member_expression_agrees_with_the_json_walk() {
+        // (expression, expected answer) — expectations are spelled out as well
+        // as compared, so a walk that always says `false` can't pass by
+        // agreeing with an equally broken oracle.
+        let cases: &[(&str, bool)] = &[
+            ("$store.value", true),
+            ("$store.a.b.c", true),
+            ("$store['a'].b", true),
+            // Not a member expression at all.
+            ("$store", false),
+            ("$store()", false),
+            // Member chain rooted at a non-store binding / an unknown name.
+            ("plain.value", false),
+            ("missing.value", false),
+            // The root of the chain is the `object` side only — a computed
+            // property that mentions the store does not make it a store member.
+            ("plain[$store]", false),
+            // Chains whose root is not an identifier.
+            ("fn().value", false),
+            ("this.value", false),
+        ];
+
+        for (src, expected) in cases {
+            let (typed, json) = both_is_store_member(src);
+            assert_eq!(typed, json, "typed and JSON paths disagree on `{src}`");
+            assert_eq!(&typed, expected, "unexpected is_store_member_expression for `{src}`");
         }
     }
 }

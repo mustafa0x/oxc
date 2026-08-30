@@ -12,18 +12,18 @@ use crate::compiler::phases::phase2_analyze::scope::BindingKind;
 
 /// Visit an export default declaration (typed JsNode path).
 pub fn visit_typed(node: &JsNode, context: &mut VisitorContext) -> Result<(), AnalysisError> {
-    if let JsNode::ExportDefaultDeclaration { declaration, .. } = node {
+    if let JsNode::ExportDefaultDeclaration { declaration, start, end, .. } = node {
         let arena = context.parse_arena;
         let decl_node = arena.get_js_node(*declaration);
 
         if context.analysis.is_module_file {
             // In .svelte.js module files, check for invalid state/derived exports
             if let JsNode::Identifier { name, .. } = decl_node {
-                validate_export(name.as_str(), context)?;
+                validate_export(name.as_str(), context, *start, *end)?;
             }
             Ok(())
         } else {
-            Err(errors::module_illegal_default_export())
+            Err(errors::module_illegal_default_export().at(*start, *end))
         }
     } else {
         Ok(())
@@ -32,17 +32,22 @@ pub fn visit_typed(node: &JsNode, context: &mut VisitorContext) -> Result<(), An
 
 /// Validate that an exported binding is not derived or reassigned state.
 /// Corresponds to `validate_export()` in the official Svelte compiler.
-fn validate_export(name: &str, context: &VisitorContext) -> Result<(), AnalysisError> {
+fn validate_export(
+    name: &str,
+    context: &VisitorContext,
+    start: u32,
+    end: u32,
+) -> Result<(), AnalysisError> {
     if let Some(binding_idx) = context.analysis.root.get_binding(name, context.scope) {
         let binding = &context.analysis.root.bindings[binding_idx];
 
         if binding.kind == BindingKind::Derived {
-            return Err(errors::derived_invalid_export());
+            return Err(errors::derived_invalid_export().at(start, end));
         }
 
         if matches!(binding.kind, BindingKind::State | BindingKind::RawState) && binding.reassigned
         {
-            return Err(errors::state_invalid_export());
+            return Err(errors::state_invalid_export().at(start, end));
         }
     }
     Ok(())

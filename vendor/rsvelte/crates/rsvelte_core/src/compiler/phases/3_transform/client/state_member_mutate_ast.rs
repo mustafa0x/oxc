@@ -61,10 +61,7 @@ pub fn transform_state_member_mutate_ast(
     }
     // Fast probe — no `=` at all means no AssignmentExpression.
     memchr::memchr(b'=', source.as_bytes())?;
-    if !state_vars
-        .iter()
-        .any(|s| memchr::memmem::find(source.as_bytes(), s.as_bytes()).is_some())
-    {
+    if !state_vars.iter().any(|s| memchr::memmem::find(source.as_bytes(), s.as_bytes()).is_some()) {
         return None;
     }
 
@@ -149,8 +146,7 @@ impl<'a, 'ast> Visit<'ast> for StateMemberMutateCollector<'a> {
         wrapped.push_str(&outer_text[re..]);
 
         let rewrite = format!("$.mutate({}, {})", state_var, wrapped);
-        self.replacements
-            .push((expr.span.start, expr.span.end, rewrite));
+        self.replacements.push((expr.span.start, expr.span.end, rewrite));
     }
 }
 
@@ -270,20 +266,14 @@ mod tests {
     fn rewrites_inside_callback() {
         let src = "items.forEach(it => { state.x = it; });";
         let out = transform_state_member_mutate_ast(src, &ssv(&["state"]), &[]).unwrap();
-        assert_eq!(
-            out,
-            "items.forEach(it => { $.mutate(state, $.get(state).x = it); });"
-        );
+        assert_eq!(out, "items.forEach(it => { $.mutate(state, $.get(state).x = it); });");
     }
 
     #[test]
     fn multiple_states_in_one_source() {
         let out =
             transform_state_member_mutate_ast("a.x = 1; b.y = 2;", &ssv(&["a", "b"]), &[]).unwrap();
-        assert_eq!(
-            out,
-            "$.mutate(a, $.get(a).x = 1); $.mutate(b, $.get(b).y = 2);"
-        );
+        assert_eq!(out, "$.mutate(a, $.get(a).x = 1); $.mutate(b, $.get(b).y = 2);");
     }
 
     #[test]
@@ -292,10 +282,7 @@ mod tests {
         // Try `a.x = (b.y = 5)` — inner b.y=5 picked up first
         let out =
             transform_state_member_mutate_ast("a.x = (b.y = 5);", &ssv(&["a", "b"]), &[]).unwrap();
-        assert_eq!(
-            out,
-            "$.mutate(a, $.get(a).x = ($.mutate(b, $.get(b).y = 5)));"
-        );
+        assert_eq!(out, "$.mutate(a, $.get(a).x = ($.mutate(b, $.get(b).y = 5)));");
     }
 
     #[test]

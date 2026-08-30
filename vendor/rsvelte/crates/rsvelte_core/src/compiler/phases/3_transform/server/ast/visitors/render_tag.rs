@@ -87,6 +87,8 @@ pub fn visit_render_tag<'a>(node: &RenderTag, state: &mut ServerTransformState<'
     // `$.store_get($$store_subs ??= {}, "$snippet", snippet)`.
     let mut callee_expr = state.reparse_slice(c_start, c_end);
     state.wrap_reads_in_place(&mut callee_expr);
+    let callee_source = source_slice(state, c_start, c_end);
+    state.claim_on_visited(callee_source.as_deref(), &mut callee_expr);
 
     // 写经 `optimiser.transform(context.visit(callee), …)`: feed the callee through
     // a fresh `PromiseOptimiser` so a callee reading a top-level-await blocker
@@ -103,18 +105,24 @@ pub fn visit_render_tag<'a>(node: &RenderTag, state: &mut ServerTransformState<'
     // each argument is also read-wrapped (a `$derived` arg becomes `arg()`) and
     // routed through the optimiser so a blocked argument makes the tag async.
     let mut args = vec![state.b.id("$$renderer")];
+    let mut comment_cursor = c_end as u32;
     if let Some(arg_list) = call_json.get("arguments").and_then(Value::as_array) {
         for arg in arg_list {
-            if let (Some(a_start), Some(a_end)) = (
-                arg.get("start").and_then(Value::as_u64),
-                arg.get("end").and_then(Value::as_u64),
-            ) {
+            if let (Some(a_start), Some(a_end)) =
+                (arg.get("start").and_then(Value::as_u64), arg.get("end").and_then(Value::as_u64))
+            {
                 let (a_start, a_end) = (a_start as usize, a_end as usize);
                 let mut arg_expr = state.reparse_slice(a_start, a_end);
                 state.wrap_reads_in_place(&mut arg_expr);
                 if let Some(t) = source_slice(state, a_start, a_end) {
                     arg_expr = optimiser.transform(state, &t, arg_expr);
                 }
+                state.place_template_expression_comments(
+                    (comment_cursor, a_end as u32),
+                    (a_start as u32, a_end as u32),
+                    &mut arg_expr,
+                );
+                comment_cursor = a_end as u32;
                 args.push(arg_expr);
             }
         }
@@ -140,8 +148,6 @@ pub fn visit_render_tag<'a>(node: &RenderTag, state: &mut ServerTransformState<'
     // fragment (single non-dynamic render tag) elides it; an ASYNC tag also
     // elides it (写经 `if (!optimiser.is_async() && !is_standalone)`).
     if !is_async && !state.is_standalone {
-        state
-            .template
-            .push(TemplateEntry::Literal(EMPTY_COMMENT.to_string()));
+        state.template.push(TemplateEntry::Literal(EMPTY_COMMENT.to_string()));
     }
 }

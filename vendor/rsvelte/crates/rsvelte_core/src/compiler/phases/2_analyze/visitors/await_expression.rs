@@ -49,6 +49,11 @@ pub fn visit_typed(node: &JsNode, context: &mut VisitorContext) -> Result<(), An
 
     let mut suspend = tla;
 
+    if context.bind_await_depth == Some(context.function_depth) {
+        context.bind_has_await = true;
+        suspend = true;
+    }
+
     if let Some(metadata) = context.current_expression() {
         metadata.set_has_await(true);
         suspend = true;
@@ -56,23 +61,30 @@ pub fn visit_typed(node: &JsNode, context: &mut VisitorContext) -> Result<(), An
         // See `visit` above — mirrors upstream's `state.expression` being set
         // for the direct argument of `$derived(...)`.
         suspend = true;
-    } else if context.in_expression_tag && !crosses_function_boundary(&context.js_path) {
+    } else if context.in_expression_tag
+        && !context.in_template_function
+        && !crosses_function_boundary(&context.js_path)
+    {
         suspend = true;
     }
 
     if suspend {
         if !context.analysis.experimental_async {
-            return Err(AnalysisError::ValidationWithCode {
-                code: "experimental_async".to_string(),
-                message: "Cannot use `await` in deriveds and template expressions, or at the top level of a component, unless the `experimental.async` compiler option is `true`".to_string(),
-            });
+            return Err(AnalysisError::validation_at(
+                "experimental_async",
+                "Cannot use `await` in deriveds and template expressions, or at the top level of a component, unless the `experimental.async` compiler option is `true`",
+                node.start().unwrap_or(0),
+                node.end().unwrap_or(0),
+            ));
         }
 
         if !context.analysis.runes {
-            return Err(AnalysisError::ValidationWithCode {
-                code: "legacy_await_invalid".to_string(),
-                message: "Cannot use `await` in deriveds and template expressions, or at the top level of a component, unless in runes mode".to_string(),
-            });
+            return Err(AnalysisError::validation_at(
+                "legacy_await_invalid",
+                "Cannot use `await` in deriveds and template expressions, or at the top level of a component, unless in runes mode",
+                node.start().unwrap_or(0),
+                node.end().unwrap_or(0),
+            ));
         }
     }
 
@@ -134,10 +146,7 @@ fn is_last_evaluated_expression_js(js_path: &[JsPathEntry], node: &Value) -> boo
             }
 
             Some("MemberExpression") => {
-                if parent
-                    .get("computed")
-                    .and_then(|c| c.as_bool())
-                    .unwrap_or(false)
+                if parent.get("computed").and_then(|c| c.as_bool()).unwrap_or(false)
                     && is_same_node(parent.get("object"), current)
                 {
                     return false;

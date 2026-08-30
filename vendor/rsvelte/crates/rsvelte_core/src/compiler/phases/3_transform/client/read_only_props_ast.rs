@@ -104,12 +104,13 @@ pub fn transform_read_only_props_ast(
         &READ_ONLY_PROPS_ALLOC,
         &parse_source,
         SourceType::mjs(),
-        ParseOptions {
-            allow_return_outside_function: true,
-            ..ParseOptions::default()
-        },
+        ParseOptions { allow_return_outside_function: true, ..ParseOptions::default() },
         |program| {
-            let semantic_ret = SemanticBuilder::new().with_build_nodes(true).build(program);
+            let semantic_ret = super::super::profile::semantic_build(
+                super::super::profile::SEM_READ_ONLY_PROPS,
+                program.source_text.len(),
+                || SemanticBuilder::new().with_build_nodes(true).build(program),
+            );
             let semantic = &semantic_ret.semantic;
 
             let mut collector = ReadOnlyPropsCollector {
@@ -180,10 +181,7 @@ struct ReadOnlyPropsCollector<'a, 'sem> {
 impl<'a, 'sem> ReadOnlyPropsCollector<'a, 'sem> {
     /// Returns the `prop_name` for the given local name, if any.
     fn prop_name_for(&self, local_name: &str) -> Option<&'a str> {
-        self.read_only_props
-            .iter()
-            .find(|(l, _)| l == local_name)
-            .map(|(_, p)| p.as_str())
+        self.read_only_props.iter().find(|(l, _)| l == local_name).map(|(_, p)| p.as_str())
     }
 
     /// Build the `$$props.foo` or `$$props['foo']` replacement.
@@ -211,11 +209,7 @@ impl<'a, 'sem, 'ast> Visit<'ast> for ReadOnlyPropsCollector<'a, 'sem> {
         if is_locally_shadowed(self.semantic, ident) {
             return;
         }
-        self.replacements.push((
-            ident.span.start,
-            ident.span.end,
-            Self::build_access(prop_name),
-        ));
+        self.replacements.push((ident.span.start, ident.span.end, Self::build_access(prop_name)));
     }
 
     fn visit_object_property(&mut self, prop: &ObjectProperty<'ast>) {
@@ -266,10 +260,7 @@ mod tests {
     use super::*;
 
     fn pp(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
-        pairs
-            .iter()
-            .map(|(l, p)| (l.to_string(), p.to_string()))
-            .collect()
+        pairs.iter().map(|(l, p)| (l.to_string(), p.to_string())).collect()
     }
 
     #[test]

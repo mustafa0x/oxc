@@ -65,7 +65,7 @@ use oxc_ast::ast::{Expression as OxcExpression, ObjectPropertyKind};
 use super::shared::{BLOCK_CLOSE, BLOCK_OPEN, TemplateEntry, build_fragment_body};
 
 /// Visit a `<slot>` / `<slot name="x">` element.
-pub fn visit_slot_element<'a>(node: &SlotElement, state: &mut ServerTransformState<'a>) {
+pub fn visit_slot_element<'a>(node: &SlotElement<'a>, state: &mut ServerTransformState<'a>) {
     let mut props: Vec<ObjectPropertyKind<'a>> = Vec::new();
     let mut spreads: Vec<OxcExpression<'a>> = Vec::new();
 
@@ -117,7 +117,9 @@ pub fn visit_slot_element<'a>(node: &SlotElement, state: &mut ServerTransformSta
         // SnippetBlock / EachBlock / SvelteComponent / SvelteBoundary / Component /
         // SvelteSelf only), so leading text does NOT get a `<!---->` anchor.
         // `b.thunk(BlockStatement)` → `() => { <body> }`.
-        let body = build_fragment_body(&node.fragment, false, true, state);
+        let saved_scope = state.enter_template_scope(node.start);
+        let body = build_fragment_body(&node.fragment.nodes, false, true, state);
+        state.restore_scope(saved_scope);
         let params = state.b.params(vec![], None);
         state.b.arrow(params, state.b.body(body), false, false)
     };
@@ -125,25 +127,15 @@ pub fn visit_slot_element<'a>(node: &SlotElement, state: &mut ServerTransformSta
     // `$.slot($$renderer, $$props, name, props_expression, fallback)`.
     let slot = state.b.call(
         "$.slot",
-        vec![
-            state.b.id("$$renderer"),
-            state.b.id("$$props"),
-            name,
-            props_expression,
-            fallback,
-        ],
+        vec![state.b.id("$$renderer"), state.b.id("$$props"), name, props_expression, fallback],
     );
 
     // block_open, <slot stmt>, block_close (the optimiser.render_block wrap is the
     // identity transform in the sync path).
-    state
-        .template
-        .push(TemplateEntry::Literal(BLOCK_OPEN.to_string()));
+    state.template.push(TemplateEntry::Literal(BLOCK_OPEN.to_string()));
     let stmt = state.b.stmt(slot);
     state.template.push(TemplateEntry::Stmt(stmt));
-    state
-        .template
-        .push(TemplateEntry::Literal(BLOCK_CLOSE.to_string()));
+    state.template.push(TemplateEntry::Literal(BLOCK_CLOSE.to_string()));
 }
 
 /// Visit a `{...expr}` spread attribute on a `<slot>` → the read-wrapped spread
@@ -152,7 +144,7 @@ fn visit_spread<'a>(
     spread: &SpreadAttribute,
     state: &mut ServerTransformState<'a>,
 ) -> OxcExpression<'a> {
-    state.visit_expr(&spread.expression)
+    state.visit_expr_claiming(&spread.expression)
 }
 
 /// `build_attribute_value(value, …, is_component = true)` for slot props: raw
@@ -165,12 +157,12 @@ fn slot_attribute_value<'a>(
 ) -> OxcExpression<'a> {
     match value {
         AttributeValue::True(_) => state.b.bool(true),
-        AttributeValue::Expression(tag) => state.visit_expr(&tag.expression),
+        AttributeValue::Expression(tag) => state.visit_expression_tag(tag),
         AttributeValue::Sequence(parts) => {
             if parts.len() == 1 {
                 return match &parts[0] {
-                    AttributeValuePart::Text(t) => state.b.string(t.data.as_str()),
-                    AttributeValuePart::ExpressionTag(tag) => state.visit_expr(&tag.expression),
+                    AttributeValuePart::Text(t) => state.b.string(t.data.as_ref()),
+                    AttributeValuePart::ExpressionTag(tag) => state.visit_expression_tag(tag),
                 };
             }
             // Mixed run → template literal with `scope.evaluate` constant-folding
@@ -185,22 +177,18 @@ fn slot_attribute_value<'a>(
             for part in parts {
                 match part {
                     AttributeValuePart::Text(t) => {
-                        quasis.last_mut().unwrap().push_str(t.data.as_str());
+                        quasis.last_mut().unwrap().push_str(t.data.as_ref());
                     }
                     AttributeValuePart::ExpressionTag(tag) => {
-                        let evaluation = state
-                            .eval_ctx()
-                            .evaluate_template_expression(&tag.expression);
+                        let evaluation =
+                            state.eval_ctx().evaluate_template_expression(&tag.expression);
                         if let Some(value) = evaluation.known_value() {
                             if !matches!(value, EvalValue::Null | EvalValue::Undefined) {
-                                quasis
-                                    .last_mut()
-                                    .unwrap()
-                                    .push_str(&js_display_string(value));
+                                quasis.last_mut().unwrap().push_str(&js_display_string(value));
                             }
                             continue;
                         }
-                        let visited = state.visit_expr(&tag.expression);
+                        let visited = state.visit_expr_claiming(&tag.expression);
                         let emitted = if evaluation.is_string() && evaluation.is_defined() {
                             visited
                         } else {

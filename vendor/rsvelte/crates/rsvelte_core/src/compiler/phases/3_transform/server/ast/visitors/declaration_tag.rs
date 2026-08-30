@@ -159,7 +159,11 @@ pub fn visit_declaration_tag<'a>(node: &DeclarationTag, state: &mut ServerTransf
     // `reparse_statement` parses plain mjs, so a `: type` annotation would make
     // it bail and silently drop the whole declaration. The official output is
     // the type-stripped JS (`const x = …`).
-    decl_src = strip_declarator_type_annotation(&decl_src);
+    decl_src = if state.analysis.is_typescript {
+        crate::compiler::phases::phase2_analyze::types::strip_typescript(&decl_src)
+    } else {
+        strip_declarator_type_annotation(&decl_src)
+    };
     if !decl_src.ends_with(';') {
         decl_src.push(';');
     }
@@ -192,10 +196,7 @@ pub fn visit_declaration_tag<'a>(node: &DeclarationTag, state: &mut ServerTransf
         let arg: Option<OxcExpression<'a>> = match d.init.take() {
             Some(OxcExpression::CallExpression(call)) => {
                 let mut call = call.unbox();
-                call.arguments
-                    .drain(..)
-                    .next()
-                    .and_then(|a| OxcExpression::try_from(a).ok())
+                call.arguments.drain(..).next().and_then(|a| OxcExpression::try_from(a).ok())
             }
             _ => None,
         };
@@ -225,12 +226,7 @@ pub fn visit_declaration_tag<'a>(node: &DeclarationTag, state: &mut ServerTransf
     if let Statement::VariableDeclaration(vd) = &mut stmt {
         for d in vd.declarations.iter_mut() {
             if let Some(init) = d.init.as_mut() {
-                super::super::read_wrap::wrap_reads(
-                    init,
-                    state.b,
-                    state.analysis,
-                    state.analysis.root.instance_scope_index,
-                );
+                state.wrap_reads_in_place(init);
             }
         }
     }
@@ -268,10 +264,9 @@ fn register_constant_folds<'a>(node: &DeclarationTag, state: &mut ServerTransfor
         let Some(name) = id.get("name").and_then(|n| n.as_str()) else {
             continue;
         };
-        let (Some(s), Some(e)) = (
-            init.get("start").and_then(|v| v.as_u64()),
-            init.get("end").and_then(|v| v.as_u64()),
-        ) else {
+        let (Some(s), Some(e)) =
+            (init.get("start").and_then(|v| v.as_u64()), init.get("end").and_then(|v| v.as_u64()))
+        else {
             continue;
         };
         let (s, e) = (s as usize, e as usize);
@@ -285,10 +280,7 @@ fn register_constant_folds<'a>(node: &DeclarationTag, state: &mut ServerTransfor
                 &state.eval_inputs.constant_vars,
             )
         {
-            state
-                .eval_inputs
-                .constant_vars
-                .insert(name.to_string(), folded);
+            state.eval_inputs.constant_vars.insert(name.to_string(), folded);
         }
     }
 }
@@ -316,11 +308,7 @@ fn try_async_declaration_tag<'a>(
     // Strip a surrounding `{ … }` (the tag braces) and append `;` so the rune
     // transformer sees a clean `let x = $state(1)` statement.
     let raw = state.source[start..end].trim();
-    let body = raw
-        .strip_prefix('{')
-        .and_then(|s| s.strip_suffix('}'))
-        .unwrap_or(raw)
-        .trim();
+    let body = raw.strip_prefix('{').and_then(|s| s.strip_suffix('}')).unwrap_or(raw).trim();
     if body.is_empty() {
         return false;
     }
@@ -353,11 +341,7 @@ fn try_async_declaration_tag<'a>(
     if trimmed.is_empty() {
         return false;
     }
-    let stmt = if trimmed.ends_with(';') {
-        trimmed.to_string()
-    } else {
-        format!("{trimmed};")
-    };
+    let stmt = if trimmed.ends_with(';') { trimmed.to_string() } else { format!("{trimmed};") };
 
     let has_await = node.metadata.expression.has_await();
     let body_no_semi = stmt.trim_end().trim_end_matches(';').trim();
@@ -392,14 +376,7 @@ fn try_async_declaration_tag<'a>(
         lhs.clone()
     };
 
-    emit_async_decl_tag(
-        state,
-        &declared_names,
-        &lhs_for_assign,
-        &rhs,
-        has_await,
-        &blockers,
-    );
+    emit_async_decl_tag(state, &declared_names, &lhs_for_assign, &rhs, has_await, &blockers);
     true
 }
 
@@ -465,35 +442,24 @@ fn emit_async_decl_tag<'a>(
 ) {
     if state.async_consts.is_none() {
         let name = state.next_promises_name();
-        state.async_consts = Some(AsyncConstsGroup {
-            name,
-            thunks: Vec::new(),
-            let_decls: Vec::new(),
-        });
+        state.async_consts =
+            Some(AsyncConstsGroup { name, thunks: Vec::new(), let_decls: Vec::new() });
     }
 
     for name in declared_names {
         let let_stmt = state.b.let_id(name, None);
-        state
-            .async_consts
-            .as_mut()
-            .unwrap()
-            .let_decls
-            .push(let_stmt);
+        state.async_consts.as_mut().unwrap().let_decls.push(let_stmt);
     }
 
     if blockers.len() == 1 {
+        state.async_consts.as_mut().unwrap().thunks.push((format!("() => {}", blockers[0]), false));
+    } else if blockers.len() > 1 {
         state
             .async_consts
             .as_mut()
             .unwrap()
             .thunks
-            .push((format!("() => {}", blockers[0]), false));
-    } else if blockers.len() > 1 {
-        state.async_consts.as_mut().unwrap().thunks.push((
-            format!("() => Promise.all([{}])", blockers.join(", ")),
-            false,
-        ));
+            .push((format!("() => Promise.all([{}])", blockers.join(", ")), false));
     }
 
     let is_destructuring = lhs.starts_with('{') || lhs.starts_with('[');

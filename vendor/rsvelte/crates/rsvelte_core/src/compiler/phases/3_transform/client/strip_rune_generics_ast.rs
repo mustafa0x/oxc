@@ -61,9 +61,7 @@ pub fn strip_rune_generic_params_ast(source: &str, is_ts: bool) -> Option<String
         ParseOptions::default(),
         false,
         |program| {
-            let mut collector = StripGenericsCollector {
-                spans_to_strip: Vec::new(),
-            };
+            let mut collector = StripGenericsCollector { spans_to_strip: Vec::new() };
             collector.visit_program(program);
             collector
                 .spans_to_strip
@@ -95,8 +93,7 @@ impl<'a> Visit<'a> for StripGenericsCollector {
         if id.name != "$state" && id.name != "$derived" {
             return;
         }
-        self.spans_to_strip
-            .push((type_args.span().start, type_args.span().end));
+        self.spans_to_strip.push((type_args.span().start, type_args.span().end));
     }
 }
 

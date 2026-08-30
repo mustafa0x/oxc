@@ -1,6 +1,5 @@
 ---
 source: apps/oxlint/src/tester.rs
-assertion_line: 142
 ---
 ########## 
 arguments: -c fixtures/cli/overrides/directories-config.json fixtures/cli/overrides

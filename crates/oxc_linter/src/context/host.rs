@@ -425,31 +425,6 @@ impl<'a> ContextHost<'a> {
         self.diagnostics.borrow_mut().push(diagnostic);
     }
 
-    #[inline]
-    pub(crate) fn push_diagnostic_without_offset(&self, diagnostic: Message) {
-        self.diagnostics.borrow_mut().push(diagnostic);
-    }
-
-    pub(crate) fn contains_disable_directive_for_full_file_span(
-        &self,
-        rule_name: &str,
-        span: Span,
-    ) -> bool {
-        self.sub_hosts.iter().any(|sub_host| {
-            let offset = sub_host.source_text_offset;
-            let len = u32::try_from(sub_host.semantic.source_text().len()).unwrap_or(u32::MAX);
-            let section_end = offset.saturating_add(len);
-
-            if span.end < offset || span.start > section_end {
-                return false;
-            }
-
-            let local_start = span.start.max(offset).saturating_sub(offset);
-            let local_end = span.end.min(section_end).saturating_sub(offset);
-            sub_host.disable_directives.contains(rule_name, Span::new(local_start, local_end))
-        })
-    }
-
     // Append a list of diagnostics. Only used in report_unused_directives.
     fn append_diagnostics(&self, mut diagnostics: Vec<Message>) {
         if self.with_ignore_fixes {

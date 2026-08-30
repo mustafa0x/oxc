@@ -67,6 +67,7 @@ use crate::ast::template::EachBlock;
 use crate::compiler::phases::phase3_transform::builders::B;
 use crate::compiler::phases::phase3_transform::builders::{BinaryOperator, UpdateOperator};
 use crate::compiler::phases::phase3_transform::server::ast::ServerTransformState;
+use crate::compiler::phases::phase3_transform::shared::js_scan::find_code;
 use oxc_ast::ast::{BindingPattern, Statement, VariableDeclarationKind};
 
 use super::shared::{
@@ -78,15 +79,12 @@ use super::shared::{
 /// Visit a `{#each expr as ctx, i (key)}...{/each}` block (sync; keyed or
 /// unkeyed, with or without a `{:else}` fallback). The key is ignored on the
 /// server — see the module docs.
-pub fn visit_each_block<'a>(node: &EachBlock, state: &mut ServerTransformState<'a>) {
+pub fn visit_each_block<'a>(node: &EachBlock<'a>, state: &mut ServerTransformState<'a>) {
     let counter = state.each_index;
     state.each_index += 1;
 
-    let array_var = if counter == 0 {
-        "each_array".to_string()
-    } else {
-        format!("each_array_{counter}")
-    };
+    let array_var =
+        if counter == 0 { "each_array".to_string() } else { format!("each_array_{counter}") };
 
     // Resolve the loop index name + optional alias, mirroring upstream:
     //   index = (contains_group_binding || !node.index) ? meta.index : node.index
@@ -96,11 +94,7 @@ pub fn visit_each_block<'a>(node: &EachBlock, state: &mut ServerTransformState<'
         Some(idx) if !node.metadata.contains_group_binding => (idx, None),
         other => {
             let meta_index = node.metadata.index.clone().unwrap_or_else(|| {
-                if counter == 0 {
-                    "$$index".to_string()
-                } else {
-                    format!("$$index_{counter}")
-                }
+                if counter == 0 { "$$index".to_string() } else { format!("$$index_{counter}") }
             });
             (meta_index, other)
         }
@@ -110,27 +104,36 @@ pub fn visit_each_block<'a>(node: &EachBlock, state: &mut ServerTransformState<'
     // blockers drive `$$renderer.async_block([…], …)`, an inline `await` drives a
     // `child_block(async …)` arrow + a `$.save`-wrapped collection argument.
     let iterable_src = state.expr_source(&node.expression).map(|s| s.to_string());
-    let blocker_indices: Vec<usize> = iterable_src
-        .as_deref()
-        .map(|s| expr_text_blockers(state, s))
-        .unwrap_or_default();
+    let blocker_indices: Vec<usize> =
+        iterable_src.as_deref().map(|s| expr_text_blockers(state, s)).unwrap_or_default();
     // Per-block async `{const}` blockers referenced by the iterable (e.g.
     // `{#each { length } as …}` where `length` is a local async-const binding →
     // `promises_N[k]`), so the each-block wraps in `$$renderer.async_block`.
-    let local_blockers: Vec<String> = iterable_src
-        .as_deref()
-        .map(|s| expr_local_const_blockers(state, s))
-        .unwrap_or_default();
+    let local_blockers: Vec<String> =
+        iterable_src.as_deref().map(|s| expr_local_const_blockers(state, s)).unwrap_or_default();
     let has_await = iterable_src.as_deref().is_some_and(text_has_await);
 
     // The collection argument to `$.ensure_array_like(...)`: an await-bearing
     // iterable is `$.save`-wrapped (`(await $.save(expr))()`); otherwise the
     // plain read-wrapped expression.
-    let collection = if has_await {
+    let mut collection = if has_await {
         save_wrap_expr_text(state, iterable_src.as_deref().unwrap_or(""))
     } else {
-        state.visit_expr(&node.expression)
+        state.visit_expr_claiming(&node.expression)
     };
+    if let (Some(start), Some(end)) = (node.expression.start(), node.expression.end()) {
+        let region_end = match node.body.nodes.first() {
+            Some(crate::ast::template::TemplateNode::ConstTag(tag)) => {
+                tag.end.saturating_sub(1).max(end)
+            }
+            _ => end,
+        };
+        state.place_template_expression_comments(
+            (node.start + 7, region_end),
+            (start, end),
+            &mut collection,
+        );
+    }
     let b = state.b;
 
     // statements[0] = const each_array = $.ensure_array_like(collection);
@@ -160,10 +163,13 @@ pub fn visit_each_block<'a>(node: &EachBlock, state: &mut ServerTransformState<'
     if let Some(ctx) = &node.context {
         collect_context_names(ctx, state, &mut each_shadow);
     }
-    if let Some(alias) = &index_alias {
-        each_shadow.insert(alias.clone());
+    // The source-level index name, not `index_alias` — without a group binding
+    // the loop variable *is* the user's name and there is no alias to record.
+    if let Some(idx) = &node.index {
+        each_shadow.insert(idx.to_string());
     }
     let pushed_shadow = !each_shadow.is_empty();
+    let fallback_shadow = each_shadow.clone();
     if pushed_shadow {
         // Push to BOTH shadow sets: `slot_let_shadows` suppresses the SSR
         // constant-fold (each-item reads are runtime values), and
@@ -174,8 +180,17 @@ pub fn visit_each_block<'a>(node: &EachBlock, state: &mut ServerTransformState<'
         state.shadowed_names.push(each_shadow.clone());
         state.slot_let_shadows.push(each_shadow);
     }
+    // Upstream never visits `node.key` on the server, but esrap's global source
+    // cursor still carries a comment in that skipped region to the next located
+    // expression in the each body. Preserve that cursor effect rather than
+    // synthesizing a server-side key expression that upstream does not emit.
+    if let Some(region) = each_key_region(node, state.source) {
+        state.defer_template_expression_comments(region);
+    }
     // EachBlock body IS an `is_text_first` parent (upstream `clean_nodes`).
-    each_body.extend(build_fragment_body(&node.body, true, false, state));
+    let saved_scope = state.enter_template_scope(node.start);
+    each_body.extend(build_fragment_body(&node.body.nodes, true, false, state));
+    state.restore_scope(saved_scope);
     if pushed_shadow {
         state.slot_let_shadows.pop();
         state.shadowed_names.pop();
@@ -205,7 +220,21 @@ pub fn visit_each_block<'a>(node: &EachBlock, state: &mut ServerTransformState<'
         // EachBlock node, so it IS an `is_text_first` parent (upstream
         // `clean_nodes`: `parent.type === 'EachBlock'`) — a text-first fallback
         // gets a leading `<!---->` anchor, same as the loop body.
-        let mut fallback_body = build_fragment_body(fallback, true, false, state);
+        // Upstream visits the fallback with the each block's scope
+        // (`if (node.fallback) visit(node.fallback, { scope })`), so an item
+        // name still shadows a same-named instance binding here even though
+        // nothing is bound to it at runtime — the shadow frame goes back on.
+        let saved_scope = state.enter_template_scope(node.start);
+        if pushed_shadow {
+            state.shadowed_names.push(fallback_shadow.clone());
+            state.slot_let_shadows.push(fallback_shadow);
+        }
+        let mut fallback_body = build_fragment_body(&fallback.nodes, true, false, state);
+        if pushed_shadow {
+            state.slot_let_shadows.pop();
+            state.shadowed_names.pop();
+        }
+        state.restore_scope(saved_scope);
         let b = state.b;
         let open_else_push = b.stmt(b.call("$$renderer.push", vec![b.string(BLOCK_OPEN_ELSE)]));
         fallback_body.insert(0, open_else_push);
@@ -233,18 +262,14 @@ pub fn visit_each_block<'a>(node: &EachBlock, state: &mut ServerTransformState<'
         for stmt in wrapped {
             state.template.push(TemplateEntry::Stmt(stmt));
         }
-        state
-            .template
-            .push(TemplateEntry::Literal(BLOCK_CLOSE.to_string()));
+        state.template.push(TemplateEntry::Literal(BLOCK_CLOSE.to_string()));
     } else {
         // No-fallback path (写经):
         //   template.push(block_open); statements.push(for_loop);
         //   template.push(...create_child_block(statements, …), block_close)
         // The `<!--[-->` open + `<!--]-->` close markers stay OUTSIDE the async
         // `create_child_block` wrap — only the const + for-loop go inside.
-        state
-            .template
-            .push(TemplateEntry::Literal(BLOCK_OPEN.to_string()));
+        state.template.push(TemplateEntry::Literal(BLOCK_OPEN.to_string()));
         statements.push(for_loop);
         let wrapped = create_child_block_combined(
             state,
@@ -256,10 +281,19 @@ pub fn visit_each_block<'a>(node: &EachBlock, state: &mut ServerTransformState<'
         for stmt in wrapped {
             state.template.push(TemplateEntry::Stmt(stmt));
         }
-        state
-            .template
-            .push(TemplateEntry::Literal(BLOCK_CLOSE.to_string()));
+        state.template.push(TemplateEntry::Literal(BLOCK_CLOSE.to_string()));
     }
+}
+
+/// The source inside the keyed-each parentheses, including leading comments
+/// that the parsed key expression's span excludes.
+fn each_key_region(node: &EachBlock<'_>, source: &str) -> Option<(u32, u32)> {
+    let context_end = node.context.as_ref()?.end()?;
+    let key_start = node.key.as_ref()?.start()?;
+    let key_end = node.key.as_ref()?.end()?;
+    let between = source.get(context_end as usize..key_start as usize)?;
+    let open = find_code(between.as_bytes(), b"(")? as u32;
+    Some((context_end + open + 1, key_end))
 }
 
 /// `for (let index = 0, $$length = array.length; index < $$length; index++) body`.

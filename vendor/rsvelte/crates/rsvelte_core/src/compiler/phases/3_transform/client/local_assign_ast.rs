@@ -56,11 +56,7 @@ pub fn transform_local_assign_ast(source: &str, var_name: &str) -> Option<String
         ParseOptions::default(),
         false,
         |program| {
-            let mut collector = LocalAssignCollector {
-                source,
-                var_name,
-                matches: Vec::new(),
-            };
+            let mut collector = LocalAssignCollector { source, var_name, matches: Vec::new() };
             collector.visit_program(program);
             // Match the text version: only the FIRST occurrence (smallest start).
             collector.matches.sort_by_key(|r| r.0);

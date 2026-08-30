@@ -14,9 +14,7 @@ use super::fragment;
 use super::utils::{
     validate_assignment_node, validate_attribute_name as validate_attribute_name_colon,
 };
-use crate::ast::template::{
-    Attribute, AttributeNode, AttributeValue, AttributeValuePart, Component,
-};
+use crate::ast::template::{Attribute, Component};
 
 /// Visit a component and perform full analysis.
 ///
@@ -27,9 +25,9 @@ use crate::ast::template::{
 /// - Fragment analysis
 ///
 /// Corresponds to `visit_component(node, context)` in shared/component.js.
-pub fn visit_component(
-    component: &mut Component,
-    context: &mut VisitorContext,
+pub fn visit_component<'a, 'b: 'a>(
+    component: &mut Component<'b>,
+    context: &mut VisitorContext<'a>,
 ) -> Result<(), AnalysisError> {
     use crate::ast::template::TemplateNode;
 
@@ -55,7 +53,8 @@ pub fn visit_component(
                     if let Some(name) = attr_name
                         && name == snippet_name
                     {
-                        return Err(errors::snippet_shadowing_prop(snippet_name));
+                        return Err(errors::snippet_shadowing_prop(snippet_name)
+                            .at(snippet.start, snippet.end));
                     }
                 }
             }
@@ -109,10 +108,7 @@ pub fn visit_component(
     // every-local-snippet fallback. The key is encoded with the component's
     // `start` offset (unique within a parse) so multiple components on the
     // same name remain distinct.
-    context
-        .analysis
-        .snippet_renderers
-        .insert(format!("Component@{}", component.start), resolved);
+    context.analysis.snippet_renderers.insert(format!("Component@{}", component.start), resolved);
 
     // Mark the subtree as dynamic
     super::super::shared::fragment::mark_subtree_dynamic(&context.path);
@@ -137,16 +133,22 @@ pub fn visit_component(
                             &context.analysis.source,
                         )
                     {
-                        return Err(errors::attribute_invalid_sequence_expression());
+                        let error = errors::attribute_invalid_sequence_expression();
+                        let error = match expression_tag
+                            .expression
+                            .start()
+                            .zip(expression_tag.expression.end())
+                        {
+                            Some((start, end)) => error.at(start, end),
+                            None => error,
+                        };
+                        return Err(error);
                     }
                 }
-                // Check for attribute_quoted: quoted single-expression attribute on component
-                if is_quoted_single_expression(attr) {
-                    context.emit_warning(super::super::super::warnings::attribute_quoted());
-                }
+                super::attribute::warn_attribute_quoted(context, attr);
                 // Check for illegal colon in attribute name
                 if let Err(warning) = validate_attribute_name_colon(&attr.name) {
-                    context.emit_warning(warning);
+                    context.emit_warning(warning.at(attr.start, attr.end));
                 }
                 // TODO: if (attribute.name === 'slot') {
                 //     validate_slot_attribute(context, attribute, true);
@@ -159,23 +161,27 @@ pub fn visit_component(
                 }
                 // Getter/setter bindings (`bind:value={get, set}`) skip the
                 // assignment + identifier validation, mirroring upstream's
-                // early SequenceExpression return in BindDirective.js.
-                if bind.expression.node_type() != Some("SequenceExpression") {
+                // early SequenceExpression return in BindDirective.js — but not
+                // the pair's own checks, which run for every host.
+                if super::super::bind_directive::is_get_set_pair(bind) {
+                    super::super::bind_directive::validate_get_set_pair(bind, context)?;
+                } else {
                     // Validate the binding expression (checks for const/import bindings)
                     let bind_node = bind.expression.as_node();
-                    validate_assignment_node(&bind_node, context, true)?;
+                    validate_assignment_node((bind.start, bind.end), &bind_node, context, true)?;
                     // `bind:x={y}` must target state or props (bind_invalid_value).
                     // Upstream's BindDirective visitor runs this for component
                     // bindings too (BindDirective.js L193-207).
-                    super::super::bind_directive::validate_bind_value_for_component(bind, context)?;
+                    super::super::bind_directive::validate_bind_value_target(bind, context)?;
                 }
             }
             Attribute::OnDirective(on) => {
                 // Validate event handler modifiers
-                // Only 'once' modifier is allowed on component events
-                let has_invalid_modifiers = on.modifiers.iter().any(|m| m.as_str() != "once");
-                if has_invalid_modifiers {
-                    return Err(errors::event_handler_invalid_component_modifier());
+                // `['once']` is the only accepted list — a repeat is not membership
+                if on.modifiers.len() > 1 || on.modifiers.iter().any(|m| m.as_str() != "once") {
+                    return Err(
+                        errors::event_handler_invalid_component_modifier().at(on.start, on.end)
+                    );
                 }
 
                 // Note: Event forwarding (on:foo without handler) sets needs_props
@@ -191,7 +197,8 @@ pub fn visit_component(
             _ => {
                 // All other directive types are invalid on components
                 // (TransitionDirective, AnimateDirective, UseDirective, ClassDirective, StyleDirective)
-                return Err(errors::component_invalid_directive());
+                let (start, end) = attr.span();
+                return Err(errors::component_invalid_directive().at(start, end));
             }
         }
     }
@@ -216,8 +223,13 @@ pub fn visit_component(
                 if bind.name == "this" {
                     context.in_bind_this = true;
                 }
-                super::super::script::walk_expression(&bind.expression, context)?;
+                let result = if super::super::bind_directive::is_get_set_pair(bind) {
+                    super::super::bind_directive::walk_get_set_pair(bind, context)
+                } else {
+                    super::super::bind_directive::walk_bind_expression(bind, context)
+                };
                 context.in_bind_this = prev_in_bind_this;
+                result?;
             }
             Attribute::OnDirective(on) => {
                 // Visit the event handler expression if present
@@ -226,19 +238,16 @@ pub fn visit_component(
                 }
             }
             Attribute::SpreadAttribute(spread) => {
-                // Visit the spread expression
-                super::super::script::walk_expression(&spread.expression, context)?;
+                super::super::spread_attribute::visit(spread, context, false)?;
             }
             Attribute::AttachTag(attach) => {
-                // Visit the attach expression
-                super::super::script::walk_expression(&attach.expression, context)?;
+                super::super::attach_tag::visit(attach, context)?;
             }
             Attribute::LetDirective(_) => {
                 // Let directives don't have expressions to visit for needs_context
             }
-            _ => {
-                // Other directives (StyleDirective, ClassDirective, etc.) are invalid
-                // on components and were already handled above
+            other => {
+                super::attribute::walk_remaining_attribute_expressions(other, context)?;
             }
         }
     }
@@ -251,31 +260,23 @@ pub fn visit_component(
     // 3. Visit each slot's content with the correct scope
     //
     // For now, just visit the fragment normally
-    // Set is_direct_child_of_component for svelte:fragment validation
-    let was_direct_child = context.is_direct_child_of_component;
+    // Set direct_component_parent for svelte:fragment validation
+    let was_direct_child = context.direct_component_parent;
     let was_direct_snippet = context.is_direct_child_of_snippet;
-    context.is_direct_child_of_component = true;
+    context.direct_component_parent = super::super::DirectComponentParent::Component;
     context.is_direct_child_of_snippet = false;
     // Track component depth for slot attribute validation
     context.component_depth += 1;
+    context.svelte_self_parent_depth += 1;
     // Track that this is a component for slot owner resolution
-    context
-        .slot_owner_ancestors
-        .push(super::super::SlotOwnerType::Component);
+    context.slot_owner_ancestors.push(super::super::SlotOwnerType::Component);
     // Push fragment owner type for const_tag placement validation
-    context
-        .fragment_owner_stack
-        .push(super::super::FragmentOwnerType::Component);
+    context.fragment_owner_stack.push(super::super::FragmentOwnerType::Component);
     // Set context.scope to the scope created by scope_builder for this component.
     // This ensures that Let directive bindings declared in scope_builder are visible
     // when analyzing children (e.g., {@const} tags that reference let: variables).
     let scope_before_component = context.scope;
-    if let Some(&comp_scope) = context
-        .analysis
-        .root
-        .template_scope_map
-        .get(&component.start)
-    {
+    if let Some(&comp_scope) = context.analysis.root.template_scope_map.get(&component.start) {
         context.scope = comp_scope;
     }
     // Clear element_ancestors and parent_element when entering a component boundary.
@@ -293,7 +294,8 @@ pub fn visit_component(
     context.fragment_owner_stack.pop();
     context.slot_owner_ancestors.pop();
     context.component_depth -= 1;
-    context.is_direct_child_of_component = was_direct_child;
+    context.svelte_self_parent_depth -= 1;
+    context.direct_component_parent = was_direct_child;
     context.is_direct_child_of_snippet = was_direct_snippet;
 
     Ok(())
@@ -311,27 +313,28 @@ fn validate_slot_attributes(component: &Component) -> Result<(), AnalysisError> 
     let mut seen_slots: FxHashSet<String> = FxHashSet::default();
     let mut has_explicit_default = false;
     let mut has_implicit_default = false;
-    let mut has_children_snippet = false;
+    let mut implicit_default_span = None;
+    let mut children_snippet_span = None;
     let mut has_other_content = false;
 
     for node in &component.fragment.nodes {
         let slot_name = get_slot_name(node);
 
-        if let Some(ref name) = slot_name {
+        if let Some((name, start, end)) = slot_name {
             if name == "default" {
                 has_explicit_default = true;
             }
 
-            if seen_slots.contains(name) {
-                return Err(errors::slot_attribute_duplicate(name, &component.name));
+            if seen_slots.contains(&name) {
+                return Err(errors::slot_attribute_duplicate(&name, &component.name).at(start, end));
             }
-            seen_slots.insert(name.clone());
+            seen_slots.insert(name);
         } else {
             // Check if this is a {#snippet children()} block
             if let TemplateNode::SnippetBlock(snippet) = node
                 && snippet.expression.is_identifier("children")
             {
-                has_children_snippet = true;
+                children_snippet_span.get_or_insert((snippet.start, snippet.end));
             }
 
             // Check if this is implicit default slot content
@@ -340,6 +343,7 @@ fn validate_slot_attributes(component: &Component) -> Result<(), AnalysisError> 
                 TemplateNode::Text(text) => {
                     if !text.data.trim().is_empty() {
                         has_implicit_default = true;
+                        implicit_default_span.get_or_insert((text.start, text.end));
                         has_other_content = true;
                     }
                 }
@@ -351,6 +355,7 @@ fn validate_slot_attributes(component: &Component) -> Result<(), AnalysisError> 
                 }
                 _ => {
                     has_implicit_default = true;
+                    implicit_default_span.get_or_insert(node.span());
                     has_other_content = true;
                 }
             }
@@ -359,20 +364,23 @@ fn validate_slot_attributes(component: &Component) -> Result<(), AnalysisError> 
 
     // Check for snippet_conflict: cannot have both {#snippet children()} and other content
     // Corresponds to SnippetBlock.js lines 59-73
-    if has_children_snippet && has_other_content {
-        return Err(errors::snippet_conflict());
+    if let Some((start, end)) = children_snippet_span
+        && has_other_content
+    {
+        return Err(errors::snippet_conflict().at(start, end));
     }
 
     // Check for slot_default_duplicate error
     if has_explicit_default && has_implicit_default {
-        return Err(errors::slot_default_duplicate());
+        let (start, end) = implicit_default_span.expect("implicit default content has a span");
+        return Err(errors::slot_default_duplicate().at(start, end));
     }
 
     Ok(())
 }
 
 /// Get the slot name from a node's slot attribute.
-fn get_slot_name(node: &crate::ast::template::TemplateNode) -> Option<String> {
+fn get_slot_name(node: &crate::ast::template::TemplateNode) -> Option<(String, u32, u32)> {
     use crate::ast::template::{Attribute, AttributeValue, AttributeValuePart, TemplateNode};
 
     let attrs = match node {
@@ -393,7 +401,7 @@ fn get_slot_name(node: &crate::ast::template::TemplateNode) -> Option<String> {
                 match &a.value {
                     AttributeValue::Sequence(parts) if parts.len() == 1 => {
                         if let AttributeValuePart::Text(text) = &parts[0] {
-                            return Some(text.data.to_string());
+                            return Some((text.data.to_string(), a.start, a.end));
                         }
                     }
                     _ => {}
@@ -421,33 +429,10 @@ pub fn validate_component(
         )));
     }
 
-    // Check for duplicate attributes
-    let mut seen_names: FxHashSet<String> = FxHashSet::default();
-
-    for attr in &component.attributes {
-        // Only check for duplicates on:
-        // - Attribute and BindDirective (treated the same)
-        // - ClassDirective
-        // - StyleDirective
-        // OnDirective can have multiple handlers for the same event
-        let attr_name = match attr {
-            Attribute::Attribute(a) => Some(format!("Attribute{}", a.name)),
-            Attribute::BindDirective(b) => Some(format!("Attribute{}", b.name)), // bind:x and x are duplicates
-            Attribute::ClassDirective(c) => Some(format!("class:{}", c.name)),
-            Attribute::StyleDirective(s) => Some(format!("style:{}", s.name)),
-            _ => None, // Other directives can have duplicates
-        };
-
-        if let Some(name) = attr_name {
-            if seen_names.contains(&name) {
-                return Err(AnalysisError::validation(
-                    "attribute_duplicate",
-                    "Attributes need to be unique",
-                ));
-            }
-            seen_names.insert(name);
-        }
-    }
+    // `attribute_duplicate` is raised once, while reading the attributes
+    // (`1-parse/state/element.js`), and that port exempts every attribute named
+    // `this`. A second copy here did not, so `<C bind:this={x} bind:this={x} />`
+    // was rejected.
 
     // Track component bindings (excluding bind:this which doesn't need the settling loop)
     let has_bindings = component
@@ -460,15 +445,4 @@ pub fn validate_component(
     }
 
     Ok(())
-}
-
-/// Check if an attribute has a quoted single-expression value like `class="{foo}"`.
-/// This corresponds to the check in shared/attribute.js:
-/// `Array.isArray(value) && value.length === 1 && value[0].type === 'ExpressionTag'`
-fn is_quoted_single_expression(attr: &AttributeNode) -> bool {
-    if let AttributeValue::Sequence(parts) = &attr.value {
-        parts.len() == 1 && matches!(&parts[0], AttributeValuePart::ExpressionTag(_))
-    } else {
-        false
-    }
 }

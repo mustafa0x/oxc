@@ -19,11 +19,9 @@ div {
 }
 </style>
 "#;
-        let parse_options = ParseOptions {
-            modern: true,
-            ..Default::default()
-        };
-        let ast = crate::parse(source, parse_options).unwrap();
+        let parse_options = ParseOptions { modern: true, ..Default::default() };
+        let ast =
+            crate::parse(source, &oxc_allocator::Allocator::default(), parse_options).unwrap();
         let result = print(&ast, None).unwrap();
 
         // Check that the CSS is printed
@@ -45,11 +43,9 @@ div {
 }
 </style>
 "#;
-        let parse_options = ParseOptions {
-            modern: true,
-            ..Default::default()
-        };
-        let ast = crate::parse(source, parse_options).unwrap();
+        let parse_options = ParseOptions { modern: true, ..Default::default() };
+        let ast =
+            crate::parse(source, &oxc_allocator::Allocator::default(), parse_options).unwrap();
         let result = print(&ast, None).unwrap();
 
         assert!(result.code.contains(".test {"));
@@ -68,11 +64,9 @@ button:hover {
 }
 </style>
 "#;
-        let parse_options = ParseOptions {
-            modern: true,
-            ..Default::default()
-        };
-        let ast = crate::parse(source, parse_options).unwrap();
+        let parse_options = ParseOptions { modern: true, ..Default::default() };
+        let ast =
+            crate::parse(source, &oxc_allocator::Allocator::default(), parse_options).unwrap();
         let result = print(&ast, None).unwrap();
 
         assert!(result.code.contains("button:hover {"));
@@ -92,11 +86,9 @@ button:hover {
 }
 </style>
 "#;
-        let parse_options = ParseOptions {
-            modern: true,
-            ..Default::default()
-        };
-        let ast = crate::parse(source, parse_options).unwrap();
+        let parse_options = ParseOptions { modern: true, ..Default::default() };
+        let ast =
+            crate::parse(source, &oxc_allocator::Allocator::default(), parse_options).unwrap();
         let result = print(&ast, None).unwrap();
 
         assert!(result.code.contains("@media screen and (min-width: 768px)"));
@@ -118,11 +110,9 @@ h3 {
 }
 </style>
 "#;
-        let parse_options = ParseOptions {
-            modern: true,
-            ..Default::default()
-        };
-        let ast = crate::parse(source, parse_options).unwrap();
+        let parse_options = ParseOptions { modern: true, ..Default::default() };
+        let ast =
+            crate::parse(source, &oxc_allocator::Allocator::default(), parse_options).unwrap();
         let result = print(&ast, None).unwrap();
 
         // The output might format selectors differently, but all should be present
@@ -144,11 +134,9 @@ input[type="text"] {
 }
 </style>
 "#;
-        let parse_options = ParseOptions {
-            modern: true,
-            ..Default::default()
-        };
-        let ast = crate::parse(source, parse_options).unwrap();
+        let parse_options = ParseOptions { modern: true, ..Default::default() };
+        let ast =
+            crate::parse(source, &oxc_allocator::Allocator::default(), parse_options).unwrap();
         let result = print(&ast, None).unwrap();
 
         assert!(result.code.contains("input"));
@@ -167,11 +155,9 @@ div p {
 }
 </style>
 "#;
-        let parse_options = ParseOptions {
-            modern: true,
-            ..Default::default()
-        };
-        let ast = crate::parse(source, parse_options).unwrap();
+        let parse_options = ParseOptions { modern: true, ..Default::default() };
+        let ast =
+            crate::parse(source, &oxc_allocator::Allocator::default(), parse_options).unwrap();
         let result = print(&ast, None).unwrap();
 
         assert!(result.code.contains("div p {"));
@@ -189,11 +175,9 @@ ul > li {
 }
 </style>
 "#;
-        let parse_options = ParseOptions {
-            modern: true,
-            ..Default::default()
-        };
-        let ast = crate::parse(source, parse_options).unwrap();
+        let parse_options = ParseOptions { modern: true, ..Default::default() };
+        let ast =
+            crate::parse(source, &oxc_allocator::Allocator::default(), parse_options).unwrap();
         let result = print(&ast, None).unwrap();
 
         assert!(result.code.contains("ul > li {"));

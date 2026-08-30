@@ -62,10 +62,7 @@ pub fn transform_private_read_wrap_ast(source: &str, qualified: &str) -> Option<
             &MODULE_PRIVATE_READ_WRAP_ALLOC,
             src,
             SourceType::mjs(),
-            ParseOptions {
-                allow_return_outside_function: true,
-                ..ParseOptions::default()
-            },
+            ParseOptions { allow_return_outside_function: true, ..ParseOptions::default() },
             true,
             |program| {
                 let mut collector = PrivateReadWrapCollector {
@@ -127,8 +124,7 @@ impl<'a, 'ast> Visit<'ast> for PrivateReadWrapCollector<'a> {
         let span_text = &self.source[expr.span.start as usize..expr.span.end as usize];
         if span_text == self.qualified {
             let rewrite = format!("$.get({})", self.qualified);
-            self.replacements
-                .push((expr.span.start, expr.span.end, rewrite));
+            self.replacements.push((expr.span.start, expr.span.end, rewrite));
         }
     }
 

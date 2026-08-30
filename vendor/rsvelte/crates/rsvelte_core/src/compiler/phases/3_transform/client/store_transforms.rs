@@ -1,9 +1,16 @@
 //! Store subscription, assignment, and mutation transformations.
 
 use memchr::memmem;
+use oxc_allocator::Allocator;
+use oxc_ast::ast::BindingIdentifier;
+use oxc_ast_visit::Visit;
+use oxc_parser::Parser;
+use oxc_span::SourceType;
 use rustc_hash::FxHashSet;
 
+use super::scan_index::ScanIndex;
 use super::{find_matching_paren, is_shorthand_object_property};
+use crate::compiler::phases::phase3_transform::shared::offsets::{CharLen, CharOffset, CharToByte};
 
 /// Transform store assignments in client-side code.
 ///
@@ -56,25 +63,24 @@ pub(super) fn transform_store_assignments_client(
         state_vars,
         non_reactive_state_vars,
     );
-    let mut result = after_assigns.unwrap_or_else(|| stage1.to_string());
+    let result = after_assigns.unwrap_or_else(|| stage1.to_string());
 
     // Member-expression mutations (`$store.prop = …`, `$store[0]++`, etc.)
-    // are handled per-store via the dedicated AST helper. The first
+    // are handled by the dedicated AST helper. The first
     // `$.store_mutate(...)` argument is the store *source* read the same way
     // any reference to its binding would be: a prop binding reads as the getter
     // call `store()`, so prop-backed stores need that form rather than the bare
     // name (other binding kinds keep the bare name).
-    for store_sub in store_sub_vars {
-        let store_name = store_sub[1..].to_string();
-        let prop_store_names: Vec<String> = if prop_vars.contains(&store_name) {
-            vec![store_name]
-        } else {
-            Vec::new()
-        };
-        result = transform_store_member_mutations(&result, store_sub, &prop_store_names);
-    }
-
-    result
+    //
+    // The rewriter matches every store in one traversal and looks `prop_store_names`
+    // up by name, so all of them go through a single parse+reprint rather than one
+    // per subscribed store.
+    let prop_store_names: Vec<String> = store_sub_vars
+        .iter()
+        .map(|store_sub| store_sub[1..].to_string())
+        .filter(|store_name| prop_vars.contains(store_name))
+        .collect();
+    transform_store_member_mutations(&result, store_sub_vars, &prop_store_names)
 }
 
 /// Check if a store subscription name appears as a function parameter in a statement.
@@ -121,20 +127,12 @@ pub(super) fn is_function_parameter_in_statement(statement: &str, store_sub: &st
         if let Some(found) = statement[pos..].find(store_sub) {
             let abs_found = pos + found;
             // Check word boundary before
-            let before_ok = if abs_found == 0 {
-                true
-            } else {
-                let prev = statement.as_bytes()[abs_found - 1] as char;
-                !prev.is_alphanumeric() && prev != '_' && prev != '$'
-            };
+            let before_ok = !crate::compiler::utils::char_before(statement, abs_found)
+                .is_some_and(is_ident_char);
             // Check word boundary after
             let after_pos = abs_found + store_sub_len;
-            let after_ok = if after_pos >= statement.len() {
-                true
-            } else {
-                let next = statement.as_bytes()[after_pos] as char;
-                !next.is_alphanumeric() && next != '_' && next != '$'
-            };
+            let after_ok =
+                !crate::compiler::utils::char_at(statement, after_pos).is_some_and(is_ident_char);
 
             if before_ok && after_ok {
                 // Check if followed by `=>` (with optional whitespace) = simple arrow param
@@ -195,6 +193,58 @@ pub(super) fn is_function_parameter_in_statement(statement: &str, store_sub: &st
     false
 }
 
+fn is_ident_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_' || c == '$'
+}
+
+/// Whether `statement` declares a binding named `name` anywhere inside it.
+///
+/// The instance-script text pipeline transforms one complete top-level statement
+/// at a time. A nested declaration can therefore shadow a component store-sub
+/// binding that was discovered from the template, even though both have the same
+/// spelling. Upstream resolves every reference through its lexical scope; the
+/// name-only text transform must at least remove that spelling from the whole
+/// statement containing the shadowing declaration.
+pub(super) fn declares_binding_in_statement(statement: &str, name: &str) -> bool {
+    if !statement.contains(name) {
+        return false;
+    }
+
+    struct BindingFinder<'n> {
+        name: &'n str,
+        found: bool,
+    }
+
+    impl<'a> Visit<'a> for BindingFinder<'_> {
+        fn visit_binding_identifier(&mut self, ident: &BindingIdentifier<'a>) {
+            if ident.name == self.name {
+                self.found = true;
+            }
+        }
+    }
+
+    let allocator = Allocator::default();
+    for source_type in [SourceType::mjs(), SourceType::ts()] {
+        let parsed = Parser::new(&allocator, statement, source_type).parse();
+        let mut finder = BindingFinder { name, found: false };
+        finder.visit_program(&parsed.program);
+        if finder.found {
+            return true;
+        }
+        if parsed.diagnostics.is_empty() {
+            return false;
+        }
+    }
+    false
+}
+
+/// The character ending at byte offset `end`, when it satisfies `pred`.
+///
+/// `end` must be a char boundary; every caller advances by `len_utf8`, so it stays one.
+fn last_char_before(s: &str, end: usize, pred: impl Fn(char) -> bool) -> Option<char> {
+    s[..end].chars().next_back().filter(|c| pred(*c))
+}
+
 /// Pre-transform store sub names that are used as function calls with arguments.
 ///
 /// Handles cases like:
@@ -225,18 +275,34 @@ pub(super) fn transform_store_sub_calls(line: &str, store_sub_vars: &[String]) -
         let pattern = format!("{}(", store_sub);
         let mut new_result = String::new();
         let mut search_start = 0;
+        let comment_ranges =
+            crate::compiler::phases::phase3_transform::shared::js_scan::comment_ranges(
+                result.as_bytes(),
+            );
+        let mut comment_range_index = 0;
 
         while let Some(pos) = result[search_start..].find(&pattern) {
             let abs_pos = search_start + pos;
 
+            while comment_ranges.get(comment_range_index).is_some_and(|&(_, end)| end <= abs_pos) {
+                comment_range_index += 1;
+            }
+            let is_comment_text = comment_ranges
+                .get(comment_range_index)
+                .is_some_and(|&(start, end)| start <= abs_pos && abs_pos < end);
+            let is_literal_text =
+                super::state_transforms::is_inside_string_literal(&result, abs_pos)
+                    || super::state_transforms::is_inside_regex_literal(&result, abs_pos);
+
+            if is_literal_text || is_comment_text {
+                new_result.push_str(&result[search_start..abs_pos + store_sub.len()]);
+                search_start = abs_pos + store_sub.len();
+                continue;
+            }
+
             // Check if this is a word boundary (not part of a larger identifier)
-            let before_ok = if abs_pos == 0 {
-                true
-            } else {
-                let prev_byte = result.as_bytes()[abs_pos - 1];
-                let prev_char = prev_byte as char;
-                !prev_char.is_alphanumeric() && prev_char != '_' && prev_char != '$'
-            };
+            let before_ok =
+                !crate::compiler::utils::char_before(&result, abs_pos).is_some_and(is_ident_char);
 
             if !before_ok {
                 // Not a word boundary, skip
@@ -261,6 +327,8 @@ pub(super) fn transform_store_sub_calls(line: &str, store_sub_vars: &[String]) -
                 let mut i = bytes.len();
                 while i > 0 {
                     i -= 1;
+                    // Sound on a byte: the only targets are ASCII, and no byte of a
+                    // multi-byte UTF-8 character can equal an ASCII byte.
                     let ch = bytes[i] as char;
                     if ch == ')' {
                         depth += 1;
@@ -275,20 +343,19 @@ pub(super) fn transform_store_sub_calls(line: &str, store_sub_vars: &[String]) -
                 if let Some(p) = open_paren_pos {
                     // Check what is immediately before the `(`, skipping whitespace
                     // and an optional identifier (the function name).
+                    // Character steps, not byte steps: `k` is a slice index below, and a
+                    // byte step lands mid-character (`0x85` reads as NEL, `0xAA` as `ª`).
                     let mut k = p;
-                    while k > 0 && (bytes[k - 1] as char).is_whitespace() {
-                        k -= 1;
+                    while let Some(c) = last_char_before(before_text, k, char::is_whitespace) {
+                        k -= c.len_utf8();
                     }
                     // Skip an optional identifier (function name) before `(`
-                    while k > 0 && {
-                        let ch = bytes[k - 1] as char;
-                        ch.is_alphanumeric() || ch == '_' || ch == '$'
-                    } {
-                        k -= 1;
+                    while let Some(c) = last_char_before(before_text, k, is_ident_char) {
+                        k -= c.len_utf8();
                     }
                     // Skip whitespace before identifier
-                    while k > 0 && (bytes[k - 1] as char).is_whitespace() {
-                        k -= 1;
+                    while let Some(c) = last_char_before(before_text, k, char::is_whitespace) {
+                        k -= c.len_utf8();
                     }
                     // Now check if preceded by `function` keyword
                     if k >= 8 {
@@ -296,10 +363,7 @@ pub(super) fn transform_store_sub_calls(line: &str, store_sub_vars: &[String]) -
                             crate::compiler::utils::char_boundary_lookback(before_text, k, 8);
                         prefix == "function"
                             && (k == 8
-                                || !{
-                                    let c = bytes[k - 9] as char;
-                                    c.is_alphanumeric() || c == '_' || c == '$'
-                                })
+                                || last_char_before(before_text, k - 8, is_ident_char).is_none())
                     } else {
                         false
                     }
@@ -364,32 +428,46 @@ pub(super) fn transform_store_reads_client(line: &str, store_sub_vars: &[String]
     let mut result = line.to_string();
 
     for store_sub in store_sub_vars {
+        // The walk below copies every character it does not match, so a name
+        // that does not occur rebuilds the line unchanged.
+        if memmem::find(result.as_bytes(), store_sub.as_bytes()).is_none() {
+            continue;
+        }
+
         // Use word boundary matching to replace identifier references
         // But avoid replacing function calls that already have ()
         let mut new_result = String::with_capacity(result.len() * 2);
+        // `i` walks `chars`, so the name's length has to be counted in the same unit.
+        let sub_chars = CharLen::of(store_sub);
         let chars: Vec<char> = result.chars().collect();
-        let mut i = 0;
+        let index = ScanIndex::new(&chars);
+        let char_to_byte = CharToByte::new(&result);
+        let comment_ranges =
+            crate::compiler::phases::phase3_transform::shared::js_scan::comment_ranges(
+                result.as_bytes(),
+            );
+        let mut comment_range_index = 0;
+        let mut i = CharOffset::ZERO;
 
-        while i < chars.len() {
+        while i.get() < chars.len() {
             // Check if we're at the start of the identifier
-            let byte_i = result
-                .char_indices()
-                .nth(i)
-                .map(|(idx, _)| idx)
-                .unwrap_or(i);
-            let remaining = &result[byte_i..];
+            let byte_i = char_to_byte.byte(i);
+            let remaining = byte_i.after(&result);
             if remaining.starts_with(store_sub) {
                 // Check character before (must be non-identifier char or start of string)
                 // Also exclude `.` - a dot before means this is a property access like `obj.$value`.
                 // EXCEPTION: a `...` spread (`[...$store]`, `f(...$store)`) ends in a `.`
                 // but is NOT a property access — the spread argument IS a read and must be
                 // wrapped. Detect the spread by the three preceding dots.
-                let is_spread_prefix =
-                    i >= 3 && chars[i - 1] == '.' && chars[i - 2] == '.' && chars[i - 3] == '.';
-                let before_ok = if i == 0 || is_spread_prefix {
+                let char_i = i.get();
+                let is_spread_prefix = char_i >= 3
+                    && chars[char_i - 1] == '.'
+                    && chars[char_i - 2] == '.'
+                    && chars[char_i - 3] == '.';
+                let before_ok = if i == CharOffset::ZERO || is_spread_prefix {
                     true
                 } else {
-                    let prev_char = chars[i - 1];
+                    let prev_char = chars[char_i - 1];
                     !prev_char.is_alphanumeric()
                         && prev_char != '_'
                         && prev_char != '$'
@@ -397,17 +475,18 @@ pub(super) fn transform_store_reads_client(line: &str, store_sub_vars: &[String]
                 };
 
                 // Check character after (must be non-identifier char)
-                let after_idx = i + store_sub.len();
-                let after_ok = if after_idx >= chars.len() {
+                let after_idx = i + sub_chars;
+                let after_ok = if after_idx.get() >= chars.len() {
                     true
                 } else {
-                    let next_char = chars[after_idx];
+                    let next_char = chars[after_idx.get()];
                     !next_char.is_alphanumeric() && next_char != '_' && next_char != '$'
                 };
 
                 // Check if this reference is already followed by `()` (getter call)
                 // If so, skip adding () to avoid double-calling: $x() is already correct
-                let is_already_call = after_idx < chars.len() && chars[after_idx] == '(';
+                let is_already_call =
+                    after_idx.get() < chars.len() && chars[after_idx.get()] == '(';
 
                 // Check if this is inside $.untrack() or $.derived() - don't transform there
                 // $.untrack expects a getter function, so $store should remain $store
@@ -424,15 +503,15 @@ pub(super) fn transform_store_reads_client(line: &str, store_sub_vars: &[String]
                 // We must distinguish from ternary operator `:` (e.g., `cond ? $store : 0`)
                 // by checking if we're inside an unmatched `{` (object literal context).
                 let is_property_key = {
-                    let after_idx2 = i + store_sub.len();
+                    let after_idx2 = i + sub_chars;
                     let mut k = after_idx2;
                     // Skip whitespace
-                    while k < chars.len() && chars[k].is_whitespace() {
-                        k += 1;
+                    while k.get() < chars.len() && chars[k.get()].is_whitespace() {
+                        k = k.next();
                     }
-                    let has_colon = k < chars.len()
-                        && chars[k] == ':'
-                        && (k + 1 >= chars.len() || chars[k + 1] != ':');
+                    let has_colon = k.get() < chars.len()
+                        && chars[k.get()] == ':'
+                        && (k.next().get() >= chars.len() || chars[k.next().get()] != ':');
 
                     // A real property key is ALWAYS immediately preceded (skipping
                     // whitespace/newlines) by `{` (first entry) or `,` (later entry).
@@ -441,7 +520,7 @@ pub(super) fn transform_store_reads_client(line: &str, store_sub_vars: &[String]
                     // whose block `{` would otherwise make the brace-depth check below
                     // a false positive for any ternary `$store :` in the body.
                     let prev_is_obj_sep = {
-                        let mut j = i;
+                        let mut j = i.get();
                         while j > 0 && chars[j - 1].is_whitespace() {
                             j -= 1;
                         }
@@ -463,39 +542,52 @@ pub(super) fn transform_store_reads_client(line: &str, store_sub_vars: &[String]
                     }
                 };
 
-                // Check if this is inside a string literal. A store-sub name can
+                // Check if this is inside literal text. A store-sub name can
                 // appear mid-string (a log/message argument like
                 // `"… if ($canvas_dim) :"`), not only right after the opening
                 // quote, so scan from the start tracking string + template `${}`
                 // state rather than only inspecting the preceding char. A `$x`
                 // inside a `${ }` interpolation is code and is still transformed.
-                let is_inside_string =
-                    super::state_transforms::is_inside_string_literal(&result, byte_i);
+                // A regex body is the third opaque kind, and rewriting `/\$s/`
+                // changes what the user's regex matches.
+                let is_literal_text =
+                    super::state_transforms::is_inside_string_literal(&result, byte_i.get())
+                        || super::state_transforms::is_inside_regex_literal(&result, byte_i.get());
+                while comment_ranges
+                    .get(comment_range_index)
+                    .is_some_and(|&(_, end)| end <= byte_i.get())
+                {
+                    comment_range_index += 1;
+                }
+                let is_comment_text = comment_ranges
+                    .get(comment_range_index)
+                    .is_some_and(|&(start, end)| start <= byte_i.get() && byte_i.get() < end);
 
                 if before_ok && after_ok {
-                    if is_inside_string {
-                        // Inside a string literal - don't transform
+                    if is_literal_text || is_comment_text {
+                        // Inside a string, regex, or comment - don't transform
                         new_result.push_str(store_sub);
-                        i += store_sub.len();
+                        i = i + sub_chars;
                         continue;
                     } else if is_property_key {
                         // Don't transform property keys like `{ $userName4: value }`
                         new_result.push_str(store_sub);
-                        i += store_sub.len();
+                        i = i + sub_chars;
                         continue;
                     } else if is_inside_getter_context {
                         // Inside $.untrack() or $.derived(), keep as $store (don't add parentheses)
                         new_result.push_str(store_sub);
-                        i += store_sub.len();
+                        i = i + sub_chars;
                         continue;
                     } else if is_already_call {
                         // Already followed by `(` - don't add another `()`
                         // This handles cases like `$x()` or `$.update_store(x, $x())`
                         // where the `()` was already generated by store assignment transforms
                         new_result.push_str(store_sub);
-                        i += store_sub.len();
+                        i = i + sub_chars;
                         continue;
-                    } else if is_shorthand_object_property(&chars, i, store_sub.len()) {
+                    } else if is_shorthand_object_property(&index, &chars, i.get(), sub_chars.get())
+                    {
                         // Shorthand object property: `{ $width }` -> `{ $width: $width() }`.
                         // Emitting `{ $width() }` is invalid (method shorthand), so expand
                         // like the prop-read path, keeping the leading `$` in the key.
@@ -503,21 +595,21 @@ pub(super) fn transform_store_reads_client(line: &str, store_sub_vars: &[String]
                         new_result.push_str(": ");
                         new_result.push_str(store_sub);
                         new_result.push_str("()");
-                        i += store_sub.len();
+                        i = i + sub_chars;
                         continue;
                     } else {
                         // Bare store reference - add () to call the getter
                         new_result.push_str(store_sub);
                         new_result.push_str("()");
-                        i += store_sub.len();
+                        i = i + sub_chars;
                         continue;
                     }
                 }
             }
 
             // No match, just copy the character
-            new_result.push(chars[i]);
-            i += 1;
+            new_result.push(chars[i.get()]);
+            i = i.next();
         }
 
         result = new_result;
@@ -534,13 +626,152 @@ pub(super) fn transform_store_reads_client(line: &str, store_sub_vars: &[String]
 /// - `$store.items[0] = x` -> `$.store_mutate(store, $.untrack($store).items[0] = x, $.untrack($store))`
 pub(super) fn transform_store_member_mutations(
     line: &str,
-    store_sub: &str,
+    store_subs: &[String],
     prop_store_names: &[String],
 ) -> String {
     super::store_member_mutate_ast::transform_store_member_mutate_ast_with_props(
         line,
-        std::slice::from_ref(&store_sub.to_string()),
+        store_subs,
         prop_store_names,
     )
     .unwrap_or_else(|| line.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn store_read_survives_a_non_ascii_store_name() {
+        let vars = vec!["$\u{540d}\u{524d}".to_string()];
+        assert_eq!(
+            transform_store_reads_client("x = $\u{540d}\u{524d} + 1;", &vars),
+            "x = $\u{540d}\u{524d}() + 1;"
+        );
+    }
+
+    #[test]
+    fn store_read_is_not_already_a_call_across_non_ascii() {
+        let vars = vec!["$\u{540d}\u{524d}".to_string()];
+        assert_eq!(
+            transform_store_reads_client("$\u{540d}\u{524d}();", &vars),
+            "$\u{540d}\u{524d}();"
+        );
+    }
+
+    #[test]
+    fn store_read_spelling_inside_comments_is_not_rewritten() {
+        let vars = vec!["$i18n".to_string()];
+        assert_eq!(
+            transform_store_reads_client(
+                "// Assuming $i18n.languages is an array\nconst languages = $i18n.languages;",
+                &vars,
+            ),
+            "// Assuming $i18n.languages is an array\nconst languages = $i18n().languages;"
+        );
+        assert_eq!(
+            transform_store_reads_client(
+                "/* $i18n.languages */ const languages = $i18n.languages;",
+                &vars,
+            ),
+            "/* $i18n.languages */ const languages = $i18n().languages;"
+        );
+    }
+
+    #[test]
+    fn store_sub_call_spelling_inside_opaque_text_is_not_rewritten() {
+        let vars = vec!["$i18n".to_string()];
+        let source = "// $i18n('line')\n/* $i18n('block') */\nconst a = \"$i18n('string')\";\nconst b = /$i18n('regex')/;\nconst c = $i18n('code');";
+        assert_eq!(
+            transform_store_sub_calls(source, &vars),
+            "// $i18n('line')\n/* $i18n('block') */\nconst a = \"$i18n('string')\";\nconst b = /$i18n('regex')/;\nconst c = $i18n()('code');"
+        );
+    }
+
+    #[test]
+    fn store_sub_call_inside_template_expression_is_still_rewritten() {
+        let vars = vec!["$i18n".to_string()];
+        assert_eq!(
+            transform_store_sub_calls("const text = `label: ${$i18n('key')}`;", &vars),
+            "const text = `label: ${$i18n()('key')}`;"
+        );
+    }
+
+    /// `$s` sits in a function parameter list, so `transform_store_sub_calls`
+    /// must leave it alone. The lookback walks back over the function name to
+    /// reach the `function` keyword, and it used to walk one byte at a time.
+    #[track_caller]
+    fn assert_param_list_is_left_alone(func_name: &str) {
+        let vars = vec!["$s".to_string()];
+        let line = format!("function {func_name}($s(1))");
+        assert_eq!(transform_store_sub_calls(&line, &vars), line);
+    }
+
+    /// Discriminating, and the quiet one. `\u{540d}`'s bytes are E5 90 8D; none of
+    /// them satisfies the identifier predicate, so the byte cursor stopped
+    /// immediately, never reached `function`, and the call was rewritten to
+    /// `$s()(1)` inside a parameter list. No panic — just the wrong answer.
+    #[test]
+    fn a_cjk_function_name_is_still_walked_back_over() {
+        assert_param_list_is_left_alone("foo\u{540d}");
+    }
+
+    /// Discriminating, and loud: `\u{3005}` is E3 80 85, and `0x85` reads as NEL,
+    /// so the whitespace loop stepped into the middle of the character.
+    #[test]
+    fn an_iteration_mark_in_the_function_name_does_not_split_a_character() {
+        assert_param_list_is_left_alone("foo\u{3005}");
+    }
+
+    /// Discriminating, and loud through the other door: `\u{05f2}` is D7 B2. The
+    /// identifier loop accepts `0xB2` (`\u{b2}`, category No) and then rejects the
+    /// lead byte `0xD7` (`\u{d7}`), stopping between the two.
+    #[test]
+    fn a_hebrew_function_name_does_not_split_a_character() {
+        assert_param_list_is_left_alone("foo\u{05f2}");
+    }
+
+    /// Same door as the Hebrew case but from a script whose lead byte passes:
+    /// `\u{306a}` is E3 81 AA, so `0xAA` (`\u{aa}`) is accepted and `0x81` rejected.
+    /// Picking one script and concluding is how this class stays hidden.
+    #[test]
+    fn a_kana_function_name_does_not_split_a_character() {
+        assert_param_list_is_left_alone("foo\u{306a}");
+    }
+
+    /// Control: byte and character steps coincide, so this passed before the fix.
+    #[test]
+    fn an_ascii_function_name_is_left_alone() {
+        assert_param_list_is_left_alone("foo");
+    }
+
+    /// Control on the other side: outside a parameter list the call *is* rewritten,
+    /// so a fix that made `is_in_func_params` always true would fail here.
+    #[test]
+    fn a_store_sub_call_outside_a_parameter_list_is_still_rewritten() {
+        let vars = vec!["$s".to_string()];
+        assert_eq!(transform_store_sub_calls("x = $s(1);", &vars), "x = $s()(1);");
+    }
+
+    #[test]
+    fn finds_nested_local_store_spelling_as_a_binding() {
+        assert!(declares_binding_in_statement(
+            "function render() { const $t = getTranslator(); return $t('key'); }",
+            "$t"
+        ));
+    }
+
+    #[test]
+    fn a_store_reference_is_not_a_binding() {
+        assert!(!declares_binding_in_statement("function render() { return $t('key'); }", "$t"));
+    }
+
+    #[test]
+    fn finds_binding_names_in_destructuring_and_catch_parameters() {
+        assert!(declares_binding_in_statement(
+            "try { const { value: $t } = source; } catch ($error) {}",
+            "$t"
+        ));
+        assert!(declares_binding_in_statement("try {} catch ($error) { use($error); }", "$error"));
+    }
 }

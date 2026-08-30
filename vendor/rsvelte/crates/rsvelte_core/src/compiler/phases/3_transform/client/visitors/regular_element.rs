@@ -5,13 +5,12 @@
 //!
 //! This visitor handles regular HTML elements like `<div>`, `<span>`, etc.
 
-// Allow dead code for TODO event handler stubs
-#![allow(dead_code)]
-
 use crate::ast::template::{
     Attribute, AttributeNode, AttributeValue, BindDirective, ClassDirective, Fragment,
     LetDirective, RegularElement as RegularElementNode, StyleDirective, TemplateNode,
 };
+use crate::ast::template::{AttributeValuePart, ExpressionTag};
+use crate::compiler::phases::phase3_transform::client::source_anchor::CommentRegion;
 use crate::compiler::phases::phase3_transform::client::transform_template::Template;
 use crate::compiler::phases::phase3_transform::client::types::*;
 use crate::compiler::phases::phase3_transform::client::visitors::animate_directive::animate_directive;
@@ -27,7 +26,9 @@ use crate::compiler::phases::phase3_transform::client::visitors::shared::fragmen
     TextOrExpr, has_dynamic_children, is_static_element, process_children,
 };
 use crate::compiler::phases::phase3_transform::client::visitors::shared::utils::{
-    build_render_statement_with_memoizer, build_template_chunk, expression_has_reactive_state,
+    build_render_statement_with_memoizer, build_template_chunk,
+    collect_expression_identifiers_for_blockers, expression_has_reactive_state, get_literal_value,
+    is_js_expr_defined,
 };
 use crate::compiler::phases::phase3_transform::client::visitors::transition_directive::transition_directive;
 use crate::compiler::phases::phase3_transform::client::visitors::use_directive::use_directive;
@@ -57,6 +58,7 @@ struct LetDirectiveResult {
         Option<crate::compiler::phases::phase3_transform::client::types::IdentifierTransform>,
     )>,
     saved_transform_deep_read: im::HashMap<String, ()>,
+    saved_shadowed_prop_names: im::HashSet<String>,
 }
 
 fn process_element_let_directives(
@@ -70,6 +72,7 @@ fn process_element_let_directives(
         Option<crate::compiler::phases::phase3_transform::client::types::IdentifierTransform>,
     )> = Vec::new();
     let saved_transform_deep_read = context.state.transform_deep_read.clone();
+    let saved_shadowed_prop_names = context.state.shadowed_prop_names.clone();
 
     for let_dir in let_directives {
         let prop_name = &let_dir.name;
@@ -127,17 +130,54 @@ fn process_element_let_directives(
                     is_defined: false,
                     is_reactive: true,
                     replacement_id: None,
+                    store_source: None,
                 },
             );
             // Let directive bindings are template-kind.
             context.state.transform_deep_read.insert(name.clone(), ());
+            // The let: binding shadows any outer same-named prop. Without this,
+            // `convert_identifier` sees the prop binding kind and emits
+            // `$$props.name` directly, bypassing the `$.get(name)` transform we
+            // just registered (mirrors the each-item / snippet-param shadowing in
+            // each_block.rs / snippet_block.rs). e.g. `let { data } = $props()`
+            // outside + `<tbody slot="…" let:data>` must read `$.get(data)`.
+            context.state.shadowed_prop_names.insert(name.clone());
+        } else if let Some((derived_name, binding_names, const_stmt)) =
+            crate::compiler::phases::phase3_transform::client::visitors::shared::component::build_destructured_let_directive(
+                let_dir, context,
+            )
+        {
+            // Destructured case (`let:cell={[first, ...rest]}`): emit the
+            // `$.derived` destructure const and route each extracted binding's
+            // reads through it (`$.get(cell).first`).
+            context.state.let_directives.push(const_stmt);
+            for binding_name in &binding_names {
+                let name = binding_name.to_string();
+                saved_transforms.push((name.clone(), context.state.transform.get(&name).cloned()));
+                context.state.transform.insert(
+                    name.clone(),
+                    crate::compiler::phases::phase3_transform::client::types::IdentifierTransform {
+                        read: Some(|arena, node| {
+                            b::call(arena, b::member_path(arena, "$.get"), vec![node])
+                        }),
+                        read_source: Some(derived_name.clone()),
+                        assign: None,
+                        mutate: None,
+                        update: None,
+                        skip_proxy: false,
+                        is_defined: false,
+                        is_reactive: true,
+                        replacement_id: None,
+                        store_source: None,
+                    },
+                );
+                context.state.transform_deep_read.insert(name.clone(), ());
+                context.state.shadowed_prop_names.insert(name);
+            }
         }
     }
 
-    LetDirectiveResult {
-        saved_transforms,
-        saved_transform_deep_read,
-    }
+    LetDirectiveResult { saved_transforms, saved_transform_deep_read, saved_shadowed_prop_names }
 }
 
 /// Visit a regular element node.
@@ -158,17 +198,10 @@ pub fn visit_regular_element(
 ) -> TransformResult {
     // Push element to template
     let is_html = context.state.metadata.namespace == "html" && node.name != "svg";
-    // Avoid allocation when name is already lowercase (common case for HTML)
     let name_str = node.name.as_str();
-    let elem_name = if is_html && name_str.bytes().any(|b| b.is_ascii_uppercase()) {
-        name_str.to_lowercase()
-    } else {
-        name_str.to_string()
-    };
-    context
-        .state
-        .template
-        .push_element(elem_name, node.start, is_html);
+    let elem_name =
+        if is_html { super::shared::utils::html_lowercase(name_str) } else { name_str.to_string() };
+    context.state.template.push_element(elem_name, node.start, is_html);
 
     // Handle <noscript> - it's skipped entirely
     if node.name == "noscript" {
@@ -203,18 +236,13 @@ pub fn visit_regular_element(
             Attribute::Attribute(attr) => {
                 // `is` attributes need to be part of the template, otherwise they break
                 // See: svelte/packages/svelte/src/compiler/phases/3-transform/client/visitors/RegularElement.js
-                if attr.name == "is"
-                    && context.state.metadata.namespace == "html"
-                    && is_text_attribute(attr)
-                    && let AttributeValue::Sequence(parts) = &attr.value
-                    && let Some(crate::ast::template::AttributeValuePart::Text(text)) =
-                        parts.first()
-                {
-                    context
-                        .state
-                        .template
-                        .set_prop("is".to_string(), Some(text.data.to_string()));
-                    continue;
+                if attr.name == "is" && context.state.metadata.namespace == "html" {
+                    let result =
+                        build_attribute_value(&attr.value, context, |expr, _metadata| expr);
+                    if let JsExpr::Literal(JsLiteral::String(value)) = result.value {
+                        context.state.template.set_prop("is".to_string(), Some(value.to_string()));
+                        continue;
+                    }
                 }
 
                 // All attributes (including event attributes like onclick={...}) go into attributes
@@ -404,7 +432,11 @@ pub fn visit_regular_element(
                 b::call(
                     &context.arena,
                     b::member_path(&context.arena, "$.remove_input_defaults"),
-                    vec![context.state.node.clone()],
+                    vec![JsExpr::Spanned(
+                        context.arena.alloc_expr(context.state.node.clone()),
+                        node.start.saturating_add(1),
+                        node.start.saturating_add(1).saturating_add(node.name.len() as u32),
+                    )],
                 ),
             ));
         }
@@ -472,11 +504,7 @@ pub fn visit_regular_element(
         };
 
         let ignore_hydration = context.state.options.dev
-            && node
-                .metadata
-                .ignored_codes
-                .iter()
-                .any(|c| c == "hydration_attribute_changed");
+            && node.metadata.ignored_codes.iter().any(|c| c == "hydration_attribute_changed");
         build_attribute_effect(
             &attributes,
             &class_directives,
@@ -542,6 +570,7 @@ pub fn visit_regular_element(
                         node,
                         &node_id_str,
                         Some(&attr.value),
+                        attr.metadata.needs_clsx,
                         &class_directives,
                         context,
                         is_html,
@@ -573,54 +602,76 @@ pub fn visit_regular_element(
                     && !cannot_be_set_statically(&name)
                     && (is_true_value || is_text_attribute(attr))
                 {
-                    let mut value = if is_text_attribute(attr) {
-                        if let AttributeValue::Sequence(parts) = &attr.value {
-                            if let crate::ast::template::AttributeValuePart::Text(text) = &parts[0]
-                            {
-                                text.data.to_string()
-                            } else {
-                                String::new()
-                            }
-                        } else {
-                            String::new()
+                    // `None` is upstream's boolean `true` for a valueless attribute,
+                    // and it has to stay distinct from `Some("")`: scoping treats it
+                    // as empty, the emptiness gate below treats it as present.
+                    let mut value: Option<String> = if is_text_attribute(attr) {
+                        match &attr.value {
+                            AttributeValue::Sequence(parts) => match &parts[0] {
+                                crate::ast::template::AttributeValuePart::Text(text) => {
+                                    Some(text.data.to_string())
+                                }
+                                _ => Some(String::new()),
+                            },
+                            _ => Some(String::new()),
                         }
                     } else {
-                        String::new()
+                        None
                     };
 
                     // Add scoped class if needed (only for class without class directives)
                     if name == "class" && is_scoped {
                         let hash = &context.state.analysis.css.hash;
-                        if value.is_empty() {
-                            value = hash.clone();
-                        } else {
-                            value.push(' ');
-                            value.push_str(hash);
+                        if !hash.is_empty() {
+                            value = Some(match value.as_deref() {
+                                None | Some("") => hash.clone(),
+                                Some(v) => format!("{v} {hash}"),
+                            });
                         }
                     }
 
-                    if name != "class" || !value.is_empty() {
-                        let prop_value = if is_true_value {
-                            Some(String::new())
-                        } else {
-                            Some(value)
-                        };
-
-                        context.state.template.set_prop(name.clone(), prop_value);
+                    if name != "class" || value.as_deref().is_none_or(|v| !v.is_empty()) {
+                        context
+                            .state
+                            .template
+                            .set_prop(name.clone(), Some(value.unwrap_or_default()));
                     }
                 } else if name == "autofocus" {
                     // Special case: autofocus needs $.autofocus() call
-                    let result =
-                        build_attribute_value(&attr.value, context, |expr, _metadata| expr);
+                    // Upstream currently emits a bare `await` as the call argument.
+                    // Keep the synchronous path byte-identical, but resolve an async
+                    // value through a local template-effect memoizer.
+                    let mut local_memoizer =
+                        Memoizer::with_parent_conflicts(&context.state.memoizer);
+                    let result = build_attribute_value(&attr.value, context, |expr, metadata| {
+                        if metadata.has_await() {
+                            local_memoizer.add(expr, false, true, false, metadata.has_state())
+                        } else {
+                            expr
+                        }
+                    });
                     let node_id = extract_node_id(&context.state.node);
-                    context.state.init.push(b::stmt(
+                    let call = b::call(
                         &context.arena,
-                        b::call(
+                        b::member_path(&context.arena, "$.autofocus"),
+                        vec![b::id(&node_id), result.value],
+                    );
+
+                    if local_memoizer.has_memoized() {
+                        context.state.init.push(b::stmt(
                             &context.arena,
-                            b::member_path(&context.arena, "$.autofocus"),
-                            vec![b::id(&node_id), result.value],
-                        ),
-                    ));
+                            build_render_statement_with_memoizer(
+                                &context.arena,
+                                vec![b::stmt(&context.arena, call)],
+                                local_memoizer.get_params(),
+                                local_memoizer.sync_values(&context.arena),
+                                local_memoizer.async_values(&context.arena),
+                                None,
+                            ),
+                        ));
+                    } else {
+                        context.state.init.push(b::stmt(&context.arena, call));
+                    }
                 } else if name == "class" {
                     // Dynamic class attribute without class directives
                     let is_html = context.state.metadata.namespace == "html" && node.name != "svg";
@@ -629,6 +680,7 @@ pub fn visit_regular_element(
                         node,
                         &node_id,
                         Some(&attr.value),
+                        attr.metadata.needs_clsx,
                         &[], // No class directives
                         context,
                         is_html,
@@ -641,28 +693,69 @@ pub fn visit_regular_element(
                     build_set_style(&node_id, Some(&attr.value), &style_directives, context);
                     style_handled = true;
                 } else if is_custom_element {
-                    // Custom element: use $.set_custom_element_data
-                    let result =
-                        build_attribute_value(&attr.value, context, |expr, _metadata| expr);
+                    // Custom element: use $.set_custom_element_data.
+                    // Its own Memoizer, and its own ungrouped `template_effect`,
+                    // because `set_custom_element_data` may not be idempotent
+                    // (RegularElement.js `build_custom_element_attribute_update_assignment`).
+                    // Routing the value through the memoizer is also what keeps an
+                    // `await` in the attribute legal: it lands in `async_values()`
+                    // as `async () => …` instead of being inlined into an arrow the
+                    // parser then rejects.
+                    let mut local_memoizer =
+                        Memoizer::with_parent_conflicts(&context.state.memoizer);
+                    let result = build_attribute_value(&attr.value, context, |expr, metadata| {
+                        local_memoizer.add(
+                            expr,
+                            metadata.has_call(),
+                            metadata.has_await(),
+                            false,
+                            metadata.has_state(),
+                        )
+                    });
                     let node_id = extract_node_id(&context.state.node);
                     let call = b::call(
                         &context.arena,
                         b::member_path(&context.arena, "$.set_custom_element_data"),
-                        vec![
-                            b::id(&node_id),
-                            b::string(attr.name.to_string()),
-                            result.value,
-                        ],
+                        vec![b::id(&node_id), b::string(attr.name.to_string()), result.value],
                     );
 
                     if result.has_state {
-                        // For reactive values, wrap in template_effect
+                        let params = local_memoizer.apply();
+                        let sync_values = local_memoizer.sync_values(&context.arena);
+                        let async_values = local_memoizer.async_values(&context.arena);
+                        let blocker_exprs =
+                            context.state.get_blockers_for_expr(&call, &context.arena);
+                        let param_patterns: Vec<JsPattern> = params
+                            .iter()
+                            .filter_map(|p| {
+                                if let JsExpr::Identifier(name) = p {
+                                    Some(JsPattern::Identifier(name.clone()))
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect();
+
+                        let mut args = vec![b::arrow(&context.arena, param_patterns, call)];
+                        if sync_values.is_some()
+                            || async_values.is_some()
+                            || !blocker_exprs.is_empty()
+                        {
+                            args.push(sync_values.unwrap_or_else(|| b::undefined(&context.arena)));
+                        }
+                        if async_values.is_some() || !blocker_exprs.is_empty() {
+                            args.push(async_values.unwrap_or_else(|| b::undefined(&context.arena)));
+                        }
+                        if !blocker_exprs.is_empty() {
+                            args.push(b::array(blocker_exprs));
+                        }
+
                         context.state.init.push(b::stmt(
                             &context.arena,
                             b::call(
                                 &context.arena,
                                 b::member_path(&context.arena, "$.template_effect"),
-                                vec![b::thunk(&context.arena, call)],
+                                args,
                             ),
                         ));
                     } else {
@@ -695,14 +788,42 @@ pub fn visit_regular_element(
                     });
                     context.state.memoizer = local_memoizer;
 
+                    // Upstream's comment cursor sees the `.svelte` source, so a
+                    // comment written in this attribute's braces lands relative
+                    // to the tag NAME's position and this value's own.
+                    // `<` + the tag name: `name_loc` is not populated unless a
+                    // source map was asked for, and only the name's LINE matters.
+                    let name_start = node.start + 1;
+                    let name_end = name_start + node.name.len() as u32;
+                    let region = expression_tag_of(&attr.value).and_then(|tag| {
+                        CommentRegion::of(&context.state, tag, name_start)
+                            .map(|region| (region, tag))
+                    });
+                    let anchors = region.as_ref().map(|(region, _)| ElementAnchors {
+                        region,
+                        name_start,
+                        name_end,
+                    });
+                    let value = match &region {
+                        Some((region, tag)) => {
+                            match (tag.expression.start(), tag.expression.end()) {
+                                (Some(start), Some(end)) => {
+                                    region.anchor(&context.arena, result.value, start, end)
+                                }
+                                _ => result.value,
+                            }
+                        }
+                        None => result.value,
+                    };
                     let update = build_element_attribute_update(
                         &context.arena,
                         node,
                         &extract_node_id(&context.state.node),
                         &name,
-                        result.value,
+                        value,
                         &attributes,
                         context.state.options.dev,
+                        anchors.as_ref(),
                     );
 
                     // Route to update (template_effect) when the expression has state.
@@ -725,11 +846,7 @@ pub fn visit_regular_element(
                     let node_id = extract_node_id(&context.state.node);
                     let is_html_ns =
                         context.state.metadata.namespace == "html" && node.name != "svg";
-                    let flags = if is_html_ns {
-                        b::number(1.0)
-                    } else {
-                        b::number(0.0)
-                    };
+                    let flags = if is_html_ns { b::number(1.0) } else { b::number(0.0) };
                     context.state.init.push(b::stmt(
                         &context.arena,
                         b::call(
@@ -740,10 +857,7 @@ pub fn visit_regular_element(
                     ));
                 } else {
                     // Regular elements: bake hash into template HTML
-                    context
-                        .state
-                        .template
-                        .set_prop("class".to_string(), Some(hash.clone()));
+                    context.state.template.set_prop("class".to_string(), Some(hash.clone()));
                 }
             }
         }
@@ -761,6 +875,7 @@ pub fn visit_regular_element(
                 node,
                 &node_id,
                 class_attr_value,
+                class_attribute.is_some_and(|attr| attr.metadata.needs_clsx),
                 &class_directives,
                 context,
                 is_html,
@@ -776,11 +891,7 @@ pub fn visit_regular_element(
             let node_id = extract_node_id(&context.state.node);
             // Pass static style attribute value if available (when style attr was skipped due to directives)
             let style_attr_value = static_style_attribute.and_then(|attr| {
-                if let Attribute::Attribute(a) = attr {
-                    Some(&a.value)
-                } else {
-                    None
-                }
+                if let Attribute::Attribute(a) = attr { Some(&a.value) } else { None }
             });
             build_set_style(
                 &node_id,
@@ -819,29 +930,51 @@ pub fn visit_regular_element(
     let child_namespace = determine_namespace_for_children(node, &context.state.metadata.namespace);
 
     // Save and update namespace for children
-    let saved_namespace = std::mem::replace(
-        &mut context.state.metadata.namespace,
-        child_namespace.clone(),
-    );
+    let saved_namespace =
+        std::mem::replace(&mut context.state.metadata.namespace, child_namespace.clone());
+
+    // `node` itself is the `parent` argument below, so the flag handed to
+    // `clean_nodes` must cover only the elements ABOVE it.
+    let saved_in_text_element = context.state.metadata.in_text_element;
+    context.state.metadata.in_text_element = saved_in_text_element || node.name == "text";
+
+    let saved_bound_contenteditable = context.state.metadata.bound_contenteditable;
+    context.state.metadata.bound_contenteditable = saved_bound_contenteditable
+        || (bindings.contains_key("innerHTML")
+            || bindings.contains_key("innerText")
+            || bindings.contains_key("textContent"))
+            && attributes.iter().any(|attribute| {
+                let Attribute::Attribute(attribute) = attribute else {
+                    return false;
+                };
+
+                attribute.name == "contenteditable"
+                    && (matches!(attribute.value, AttributeValue::True(_))
+                        || (is_text_attribute(attribute)
+                            && matches!(
+                                attribute.value,
+                                AttributeValue::Sequence(ref parts)
+                                    if matches!(parts.first(), Some(crate::ast::template::AttributeValuePart::Text(text)) if text.data == "true")
+                            )))
+            });
 
     let cleaned = clean_nodes(
         crate::compiler::phases::phase3_transform::utils::ParentRef::RegularElement(node),
         &node.fragment.nodes,
         &[], // path - not needed for our implementation
+        saved_in_text_element,
         &context.state.metadata.namespace,
         context.state.scope,
         context.state.analysis,
         preserve_whitespace || node.name == "script",
         context.state.options.preserve_comments,
+        context.state.options.hmr,
     );
 
     // Check if there are any SnippetBlocks in the fragment
     // This affects how we handle child state
-    let has_snippet_blocks = node
-        .fragment
-        .nodes
-        .iter()
-        .any(|n| matches!(n, TemplateNode::SnippetBlock(_)));
+    let has_snippet_blocks =
+        node.fragment.nodes.iter().any(|n| matches!(n, TemplateNode::SnippetBlock(_)));
 
     // `has_declarations` mirrors upstream `RegularElement.js`:
     //   const has_declarations = !node.fragment.metadata.transparent;
@@ -854,11 +987,8 @@ pub fn visit_regular_element(
     // `{const}` can shadow an outer binding of the same name. Computing it
     // directly off the DeclarationTag presence avoids depending on the
     // `transparent` metadata being threaded through analysis.
-    let has_declarations = node
-        .fragment
-        .nodes
-        .iter()
-        .any(|n| matches!(n, TemplateNode::DeclarationTag(_)));
+    let has_declarations =
+        node.fragment.nodes.iter().any(|n| matches!(n, TemplateNode::DeclarationTag(_)));
 
     // Always create a separate child state for processing children.
     // This matches the JS implementation which always creates:
@@ -879,8 +1009,13 @@ pub fn visit_regular_element(
     // so a nested `{const = $derived(await …)}` / `{let = $state(await …)}`
     // emits its own `var promises_N = $.run([…])` inside the element block,
     // rather than leaking its thunk into the enclosing block's group.
-    let saved_async_consts = if has_declarations {
-        context.state.async_consts.take()
+    let saved_async_consts =
+        if has_declarations { context.state.async_consts.take() } else { None };
+    // Upstream `memoizer: has_declarations ? new Memoizer() : state.memoizer` —
+    // a declaring element's block owns the `$0`/`$1` bindings its children memoize.
+    let saved_memoizer = if has_declarations {
+        let child_memoizer = Memoizer::with_parent_conflicts(&context.state.memoizer);
+        Some(std::mem::replace(&mut context.state.memoizer, child_memoizer))
     } else {
         None
     };
@@ -937,6 +1072,18 @@ pub fn visit_regular_element(
         }
     }
 
+    // `{#snippet}` children shadow a same-named outer binding for the whole
+    // element fragment, exactly as they do for a block fragment (see
+    // `client::utils::shadow_snippet_declarations`).
+    let saved_transform_deep_read = context.state.transform_deep_read.clone();
+    let saved_shadowed_props = context.state.shadowed_prop_names.clone();
+    crate::compiler::phases::phase3_transform::client::utils::shadow_snippet_declarations(
+        &node.fragment.nodes,
+        &mut context.state.transform,
+        &mut context.state.transform_deep_read,
+        &mut context.state.shadowed_prop_names,
+    );
+
     // Propagate preserve_whitespace to child processing so that `pre`/`textarea`
     // whitespace is preserved for ExpressionTag/Text content within nested elements.
     // This mirrors the official compiler's state spread:
@@ -959,22 +1106,27 @@ pub fn visit_regular_element(
     // 1. All children are Text or ExpressionTag
     // 2. All ExpressionTags are non-reactive (no has_state, no has_await, no blockers)
     // 3. At least one ExpressionTag exists (otherwise pure text is in template)
-    let all_text_or_expr = cleaned.trimmed.iter().all(|n| {
-        matches!(
-            n.as_ref(),
-            TemplateNode::Text(_) | TemplateNode::ExpressionTag(_)
-        )
-    });
-
-    let has_expression_tag = cleaned
+    let all_text_or_expr = cleaned
         .trimmed
         .iter()
-        .any(|n| matches!(n.as_ref(), TemplateNode::ExpressionTag(_)));
+        .all(|n| matches!(n.as_ref(), TemplateNode::Text(_) | TemplateNode::ExpressionTag(_)));
+
+    let has_expression_tag =
+        cleaned.trimmed.iter().any(|n| matches!(n.as_ref(), TemplateNode::ExpressionTag(_)));
 
     let all_expressions_static = cleaned.trimmed.iter().all(|n| {
         match n.as_ref() {
             TemplateNode::Text(_) => true,
             TemplateNode::ExpressionTag(expr_tag) => {
+                let has_blockers = if context.state.blocker_map.borrow().is_empty() {
+                    false
+                } else {
+                    let blocker_names =
+                        collect_expression_identifiers_for_blockers(&expr_tag.expression);
+                    let blocker_name_refs: Vec<&str> =
+                        blocker_names.iter().map(String::as_str).collect();
+                    context.state.has_blockers_for_names(&blocker_name_refs)
+                };
                 // Check if expression is non-reactive AND has no non-pure calls.
                 // Non-pure calls (to local functions) need to be in a template_effect
                 // for proper execution context, so they can't use the textContent shortcut.
@@ -991,8 +1143,10 @@ pub fn visit_regular_element(
                 !super::shared::utils::is_effect_pending_expr(
                     &expr_tag.expression,
                     context.state.parse_arena,
-                ) && !expression_has_reactive_state(&expr_tag.expression, context)
+                ) && (get_literal_value(&expr_tag.expression, context).is_some()
+                    || !expression_has_reactive_state(&expr_tag.expression, context))
                     && !expr_tag.metadata.expression.has_call()
+                    && !has_blockers
             }
             _ => false,
         }
@@ -1008,7 +1162,7 @@ pub fn visit_regular_element(
 
     if use_text_content {
         // Convert children to TextOrExpr for build_template_chunk
-        let values: Vec<TextOrExpr> = cleaned
+        let values: Vec<TextOrExpr<'_>> = cleaned
             .trimmed
             .iter()
             .filter_map(|n| match n.as_ref() {
@@ -1084,11 +1238,7 @@ pub fn visit_regular_element(
                 if is_text {
                     args.push(b::boolean(true));
                 }
-                b::call(
-                    arena_ref2,
-                    b::member_path(arena_ref2, "$.first_child"),
-                    args,
-                )
+                b::call(arena_ref2, b::member_path(arena_ref2, "$.first_child"), args)
             },
             false, // Not an element - we're processing into a fragment
             context,
@@ -1194,15 +1344,22 @@ pub fn visit_regular_element(
             vec![element_node, b::arrow_block(vec![], body_stmts)],
         );
 
-        context
-            .state
-            .init
-            .push(b::stmt(&context.arena, customizable_select_call));
+        context.state.init.push(b::stmt(&context.arena, customizable_select_call));
         force_merge_child_init = true;
     } else {
         // Process trimmed child nodes
         // These statements go directly into context.state (child_state in JS)
-        let mut current_node = context.state.node.clone();
+        let element_name_start = node.start.saturating_add(1);
+        let element_name_end = element_name_start.saturating_add(node.name.len() as u32);
+        let element_node = match &context.state.node {
+            JsExpr::Spanned(inner, _, _) => context.arena.get_expr(*inner).clone(),
+            node => node.clone(),
+        };
+        let mut current_node = JsExpr::Spanned(
+            context.arena.alloc_expr(element_node.clone()),
+            element_name_start,
+            element_name_end,
+        );
 
         // For <template> elements, needs_reset is always true and we need to call
         // $.hydrate_template() and use element.content as the child arg.
@@ -1255,7 +1412,11 @@ pub fn visit_regular_element(
                 b::call(
                     &context.arena,
                     b::member_path(&context.arena, "$.reset"),
-                    vec![context.state.node.clone()],
+                    vec![JsExpr::Spanned(
+                        context.arena.alloc_expr(element_node),
+                        element_name_start,
+                        element_name_end,
+                    )],
                 ),
             ));
         }
@@ -1271,6 +1432,11 @@ pub fn visit_regular_element(
     let child_update = std::mem::take(&mut context.state.update);
     let child_after_update = std::mem::take(&mut context.state.after_update);
     let child_consts = std::mem::take(&mut context.state.consts);
+    // Captured before the parent memoizer is restored: the block below binds these
+    // as the `template_effect` parameters that `child_update` already references.
+    let child_memo_params = context.state.memoizer.get_params();
+    let child_memo_sync = context.state.memoizer.sync_values(&context.arena);
+    let child_memo_async = context.state.memoizer.async_values(&context.arena);
     // Take the child's async_consts group (if any) and build its
     // `var promises_N = $.run([…thunks])` declaration, mirroring
     // `fragment.rs`. Emitted into the block after the consts, before init.
@@ -1305,8 +1471,13 @@ pub fn visit_regular_element(
     context.state.consts = saved_child_consts;
     context.state.scope = saved_scope;
     context.state.transform = saved_transform;
+    context.state.transform_deep_read = saved_transform_deep_read;
+    context.state.shadowed_prop_names = saved_shadowed_props;
     if has_declarations {
         context.state.async_consts = saved_async_consts;
+    }
+    if let Some(saved) = saved_memoizer {
+        context.state.memoizer = saved;
     }
     // For a transparent fragment (no DeclarationTag), child consts (e.g. legacy
     // `{@const}` that bubbled up from a nested transparent element) flow back to
@@ -1366,34 +1537,21 @@ pub fn visit_regular_element(
                         ));
                     }
                 }
-                if exprs.is_empty() {
-                    None
-                } else {
-                    Some(b::array(exprs))
-                }
+                if exprs.is_empty() { None } else { Some(b::array(exprs)) }
             };
-            if block_blockers.is_some() {
-                block_body.push(b::stmt(
+            // A single expression-statement update collapses to the concise
+            // `() => stmt` arrow; only a multi-statement body uses a block.
+            block_body.push(b::stmt(
+                &context.arena,
+                build_render_statement_with_memoizer(
                     &context.arena,
-                    build_render_statement_with_memoizer(
-                        &context.arena,
-                        child_update,
-                        vec![],
-                        None,
-                        None,
-                        block_blockers,
-                    ),
-                ));
-            } else {
-                block_body.push(b::stmt(
-                    &context.arena,
-                    b::call(
-                        &context.arena,
-                        b::member_path(&context.arena, "$.template_effect"),
-                        vec![b::arrow_block(vec![], child_update)],
-                    ),
-                ));
-            }
+                    child_update,
+                    child_memo_params,
+                    child_memo_sync,
+                    child_memo_async,
+                    block_blockers,
+                ),
+            ));
         }
 
         block_body.extend(child_after_update);
@@ -1410,18 +1568,12 @@ pub fn visit_regular_element(
         context.state.init.extend(element_state_init);
         context.state.update.extend(child_update);
         context.state.after_update.extend(child_after_update);
-        context
-            .state
-            .after_update
-            .extend(element_state_after_update);
+        context.state.after_update.extend(element_state_after_update);
     } else {
         // Static fragment: discard child_state (only $.next() from process_children),
         // only merge element_state
         context.state.init.extend(element_state_init);
-        context
-            .state
-            .after_update
-            .extend(element_state_after_update);
+        context.state.after_update.extend(element_state_after_update);
     }
 
     // Handle <selectedcontent> element
@@ -1569,19 +1721,19 @@ pub fn visit_regular_element(
 
     // Restore namespace after processing children
     context.state.metadata.namespace = saved_namespace;
+    context.state.metadata.in_text_element = saved_in_text_element;
+    context.state.metadata.bound_contenteditable = saved_bound_contenteditable;
 
     // Restore original transforms that were saved before let: directives
     for (name, saved) in &let_directive_result.saved_transforms {
         if let Some(original_transform) = saved {
-            context
-                .state
-                .transform
-                .insert(name.clone(), original_transform.clone());
+            context.state.transform.insert(name.clone(), original_transform.clone());
         } else {
             context.state.transform.remove(name);
         }
     }
     context.state.transform_deep_read = let_directive_result.saved_transform_deep_read;
+    context.state.shadowed_prop_names = let_directive_result.saved_shadowed_prop_names;
 
     context.state.template.pop_element();
     TransformResult::None
@@ -1595,9 +1747,13 @@ pub fn visit_regular_element(
 /// child_init is merged. Since our Phase 2 analysis doesn't mutate the AST to set
 /// this flag (immutable references), we check for DebugTag presence as a fallback.
 fn has_hoisted_init_producers(hoisted: &[Cow<'_, TemplateNode>]) -> bool {
-    hoisted
-        .iter()
-        .any(|n| matches!(n.as_ref(), TemplateNode::DebugTag(_)))
+    hoisted.iter().any(|n| match n.as_ref() {
+        // Upstream's dynamism comes from the Identifier visitor, so a `{@debug}`
+        // with no identifiers leaves the fragment static and its effect is
+        // discarded with the rest of `child_state.init`.
+        TemplateNode::DebugTag(tag) => !tag.identifiers.is_empty(),
+        _ => false,
+    })
 }
 
 /// Check if any trimmed children are dynamic (non-static, non-text).
@@ -1619,21 +1775,16 @@ fn has_dynamic_children_for_merge(
     // when visited) and forced the parent to traverse, emitting a spurious
     // `$.child(...) + $.remove_input_defaults(...)` (e.g. framer-command's
     // `<label><input type="radio" checked/> Radio Button</label>`).
-    trimmed
-        .iter()
-        .any(|n| has_dynamic_children(std::slice::from_ref(n.as_ref())))
+    trimmed.iter().any(|n| has_dynamic_children(std::slice::from_ref(n.as_ref())))
 }
 
 /// Check if a node is a custom element.
 fn is_custom_element_node(node: &RegularElementNode) -> bool {
     node.name.contains('-')
-        || node.attributes.iter().any(|attr| {
-            if let Attribute::Attribute(a) = attr {
-                a.name == "is"
-            } else {
-                false
-            }
-        })
+        || node
+            .attributes
+            .iter()
+            .any(|attr| if let Attribute::Attribute(a) = attr { a.name == "is" } else { false })
 }
 
 /// Check if an attribute is a text attribute (static string).
@@ -1643,9 +1794,9 @@ fn is_text_attribute(attr: &AttributeNode) -> bool {
     match &attr.value {
         AttributeValue::True(_) => false,
         AttributeValue::Expression(_) => false,
-        AttributeValue::Sequence(parts) => parts
-            .iter()
-            .all(|p| matches!(p, AttributeValuePart::Text(_))),
+        AttributeValue::Sequence(parts) => {
+            parts.iter().all(|p| matches!(p, AttributeValuePart::Text(_)))
+        }
     }
 }
 
@@ -1670,10 +1821,7 @@ fn cannot_be_set_statically(name: &str) -> bool {
     // Only these attributes are unconditionally non-static
     // Other attributes like value, checked, selected are handled conditionally
     // based on the element type (see is_static_attribute)
-    matches!(
-        name,
-        "autofocus" | "muted" | "defaultValue" | "defaultChecked" | "inert"
-    )
+    matches!(name, "autofocus" | "muted" | "defaultValue" | "defaultChecked")
 }
 
 /// Check if an element emits `load` and `error` events.
@@ -1682,37 +1830,6 @@ fn is_load_error_element(name: &str) -> bool {
     matches!(
         name,
         "body" | "embed" | "iframe" | "img" | "link" | "object" | "script" | "style" | "track"
-    )
-}
-
-/// Check if an attribute is a boolean attribute.
-fn is_boolean_attribute(name: &str) -> bool {
-    matches!(
-        name,
-        "allowfullscreen"
-            | "async"
-            | "autofocus"
-            | "autoplay"
-            | "checked"
-            | "controls"
-            | "default"
-            | "defer"
-            | "disabled"
-            | "formnovalidate"
-            | "hidden"
-            | "indeterminate"
-            | "ismap"
-            | "loop"
-            | "multiple"
-            | "muted"
-            | "nomodule"
-            | "novalidate"
-            | "open"
-            | "playsinline"
-            | "readonly"
-            | "required"
-            | "reversed"
-            | "selected"
     )
 }
 
@@ -1747,29 +1864,6 @@ fn normalize_attribute_string(name: &str) -> String {
                 name.to_string()
             }
         }
-    }
-}
-
-/// Normalize attribute name to DOM property name (returns &str reference).
-/// For cases where the result doesn't need to be owned.
-/// Reference: svelte/packages/svelte/src/utils.js ATTRIBUTE_ALIASES and normalize_attribute
-fn normalize_attribute(name: &str) -> &str {
-    // Use case-insensitive comparison to avoid allocating a lowercase copy.
-    // Match on length first to minimize comparisons.
-    match name.len() {
-        5 if name.eq_ignore_ascii_case("ismap") => "isMap",
-        8 if name.eq_ignore_ascii_case("readonly") => "readOnly",
-        8 if name.eq_ignore_ascii_case("nomodule") => "noModule",
-        9 if name.eq_ignore_ascii_case("srcobject") => "srcObject",
-        10 if name.eq_ignore_ascii_case("novalidate") => "noValidate",
-        11 if name.eq_ignore_ascii_case("playsinline") => "playsInline",
-        12 if name.eq_ignore_ascii_case("defaultvalue") => "defaultValue",
-        14 if name.eq_ignore_ascii_case("defaultchecked") => "defaultChecked",
-        14 if name.eq_ignore_ascii_case("formnovalidate") => "formNoValidate",
-        15 if name.eq_ignore_ascii_case("allowfullscreen") => "allowFullscreen",
-        21 if name.eq_ignore_ascii_case("disableremoteplayback") => "disableRemotePlayback",
-        23 if name.eq_ignore_ascii_case("disablepictureinpicture") => "disablePictureInPicture",
-        _ => name,
     }
 }
 
@@ -1843,6 +1937,28 @@ fn extract_node_id(expr: &JsExpr) -> String {
 
 /// Build element attribute update expression.
 /// The `name` parameter should already be normalized via `get_attribute_name()`.
+/// The element identifier upstream stamps with the tag NAME's location
+/// (`fragment.js`: `b.id(scope.generate(name), element.name_loc)`), which is why
+/// a comment on the same source line as the tag name is flushed as this
+/// argument's trailing comment instead of before the value.
+fn node_id_expr(
+    arena: &crate::compiler::phases::phase3_transform::js_ast::arena::JsArena,
+    node_id: &str,
+    anchors: Option<&ElementAnchors<'_>>,
+) -> JsExpr {
+    match anchors {
+        Some(a) => a.region.anchor(arena, b::id(node_id), a.name_start, a.name_end),
+        None => b::id(node_id),
+    }
+}
+
+/// The comment region an attribute's value shares with its element's tag name.
+struct ElementAnchors<'r> {
+    region: &'r crate::compiler::phases::phase3_transform::client::source_anchor::CommentRegion,
+    name_start: u32,
+    name_end: u32,
+}
+
 fn build_element_attribute_update(
     arena: &crate::compiler::phases::phase3_transform::js_ast::arena::JsArena,
 
@@ -1852,6 +1968,7 @@ fn build_element_attribute_update(
     value: JsExpr,
     attributes: &[&Attribute],
     dev: bool,
+    anchors: Option<&ElementAnchors<'_>>,
 ) -> JsExpr {
     // Special case: muted (Firefox needs property assignment)
     if name == "muted" {
@@ -1860,20 +1977,12 @@ fn build_element_attribute_update(
 
     // Special case: value
     if name == "value" {
-        return b::call(
-            arena,
-            b::member_path(arena, "$.set_value"),
-            vec![b::id(node_id), value],
-        );
+        return b::call(arena, b::member_path(arena, "$.set_value"), vec![b::id(node_id), value]);
     }
 
     // Special case: checked
     if name == "checked" {
-        return b::call(
-            arena,
-            b::member_path(arena, "$.set_checked"),
-            vec![b::id(node_id), value],
-        );
+        return b::call(arena, b::member_path(arena, "$.set_checked"), vec![b::id(node_id), value]);
     }
 
     // Special case: selected
@@ -1924,25 +2033,18 @@ fn build_element_attribute_update(
     }
 
     // DOM property (name is already normalized, e.g., "async", "defer", "required")
-    if is_dom_property(name) {
+    let is_svg_content_attribute =
+        element.metadata.svg && matches!(name, "innerHTML" | "innerText" | "textContent");
+    if is_dom_property(name) && !is_svg_content_attribute {
         return b::assign(arena, b::member(arena, b::id(node_id), name), value);
     }
 
     // Regular attribute (use normalized name for HTML attribute)
-    let set_fn = if name.starts_with("xlink") {
-        "$.set_xlink_attribute"
-    } else {
-        "$.set_attribute"
-    };
+    let set_fn =
+        if name.starts_with("xlink") { "$.set_xlink_attribute" } else { "$.set_attribute" };
 
-    let mut args = vec![b::id(node_id), b::string(name), value];
-    if dev
-        && element
-            .metadata
-            .ignored_codes
-            .iter()
-            .any(|c| c == "hydration_attribute_changed")
-    {
+    let mut args = vec![node_id_expr(arena, node_id, anchors), b::string(name), value];
+    if dev && element.metadata.ignored_codes.iter().any(|c| c == "hydration_attribute_changed") {
         args.push(b::boolean(true));
     }
 
@@ -2002,13 +2104,13 @@ fn is_customizable_select_element(node: &RegularElementNode) -> bool {
 ///
 /// Corresponds to `find_descendants` generator in
 /// `svelte/packages/svelte/src/compiler/phases/nodes.js`.
-fn find_descendants(fragment: &Fragment) -> Vec<TemplateNode> {
+fn find_descendants<'a>(fragment: &Fragment<'a>) -> Vec<TemplateNode<'a>> {
     let mut result = Vec::new();
     find_descendants_recursive(&fragment.nodes, &mut result);
     result
 }
 
-fn find_descendants_recursive(nodes: &[TemplateNode], result: &mut Vec<TemplateNode>) {
+fn find_descendants_recursive<'a>(nodes: &[TemplateNode<'a>], result: &mut Vec<TemplateNode<'a>>) {
     for node in nodes {
         match node {
             // Skip these types - they don't contribute to rich content detection
@@ -2069,86 +2171,6 @@ fn find_descendants_recursive(nodes: &[TemplateNode], result: &mut Vec<TemplateN
     }
 }
 
-/// Checks if a transformed value expression is guaranteed to be defined (not undefined).
-/// Approximates scope.evaluate().is_defined from the official compiler.
-/// In the official compiler, is_defined is false when value == null (loose comparison)
-/// or when value is UNKNOWN. So null and undefined are not defined, and any
-/// unresolvable expression is also not defined.
-///
-/// When `scope_root` is provided, identifiers are resolved to their bindings. If a binding
-/// is not updated (neither reassigned nor mutated), not a prop, and has `initial_is_defined`
-/// set, the identifier is considered defined. This mirrors the official compiler's
-/// `scope.evaluate()` behavior which recurses into binding initial values.
-fn is_value_known_defined(
-    value: &JsExpr,
-    scope_root: Option<&crate::compiler::phases::phase2_analyze::scope::ScopeRoot>,
-    scope: Option<&crate::compiler::phases::phase2_analyze::scope::Scope>,
-) -> bool {
-    match value {
-        // null and undefined literals are explicitly not defined
-        JsExpr::Literal(JsLiteral::Null) => false,
-        JsExpr::Literal(JsLiteral::Undefined) => false,
-        // void expressions (void 0) are undefined
-        JsExpr::Void(_) => false,
-        // Known defined literals: numbers, strings, booleans, regex
-        JsExpr::Literal(JsLiteral::Number(_)) => true,
-        JsExpr::Literal(JsLiteral::String(_)) => true,
-        JsExpr::Literal(JsLiteral::Boolean(_)) => true,
-        JsExpr::Literal(JsLiteral::Regex { .. }) => true,
-        // Arrays and objects are always defined
-        JsExpr::Array(_) => true,
-        JsExpr::Object(_) => true,
-        // Template literals are always strings (defined)
-        JsExpr::TemplateLiteral(_) => true,
-        // For identifiers: look up the binding to check if the initial value is defined.
-        // This mirrors the official compiler's scope.evaluate() which, for identifiers,
-        // checks if the binding is not updated, has an initial value, and is not a prop,
-        // then recursively evaluates the initial value.
-        JsExpr::Identifier(name) => {
-            if let Some(root) = scope_root
-                // Scope-aware resolution so a shadowed name resolves to the
-                // INNERMOST binding (e.g. an each-index `i` shadowing an outer
-                // `<select bind:value={i}>` `i`), not an arbitrary same-named
-                // binding. Walk the scope chain from the current scope; fall
-                // back to any-scope when the chain has no match.
-                && let Some(binding_idx) = {
-                    let mut found = None;
-                    let mut cur = scope;
-                    while let Some(s) = cur {
-                        if let Some(&b) = s.declarations.get(name.as_str()) {
-                            found = Some(b);
-                            break;
-                        }
-                        cur = s.parent.and_then(|p| root.all_scopes.get(p));
-                    }
-                    found.or_else(|| root.find_binding_any_scope(name))
-                }
-                && let Some(binding) = root.bindings.get(binding_idx)
-            {
-                use crate::compiler::phases::phase2_analyze::scope::BindingKind;
-                // An each-block index (`{#each … as item, i}`) is always a
-                // number, so upstream `scope.evaluate` reports it defined and
-                // the `?? ""` fallback is elided (scope.js: an Identifier whose
-                // binding initial is an EachBlock with `index === name` → NUMBER).
-                if matches!(binding.kind, BindingKind::EachIndex) {
-                    return true;
-                }
-                let is_prop = matches!(
-                    binding.kind,
-                    BindingKind::Prop | BindingKind::RestProp | BindingKind::BindableProp
-                );
-                let is_updated = binding.reassigned || binding.mutated;
-                if !is_updated && !is_prop && binding.initial_is_defined {
-                    return true;
-                }
-            }
-            false
-        }
-        // Everything else: calls, member access, $.get() - treat as UNKNOWN (not defined)
-        _ => false,
-    }
-}
-
 /// Serializes an assignment to the value property of a `<select>`, `<option>` or `<input>` element
 /// that needs the hidden `__value` property.
 ///
@@ -2176,20 +2198,19 @@ fn build_element_special_value_attribute(
     // again here, as that would cause double-transformation (e.g., value() -> value()()).
     let transformed_value = value;
 
-    // Check if the value is defined (i.e., guaranteed to not be null/undefined)
-    // The official compiler uses scope.evaluate(value).is_defined which checks if
-    // value == null || value === UNKNOWN. We approximate this:
-    // - Literal null/undefined: NOT defined (null == null is true in JS)
-    // - Known literals (numbers, strings, booleans): defined
-    // - Everything else (identifiers, calls, reactive values): NOT defined (could be UNKNOWN)
-    // Reference: svelte/packages/svelte/src/compiler/phases/scope.js L574
+    // Check the transformed value with the shared counterpart of upstream's
+    // `scope.evaluate(value).is_defined`.
     // An each-block index (`{#each … as item, i}`) is always a number, so the
     // `?? ""` fallback is elided. Check the in-scope each-index names directly:
     // template scope tracking is imprecise, so a name shadowed by an outer
     // binding (`<select bind:value={i}>` + `{#each … as person, i}`) would
     // otherwise resolve to the wrong binding via `find_binding_any_scope`.
+    let mut value_for_definedness = &transformed_value;
+    while let JsExpr::Spanned(inner, _, _) = value_for_definedness {
+        value_for_definedness = context.arena.get_expr(*inner);
+    }
     let is_in_scope_each_index = matches!(
-        &transformed_value,
+        value_for_definedness,
         JsExpr::Identifier(name)
             if context.state.each_index_name.as_deref() == Some(name.as_str())
                 || context
@@ -2199,11 +2220,7 @@ fn build_element_special_value_attribute(
                     .any(|(n, _)| n == name.as_str())
     );
     let value_is_defined = is_in_scope_each_index
-        || is_value_known_defined(
-            &transformed_value,
-            Some(context.state.scope_root),
-            Some(context.state.scope),
-        );
+        || is_js_expr_defined(value_for_definedness, &context.arena, context);
 
     // node.__value = transformed_value
     let assignment = b::assign(
@@ -2224,11 +2241,7 @@ fn build_element_special_value_attribute(
             // Wrap with ?? '' for potentially undefined values
             b::nullish(&context.arena, assignment.clone(), b::string(""))
         };
-        b::assign(
-            &context.arena,
-            b::member(&context.arena, b::id(node_id), "value"),
-            inner,
-        )
+        b::assign(&context.arena, b::member(&context.arena, b::id(node_id), "value"), inner)
     };
 
     // For select elements with value, wrap in sequence: (set_value_assignment, $.select_option(node, value))
@@ -2256,24 +2269,14 @@ fn build_element_special_value_attribute(
         // if (node_value !== (node_value = transformed_value)) {
         //     node.__value = transformed_value;  // or node.value = node.__value = transformed_value for non-synthetic
         // }
-        let value_id = context
-            .state
-            .memoizer
-            .generate_id(&format!("{}_value", node_id));
+        let value_id = context.state.memoizer.generate_id(&format!("{}_value", node_id));
 
         // For option elements, use {} as initial value (a sentinel that won't equal any real value)
         // This ensures the first comparison always triggers the update
-        let init_value = if element_name == "option" {
-            Some(b::object(vec![]))
-        } else {
-            None
-        };
+        let init_value = if element_name == "option" { Some(b::object(vec![])) } else { None };
 
         // Add variable declaration: var node_value = {} (for option) or var node_value (for others)
-        context
-            .state
-            .init
-            .push(b::var_decl(&context.arena, &value_id, init_value));
+        context.state.init.push(b::var_decl(&context.arena, &value_id, init_value));
 
         // Create the comparison: value_id !== (value_id = transformed_value)
         let comparison = b::binary_str(
@@ -2294,18 +2297,21 @@ fn build_element_special_value_attribute(
     }
 }
 
+/// The single `{ … }` an attribute's value consists of, in either spelling.
+fn expression_tag_of<'a>(value: &'a AttributeValue<'a>) -> Option<&'a ExpressionTag<'a>> {
+    match value {
+        AttributeValue::Expression(tag) => Some(tag),
+        AttributeValue::Sequence(parts) if parts.len() == 1 => match &parts[0] {
+            AttributeValuePart::ExpressionTag(tag) => Some(tag),
+            AttributeValuePart::Text(_) => None,
+        },
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_is_boolean_attribute() {
-        assert!(is_boolean_attribute("checked"));
-        assert!(is_boolean_attribute("disabled"));
-        assert!(is_boolean_attribute("readonly"));
-        assert!(!is_boolean_attribute("value"));
-        assert!(!is_boolean_attribute("class"));
-    }
 
     #[test]
     fn test_is_dom_property() {

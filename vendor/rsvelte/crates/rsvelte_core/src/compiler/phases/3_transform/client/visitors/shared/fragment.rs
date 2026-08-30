@@ -10,7 +10,9 @@ use crate::compiler::phases::phase3_transform::client::types::*;
 use crate::compiler::phases::phase3_transform::client::visitors::shared::utils::build_template_chunk;
 use crate::compiler::phases::phase3_transform::js_ast::builders as b;
 use crate::compiler::phases::phase3_transform::js_ast::nodes::*;
-use crate::compiler::phases::phase3_transform::utils::is_svelte_whitespace_only;
+use crate::compiler::phases::phase3_transform::utils::{
+    is_svelte_whitespace_only, replace_leading_whitespace, replace_trailing_whitespace,
+};
 use std::borrow::Cow;
 
 /// NON_STATIC_PROPERTIES - properties that cannot be set statically
@@ -24,22 +26,15 @@ fn cannot_be_set_statically(name: &str) -> bool {
 /// Check if node is a custom element.
 fn is_custom_element_node(node: &RegularElement) -> bool {
     node.name.contains('-')
-        || node.attributes.iter().any(|attr| {
-            if let Attribute::Attribute(a) = attr {
-                a.name == "is"
-            } else {
-                false
-            }
-        })
+        || node
+            .attributes
+            .iter()
+            .any(|attr| if let Attribute::Attribute(a) = attr { a.name == "is" } else { false })
 }
 
 /// Check if attribute is an event attribute.
 fn is_event_attribute(attr: &Attribute) -> bool {
-    if let Attribute::Attribute(a) = attr {
-        a.name.starts_with("on")
-    } else {
-        false
-    }
+    if let Attribute::Attribute(a) = attr { a.name.starts_with("on") } else { false }
 }
 
 /// Check if attribute is a text attribute (single text value).
@@ -252,7 +247,7 @@ pub fn process_children<F>(
 ) where
     F: FnMut(bool) -> JsExpr,
 {
-    let within_bound_contenteditable = false; // TODO: implement bound_contenteditable tracking
+    let within_bound_contenteditable = context.state.metadata.bound_contenteditable;
 
     // After the first flush, `prev` always returns a cached `JsExpr` clone.
     // Express the two states as an enum so we don't `Box::new` a new
@@ -278,7 +273,7 @@ pub fn process_children<F>(
     // Sequence of Text/ExpressionTag nodes — pre-allocate for the common
     // case (≤8 contiguous text/expression nodes per fragment) so we don't
     // pay the Vec growth-and-reallocate cost on every push.
-    let mut sequence: Vec<TextOrExpr> = Vec::with_capacity(8);
+    let mut sequence: Vec<TextOrExpr<'_>> = Vec::with_capacity(8);
 
     // SAFETY: Extract a reference to the arena that outlives the closures.
     // The arena uses UnsafeCell internally and only appends, so holding a
@@ -312,7 +307,7 @@ pub fn process_children<F>(
     // Helper: flush a single node
     let flush_node = |is_text: bool,
                       name: &str,
-                      _loc: Option<&str>,
+                      loc: Option<(u32, u32)>,
                       prev_fn: &mut SiblingPrev<F>,
                       skip_count: &mut usize,
                       ctx: &mut ComponentContext|
@@ -326,9 +321,14 @@ pub fn process_children<F>(
             // Generate a unique identifier
             let id_name = ctx.state.memoizer.generate_id(name);
             id = b::id(&id_name);
-            ctx.state
-                .init
-                .push(b::var_decl(arena_ref, &id_name, Some(expression)));
+            if let Some((start, end)) = loc {
+                // Upstream creates one located Identifier and reuses it for the
+                // declaration and every runtime use. Record that identity by
+                // its component-wide unique generated name without changing
+                // the Identifier variant seen by the rest of lowering.
+                arena_ref.note_identifier_span(&id_name, start, end);
+            }
+            ctx.state.init.push(b::var_decl_anchored(arena_ref, &id_name, Some(expression), loc));
         }
 
         // Update prev to return this id (no allocation — enum variant swap).
@@ -339,7 +339,7 @@ pub fn process_children<F>(
     };
 
     // Helper: flush a sequence of Text/ExpressionTag nodes
-    let flush_sequence = |seq: Vec<TextOrExpr>,
+    let flush_sequence = |seq: Vec<TextOrExpr<'_>>,
                           prev_fn: &mut SiblingPrev<F>,
                           skip_count: &mut usize,
                           ctx: &mut ComponentContext| {
@@ -348,13 +348,7 @@ pub fn process_children<F>(
             *skip_count += 1;
             let text_nodes: Vec<Text> = seq
                 .into_iter()
-                .filter_map(|n| {
-                    if let TextOrExpr::Text(t) = n {
-                        Some(t)
-                    } else {
-                        None
-                    }
-                })
+                .filter_map(|n| if let TextOrExpr::Text(t) = n { Some(t) } else { None })
                 .collect();
             ctx.state.template.push_text(text_nodes);
             return;
@@ -400,11 +394,7 @@ pub fn process_children<F>(
         } else {
             ctx.state.init.push(b::stmt(
                 arena_ref,
-                b::assign(
-                    arena_ref,
-                    b::member(arena_ref, id, "nodeValue"),
-                    result.value,
-                ),
+                b::assign(arena_ref, b::member(arena_ref, id, "nodeValue"), result.value),
             ));
         }
     };
@@ -446,12 +436,16 @@ pub fn process_children<F>(
                     // Push the static element to the template
                     let css_hash = &context.state.analysis.css.hash;
                     let preserve_comments = context.state.options.preserve_comments;
+                    let in_text_element = context.state.metadata.in_text_element;
+                    let preserve_whitespace = context.state.preserve_whitespace;
                     let had_lone_script = push_static_element_to_template(
                         node,
                         &mut context.state.template,
                         &context.state.metadata.namespace,
                         css_hash,
                         preserve_comments,
+                        preserve_whitespace,
+                        in_text_element,
                     );
 
                     // When a static element has a lone <script> child, the official
@@ -528,13 +522,17 @@ pub fn process_children<F>(
                     }
                 } else {
                     // Get node name for identifier
-                    let name = if let TemplateNode::RegularElement(elem) = node {
-                        elem.name.as_str()
+                    let (name, name_loc) = if let TemplateNode::RegularElement(elem) = node {
+                        let start = elem.start.saturating_add(1);
+                        (
+                            elem.name.as_str(),
+                            Some((start, start.saturating_add(elem.name.len() as u32))),
+                        )
                     } else {
-                        "node"
+                        ("node", None)
                     };
 
-                    let id = flush_node(false, name, None, &mut prev, &mut skipped, context);
+                    let id = flush_node(false, name, name_loc, &mut prev, &mut skipped, context);
                     // Save original node and temporarily replace it
                     let saved_node = std::mem::replace(&mut context.state.node, id);
                     let result = context.visit_node(node, None);
@@ -568,11 +566,7 @@ pub fn process_children<F>(
         }
         context.state.init.push(b::stmt(
             &context.arena,
-            b::call(
-                &context.arena,
-                b::member_path(&context.arena, "$.next"),
-                args,
-            ),
+            b::call(&context.arena, b::member_path(&context.arena, "$.next"), args),
         ));
     }
 }
@@ -584,9 +578,9 @@ pub fn process_children<F>(
 /// boxing.
 #[derive(Debug, Clone)]
 #[allow(clippy::large_enum_variant)]
-pub enum TextOrExpr {
-    Text(Text),
-    Expr(ExpressionTag),
+pub enum TextOrExpr<'a> {
+    Text(Text<'a>),
+    Expr(ExpressionTag<'a>),
 }
 
 /// Push a static element and its children to the template.
@@ -598,6 +592,8 @@ fn push_static_element_to_template(
     namespace: &str,
     css_hash: &str,
     preserve_comments: bool,
+    preserve_whitespace: bool,
+    in_text_element: bool,
 ) -> bool {
     push_static_element_to_template_inner(
         node,
@@ -605,12 +601,17 @@ fn push_static_element_to_template(
         namespace,
         css_hash,
         preserve_comments,
-        false,
+        preserve_whitespace,
+        in_text_element,
     )
 }
 
 /// Inner implementation with preserve_whitespace tracking.
 /// Returns true if a lone <script> child was encountered (and a <!> comment was added).
+///
+/// `in_text_element` stands in for upstream `clean_nodes`' `path.some((n) => n.type
+/// === 'RegularElement' && n.name === 'text')`: whitespace-only text survives
+/// anywhere below an SVG `<text>`, not just as its direct child.
 fn push_static_element_to_template_inner(
     node: &TemplateNode,
     template: &mut Template,
@@ -618,19 +619,15 @@ fn push_static_element_to_template_inner(
     css_hash: &str,
     preserve_comments: bool,
     preserve_whitespace: bool,
+    in_text_element: bool,
 ) -> bool {
     match node {
         TemplateNode::RegularElement(elem) => {
             // Determine if this is an HTML element (not SVG/MathML)
             let is_html = namespace == "html" && elem.name != "svg";
-            // Avoid allocation when name is already lowercase (common case for HTML)
             let name_str = elem.name.as_str();
-            let needs_lowercase = is_html && name_str.bytes().any(|b| b.is_ascii_uppercase());
-            let elem_name = if needs_lowercase {
-                name_str.to_lowercase()
-            } else {
-                name_str.to_string()
-            };
+            let elem_name =
+                if is_html { super::utils::html_lowercase(name_str) } else { name_str.to_string() };
 
             // Push the element opening tag
             template.push_element(elem_name.clone(), elem.start, is_html);
@@ -696,8 +693,13 @@ fn push_static_element_to_template_inner(
                         }
                     }
 
-                    // Skip empty class attributes (matches official compiler behavior)
-                    if a.name == "class" && value.as_deref() == Some("") {
+                    // Skip empty class attributes (matches official compiler behavior).
+                    // A valueless `class` is upstream's boolean `true`, which is
+                    // truthy here and survives as `class=""`.
+                    if a.name == "class"
+                        && value.as_deref() == Some("")
+                        && !matches!(&a.value, crate::ast::template::AttributeValue::True(_))
+                    {
                         continue;
                     }
                     // Lowercase attribute names for HTML elements (matches official compiler)
@@ -728,6 +730,7 @@ fn push_static_element_to_template_inner(
                 elem.name == "script" || elem.name == "pre" || elem.name == "textarea";
 
             let effective_preserve_ws = preserve_ws || preserve_whitespace;
+            let child_in_text_element = in_text_element || elem.name == "text";
             if effective_preserve_ws {
                 // For script/pre/textarea elements, add all children without whitespace trimming
                 let mut is_first = true;
@@ -740,7 +743,7 @@ fn push_static_element_to_template_inner(
                     if is_first
                         && elem.name == "pre"
                         && let TemplateNode::Text(text) = child
-                        && (text.data.as_str() == "\n" || text.data.as_str() == "\r\n")
+                        && (text.data.as_ref() == "\n" || text.data.as_ref() == "\r\n")
                     {
                         is_first = false;
                         continue;
@@ -753,6 +756,7 @@ fn push_static_element_to_template_inner(
                         css_hash,
                         preserve_comments,
                         effective_preserve_ws,
+                        child_in_text_element,
                     );
                 }
             } else {
@@ -787,61 +791,14 @@ fn push_static_element_to_template_inner(
                     .map(|i| i + 1)
                     .unwrap_or(0);
 
-                let raw_range = &children[start..end.max(start)];
-                // Pre-pass: when comments are being removed, merge consecutive text
-                // nodes that are only separated by removed comments. This avoids
-                // double-spacing where each side independently collapses to a single
-                // space.
-                let merged_range: Vec<TemplateNode> = if preserve_comments {
-                    raw_range.to_vec()
-                } else {
-                    let mut out: Vec<TemplateNode> = Vec::with_capacity(raw_range.len());
-                    let mut pending_text: Option<crate::ast::template::Text> = None;
-                    for child in raw_range.iter() {
-                        match child {
-                            TemplateNode::Comment(_) => {
-                                // Skip — but keep pending_text alive so the next text
-                                // will merge with it.
-                            }
-                            TemplateNode::Text(t) => {
-                                if let Some(prev) = pending_text.take() {
-                                    // Merge: combine prev.data + t.data (and raw)
-                                    let mut merged = prev.clone();
-                                    let mut new_data = prev.data.to_string();
-                                    new_data.push_str(&t.data);
-                                    merged.data = compact_str::CompactString::new(&new_data);
-                                    let mut new_raw = prev.raw.to_string();
-                                    new_raw.push_str(&t.raw);
-                                    merged.raw = compact_str::CompactString::new(&new_raw);
-                                    pending_text = Some(merged);
-                                } else {
-                                    pending_text = Some(t.clone());
-                                }
-                            }
-                            other => {
-                                if let Some(t) = pending_text.take() {
-                                    out.push(TemplateNode::Text(t));
-                                }
-                                out.push(other.clone());
-                            }
-                        }
-                    }
-                    if let Some(t) = pending_text.take() {
-                        out.push(TemplateNode::Text(t));
-                    }
-                    out
-                };
-                let range: &[TemplateNode] = &merged_range;
-                // Collect non-comment children indices for boundary trimming
-                let meaningful_indices: Vec<usize> = range
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, c)| preserve_comments || !matches!(c, TemplateNode::Comment(_)))
-                    .map(|(i, _)| i)
-                    .collect();
+                let range = &children[start..end.max(start)];
+                let last_idx = range.len().saturating_sub(1);
 
-                let first_meaningful = meaningful_indices.first().copied();
-                let last_meaningful = meaningful_indices.last().copied();
+                // 写经 `clean_nodes` (utils.js:223-251): each text node's leading run is
+                // dropped only when the *preceding* node's already-rewritten data still
+                // ends in whitespace. A text emptied that way stays in the chain with no
+                // trailing whitespace, so the next one contributes its own single space.
+                let mut prev_ends_with_whitespace = false;
 
                 for (i, child) in range.iter().enumerate() {
                     if !preserve_comments && matches!(child, TemplateNode::Comment(_)) {
@@ -850,73 +807,36 @@ fn push_static_element_to_template_inner(
                     // Trim/collapse whitespace from text nodes to match clean_nodes behavior
                     if let TemplateNode::Text(text) = child {
                         let ws = |c: char| c == ' ' || c == '\t' || c == '\n' || c == '\r';
-                        let mut data = text.data.to_string();
-                        let mut raw = text.raw.to_string();
-                        if Some(i) == first_meaningful {
-                            // First text: trim leading whitespace entirely
-                            let trimmed = data.trim_start_matches(ws);
-                            if trimmed.len() < data.len() {
-                                let start = data.len() - trimmed.len();
-                                data.drain(..start);
-                            }
-                            let trimmed = raw.trim_start_matches(ws);
-                            if trimmed.len() < raw.len() {
-                                let start = raw.len() - trimmed.len();
-                                raw.drain(..start);
-                            }
-                        } else {
-                            // Non-first text: collapse leading whitespace to single space
-                            let trimmed_data = data.trim_start_matches(ws);
-                            if trimmed_data.len() < data.len() && !trimmed_data.is_empty() {
-                                let start = data.len() - trimmed_data.len();
-                                data.drain(..start);
-                                data.insert(0, ' ');
-                            } else if trimmed_data.is_empty() && !data.is_empty() {
-                                data.clear();
-                                data.push(' ');
-                            }
-                            let trimmed_raw = raw.trim_start_matches(ws);
-                            if trimmed_raw.len() < raw.len() && !trimmed_raw.is_empty() {
-                                let start = raw.len() - trimmed_raw.len();
-                                raw.drain(..start);
-                                raw.insert(0, ' ');
-                            } else if trimmed_raw.is_empty() && !raw.is_empty() {
-                                raw.clear();
-                                raw.push(' ');
-                            }
+                        let mut data: &str = &text.data;
+                        let mut raw: &str = &text.raw;
+
+                        // `regular[0]` / `regular.at(-1)` lose their outer whitespace runs
+                        if i == 0 {
+                            data = data.trim_start_matches(ws);
+                            raw = raw.trim_start_matches(ws);
                         }
-                        if Some(i) == last_meaningful {
-                            // Last text: trim trailing whitespace entirely
-                            let trimmed = data.trim_end_matches(ws);
-                            data.truncate(trimmed.len());
-                            let trimmed = raw.trim_end_matches(ws);
-                            raw.truncate(trimmed.len());
-                        } else {
-                            // Non-last text: collapse trailing whitespace to single space
-                            let trimmed_data = data.trim_end_matches(ws);
-                            if trimmed_data.len() < data.len() && !trimmed_data.is_empty() {
-                                let new_len = trimmed_data.len();
-                                data.truncate(new_len);
-                                data.push(' ');
-                            } else if trimmed_data.is_empty() && !data.is_empty() {
-                                data.clear();
-                                data.push(' ');
-                            }
-                            let trimmed_raw = raw.trim_end_matches(ws);
-                            if trimmed_raw.len() < raw.len() && !trimmed_raw.is_empty() {
-                                let new_len = trimmed_raw.len();
-                                raw.truncate(new_len);
-                                raw.push(' ');
-                            } else if trimmed_raw.is_empty() && !raw.is_empty() {
-                                raw.clear();
-                                raw.push(' ');
-                            }
+                        if i == last_idx {
+                            data = data.trim_end_matches(ws);
+                            raw = raw.trim_end_matches(ws);
                         }
+
+                        let leading = if prev_ends_with_whitespace { "" } else { " " };
+                        let data = replace_trailing_whitespace(
+                            &replace_leading_whitespace(data, leading),
+                            " ",
+                        );
+                        let raw = replace_trailing_whitespace(
+                            &replace_leading_whitespace(raw, leading),
+                            " ",
+                        );
+
+                        prev_ends_with_whitespace = data.ends_with(ws);
+
                         // Skip whitespace-only text that would collapse to just space
                         // in SVG namespace (can_remove_entirely logic)
                         if !data.is_empty()
                             && !(data == " "
-                                && (child_namespace == "svg"
+                                && ((child_namespace == "svg" && !child_in_text_element)
                                     || matches!(
                                         elem_name.as_str(),
                                         "select"
@@ -930,8 +850,8 @@ fn push_static_element_to_template_inner(
                                     )))
                         {
                             let mut trimmed = text.clone();
-                            trimmed.data = compact_str::CompactString::new(&data);
-                            trimmed.raw = compact_str::CompactString::new(&raw);
+                            trimmed.data = Cow::Owned(data);
+                            trimmed.raw = Cow::Owned(raw);
                             push_static_element_to_template_inner(
                                 &TemplateNode::Text(trimmed),
                                 template,
@@ -939,9 +859,11 @@ fn push_static_element_to_template_inner(
                                 css_hash,
                                 preserve_comments,
                                 false,
+                                child_in_text_element,
                             );
                         }
                     } else {
+                        prev_ends_with_whitespace = false;
                         push_static_element_to_template_inner(
                             child,
                             template,
@@ -949,6 +871,7 @@ fn push_static_element_to_template_inner(
                             css_hash,
                             preserve_comments,
                             false,
+                            child_in_text_element,
                         );
                     }
                 }

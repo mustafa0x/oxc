@@ -78,11 +78,7 @@ pub fn debug_tag(node: &DebugTag, context: &mut ComponentContext) {
     let object = b::object(properties);
 
     // Create console.log(object)
-    let call = b::call(
-        &context.arena,
-        b::member_path(&context.arena, "console.log"),
-        vec![object],
-    );
+    let call = b::call(&context.arena, b::member_path(&context.arena, "console.log"), vec![object]);
 
     // Wrap in $.template_effect(() => { console.log({...}); debugger; })
     let effect_body = vec![b::stmt(&context.arena, call), b::debugger()];
@@ -135,11 +131,7 @@ pub fn debug_tag(node: &DebugTag, context: &mut ComponentContext) {
         args.push(b::array(blocker_exprs));
     }
 
-    let effect = b::call(
-        &context.arena,
-        b::member_path(&context.arena, "$.template_effect"),
-        args,
-    );
+    let effect = b::call(&context.arena, b::member_path(&context.arena, "$.template_effect"), args);
 
     context.state.init.push(b::stmt(&context.arena, effect));
 }

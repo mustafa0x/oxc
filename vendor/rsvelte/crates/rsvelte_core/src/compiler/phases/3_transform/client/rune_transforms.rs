@@ -1,34 +1,66 @@
 //! Rune detection and transformation for $state, $derived, and $effect.
 
 use memchr::memmem;
+use std::borrow::Cow;
 
-use super::destructure_transforms::build_fallback_string;
+use super::destructure_transforms::{build_fallback_string, literal_key_value};
 use super::{
     ARRAY_LOOKUP_COUNTER, SCRIPT_ARRAY_COUNTER, find_matching_paren,
     is_function_parameter_in_statement,
 };
 use crate::compiler::phases::phase2_analyze::ComponentAnalysis;
+use crate::compiler::phases::phase3_transform::shared::js_scan::{
+    code_bytes, find_rune_code, find_rune_code_from, skip_opaque,
+};
+use crate::compiler::phases::phase3_transform::shared::rune_shadow::RuneShadows;
+use crate::compiler::phases::phase3_transform::shared::template::escape_js_string;
+
+/// Find the next rune call whose base identifier does not resolve to a local
+/// declaration. The text changes after every removal, so `RuneShadows` caches
+/// by the current text and gives us positions in the same coordinate space.
+fn find_unbound_rune_code(script: &str, needle: &[u8], shadows: &mut RuneShadows) -> Option<usize> {
+    let mut from = 0;
+    loop {
+        let pos = find_rune_code_from(script.as_bytes(), needle, from)?;
+        if !shadows.is_bound(script, pos) {
+            return Some(pos);
+        }
+        from = pos + needle.len();
+    }
+}
+
+/// Does the code preceding a removed call demand an operand — i.e. was the call
+/// in a value position rather than a statement of its own? The last significant
+/// character answers it: only a terminator, a block delimiter or the `)` of a
+/// bodyless `if`/`for`/`while` head can be followed by a fresh statement.
+pub(super) fn operand_expected_before(before: &str) -> bool {
+    let last_code_byte = code_bytes(before.as_bytes())
+        .filter_map(|(_, byte)| (!byte.is_ascii_whitespace()).then_some(byte))
+        .last();
+    !matches!(last_code_byte, None | Some(b';' | b'{' | b'}' | b')'))
+}
 
 /// Transform runes for client-side usage with skip and state variable handling.
-pub(super) fn transform_client_runes_with_skip_and_state(
-    line: &str,
+pub(super) fn transform_client_runes_with_skip_and_state<'a>(
+    line: &'a str,
     _skip_state_vars: &[String],
     _state_vars: &[String],
     _non_reactive_vars: &[String],
-    _prop_source_vars: &[String],
-    _exported_names: &[String],
+    prop_source_vars: &[String],
+    exported_names: &[String],
     _proxy_vars: &[String],
     dev: bool,
-    _analysis: &ComponentAnalysis,
+    analysis: &ComponentAnalysis,
     store_sub_vars: &[String],
-    _read_only_props: &[(String, String)],
-) -> String {
+    read_only_props: &[(String, String)],
+    pre_class_script: &str,
+) -> Cow<'a, str> {
     // Quick pre-check: if no rune-like pattern (`$` followed by letter) appears, skip
     if !line.contains('$') {
-        return line.to_string();
+        return Cow::Borrowed(line);
     }
 
-    let mut result = line.to_string();
+    let mut result = Cow::Borrowed(line);
 
     // Check which rune names are actually store subscriptions.
     // When $state or $effect is imported from a store (not a real rune),
@@ -36,6 +68,7 @@ pub(super) fn transform_client_runes_with_skip_and_state(
     let state_is_store_sub = store_sub_vars.iter().any(|s| s == "$state");
     let effect_is_store_sub = store_sub_vars.iter().any(|s| s == "$effect");
     let derived_is_store_sub = store_sub_vars.iter().any(|s| s == "$derived");
+    let inspect_is_store_sub = store_sub_vars.iter().any(|s| s == "$inspect");
 
     // Lazily check if rune names appear as function parameters in this statement.
     // is_function_parameter_in_statement is expensive (scans the entire line), so
@@ -51,6 +84,40 @@ pub(super) fn transform_client_runes_with_skip_and_state(
     let derived_is_func_param = !derived_is_store_sub
         && memmem::find(line.as_bytes(), b"$derived").is_some()
         && is_function_parameter_in_statement(line, "$derived");
+    // The production inspect removal is the last rune transform still on the
+    // statement-text path. Resolve its candidates with the same scope model as
+    // upstream's `get_rune`; a function/catch parameter, block local, loop
+    // binding or destructured local named `$inspect` is an ordinary value.
+    let mut inspect_shadows = RuneShadows::new(
+        !dev && !inspect_is_store_sub && memmem::find(line.as_bytes(), b"$inspect").is_some(),
+        analysis.is_typescript,
+    );
+
+    // A comment between a destructured assignment's `=` and `$props()` can
+    // split the source projection used by the later whole-script AST pass.
+    // Handle only that comment-straddled shape while it is still one complete
+    // source statement. The ordinary `$props()` population remains on the AST
+    // path below, so this does not restore its former per-statement scan.
+    if !store_sub_vars.iter().any(|name| name == "$props")
+        && let Some(props_at) = find_rune_code(result.as_bytes(), b"$props(")
+        && let Some(assignment) = code_bytes(&result.as_bytes()[..props_at])
+            .filter_map(|(offset, byte)| (byte == b'=').then_some(offset))
+            .last()
+        && !crate::compiler::phases::phase3_transform::server::transform_script::extract_comments_from_snippet(
+            &result[assignment + 1..props_at],
+        )
+        .is_empty()
+        && let Some(transformed) = super::props_transforms::transform_props_destructuring(
+            &result,
+            prop_source_vars,
+            exported_names,
+            analysis,
+            read_only_props,
+            dev,
+        )
+    {
+        result = Cow::Owned(transformed);
+    }
 
     // Skip all $state rune transforms if $state is actually a store subscription or function param
     if !state_is_store_sub && !state_is_func_param {
@@ -65,7 +132,7 @@ pub(super) fn transform_client_runes_with_skip_and_state(
         // `$state.snapshot(x)` -> `$.snapshot(x)` is now done by the AST pass
         // in `ast_state_transform::visit_call_expression`. The dev-mode
         // `svelte-ignore state_snapshot_uncloneable` handler in
-        // `mod.rs::transform_client_with_visitors`'s `process_accumulated`
+        // `mod.rs::transform_client`'s `process_accumulated`
         // closure still runs *before* that AST rewrite; it now matches the
         // un-renamed `$state.snapshot(` shape and emits
         // `$state.snapshot(x, true)`, which the AST then renames to
@@ -180,8 +247,10 @@ pub(super) fn transform_client_runes_with_skip_and_state(
     // text trimming around the call site (leading tabs/spaces on the
     // same line, trailing `;`/newlines) that's statement-shaped rather
     // than expression-shaped and is awkward to express at the AST level.
-    if !dev {
-        while let Some(pos) = memmem::find(result.as_bytes(), b"$inspect.trace(") {
+    if !dev && !inspect_is_store_sub {
+        while let Some(pos) =
+            find_unbound_rune_code(&result, b"$inspect.trace(", &mut inspect_shadows)
+        {
             let trace_start = pos + 15; // after "$inspect.trace("
             if let Some(content_end) = find_matching_paren(&result[trace_start..]) {
                 let mut end = trace_start + content_end + 1;
@@ -201,7 +270,7 @@ pub(super) fn transform_client_runes_with_skip_and_state(
                 {
                     start -= 1;
                 }
-                result = format!("{}{}", &result[..start], &result[end..]);
+                result = Cow::Owned(format!("{}{}", &result[..start], &result[end..]));
             } else {
                 break;
             }
@@ -215,45 +284,76 @@ pub(super) fn transform_client_runes_with_skip_and_state(
     // emits the `/* $$async_hole:... */` async-mode marker or just
     // strips the call) is statement-shaped rather than expression-shaped
     // and is awkward to do at the AST level.
-    if !dev && let Some(pos) = memmem::find(result.as_bytes(), b"$inspect(") {
-        {
+    // The loop matters: a nested body can hold more than one, and a single
+    // pass left the second `$inspect(...)` verbatim in the output.
+    if !dev && !inspect_is_store_sub {
+        while let Some(pos) = find_unbound_rune_code(&result, b"$inspect(", &mut inspect_shadows) {
             // In non-dev mode, remove the entire $inspect(...) call
             // Find matching closing paren
             let inspect_start = pos + 9; // after "$inspect("
-            if let Some(content_end) = find_matching_paren(&result[inspect_start..]) {
-                // Check for .with() chaining
-                let after_inspect = &result[inspect_start + content_end + 1..];
-                let total_end = if after_inspect.trim_start().starts_with(".with(") {
-                    let with_start_offset =
-                        memmem::find(after_inspect.as_bytes(), b".with(").unwrap();
-                    let with_content_start =
-                        inspect_start + content_end + 1 + with_start_offset + 6;
-                    if let Some(with_end) = find_matching_paren(&result[with_content_start..]) {
-                        with_content_start + with_end + 1 - pos
-                    } else {
-                        inspect_start + content_end + 1 - pos
-                    }
+            let Some(content_end) = find_matching_paren(&result[inspect_start..]) else {
+                break;
+            };
+            // Check for .with() chaining
+            let after_inspect = &result[inspect_start + content_end + 1..];
+            let total_end = if after_inspect.trim_start().starts_with(".with(") {
+                let with_start_offset = memmem::find(after_inspect.as_bytes(), b".with(").unwrap();
+                let with_content_start = inspect_start + content_end + 1 + with_start_offset + 6;
+                if let Some(with_end) = find_matching_paren(&result[with_content_start..]) {
+                    with_content_start + with_end + 1 - pos
                 } else {
                     inspect_start + content_end + 1 - pos
-                };
-
-                // Check if the $inspect call is a statement on its own
-                let before = result[..pos].trim();
-                let after = result[pos + total_end..].trim();
-
-                // If the line is just the $inspect call, output:
-                // - In async mode: a `/* $$async_hole:... */` marker that the async
-                //   body transform uses for position tracking
-                // - Otherwise: `;;` (two empty statements) matching the official compiler
-                if before.is_empty() && (after.is_empty() || after == ";") {
-                    let args = &result[inspect_start..inspect_start + content_end];
-                    // Use $$INSPECT_EMPTY$$ marker that survives wrap_state_vars_in_expr
-                    // and later transforms, then gets converted to ;; before OXC processing
-                    return format!("/* $$async_hole:{} */", args);
-                } else {
-                    // Remove just the $inspect(...) part but keep other code on the line
-                    result = format!("{}{}", &result[..pos], &result[pos + total_end..]);
                 }
+            } else {
+                inspect_start + content_end + 1 - pos
+            };
+
+            // Check if the $inspect call is a statement on its own
+            let before = result[..pos].trim();
+            let after = result[pos + total_end..].trim();
+
+            // If the line is just the $inspect call, output:
+            // - In async mode: a `/* $$async_hole:... */` marker that the async
+            //   body transform uses for position tracking
+            // - Otherwise: `;;` (two empty statements) matching the official compiler
+            if before.is_empty() && (after.is_empty() || after == ";") {
+                let args = &result[inspect_start..inspect_start + content_end];
+                // Use $$INSPECT_EMPTY$$ marker that survives wrap_state_vars_in_expr
+                // and later transforms, then gets converted to ;; before OXC processing
+                return Cow::Owned(format!("/* $$async_hole:{} */", args));
+            } else {
+                let marker = if before.is_empty() && after.starts_with(';') {
+                    // A leading statement-position call keeps its own trailing
+                    // semicolon as the second half of upstream's `;;`, even
+                    // when another statement follows on the same source line.
+                    "/* $$inspect_removed$$ */;"
+                } else if after.starts_with(';') && !operand_expected_before(before) {
+                    // A NESTED statement-position call prints the same `;;` a
+                    // top-level one does: upstream keeps the
+                    // `ExpressionStatement` and replaces its expression with
+                    // `b.empty` at every depth. The call's own `;` is the
+                    // second one.
+                    // Keep the pair identifiable after the Raw fragment is
+                    // parsed into the final AST; ordinary user-written empty
+                    // statements are intentionally elided by the printer.
+                    "/* $$inspect_removed$$ */;"
+                } else if operand_expected_before(before) {
+                    // Upstream drops in an `EmptyStatement` wherever the call
+                    // was; in an operand slot that prints as a bare `;`, which
+                    // no parser accepts. Keep the slot filled with the value
+                    // `$inspect` evaluates to (see
+                    // `upstream_issues/3213-svelte-inspect-in-a-value-position.md`).
+                    "undefined"
+                } else {
+                    ""
+                };
+                // Remove just the $inspect(...) part but keep other code on the line
+                result = Cow::Owned(format!(
+                    "{}{}{}",
+                    &result[..pos],
+                    marker,
+                    &result[pos + total_end..]
+                ));
             }
         }
     }
@@ -286,14 +386,17 @@ pub(super) fn transform_client_runes_with_skip_and_state(
         if let Some(rewritten) =
             super::tag_declarator_ast::wrap_state_derived_with_tag_declarators_ast(&result, false)
         {
-            result = rewritten;
+            result = Cow::Owned(rewritten);
         }
         if let Some(rewritten) =
-            super::tag_class_field_ast::wrap_state_derived_with_tag_class_fields_ast(&result)
+            super::tag_class_field_ast::wrap_state_derived_with_tag_class_fields_ast_from(
+                &result,
+                pre_class_script,
+            )
         {
-            result = rewritten;
+            result = Cow::Owned(rewritten);
         }
-        result = wrap_state_derived_with_tag(&result);
+        result = Cow::Owned(wrap_state_derived_with_tag(&result));
     }
 
     result
@@ -312,11 +415,8 @@ pub(super) fn wrap_state_derived_with_tag(input: &str) -> String {
 
     // Patterns to check and their prefix lengths
     // (pattern, prefix_len, tag_fn)
-    let patterns: &[(&str, usize, &str)] = &[
-        ("$.state(", 8, "$.tag"),
-        ("$.derived(", 10, "$.tag"),
-        ("$.proxy(", 8, "$.tag_proxy"),
-    ];
+    let patterns: &[(&str, usize, &str)] =
+        &[("$.state(", 8, "$.tag"), ("$.derived(", 10, "$.tag"), ("$.proxy(", 8, "$.tag_proxy")];
 
     // Process each declaration keyword
     for keyword in &["let ", "const ", "var "] {
@@ -335,7 +435,10 @@ pub(super) fn wrap_state_derived_with_tag(input: &str) -> String {
                 .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$')
                 .collect();
 
-            if var_name.is_empty() {
+            // `$$`-prefixed names are the compiler's own temps (`$$d`,
+            // `$$array`); upstream labels a binding the user wrote, never one it
+            // generated.
+            if var_name.is_empty() || var_name.starts_with("$$") {
                 search_from = abs_kw_pos + keyword.len();
                 continue;
             }
@@ -376,12 +479,8 @@ pub(super) fn wrap_state_derived_with_tag(input: &str) -> String {
                     let call_expr = &result[rhs_abs_start..call_end];
 
                     let tagged = format!("{}({}, '{}')", tag_fn, call_expr, var_name);
-                    result = format!(
-                        "{}{}{}",
-                        &result[..rhs_abs_start],
-                        tagged,
-                        &result[call_end..]
-                    );
+                    result =
+                        format!("{}{}{}", &result[..rhs_abs_start], tagged, &result[call_end..]);
                     search_from = rhs_abs_start + tagged.len();
                     matched = true;
                 }
@@ -430,7 +529,7 @@ pub(super) fn wrap_state_derived_with_tag(input: &str) -> String {
                 .unwrap_or(0);
             let var_name = &before_eq[name_start..name_end];
 
-            if var_name.is_empty() {
+            if var_name.is_empty() || var_name.starts_with("$$") {
                 search_from = abs_pat_pos + pattern.len();
                 continue;
             }
@@ -460,12 +559,7 @@ pub(super) fn wrap_state_derived_with_tag(input: &str) -> String {
                 let call_end = inner_start + close_paren + 1;
                 let call_expr = result[abs_pat_pos..call_end].to_string();
                 let tagged = format!("{}({}, '{}')", tag_fn, call_expr, var_name);
-                result = format!(
-                    "{}{}{}",
-                    &result[..abs_pat_pos],
-                    tagged,
-                    &result[call_end..]
-                );
+                result = format!("{}{}{}", &result[..abs_pat_pos], tagged, &result[call_end..]);
                 search_from = abs_pat_pos + tagged.len();
             } else {
                 search_from = abs_pat_pos + pattern.len();
@@ -488,7 +582,7 @@ pub(super) fn wrap_state_derived_with_tag(input: &str) -> String {
             // Check it's not preceded by `this.`
             let before = &result[..abs_hash_pos];
             if before.trim_end().ends_with("this.") || before.ends_with("$.") {
-                search_from = abs_hash_pos + 1;
+                search_from = crate::compiler::utils::next_char_boundary(&result, abs_hash_pos);
                 continue;
             }
 
@@ -500,7 +594,7 @@ pub(super) fn wrap_state_derived_with_tag(input: &str) -> String {
                 .collect();
 
             if field_name.is_empty() {
-                search_from = abs_hash_pos + 1;
+                search_from = crate::compiler::utils::next_char_boundary(&result, abs_hash_pos);
                 continue;
             }
 
@@ -536,39 +630,17 @@ pub(super) fn wrap_state_derived_with_tag(input: &str) -> String {
 
                     // Extract class name from context
                     let before_text = &result[..abs_hash_pos];
-                    let class_name = extract_enclosing_class_name(before_text).unwrap_or("Unknown");
+                    // Upstream: `declaration.id?.name ?? '[class]'`.
+                    let class_name = extract_enclosing_class_name(before_text).unwrap_or("[class]");
 
-                    // Determine if this was originally a private field or a public field
-                    // that was converted to private by the compiler.
-                    // For compiler-converted public fields: a public field `fieldname = $state()`
-                    // gets converted to `#fieldname = $.state()` with getter/setter pair.
-                    // For originally private fields: `#fieldname = $state()` stays as
-                    // `#fieldname = $.state()` WITHOUT compiler-generated getter/setter.
-                    //
-                    // We distinguish by checking if the class has a PUBLIC field with the
-                    // same name that was converted. A getter pattern like `get fieldname()`
-                    // with `$.get(this.#fieldname)` exists for BOTH cases (user-written
-                    // or compiler-generated), so we need another approach:
-                    // Check if the class body contains a SETTER `set fieldname(value)` with
-                    // `$.set(this.#fieldname, ...)` - this is only generated for converted public fields.
-                    let setter_sig = format!("set {}(", field_name);
-                    let setter_body = format!("$.set(this.#{})", field_name);
-                    // Also check for a simpler setter pattern
-                    let setter_body2 = format!("$.set(this.#{},", field_name);
-                    let was_originally_public = result.contains(&setter_sig)
-                        && (result.contains(&setter_body) || result.contains(&setter_body2));
-                    let label = if was_originally_public {
+                    let label = if lowered_from_public(&result, &field_name, &field_name) {
                         format!("{}.{}", class_name, field_name)
                     } else {
                         format!("{}.#{}", class_name, field_name)
                     };
                     let tagged = format!("{}({}, '{}')", tag_fn, call_expr, label);
-                    result = format!(
-                        "{}{}{}",
-                        &result[..rhs_abs_start],
-                        tagged,
-                        &result[call_end..]
-                    );
+                    result =
+                        format!("{}{}{}", &result[..rhs_abs_start], tagged, &result[call_end..]);
                     search_from = rhs_abs_start + tagged.len();
                     matched = true;
                 }
@@ -637,32 +709,18 @@ pub(super) fn wrap_state_derived_with_tag(input: &str) -> String {
 
                     // Extract class name from context (look for `class NAME {` before this position)
                     let before_text = &result[..abs_this_pos];
-                    let class_name = extract_enclosing_class_name(before_text).unwrap_or("Unknown");
+                    // Upstream: `declaration.id?.name ?? '[class]'`.
+                    let class_name = extract_enclosing_class_name(before_text).unwrap_or("[class]");
 
-                    // Build tag label: ClassName.#field or ClassName.field
-                    // If the field starts with # but has a compiler-generated getter, it was
-                    // originally a public field converted to private by the compiler.
-                    let label = if let Some(base_name) = field_name.strip_prefix('#') {
-                        let compiler_getter_pattern = format!(
-                            "get {}() {{ return $.get(this.{}); }}",
-                            base_name, field_name
-                        );
-                        let was_originally_public = result.contains(&compiler_getter_pattern);
-                        if was_originally_public {
-                            format!("{}.{}", class_name, base_name)
-                        } else {
-                            format!("{}.{}", class_name, field_name)
+                    let label = match field_name.strip_prefix('#') {
+                        Some(base) if lowered_from_public(&result, base, base) => {
+                            format!("{}.{}", class_name, base)
                         }
-                    } else {
-                        format!("{}.{}", class_name, field_name)
+                        _ => format!("{}.{}", class_name, field_name),
                     };
                     let tagged = format!("{}({}, '{}')", tag_fn, call_expr, label);
-                    result = format!(
-                        "{}{}{}",
-                        &result[..rhs_abs_start],
-                        tagged,
-                        &result[call_end..]
-                    );
+                    result =
+                        format!("{}{}{}", &result[..rhs_abs_start], tagged, &result[call_end..]);
                     search_from = rhs_abs_start + tagged.len();
                     matched = true;
                 }
@@ -676,6 +734,47 @@ pub(super) fn wrap_state_derived_with_tag(input: &str) -> String {
     }
 
     result
+}
+
+/// Whether `#backing` is the lowering of a public `base = $state()` field, in
+/// which case the dev label keeps the public name (`get_name` runs on the
+/// *original* key). The tell is the setter the lowering generates, whose body
+/// is exactly `$.set(this.#backing, value[, true])` — a hand-written accessor
+/// over a genuinely private field does not have that shape.
+fn lowered_from_public(source: &str, base: &str, backing: &str) -> bool {
+    let signature = format!("set {}(value)", base);
+    let mut from = 0;
+    while let Some(rel) = source[from..].find(&signature) {
+        let after = from + rel + signature.len();
+        from = after;
+        let Some(open) = source[after..].find('{') else {
+            break;
+        };
+        let open = after + open;
+        let mut depth = 0usize;
+        let mut close = None;
+        for (i, c) in source[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = Some(open + i + 1);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(close) = close else { break };
+        let compact: String = source[open..close].split_whitespace().collect::<Vec<_>>().join(" ");
+        if compact == format!("{{ $.set(this.#{}, value); }}", backing)
+            || compact == format!("{{ $.set(this.#{}, value, true); }}", backing)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// Extract the enclosing class name from the text before a given position.
@@ -700,11 +799,7 @@ pub(super) fn extract_enclosing_class_name(before: &str) -> Option<&str> {
 /// - `$state.raw` + not is_state_source -> just `expr`
 pub(super) fn wrap_state_value(member_access: &str, is_raw: bool, is_skip: bool) -> String {
     if is_raw {
-        if is_skip {
-            member_access.to_string()
-        } else {
-            format!("$.state({})", member_access)
-        }
+        if is_skip { member_access.to_string() } else { format!("$.state({})", member_access) }
     } else if is_skip {
         format!("$.proxy({})", member_access)
     } else {
@@ -712,29 +807,177 @@ pub(super) fn wrap_state_value(member_access: &str, is_raw: bool, is_skip: bool)
     }
 }
 
+/// Dev-mode `$.tag(<derived>, '<label>')` label for a destructured `$derived`
+/// declarator. `label` is `None` outside dev; the `$$array` temps carry the
+/// declarator-wide `[$derived iterable|object]` kind (they have no name of their
+/// own) while every leaf carries its own binding name.
+fn tag_derived(init: String, label: Option<&str>) -> String {
+    match label {
+        Some(label) => format!("$.tag({}, '{}')", init, label),
+        None => init,
+    }
+}
+
+/// `member_base` is the base expression used for **member reads** (`base.key`),
+/// while `base_expr` is used for the top-level rest's `$.exclude_from_object`.
+/// They differ only when destructuring `$derived(<rest-prop-binding>)`: a
+/// `let { ssr, …, ...restProps } = $derived(props)` where `props` is
+/// `$.rest_props($$props, …)` reads named members straight from `$$props`
+/// (`member_base = "$$props"`) — mirroring upstream's rest-prop member rewrite —
+/// but keeps `props` for `$.exclude_from_object(props, …)` (the rest must
+/// subtract the already-excluded keys held by `props`). Every other caller and
+/// all nested recursion pass `member_base == base_expr`.
 pub(super) fn process_derived_destructuring_pattern(
     pattern: &str,
     base_expr: &str,
+    member_base: &str,
     declarations: &mut Vec<String>,
     array_counter: &mut usize,
+    insert_label: Option<&str>,
+    array_temp_prefix: &str,
 ) -> Option<()> {
     let pattern = pattern.trim();
     if pattern.starts_with('{') && pattern.ends_with('}') {
         let inner = &pattern[1..pattern.len() - 1];
-        process_derived_object_pattern(inner, base_expr, declarations, array_counter)
+        process_derived_object_pattern(
+            inner,
+            base_expr,
+            member_base,
+            declarations,
+            array_counter,
+            insert_label,
+            array_temp_prefix,
+        )
     } else if pattern.starts_with('[') && pattern.ends_with(']') {
         let inner = &pattern[1..pattern.len() - 1];
-        process_derived_array_pattern(inner, base_expr, declarations, array_counter)
+        process_derived_array_pattern(
+            inner,
+            base_expr,
+            member_base,
+            declarations,
+            array_counter,
+            insert_label,
+            array_temp_prefix,
+        )
     } else {
         None
     }
 }
 
+/// The expression inside a computed destructuring key (`[k]` → `k`).
+fn computed_key_expr(key: &str) -> Option<&str> {
+    let key = key.trim();
+    Some(key.strip_prefix('[')?.strip_suffix(']')?.trim())
+}
+
+/// Whether `key` is a single complete string literal (`'a-b'` / `"a-b"`).
+fn is_string_literal_key(key: &str) -> bool {
+    let bytes = key.as_bytes();
+    if bytes.len() < 2 {
+        return false;
+    }
+    let quote = bytes[0];
+    if quote != b'\'' && quote != b'"' {
+        return false;
+    }
+    let mut i = 1;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' {
+            i += 2;
+            continue;
+        }
+        if bytes[i] == quote {
+            return i == bytes.len() - 1;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Whether `key` is a numeric literal (`0`, `1.5`) — `base.0` is not valid JS.
+fn is_numeric_literal_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.as_bytes()[0].is_ascii_digit()
+        && key.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+}
+
+/// Member access for a destructured property key, mirroring upstream's
+/// `b.member(expression, prop.key, prop.computed || prop.key.type !== 'Identifier')`.
+///
+/// Computed / literal keys need bracket notation, and they read from
+/// `base_expr` rather than `member_base`: upstream's rest-prop rewrite only
+/// retargets *static* member reads (`props.a` → `$$props.a`), so `props[k]`
+/// keeps the binding itself as its object.
+pub(super) fn derived_prop_access(base_expr: &str, member_base: &str, key: &str) -> String {
+    if let Some(expr) = computed_key_expr(key) {
+        format!("{}[{}]", base_expr, expr)
+    } else if is_string_literal_key(key) || is_numeric_literal_key(key) {
+        format!("{}[{}]", base_expr, key)
+    } else {
+        format!("{}.{}", member_base, key)
+    }
+}
+
+/// The `$.exclude_from_object(base, [...])` entry for a non-rest property key.
+/// Upstream turns identifier and `Literal` keys into string literals and every
+/// other computed key into `String(<expr>)`, so the rest subtracts it at runtime.
+///
+/// Unlike the member access, the key list is *not* source-verbatim: upstream
+/// builds it with `b.literal(...)`, a fresh node with no `raw`, so the printer
+/// always emits the decoded value single-quoted.
+pub(super) fn exclude_key_literal(key: &str) -> String {
+    if let Some(expr) = computed_key_expr(key) {
+        return match literal_key_value(expr) {
+            Some(value) => quote_exclude_key(&value),
+            None => format!("String({})", expr),
+        };
+    }
+    // A non-computed key is either a literal or an identifier, whose name is
+    // already its own value — only a literal needs the re-parse.
+    if !is_string_literal_key(key) && !is_numeric_literal_key(key) {
+        return quote_exclude_key(key);
+    }
+    match literal_key_value(key) {
+        Some(value) => quote_exclude_key(&value),
+        None => quote_exclude_key(key),
+    }
+}
+
+fn quote_exclude_key(value: &str) -> String {
+    format!("'{}'", escape_js_string(value))
+}
+
+/// The `$.exclude_from_object(base, [<keys>])` key list of an object pattern's
+/// non-rest properties, shared by the legacy declaration and assignment
+/// destructuring expansions so both subtract exactly the keys upstream does.
+pub(super) fn exclude_from_object_keys<S: AsRef<str>>(props: &[S]) -> Vec<String> {
+    props
+        .iter()
+        .filter_map(|prop| {
+            let prop = prop.as_ref().trim();
+            if prop.is_empty() || prop.starts_with("...") {
+                return None;
+            }
+            let key = if let Some(colon_pos) = find_derived_property_colon(prop) {
+                prop[..colon_pos].trim()
+            } else if let Some(eq_pos) = find_default_equals(prop) {
+                prop[..eq_pos].trim()
+            } else {
+                prop
+            };
+            Some(exclude_key_literal(key))
+        })
+        .collect()
+}
+
 pub(super) fn process_derived_object_pattern(
     inner: &str,
     base_expr: &str,
+    member_base: &str,
     declarations: &mut Vec<String>,
     array_counter: &mut usize,
+    insert_label: Option<&str>,
+    array_temp_prefix: &str,
 ) -> Option<()> {
     let properties = split_derived_object_properties(inner);
 
@@ -748,17 +991,34 @@ pub(super) fn process_derived_object_pattern(
         if let Some(colon_pos) = find_derived_property_colon(prop) {
             let key = prop[..colon_pos].trim();
             let value_pattern = prop[colon_pos + 1..].trim();
-            let prop_access = format!("{}.{}", base_expr, key);
+            let prop_access = derived_prop_access(base_expr, member_base, key);
             if value_pattern.starts_with('[') || value_pattern.starts_with('{') {
-                let (nested_pattern, _default_val) = split_nested_pattern_default(value_pattern);
-                collect_array_helpers_only(nested_pattern, &prop_access, declarations)?;
+                // The pattern's default must survive into the helper's base
+                // (`sizes: [x] = []` → `$.to_array($.fallback(o.sizes, () => [],
+                // true))`) — the second pass builds the same effective access for
+                // the element declarations.
+                let (nested_pattern, default_val) = split_nested_pattern_default(value_pattern);
+                let effective_access = if let Some(dv) = default_val {
+                    build_fallback_string(&prop_access, dv)
+                } else {
+                    prop_access
+                };
+                collect_array_helpers_only(
+                    nested_pattern,
+                    &effective_access,
+                    declarations,
+                    insert_label,
+                    array_temp_prefix,
+                )?;
             }
         }
     }
 
     // Collect all non-rest property keys for $.exclude_from_object
+    let has_rest = properties.iter().any(|prop| prop.trim().starts_with("..."));
     let excluded_keys: Vec<String> = properties
         .iter()
+        .filter(|_| has_rest)
         .filter_map(|prop| {
             let prop = prop.trim();
             if prop.is_empty() || prop.starts_with("...") {
@@ -770,18 +1030,9 @@ pub(super) fn process_derived_object_pattern(
             } else {
                 // Strip default value: `animated = false` → `animated`
                 let key = prop.trim();
-                if let Some(eq_pos) = find_default_equals(key) {
-                    key[..eq_pos].trim()
-                } else {
-                    key
-                }
+                if let Some(eq_pos) = find_default_equals(key) { key[..eq_pos].trim() } else { key }
             };
-            // Handle computed keys and quoted keys
-            if key.starts_with('[') {
-                None // computed keys can't be excluded statically
-            } else {
-                Some(format!("\"{}\"", key))
-            }
+            Some(exclude_key_literal(key))
         })
         .collect();
 
@@ -803,7 +1054,7 @@ pub(super) fn process_derived_object_pattern(
         if let Some(colon_pos) = find_derived_property_colon(prop) {
             let key = prop[..colon_pos].trim();
             let value_pattern = prop[colon_pos + 1..].trim();
-            let prop_access = format!("{}.{}", base_expr, key);
+            let prop_access = derived_prop_access(base_expr, member_base, key);
             if value_pattern.starts_with('[') || value_pattern.starts_with('{') {
                 // Handle nested destructuring patterns, possibly with default values
                 // e.g., `measured: { width: w, height: h } = { width: 0, height: 0 }`
@@ -819,6 +1070,7 @@ pub(super) fn process_derived_object_pattern(
                     &effective_access,
                     declarations,
                     array_counter,
+                    array_temp_prefix,
                 )?;
             } else {
                 // Handle renamed properties with default values
@@ -829,10 +1081,8 @@ pub(super) fn process_derived_object_pattern(
                     let fallback = build_fallback_string(&prop_access, default_val);
                     declarations.push(format!("{} = $.derived(() => {})", name, fallback));
                 } else {
-                    declarations.push(format!(
-                        "{} = $.derived(() => {})",
-                        value_pattern, prop_access
-                    ));
+                    declarations
+                        .push(format!("{} = $.derived(() => {})", value_pattern, prop_access));
                 }
             }
         } else {
@@ -841,33 +1091,46 @@ pub(super) fn process_derived_object_pattern(
             if let Some(eq_pos) = find_default_equals(prop) {
                 let name = prop[..eq_pos].trim();
                 let default_val = prop[eq_pos + 1..].trim();
-                let member_access = format!("{}.{}", base_expr, name);
+                let member_access = format!("{}.{}", member_base, name);
                 let fallback = build_fallback_string(&member_access, default_val);
                 declarations.push(format!("{} = $.derived(() => {})", name, fallback));
             } else {
-                declarations.push(format!(
-                    "{} = $.derived(() => {}.{})",
-                    prop, base_expr, prop
-                ));
+                declarations.push(format!("{} = $.derived(() => {}.{})", prop, member_base, prop));
             }
         }
     }
     Some(())
 }
 
+/// The `$.to_array(...)` call for an array pattern. Upstream passes a length only
+/// when the pattern has no rest element — with one the iterable must be drained
+/// completely, and a fixed length would truncate it.
+fn to_array_call(base_expr: &str, elements: &[String]) -> String {
+    let has_rest = elements.last().is_some_and(|element| element.trim().starts_with("..."));
+    if has_rest {
+        format!("$.to_array({})", base_expr)
+    } else {
+        format!("$.to_array({}, {})", base_expr, elements.len())
+    }
+}
+
 /// Collect ONLY $$array helper declarations from nested patterns.
 /// This is used in the first pass to ensure $$array declarations come before
 /// the variable declarations that depend on them.
+///
+/// Only ever reached below the top level, so `base_expr` is already a resolved
+/// member/element access and the `member_base` distinction does not apply.
 pub(super) fn collect_array_helpers_only(
     pattern: &str,
     base_expr: &str,
     declarations: &mut Vec<String>,
+    insert_label: Option<&str>,
+    array_temp_prefix: &str,
 ) -> Option<()> {
     let pattern = pattern.trim();
     if pattern.starts_with('[') && pattern.ends_with(']') {
         let inner = &pattern[1..pattern.len() - 1];
         let elements = split_derived_array_elements(inner);
-        let element_count = elements.len();
 
         // Generate the $$array helper
         let global_counter = SCRIPT_ARRAY_COUNTER.with(|c| {
@@ -877,14 +1140,18 @@ pub(super) fn collect_array_helpers_only(
         });
 
         let array_var = if global_counter == 0 {
-            "$$array".to_string()
+            array_temp_prefix.to_string()
         } else {
-            format!("$$array_{}", global_counter)
+            format!("{}_{}", array_temp_prefix, global_counter)
         };
 
         declarations.push(format!(
-            "{} = $.derived(() => $.to_array({}, {}))",
-            array_var, base_expr, element_count
+            "{} = {}",
+            array_var,
+            tag_derived(
+                format!("$.derived(() => {})", to_array_call(base_expr, &elements)),
+                insert_label
+            )
         ));
 
         // Recursively collect array helpers from nested patterns
@@ -895,7 +1162,13 @@ pub(super) fn collect_array_helpers_only(
             }
             let element_access = format!("$.get({})[{}]", array_var, index);
             if element.starts_with('[') || element.starts_with('{') {
-                collect_array_helpers_only(element, &element_access, declarations)?;
+                collect_array_helpers_only(
+                    element,
+                    &element_access,
+                    declarations,
+                    insert_label,
+                    array_temp_prefix,
+                )?;
             }
         }
     } else if pattern.starts_with('{') && pattern.ends_with('}') {
@@ -911,9 +1184,15 @@ pub(super) fn collect_array_helpers_only(
             if let Some(colon_pos) = find_derived_property_colon(prop) {
                 let key = prop[..colon_pos].trim();
                 let value_pattern = prop[colon_pos + 1..].trim();
-                let prop_access = format!("{}.{}", base_expr, key);
+                let prop_access = derived_prop_access(base_expr, base_expr, key);
                 if value_pattern.starts_with('[') || value_pattern.starts_with('{') {
-                    collect_array_helpers_only(value_pattern, &prop_access, declarations)?;
+                    collect_array_helpers_only(
+                        value_pattern,
+                        &prop_access,
+                        declarations,
+                        insert_label,
+                        array_temp_prefix,
+                    )?;
                 }
             }
         }
@@ -928,6 +1207,7 @@ pub(super) fn process_nested_pattern_elements(
     base_expr: &str,
     declarations: &mut Vec<String>,
     _array_counter: &mut usize,
+    array_temp_prefix: &str,
 ) -> Option<()> {
     let pattern = pattern.trim();
     if pattern.starts_with('[') && pattern.ends_with(']') {
@@ -936,7 +1216,7 @@ pub(super) fn process_nested_pattern_elements(
 
         // Get the array variable that was already created by collect_array_helpers_only
         // We need to track which $$array we're using - use a separate counter for lookups
-        let array_var = get_current_array_var_for_base(base_expr);
+        let array_var = get_current_array_var_for_base(base_expr, array_temp_prefix);
 
         for (index, element) in elements.iter().enumerate() {
             let element = element.trim();
@@ -958,7 +1238,12 @@ pub(super) fn process_nested_pattern_elements(
                     &element_access,
                     declarations,
                     _array_counter,
+                    array_temp_prefix,
                 )?;
+            } else if let Some(eq_pos) = find_default_equals(element) {
+                let name = element[..eq_pos].trim();
+                let fallback = build_fallback_string(&element_access, element[eq_pos + 1..].trim());
+                declarations.push(format!("{} = $.derived(() => {})", name, fallback));
             } else {
                 declarations.push(format!("{} = $.derived(() => {})", element, element_access));
             }
@@ -968,8 +1253,10 @@ pub(super) fn process_nested_pattern_elements(
         let properties = split_derived_object_properties(inner);
 
         // Collect all non-rest property keys for $.exclude_from_object
+        let has_rest = properties.iter().any(|prop| prop.trim().starts_with("..."));
         let excluded_keys: Vec<String> = properties
             .iter()
+            .filter(|_| has_rest)
             .filter_map(|prop| {
                 let prop = prop.trim();
                 if prop.is_empty() || prop.starts_with("...") {
@@ -977,14 +1264,12 @@ pub(super) fn process_nested_pattern_elements(
                 }
                 let key = if let Some(colon_pos) = find_derived_property_colon(prop) {
                     prop[..colon_pos].trim()
+                } else if let Some(eq_pos) = find_default_equals(prop) {
+                    prop[..eq_pos].trim()
                 } else {
-                    prop.trim()
+                    prop
                 };
-                if key.starts_with('[') {
-                    None
-                } else {
-                    Some(format!("\"{}\"", key))
-                }
+                Some(exclude_key_literal(key))
             })
             .collect();
 
@@ -1005,7 +1290,7 @@ pub(super) fn process_nested_pattern_elements(
             if let Some(colon_pos) = find_derived_property_colon(prop) {
                 let key = prop[..colon_pos].trim();
                 let value_pattern = prop[colon_pos + 1..].trim();
-                let prop_access = format!("{}.{}", base_expr, key);
+                let prop_access = derived_prop_access(base_expr, base_expr, key);
                 if value_pattern.starts_with('[') || value_pattern.starts_with('{') {
                     let (nested_pattern, default_val) = split_nested_pattern_default(value_pattern);
                     let effective_access = if let Some(dv) = default_val {
@@ -1018,6 +1303,7 @@ pub(super) fn process_nested_pattern_elements(
                         &effective_access,
                         declarations,
                         _array_counter,
+                        array_temp_prefix,
                     )?;
                 } else {
                     // Handle default values for renamed properties
@@ -1027,17 +1313,17 @@ pub(super) fn process_nested_pattern_elements(
                         let fallback = build_fallback_string(&prop_access, default_val);
                         declarations.push(format!("{} = $.derived(() => {})", name, fallback));
                     } else {
-                        declarations.push(format!(
-                            "{} = $.derived(() => {})",
-                            value_pattern, prop_access
-                        ));
+                        declarations
+                            .push(format!("{} = $.derived(() => {})", value_pattern, prop_access));
                     }
                 }
+            } else if let Some(eq_pos) = find_default_equals(prop) {
+                let name = prop[..eq_pos].trim();
+                let member_access = format!("{}.{}", base_expr, name);
+                let fallback = build_fallback_string(&member_access, prop[eq_pos + 1..].trim());
+                declarations.push(format!("{} = $.derived(() => {})", name, fallback));
             } else {
-                declarations.push(format!(
-                    "{} = $.derived(() => {}.{})",
-                    prop, base_expr, prop
-                ));
+                declarations.push(format!("{} = $.derived(() => {}.{})", prop, base_expr, prop));
             }
         }
     }
@@ -1084,7 +1370,7 @@ pub(super) fn split_nested_pattern_default(pattern: &str) -> (&str, Option<&str>
 /// Helper to determine which $$array variable corresponds to a given base expression.
 /// This is needed because we pre-generate $$array helpers in the first pass,
 /// and need to reference the correct one in the second pass.
-pub(super) fn get_current_array_var_for_base(_base_expr: &str) -> String {
+pub(super) fn get_current_array_var_for_base(_base_expr: &str, array_temp_prefix: &str) -> String {
     // The $$array variables are generated in order during collect_array_helpers_only.
     // We use the module-level ARRAY_LOOKUP_COUNTER to track which $$array we're on.
     // This counter is reset at the start of each component transformation along with
@@ -1096,20 +1382,25 @@ pub(super) fn get_current_array_var_for_base(_base_expr: &str) -> String {
     });
 
     if counter == 0 {
-        "$$array".to_string()
+        array_temp_prefix.to_string()
     } else {
-        format!("$$array_{}", counter)
+        format!("{}_{}", array_temp_prefix, counter)
     }
 }
 
 pub(super) fn process_derived_array_pattern(
     inner: &str,
+    // An array pattern consumes the *value*, not a named member of it, so
+    // `$.to_array` takes `base_expr`; `member_base` (upstream's rest-prop member
+    // rewrite target) never applies here.
     base_expr: &str,
+    _member_base: &str,
     declarations: &mut Vec<String>,
     _array_counter: &mut usize,
+    insert_label: Option<&str>,
+    array_temp_prefix: &str,
 ) -> Option<()> {
     let elements = split_derived_array_elements(inner);
-    let element_count = elements.len();
 
     // Use the global counter to generate a unique $$array variable name
     // This ensures unique names across multiple $derived destructuring patterns
@@ -1120,14 +1411,18 @@ pub(super) fn process_derived_array_pattern(
     });
 
     let array_var = if global_counter == 0 {
-        "$$array".to_string()
+        array_temp_prefix.to_string()
     } else {
-        format!("$$array_{}", global_counter)
+        format!("{}_{}", array_temp_prefix, global_counter)
     };
 
     declarations.push(format!(
-        "{} = $.derived(() => $.to_array({}, {}))",
-        array_var, base_expr, element_count
+        "{} = {}",
+        array_var,
+        tag_derived(
+            format!("$.derived(() => {})", to_array_call(base_expr, &elements)),
+            insert_label
+        )
     ));
     for (index, element) in elements.iter().enumerate() {
         let element = element.trim();
@@ -1149,9 +1444,16 @@ pub(super) fn process_derived_array_pattern(
             process_derived_destructuring_pattern(
                 element,
                 &element_access,
+                &element_access,
                 declarations,
                 &mut nested_counter,
+                insert_label,
+                array_temp_prefix,
             )?;
+        } else if let Some(eq_pos) = find_default_equals(element) {
+            let name = element[..eq_pos].trim();
+            let fallback = build_fallback_string(&element_access, element[eq_pos + 1..].trim());
+            declarations.push(format!("{} = $.derived(() => {})", name, fallback));
         } else {
             declarations.push(format!("{} = $.derived(() => {})", element, element_access));
         }
@@ -1159,95 +1461,164 @@ pub(super) fn process_derived_array_pattern(
     Some(())
 }
 
-pub(super) fn split_derived_object_properties(inner: &str) -> Vec<String> {
-    let mut properties = Vec::new();
-    let mut current = String::new();
-    let mut depth = 0;
-    for c in inner.chars() {
-        match c {
-            '{' | '[' | '(' => {
-                depth += 1;
-                current.push(c);
+/// Split a destructuring pattern body on its top-level `,` separators, skipping
+/// nested patterns, string/template literals and comments — a comma inside a
+/// default value (`b = 'x,y'`) is not a separator.
+fn split_top_level_commas(inner: &str) -> Vec<&str> {
+    let bytes = inner.as_bytes();
+    let mut segments = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if let Some(end) = skip_literal_or_comment(bytes, i) {
+            i = end + 1;
+            continue;
+        }
+        match bytes[i] {
+            b'{' | b'[' | b'(' => depth += 1,
+            b'}' | b']' | b')' => depth -= 1,
+            b',' if depth == 0 => {
+                segments.push(&inner[start..i]);
+                start = i + 1;
             }
-            '}' | ']' | ')' => {
-                depth -= 1;
-                current.push(c);
+            _ => {}
+        }
+        i += 1;
+    }
+    segments.push(&inner[start..]);
+    segments
+}
+
+/// Drop comments from one destructuring-pattern segment.
+///
+/// `split_top_level_commas` skips comments when locating the separators, but the
+/// segment it returns still contains them and every consumer reads a segment as
+/// pattern text — so a `//` comment became a binding name and commented out the
+/// rest of the emitted line, `;` included.
+fn strip_pattern_comments(segment: &str) -> String {
+    let bytes = segment.as_bytes();
+    if !bytes.contains(&b'/') {
+        return segment.to_string();
+    }
+
+    let mut out = String::with_capacity(segment.len());
+    let mut kept_from = 0usize;
+    let mut prev: Option<u8> = None;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match skip_opaque(bytes, i, prev) {
+            // `skip_opaque`'s end is exclusive, so a `//` comment's newline is
+            // not part of it and survives — the next line still starts on its own.
+            Some((end, true)) => {
+                out.push_str(&segment[kept_from..i]);
+                // A separator, so stripping cannot glue two tokens together.
+                out.push(' ');
+                kept_from = end;
+                i = end;
             }
-            ',' if depth == 0 => {
-                if !current.trim().is_empty() {
-                    properties.push(current.trim().to_string());
+            // A string, template or regex literal is skipped over, not removed.
+            Some((end, false)) => {
+                prev = Some(bytes[end - 1]);
+                i = end;
+            }
+            None => {
+                if !bytes[i].is_ascii_whitespace() {
+                    prev = Some(bytes[i]);
                 }
-                current = String::new();
+                i += 1;
             }
-            _ => current.push(c),
         }
     }
-    if !current.trim().is_empty() {
-        properties.push(current.trim().to_string());
-    }
-    properties
+    out.push_str(&segment[kept_from..]);
+    out
+}
+
+pub(super) fn split_derived_object_properties(inner: &str) -> Vec<String> {
+    split_top_level_commas(inner)
+        .into_iter()
+        .map(strip_pattern_comments)
+        .map(|segment| segment.trim().to_string())
+        .filter(|segment| !segment.is_empty())
+        .collect()
 }
 
 pub(super) fn split_derived_array_elements(inner: &str) -> Vec<String> {
-    let mut elements = Vec::new();
-    let mut current = String::new();
-    let mut depth = 0;
-    for c in inner.chars() {
-        match c {
-            '{' | '[' | '(' => {
-                depth += 1;
-                current.push(c);
-            }
-            '}' | ']' | ')' => {
-                depth -= 1;
-                current.push(c);
-            }
-            ',' if depth == 0 => {
-                elements.push(current.clone());
-                current = String::new();
-            }
-            _ => current.push(c),
-        }
-    }
-    elements.push(current);
-    elements
+    // Not trimmed or filtered: an empty element is an elision and is positional.
+    split_top_level_commas(inner).into_iter().map(strip_pattern_comments).collect()
 }
 
 pub(super) fn find_derived_property_colon(prop: &str) -> Option<usize> {
-    let mut depth = 0;
-    for (i, c) in prop.char_indices() {
-        match c {
-            '{' | '[' | '(' => depth += 1,
-            '}' | ']' | ')' => depth -= 1,
-            ':' if depth == 0 => return Some(i),
-            _ => {}
-        }
-    }
-    None
+    scan_property_separators(prop).0
 }
 
 /// Find the position of `=` in a shorthand destructuring property with a default value.
 /// e.g., `animated = false` → Some(9), `animated` → None
 /// Respects nesting so `data = { x: 1 }` finds the top-level `=`.
 pub(super) fn find_default_equals(prop: &str) -> Option<usize> {
-    let mut depth = 0;
+    scan_property_separators(prop).1
+}
+
+/// Byte offsets of a destructuring property's key separator `:` and default-value
+/// `=`, skipping nested patterns, string/template literals and comments.
+///
+/// A property is always `key: value = default`, so the key separator can only
+/// precede the default `=` — scanning the whole property would otherwise mistake a
+/// `:` from the default (a ternary, a string literal) for the key separator.
+fn scan_property_separators(prop: &str) -> (Option<usize>, Option<usize>) {
     let bytes = prop.as_bytes();
+    let mut depth = 0i32;
+    let mut colon = None;
     let mut i = 0;
     while i < bytes.len() {
+        if let Some(end) = skip_literal_or_comment(bytes, i) {
+            i = end + 1;
+            continue;
+        }
         match bytes[i] {
             b'{' | b'[' | b'(' => depth += 1,
             b'}' | b']' | b')' => depth -= 1,
+            b':' if depth == 0 && colon.is_none() => colon = Some(i),
             b'=' if depth == 0 => {
-                // Make sure it's not `==` or `=>`
-                if i + 1 < bytes.len() && (bytes[i + 1] == b'=' || bytes[i + 1] == b'>') {
-                    i += 2;
-                    continue;
+                let prev = if i > 0 { bytes[i - 1] } else { 0 };
+                let is_operator = matches!(bytes.get(i + 1), Some(b'=' | b'>'))
+                    || matches!(prev, b'!' | b'<' | b'>' | b'=');
+                if !is_operator {
+                    return (colon, Some(i));
                 }
-                return Some(i);
             }
             _ => {}
         }
         i += 1;
     }
-    None
+    (colon, None)
+}
+
+/// Index of the last byte of the comment or string/template literal starting at
+/// `i`, or `None` when `i` does not start one. Callers resume at `end + 1`.
+fn skip_literal_or_comment(bytes: &[u8], i: usize) -> Option<usize> {
+    match bytes[i] {
+        b'/' if bytes.get(i + 1) == Some(&b'/') => {
+            let mut j = i;
+            while j < bytes.len() && bytes[j] != b'\n' {
+                j += 1;
+            }
+            Some(j)
+        }
+        b'/' if bytes.get(i + 1) == Some(&b'*') => {
+            let mut j = i + 2;
+            while j < bytes.len() && !(bytes[j] == b'*' && bytes.get(j + 1) == Some(&b'/')) {
+                j += 1;
+            }
+            Some(j + 1)
+        }
+        quote @ (b'\'' | b'"' | b'`') => {
+            let mut j = i + 1;
+            while j < bytes.len() && bytes[j] != quote {
+                j += if bytes[j] == b'\\' { 2 } else { 1 };
+            }
+            Some(j)
+        }
+        _ => None,
+    }
 }

@@ -15,7 +15,10 @@ use crate::ast::template::IfBlock;
 use crate::compiler::phases::phase2_analyze::AnalysisError;
 
 /// Visit an if block.
-pub fn visit(block: &mut IfBlock, context: &mut VisitorContext) -> Result<(), AnalysisError> {
+pub fn visit<'a, 'b: 'a>(
+    block: &mut IfBlock<'b>,
+    context: &mut VisitorContext<'a>,
+) -> Result<(), AnalysisError> {
     // Check if inside a textarea (logic blocks not allowed)
     if context.element_ancestors.iter().any(|a| a == "textarea") {
         return Err(errors::block_invalid_placement("{#if ...}"));
@@ -65,36 +68,51 @@ pub fn visit(block: &mut IfBlock, context: &mut VisitorContext) -> Result<(), An
 
     // Increment block depth for child analysis
     context.block_depth += 1;
+    context.svelte_self_parent_depth += 1;
 
-    // Clear is_direct_child_of_component since children of control flow blocks
+    // Clear direct_component_parent since children of control flow blocks
     // are not direct children of a component
-    let was_direct_child = context.is_direct_child_of_component;
+    let was_direct_child = context.direct_component_parent;
     let was_direct_snippet = context.is_direct_child_of_snippet;
-    context.is_direct_child_of_component = false;
+    context.direct_component_parent = super::DirectComponentParent::None;
     context.is_direct_child_of_snippet = false;
 
     // Push fragment owner type for const_tag placement validation
-    context
-        .fragment_owner_stack
-        .push(super::FragmentOwnerType::IfBlock);
+    context.fragment_owner_stack.push(super::FragmentOwnerType::IfBlock);
 
-    // Analyze the consequent
+    // Each branch has its own scope in the scope builder, so the visitor has to
+    // enter it too — otherwise a lexical lookup from inside the branch (a
+    // `{@render}` resolving a sibling `{#snippet}`, say) never reaches a binding
+    // declared there and falls back to the dynamic lowering.
+    let old_scope = context.scope;
+    if let Some(&consequent_scope) = context.analysis.root.template_scope_map.get(&block.start) {
+        context.scope = consequent_scope;
+    }
     fragment::analyze(&mut block.consequent, context)?;
+    context.scope = old_scope;
 
     // Analyze the alternate if present
     if let Some(ref mut alternate) = block.alternate {
+        let old_scope = context.scope;
+        if let Some(&alternate_scope) =
+            context.analysis.root.if_alternate_scope_map.get(&block.start)
+        {
+            context.scope = alternate_scope;
+        }
         fragment::analyze(alternate, context)?;
+        context.scope = old_scope;
     }
 
     // Pop fragment owner type
     context.fragment_owner_stack.pop();
 
-    // Restore is_direct_child_of_component
-    context.is_direct_child_of_component = was_direct_child;
+    // Restore direct_component_parent
+    context.direct_component_parent = was_direct_child;
     context.is_direct_child_of_snippet = was_direct_snippet;
 
     // Decrement block depth
     context.block_depth -= 1;
+    context.svelte_self_parent_depth -= 1;
 
     Ok(())
 }
@@ -130,12 +148,4 @@ fn analyze_test_expression(
     }
 
     Ok(())
-}
-
-/// Alias for visit function.
-pub fn visit_if_block(
-    block: &mut IfBlock,
-    context: &mut VisitorContext,
-) -> Result<(), AnalysisError> {
-    visit(block, context)
 }

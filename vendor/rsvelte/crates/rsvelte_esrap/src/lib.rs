@@ -3,23 +3,21 @@
 //!
 //! ## Why
 //!
-//! The official Svelte compiler builds an ESTree and prints it once with esrap.
+//! The official Svelte compiler builds an `ESTree` and prints it once with esrap.
 //! rsvelte's Phase 3 instead generates JS by string surgery — splicing edits
 //! into source text across hundreds of passes — which is both the root cause of
-//! a class of formatting divergences and, per `docs/phase3-perf-baseline.md`,
-//! ~68% of client-transform time. The durable fix is the same architecture
-//! upstream uses: build an output AST and print it once. This crate is that
-//! printer (plan: `docs/phase3-ast-refactor-plan.md`, step 0).
+//! a class of formatting divergences and a large share of client-transform time.
+//! The durable fix is the same architecture upstream uses: build an output AST
+//! and print it once. This crate is that printer.
 //!
 //! ## Model
 //!
-//! Printing is two layers, mirroring esrap:
-//! - a [`command`] buffer with a flattening driver (whitespace/indent
-//!   sentinels + literal strings), and
-//! - a [`context::Context`] the visitors push commands onto, tracking the
+//! Printing is two internal layers, mirroring esrap's semantics:
+//! - a flat text buffer with offset-based whitespace, indentation, and mapping events, and
+//! - a context the visitors write into, tracking the
 //!   `multiline` signal used to choose layouts.
 //!
-//! The visitor ([`printer`]) walks the oxc AST. Where esrap dispatches through a
+//! The printer walks the oxc AST. Where esrap dispatches through a
 //! `visitors[node.type]` map, this port matches on oxc node kinds; the layout
 //! logic (precedence-based parens, `sequence`, `body`, length-based line
 //! breaking) is ported 1:1.
@@ -31,43 +29,76 @@
 //! this crate, and assert byte-identity. The `golden` integration test reports
 //! the round-trip rate; it only ever ratchets up as visitor coverage grows.
 
-pub mod command;
-pub mod context;
-pub mod printer;
+#![deny(missing_docs)]
+
+mod command;
+mod context;
+mod pool;
+mod printer;
+
+#[cfg(test)]
+mod internal_tests;
+
+pub use command::Mapping;
+pub use printer::{BraceMapping, LocRange};
 
 use oxc_ast::ast::Program;
+use oxc_span::Span;
+
+const UNLOCATED_OFFSET: u32 = u32::MAX;
+
+/// First reserved callee offset used to tell the printer which call argument
+/// owns comments from a source-backed template region. The argument index is
+/// added to this value; these offsets can never be real source locations.
+pub const COMMENT_ARGUMENT_CALLEE_BASE: u32 = u32::MAX - 256;
+
+/// Span reserved for synthesized nodes that carry no source location.
+pub const UNLOCATED_SPAN: Span = Span::new(UNLOCATED_OFFSET, UNLOCATED_OFFSET);
 
 /// Options controlling output layout. Defaults match esrap's defaults and
 /// rsvelte's conventions (tab indent, single quotes).
 #[derive(Debug, Clone)]
 pub struct PrintOptions {
-    /// The indentation unit for one level (default `"\t"`).
-    pub indent: String,
-    /// Preferred quote character for string literals without a preserved `raw`
-    /// (default single quote).
-    pub quote: QuoteStyle,
+    /// The indentation unit for one level (always `"\t"`).
+    indent: String,
     /// Keep `EmptyStatement` (`;`) nodes in statement-list bodies instead of
     /// filtering them (esrap's default, matching the server AST). The rsvelte
     /// client `to_oxc` path parses string-codegen `Raw` chunks whose `;;` become
     /// real `EmptyStatement` nodes that the official *compiler* output keeps, so
     /// that path sets this to byte-match. Default `false` (filter, = esrap/server).
-    pub keep_empty_statements: bool,
-}
-
-/// Quote preference for synthesized string literals.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum QuoteStyle {
-    Single,
-    Double,
+    keep_empty_statements: bool,
+    /// Treat the top-level `Program` as carrying no location, like the
+    /// builder-made program upstream hands esrap. Its statement list then
+    /// discards every pending comment (esrap's `!node.loc` branch), so only a
+    /// nested body that does carry one re-finds its own comments. Only a caller
+    /// whose nested bodies keep real locations may set this — otherwise the
+    /// comments have nothing to be recovered by. Default `false`.
+    unlocated_program: bool,
 }
 
 impl Default for PrintOptions {
     fn default() -> Self {
-        Self {
-            indent: String::from("\t"),
-            quote: QuoteStyle::Single,
-            keep_empty_statements: false,
-        }
+        Self { indent: String::from("\t"), keep_empty_statements: false, unlocated_program: false }
+    }
+}
+
+impl PrintOptions {
+    /// Control whether empty statements are retained in statement lists.
+    #[must_use]
+    pub const fn with_empty_statements(mut self, keep: bool) -> Self {
+        self.keep_empty_statements = keep;
+        self
+    }
+
+    /// Treat the top-level `Program` as carrying no location, like the
+    /// builder-made program upstream hands esrap: its statement list then
+    /// discards every pending comment, and only a nested body that does carry a
+    /// location re-finds its own. Only a caller whose nested bodies keep real
+    /// locations may set this — otherwise nothing can recover the comments.
+    #[must_use]
+    pub const fn with_unlocated_program(mut self, unlocated: bool) -> Self {
+        self.unlocated_program = unlocated;
+        self
     }
 }
 
@@ -80,99 +111,229 @@ pub fn print(program: &Program<'_>, source: &str) -> String {
 
 /// Print `program` to JavaScript with explicit options, interleaving comments.
 pub fn print_with(program: &Program<'_>, source: &str, options: &PrintOptions) -> String {
-    let comments = printer::build_comments(program, source);
+    if program.comments.is_empty() {
+        print_direct(program, options, source.len())
+    } else if printer::comments_are_program_level(program) {
+        print_direct_outer_comments(program, source, options)
+    } else {
+        // Interior comments still go through the deferred printer: the direct
+        // one emits some that have no located node left to attach to, which the
+        // official compiler drops.
+        print_interleaved(program, source, options)
+    }
+}
+
+fn print_interleaved(program: &Program<'_>, source: &str, options: &PrintOptions) -> String {
     let mut printer =
-        printer::Printer::with_comments(options, comments, printer::line_starts(source));
+        printer::Printer::<true, false>::with_comments(options, Vec::new(), Vec::new())
+            .with_borrowed_comments(&program.comments, source);
     let mut ctx = context::Context::new();
     printer.print_program(program, &mut ctx);
-    command::print(&ctx.into_commands(), &options.indent)
+    let capacity = ctx.measure();
+    let (buffer, returned) = ctx.into_parts();
+    let code = command::print(&buffer, &options.indent, capacity);
+    pool::give(buffer, returned);
+    code
 }
 
-/// A synthetic comment injected by a [`CommentHooks`] callback (esrap's
-/// `BaseComment`). `block` chooses `/* … */` vs `// …`; `value` is the interior
-/// text (without delimiters).
-#[derive(Debug, Clone)]
-pub struct SynthComment {
-    pub block: bool,
-    pub value: String,
-}
-
-impl SynthComment {
-    /// A `// value` line comment.
-    pub fn line(value: impl Into<String>) -> Self {
-        Self {
-            block: false,
-            value: value.into(),
-        }
-    }
-
-    /// A `/* value */` block comment.
-    pub fn block(value: impl Into<String>) -> Self {
-        Self {
-            block: true,
-            value: value.into(),
-        }
-    }
-}
-
-/// Caller hooks that inject synthetic comments around statements, mirroring
-/// esrap's `getLeadingComments` / `getTrailingComments` options. Each callback
-/// receives the statement node and returns the comments to emit (leading
-/// comments precede the node; trailing comments follow it on the same line).
-#[derive(Default)]
-pub struct CommentHooks<'h> {
-    #[allow(clippy::type_complexity)]
-    pub get_leading: Option<Box<dyn Fn(&oxc_ast::ast::Statement) -> Vec<SynthComment> + 'h>>,
-    #[allow(clippy::type_complexity)]
-    pub get_trailing: Option<Box<dyn Fn(&oxc_ast::ast::Statement) -> Vec<SynthComment> + 'h>>,
-}
-
-/// Like [`print_with`], but invokes `hooks` to inject synthetic leading/trailing
-/// comments per statement (esrap's `getLeadingComments`/`getTrailingComments`).
-pub fn print_with_hooks(
+fn print_direct_outer_comments(
     program: &Program<'_>,
     source: &str,
     options: &PrintOptions,
-    hooks: &CommentHooks<'_>,
 ) -> String {
-    let comments = printer::build_comments(program, source);
     let mut printer =
-        printer::Printer::with_comments(options, comments, printer::line_starts(source))
-            .with_hooks(hooks);
-    let mut ctx = context::Context::new();
-    printer.print_program(program, &mut ctx);
-    command::print(&ctx.into_commands(), &options.indent)
+        printer::Printer::<false, true>::with_comments(options, Vec::new(), Vec::new());
+    let mut ctx = context::Context::new_direct(&options.indent, source.len());
+    printer.print_program_with_outer_comments(program, source, &mut ctx);
+    let (buffer, returned, indent, dirty) = ctx.into_direct_parts();
+    let (code, buffer) = command::finish_direct(buffer, &indent, dirty);
+    pool::give(buffer, returned);
+    code
 }
 
-/// Print `program` to JavaScript with the default options, returning both the
-/// code and decoded source-map mappings. The emitted code is byte-identical to
-/// [`print()`] — `Location` anchors only carry mapping data, never add text.
-pub fn print_with_map(program: &Program<'_>, source: &str) -> PrintWithMap {
-    print_with_map_opts(program, source, &PrintOptions::default())
+fn print_direct(program: &Program<'_>, options: &PrintOptions, capacity: usize) -> String {
+    let mut printer =
+        printer::Printer::<false, true>::with_comments(options, Vec::new(), Vec::new());
+    let mut ctx = context::Context::new_direct(&options.indent, capacity);
+    printer.print_program(program, &mut ctx);
+    let (buffer, returned, indent, dirty) = ctx.into_direct_parts();
+    let (code, buffer) = command::finish_direct(buffer, &indent, dirty);
+    pool::give(buffer, returned);
+    code
+}
+
+/// Print a program whose comment coordinates and source-map coordinates live in two different buffers.
+///
+/// This is the shape a *reassembled* program has, where the
+/// nodes carrying comments were parsed from generated chunks rather than from
+/// the original file.
+///
+/// * `comment_source` is the buffer the program's comment spans (and the spans
+///   of the nodes those comments attach to) index into.
+/// * `loc_base` splits the two: spans below it are synthesized nodes that carry
+///   no location, exactly like a missing `node.loc` in esrap, and take part in
+///   no comment placement.
+/// * `map_source` (when `Some`) is the buffer source-map line/columns resolve
+///   against, with `loc_map` translating comment-space offsets back into it —
+///   sorted and disjoint, one entry per chunk, a `None` third field meaning the
+///   chunk has no original-source anchor. `map_source: None` prints without
+///   source-map anchors.
+///
+/// A chunk maps to a single point, so source-map *resolution* inside a chunk is
+/// chunk-granular, not statement-granular.
+pub fn print_split(
+    program: &Program<'_>,
+    comment_source: &str,
+    loc_base: u32,
+    map_source: Option<&str>,
+    loc_map: &[LocRange],
+    brace_mappings: &[BraceMapping],
+    options: &PrintOptions,
+) -> PrintWithMap {
+    let (comments, line_starts) = comments_and_line_starts(program, comment_source);
+    let map_line_starts = map_source.map(printer::line_starts).unwrap_or_default();
+    if comments.is_empty() {
+        print_split_impl::<false>(
+            program,
+            loc_base,
+            comment_source,
+            map_source,
+            loc_map,
+            brace_mappings,
+            options,
+            comments,
+            line_starts,
+            map_line_starts,
+        )
+    } else {
+        print_split_impl::<true>(
+            program,
+            loc_base,
+            comment_source,
+            map_source,
+            loc_map,
+            brace_mappings,
+            options,
+            comments,
+            line_starts,
+            map_line_starts,
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn print_split_impl<const HAS_COMMENTS: bool>(
+    program: &Program<'_>,
+    loc_base: u32,
+    comment_source: &str,
+    map_source: Option<&str>,
+    loc_map: &[LocRange],
+    brace_mappings: &[BraceMapping],
+    options: &PrintOptions,
+    comments: Vec<printer::Cmt>,
+    line_starts: Vec<u32>,
+    map_line_starts: Vec<u32>,
+) -> PrintWithMap {
+    if !HAS_COMMENTS && map_source.is_none() {
+        let mut printer =
+            printer::Printer::<HAS_COMMENTS, true>::with_comments(options, comments, line_starts)
+                .with_placement_source(comment_source)
+                .with_split_coordinates(map_line_starts, loc_base, loc_map, brace_mappings, false);
+        let mut ctx = context::Context::new_direct(&options.indent, program.source_text.len());
+        printer.print_program(program, &mut ctx);
+        let (buffer, returned, indent, dirty) = ctx.into_direct_parts();
+        let (code, buffer) = command::finish_direct(buffer, &indent, dirty);
+        pool::give(buffer, returned);
+        return PrintWithMap { code, mappings: Vec::new() };
+    }
+    let mut printer =
+        printer::Printer::<HAS_COMMENTS, false>::with_comments(options, comments, line_starts)
+            .with_placement_source(comment_source)
+            .with_split_coordinates(
+                map_line_starts,
+                loc_base,
+                loc_map,
+                brace_mappings,
+                map_source.is_some(),
+            );
+    let mut ctx = context::Context::new();
+    printer.print_program(program, &mut ctx);
+    let capacity = ctx.measure();
+    let (buffer, returned) = ctx.into_parts();
+    let output = if map_source.is_some() {
+        let (code, mappings) = command::flatten_with_map(
+            &buffer,
+            &options.indent,
+            capacity,
+            printer.source_map_line_starts(),
+        );
+        PrintWithMap { code, mappings }
+    } else {
+        PrintWithMap {
+            code: command::print(&buffer, &options.indent, capacity),
+            mappings: Vec::new(),
+        }
+    };
+    pool::give(buffer, returned);
+    output
 }
 
 /// The decoded result of [`print_with_map`].
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct PrintWithMap {
     /// The generated source text (identical to what [`print_with`] returns).
     pub code: String,
-    /// Source-map mappings: one entry per generated line, each a list of
-    /// `[generated_column, source_index, source_line_0based, source_column_0based]`
-    /// segments. Matches esrap's `sourceMapEncodeMappings: false` shape.
-    pub mappings: Vec<Vec<command::Segment>>,
+    /// Source-map mappings in generated order (line/column pairs are 0-based;
+    /// the flat list replaces esrap's per-line `sourceMapEncodeMappings: false` shape).
+    pub mappings: Vec<Mapping>,
 }
 
-/// Like [`print_with_map`] but with explicit options.
-pub fn print_with_map_opts(
+/// Print `program` to JavaScript, returning both the code and decoded source-map mappings.
+///
+/// The emitted code is byte-identical to what
+/// [`print_with`] returns — `Location` anchors only carry mapping data, never
+/// add text.
+pub fn print_with_map(program: &Program<'_>, source: &str, options: &PrintOptions) -> PrintWithMap {
+    let line_starts = printer::line_starts(source);
+    let comments = printer::build_comments(program, source, &line_starts);
+    if comments.is_empty() {
+        print_with_map_impl::<false>(program, source, options, comments, line_starts)
+    } else {
+        print_with_map_impl::<true>(program, source, options, comments, line_starts)
+    }
+}
+
+fn print_with_map_impl<const HAS_COMMENTS: bool>(
     program: &Program<'_>,
     source: &str,
     options: &PrintOptions,
+    comments: Vec<printer::Cmt>,
+    line_starts: Vec<u32>,
 ) -> PrintWithMap {
-    let comments = printer::build_comments(program, source);
     let mut printer =
-        printer::Printer::with_comments(options, comments, printer::line_starts(source));
+        printer::Printer::<HAS_COMMENTS, false>::with_comments(options, comments, line_starts)
+            .with_placement_source(source)
+            .with_source_map();
     let mut ctx = context::Context::new();
     printer.print_program(program, &mut ctx);
-    let (code, mappings) = command::flatten_with_map(&ctx.into_commands(), &options.indent);
+    let capacity = ctx.measure();
+    let (buffer, returned) = ctx.into_parts();
+    let (code, mappings) = command::flatten_with_map(
+        &buffer,
+        &options.indent,
+        capacity,
+        printer.source_map_line_starts(),
+    );
+    pool::give(buffer, returned);
     PrintWithMap { code, mappings }
+}
+
+fn comments_and_line_starts(program: &Program<'_>, source: &str) -> (Vec<printer::Cmt>, Vec<u32>) {
+    if program.comments.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    let line_starts = printer::line_starts(source);
+    let comments = printer::build_comments(program, source, &line_starts);
+    (comments, line_starts)
 }

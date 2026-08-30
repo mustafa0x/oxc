@@ -9,7 +9,6 @@ use super::super::errors;
 use super::VisitorContext;
 use super::shared::fragment;
 use crate::ast::template::{Attribute, AttributeValue, AttributeValuePart, SvelteDynamicElement};
-use rustc_hash::FxHashSet;
 
 const NAMESPACE_SVG: &str = "http://www.w3.org/2000/svg";
 const NAMESPACE_MATHML: &str = "http://www.w3.org/1998/Math/MathML";
@@ -18,122 +17,69 @@ const NAMESPACE_MATHML: &str = "http://www.w3.org/1998/Math/MathML";
 fn is_text_attribute(attr: &crate::ast::template::AttributeNode) -> bool {
     match &attr.value {
         AttributeValue::True(_) | AttributeValue::Expression(_) => false,
-        AttributeValue::Sequence(parts) => parts
-            .iter()
-            .all(|p| matches!(p, AttributeValuePart::Text(_))),
+        AttributeValue::Sequence(parts) => {
+            parts.iter().all(|p| matches!(p, AttributeValuePart::Text(_)))
+        }
     }
 }
 
 /// Visit a svelte:element.
-pub fn visit(
-    element: &mut SvelteDynamicElement,
-    context: &mut VisitorContext,
+pub fn visit<'a, 'b: 'a>(
+    element: &mut SvelteDynamicElement<'b>,
+    context: &mut VisitorContext<'a>,
 ) -> Result<(), AnalysisError> {
-    // Mark that we have dynamic elements (can't safely prune type selectors)
-    context.analysis.css.has_dynamic_elements = true;
+    // Upstream's `SvelteElement` visitor runs the same `validate_element` as the
+    // regular one, so an illegal attribute name or a non-expression `on*` handler
+    // is rejected here too.
+    super::shared::element::validate_element(&element.attributes, context)?;
 
-    // Extract class names and ID from svelte:element attributes for CSS selector detection.
-    // Since svelte:element can resolve to any element, we still need to know which classes
-    // are used so the CSS pruner can keep the right selectors.
-    let mut element_classes = rustc_hash::FxHashSet::default();
-    let mut element_id = None;
+    let collect_css = context.analysis.css.has_css;
+    let mut css_facts = super::shared::element::CssAttributeFacts::default();
 
-    for attr in &element.attributes {
-        match attr {
-            Attribute::Attribute(attr_node) if attr_node.name == "class" => {
-                match &attr_node.value {
-                    AttributeValue::Sequence(parts) => {
-                        for part in parts {
-                            match part {
-                                AttributeValuePart::Text(text) => {
-                                    for class_name in text.data.split_whitespace() {
-                                        context
-                                            .analysis
-                                            .css
-                                            .used_classes
-                                            .insert(class_name.to_string());
-                                        element_classes.insert(class_name.to_string());
-                                    }
-                                }
-                                AttributeValuePart::ExpressionTag(_) => {
-                                    context.analysis.css.has_dynamic_classes = true;
-                                }
-                            }
-                        }
-                    }
-                    AttributeValue::Expression(_) => {
-                        context.analysis.css.has_dynamic_classes = true;
-                    }
-                    _ => {}
-                }
-            }
-            Attribute::Attribute(attr_node) if attr_node.name == "id" => match &attr_node.value {
-                AttributeValue::Sequence(parts) => {
-                    let has_dynamic_part = parts
-                        .iter()
-                        .any(|p| matches!(p, AttributeValuePart::ExpressionTag(_)));
-                    if has_dynamic_part {
-                        context.analysis.css.has_dynamic_ids = true;
-                    } else if parts.len() == 1
-                        && let Some(AttributeValuePart::Text(text)) = parts.first()
-                    {
-                        element_id = Some(text.data.to_string());
-                    }
-                }
-                AttributeValue::Expression(_) => {
-                    context.analysis.css.has_dynamic_ids = true;
-                }
-                _ => {}
-            },
-            Attribute::ClassDirective(cd) => {
-                context
-                    .analysis
-                    .css
-                    .used_classes
-                    .insert(cd.name.to_string());
-                element_classes.insert(cd.name.to_string());
-            }
-            _ => {}
-        }
+    if collect_css {
+        context.analysis.css.has_dynamic_elements = true;
+        css_facts =
+            super::shared::element::collect_css_attribute_facts(&element.attributes, context);
     }
 
-    // Create DOM element for CSS sibling combinator detection
     let parent_idx = context.current_parent_idx();
     let is_root_child = context.dom_element_stack.is_empty();
-    let dom_element = super::super::types::CssDomElement {
-        tag_name: String::new(), // Dynamic tag, will use is_dynamic_tag
-        classes: element_classes,
-        id: element_id,
-        static_attributes: Vec::new(), // Dynamic element, no static attributes
-        dynamic_attribute_names: FxHashSet::default(),
-        has_spread: false,
-        has_class_directive: false,
-        class_directive_names: FxHashSet::default(),
-        has_style_directive: false,
-        parent_idx,
-        children_idx: Vec::new(),
-        is_root_child,
-        possible_prev_adjacent: Vec::new(),
-        possible_next_adjacent: Vec::new(),
-        possible_prev_general: Vec::new(),
-        possible_next_general: Vec::new(),
-        has_content: !element.fragment.nodes.is_empty(),
-        has_opaque_content: false, // Dynamic element, conservatively handled via is_dynamic_tag
-        is_dynamic_tag: true,
-        prev_is_opaque_boundary: false,
-        prev_has_opaque_boundary: false,
+    let element_idx = if collect_css {
+        let dom_element = super::super::types::CssDomElement {
+            tag_name: String::new(),
+            classes: css_facts.classes,
+            id: css_facts.id,
+            static_attributes: css_facts.static_attributes,
+            dynamic_attribute_names: css_facts.dynamic_attribute_names,
+            has_spread: css_facts.has_spread,
+            has_class_directive: css_facts.has_class_directive,
+            class_directive_names: css_facts.class_directive_names,
+            has_style_directive: css_facts.has_style_directive,
+            parent_idx,
+            children_idx: Vec::new(),
+            is_root_child,
+            possible_prev_adjacent: Vec::new(),
+            possible_next_adjacent: Vec::new(),
+            possible_prev_general: Vec::new(),
+            possible_next_general: Vec::new(),
+            has_content: !element.fragment.nodes.is_empty(),
+            has_opaque_content: false,
+            is_dynamic_tag: true,
+            snippet_name: context.current_snippet_name(),
+            sibling_walk_incomplete: false,
+            prev_is_opaque_boundary: false,
+            prev_has_opaque_boundary: false,
+        };
+        let element_idx = context.add_dom_element(dom_element);
+        if let Some(parent_idx) = parent_idx
+            && parent_idx < context.analysis.css.dom_structure.elements.len()
+        {
+            context.analysis.css.dom_structure.elements[parent_idx].children_idx.push(element_idx);
+        }
+        element_idx
+    } else {
+        usize::MAX
     };
-
-    let element_idx = context.add_dom_element(dom_element);
-
-    // Update parent's children list
-    if let Some(parent_idx) = parent_idx
-        && parent_idx < context.analysis.css.dom_structure.elements.len()
-    {
-        context.analysis.css.dom_structure.elements[parent_idx]
-            .children_idx
-            .push(element_idx);
-    }
 
     // Check that svelte:element has a 'this' attribute with a value
     // The 'tag' field is populated from the 'this' attribute during parsing
@@ -141,7 +87,23 @@ pub fn visit(
     let has_valid_this = element.tag.node_type().is_some();
 
     if !has_valid_this {
-        return Err(errors::svelte_element_missing_this());
+        return Err(errors::svelte_element_missing_this().at(element.start, element.end));
+    }
+
+    // Upstream runs the shared a11y checker from both element visitors; the tag
+    // is not statically known, so the rules that need it are skipped inside.
+    let a11y_warnings = super::shared::a11y::check_element(
+        &super::shared::a11y::A11yElement::dynamic(element),
+        &context.a11y_ancestors(),
+    );
+    for mut warning in a11y_warnings {
+        if warning.start.is_none() {
+            warning.start = Some(element.start);
+        }
+        if warning.end.is_none() {
+            warning.end = Some(element.end);
+        }
+        context.emit_warning(warning);
     }
 
     // Analyze the 'this' expression to track template references
@@ -228,37 +190,42 @@ pub fn visit(
         }
     }
 
-    // Check for invalid bindings on svelte:element
-    // bind:value, bind:files, bind:group can only be used with specific elements
     for attr in &element.attributes {
+        if let Attribute::Attribute(attr_node) = attr {
+            super::shared::attribute::record_event_attribute_arrow(context, attr_node);
+        }
+    }
+
+    for attr in &element.attributes {
+        if let Attribute::AnimateDirective(animate) = attr
+            && context.each_block_stack.last().is_none()
+        {
+            return Err(errors::animation_invalid_placement().at(animate.start, animate.end));
+        }
         if let Attribute::BindDirective(bind) = attr {
-            let name = bind.name.as_str();
-            match name {
-                "value" => {
-                    return Err(AnalysisError::validation(
-                        "bind_invalid_target",
-                        "`bind:value` can only be used with `<input>`, `<textarea>`, `<select>`",
-                    ));
-                }
-                "files" => {
-                    return Err(AnalysisError::validation(
-                        "bind_invalid_target",
-                        "`bind:files` can only be used with `<input type=\"file\">`",
-                    ));
-                }
-                "group" => {
-                    return Err(AnalysisError::validation(
-                        "bind_invalid_target",
-                        "`bind:group` can only be used with `<input type=\"checkbox\">` or `<input type=\"radio\">`",
-                    ));
-                }
-                "checked" => {
-                    return Err(AnalysisError::validation(
-                        "bind_invalid_target",
-                        "`bind:checked` can only be used with `<input type=\"checkbox\">` or `<input type=\"radio\">`",
-                    ));
-                }
-                _ => {}
+            super::shared::attribute::record_assign_exempt_expression(
+                context,
+                &bind.expression,
+                true,
+            );
+            super::bind_directive::validate_binding_target(
+                bind,
+                "svelte:element",
+                &element.attributes,
+            )?;
+            // Upstream's `BindDirective` visitor runs the host-independent half
+            // for a `SvelteElement` too — the target-shape / target-kind checks
+            // live below its `parent.type` block, not inside it.
+            if super::bind_directive::is_get_set_pair(bind) {
+                super::bind_directive::validate_get_set_pair(bind, context)?;
+            } else {
+                super::shared::utils::validate_assignment_node(
+                    (bind.start, bind.end),
+                    &bind.expression.as_node(),
+                    context,
+                    true,
+                )?;
+                super::bind_directive::validate_bind_value_target(bind, context)?;
             }
         }
     }
@@ -267,19 +234,16 @@ pub fn visit(
     // <svelte:element> can dynamically resolve to any element including custom elements,
     // so children with slot attributes should be allowed (they may be valid at runtime).
     // This matches how <svelte:component> allows slot attributes on its children.
-    let was_direct_child = context.is_direct_child_of_component;
+    let was_direct_child = context.direct_component_parent;
     let was_direct_snippet = context.is_direct_child_of_snippet;
-    context.is_direct_child_of_component = true;
+    context.direct_component_parent = super::DirectComponentParent::SlotOwnerOnly;
     context.is_direct_child_of_snippet = false;
-    context
-        .slot_owner_ancestors
-        .push(super::SlotOwnerType::Component);
-    context
-        .fragment_owner_stack
-        .push(super::FragmentOwnerType::SvelteElement);
+    context.slot_owner_ancestors.push(super::SlotOwnerType::CustomElement);
+    context.fragment_owner_stack.push(super::FragmentOwnerType::SvelteElement);
 
-    // Push this element index to DOM element stack for tracking children
-    context.dom_element_stack.push(element_idx);
+    if collect_css {
+        context.dom_element_stack.push(element_idx);
+    }
 
     // Save and update the SVG/MathML namespace state for child analysis.
     // Child svelte:element nodes will check these fields to determine their namespace.
@@ -302,17 +266,24 @@ pub fn visit(
                 super::style_directive::visit(sd, context)?;
             }
             Attribute::BindDirective(bd) => {
-                super::script::walk_expression(&bd.expression, context)?;
-            }
-            Attribute::SpreadAttribute(spread) => {
-                super::spread_attribute::visit(spread, context)?;
-            }
-            Attribute::OnDirective(on) => {
-                if let Some(ref expr) = on.expression {
-                    super::script::walk_expression(expr, context)?;
+                if super::bind_directive::is_get_set_pair(bd) {
+                    super::bind_directive::walk_get_set_pair(bd, context)?;
+                } else {
+                    super::bind_directive::walk_bind_expression(bd, context)?;
                 }
             }
-            _ => {}
+            Attribute::SpreadAttribute(spread) => {
+                super::spread_attribute::visit(spread, context, true)?;
+            }
+            Attribute::OnDirective(on) => {
+                super::on_directive::visit(on, context)?;
+            }
+            Attribute::AttachTag(attach) => {
+                super::attach_tag::visit(attach, context)?;
+            }
+            other => {
+                super::shared::attribute::walk_remaining_attribute_expressions(other, context)?;
+            }
         }
     }
 
@@ -322,7 +293,15 @@ pub fn visit(
     let saved_element_ancestors = std::mem::take(&mut context.element_ancestors);
     let saved_block_depth_at_element = std::mem::take(&mut context.block_depth_at_element);
     let saved_parent_element = context.parent_element.take();
+    // Enter the template scope the scope builder created for this node, the way
+    // the plain-component visitor does. Without it a `{@render}` cannot see a
+    // `{#snippet}` declared as its sibling here, so the tag reads as dynamic.
+    let saved_scope = context.scope;
+    if let Some(&node_scope) = context.analysis.root.template_scope_map.get(&element.start) {
+        context.scope = node_scope;
+    }
     fragment::analyze(&mut element.fragment, context)?;
+    context.scope = saved_scope;
     context.element_ancestors = saved_element_ancestors;
     context.block_depth_at_element = saved_block_depth_at_element;
     context.parent_element = saved_parent_element;
@@ -331,13 +310,14 @@ pub fn visit(
     context.analysis.component_namespace_is_svg = saved_svg;
     context.analysis.component_namespace_is_mathml = saved_mathml;
 
-    // Pop this element from DOM element stack
-    context.dom_element_stack.pop();
+    if collect_css {
+        context.dom_element_stack.pop();
+    }
 
     // Restore context
     context.fragment_owner_stack.pop();
     context.slot_owner_ancestors.pop();
-    context.is_direct_child_of_component = was_direct_child;
+    context.direct_component_parent = was_direct_child;
     context.is_direct_child_of_snippet = was_direct_snippet;
 
     Ok(())

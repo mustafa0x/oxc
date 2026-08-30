@@ -9,6 +9,11 @@ use super::transform_legacy::transform_export_let_declarations;
 use super::transform_store::{
     transform_store_assignments, transform_store_destructure_assignments,
 };
+use crate::compiler::phases::phase3_transform::shared::class_body::{
+    find_assignment_eq, find_class_header, initializer_starts_later, skip_ws_and_comments,
+    split_class_members_onto_lines,
+};
+use crate::compiler::utils::{is_escaped, is_escaped_char};
 use memchr::memmem;
 use rustc_hash::FxHashSet;
 use std::fmt::Write as _;
@@ -51,11 +56,6 @@ fn transform_script_content_inner(
     let derived_imported =
         imported_names.contains("derived") || store_sub_bases.contains("derived");
 
-    // NOTE: split_comma_separated_declarations has been moved to build.rs to run
-    // BEFORE transform_reassigned_destructures. This ensures user-written comma-separated
-    // declarations are split, but generated comma patterns (from destructure flattening)
-    // are preserved.
-
     let script = if memmem::find(script.as_bytes(), b"$props()").is_some() {
         script.replace("$props()", "$$props")
     } else {
@@ -77,10 +77,7 @@ fn transform_script_content_inner(
     let script = if memmem::find(script.as_bytes(), b"$props.id()").is_some() {
         let s = script.replace("$props.id()", "$.props_id($$renderer)");
         // Convert "let id = $.props_id($$renderer)" to "const id = ..."
-        s.replace(
-            "let id = $.props_id($$renderer)",
-            "const id = $.props_id($$renderer)",
-        )
+        s.replace("let id = $.props_id($$renderer)", "const id = $.props_id($$renderer)")
     } else {
         script
     };
@@ -93,35 +90,20 @@ fn transform_script_content_inner(
         script
     };
     let script = transform_state_snapshot_server(&script, dev);
-    let script = if !state_imported {
-        transform_object_destructure_state(&script)
-    } else {
-        script
-    };
+    let script = if !state_imported { transform_object_destructure_state(&script) } else { script };
     let script = if !state_imported {
         transform_rune_call_multiline(&script, "$state.raw(")
     } else {
         script
     };
-    let script = if !state_imported {
-        transform_array_destructure_state(&script)
-    } else {
-        script
-    };
-    let script = if !state_imported {
-        transform_rune_call_multiline(&script, "$state(")
-    } else {
-        script
-    };
+    let script = if !state_imported { transform_array_destructure_state(&script) } else { script };
+    let script =
+        if !state_imported { transform_rune_call_multiline(&script, "$state(") } else { script };
     // Svelte 5.52+: destructured `$derived(...)` / `$derived.by(...)` expands
     // into per-leaf `$.derived(...)` declarators (extract_paths semantics).
     // This must run BEFORE the plain `$derived[.by](` rewrites below so the
     // expanded form can use the standard pipeline.
-    let script = if !derived_imported {
-        expand_destructured_derived(&script)
-    } else {
-        script
-    };
+    let script = if !derived_imported { expand_destructured_derived(&script) } else { script };
     let script = if !derived_imported {
         transform_rune_call_multiline(&script, "$derived.by(")
     } else {
@@ -162,16 +144,8 @@ fn transform_script_content_inner(
     let script = transform_rune_call_multiline(&script, "$bindable(");
     let script = transform_store_destructure_assignments(&script);
     let script = transform_store_assignments(&script);
-    let script = if is_module {
-        script
-    } else {
-        transform_export_let_declarations(&script)
-    };
-    let script = if is_module {
-        script
-    } else {
-        strip_export_from_declarations(&script)
-    };
+    let script = if is_module { script } else { transform_export_let_declarations(&script) };
+    let script = if is_module { script } else { strip_export_from_declarations(&script) };
     // Transform `let x = value` declarations for variables exported via `export { x }`
     let script = if !reexported_props.is_empty() {
         transform_reexported_prop_declarations(&script, reexported_props)
@@ -259,17 +233,15 @@ fn transform_script_content_inner(
     // when they're not part of an IIFE call.
     result = strip_arrow_function_parens(result);
 
-    // In legacy mode (non-module, non-runes), reorder $: reactive statements
-    // to appear after function declarations (to match official Svelte SSR behavior)
-    if !is_module {
-        super::transform_legacy::reorder_reactive_statements_after_functions(&result)
-    } else {
+    if is_module {
         // In a `<script module>` body, a top-level `$:` labeled reactive
         // statement is dropped on the server: upstream's server
         // LabeledStatement visitor returns `b.empty` and collects it into the
         // (instance) reactive-statement set, which a module has no component
         // body to emit, so it vanishes. The client keeps it as a plain label.
         strip_top_level_reactive_labels(&result)
+    } else {
+        result
     }
 }
 
@@ -480,7 +452,7 @@ fn line_opens_unclosed_template_literal(line: &str) -> bool {
     while i < chars.len() {
         let ch = chars[i];
         if in_str {
-            if ch == str_ch && (i == 0 || chars[i - 1] != '\\') {
+            if ch == str_ch && !is_escaped_char(&chars, i) {
                 in_str = false;
             }
             i += 1;
@@ -489,7 +461,7 @@ fn line_opens_unclosed_template_literal(line: &str) -> bool {
         if ch == '\'' || ch == '"' {
             in_str = true;
             str_ch = ch;
-        } else if ch == '`' && (i == 0 || chars[i - 1] != '\\') {
+        } else if ch == '`' && !is_escaped_char(&chars, i) {
             backtick_count += 1;
         }
         i += 1;
@@ -511,7 +483,7 @@ fn line_closes_template_literal(line: &str) -> bool {
     while i < chars.len() {
         let ch = chars[i];
         if in_str {
-            if ch == str_ch && (i == 0 || chars[i - 1] != '\\') {
+            if ch == str_ch && !is_escaped_char(&chars, i) {
                 in_str = false;
             }
             i += 1;
@@ -520,7 +492,7 @@ fn line_closes_template_literal(line: &str) -> bool {
         if ch == '\'' || ch == '"' {
             in_str = true;
             str_ch = ch;
-        } else if ch == '`' && (i == 0 || chars[i - 1] != '\\') {
+        } else if ch == '`' && !is_escaped_char(&chars, i) {
             return true;
         }
         i += 1;
@@ -538,7 +510,7 @@ fn format_js_line(line: &str) -> String {
     while i < chars.len() {
         let c = chars[i];
 
-        if (c == '"' || c == '\'' || c == '`') && (i == 0 || chars[i - 1] != '\\') {
+        if (c == '"' || c == '\'' || c == '`') && !is_escaped_char(&chars, i) {
             if !in_string {
                 in_string = true;
                 string_char = c;
@@ -564,11 +536,7 @@ fn format_js_line(line: &str) -> String {
             while j + 1 < chars.len() && !(chars[j] == '*' && chars[j + 1] == '/') {
                 j += 1;
             }
-            let end = if j + 1 < chars.len() {
-                j + 2
-            } else {
-                chars.len()
-            };
+            let end = if j + 1 < chars.len() { j + 2 } else { chars.len() };
             result.extend(&chars[i..end]);
             i = end;
             continue;
@@ -576,11 +544,7 @@ fn format_js_line(line: &str) -> String {
 
         if c == '=' {
             let next = chars.get(i + 1).copied();
-            let prev = if !result.is_empty() {
-                result.chars().last()
-            } else {
-                None
-            };
+            let prev = if !result.is_empty() { result.chars().last() } else { None };
 
             if next == Some('=')
                 || next == Some('>')
@@ -613,11 +577,7 @@ fn format_js_line(line: &str) -> String {
         }
 
         if c == '{' {
-            let prev = if !result.is_empty() {
-                result.chars().last()
-            } else {
-                None
-            };
+            let prev = if !result.is_empty() { result.chars().last() } else { None };
             if prev == Some(')') {
                 result.push(' ');
             }
@@ -661,11 +621,8 @@ fn transform_object_destructure_state(script: &str) -> String {
             let value = remaining[..paren_end].trim();
 
             // Generate tmp variable name
-            let tmp_name = if tmp_counter == 0 {
-                "tmp".to_string()
-            } else {
-                format!("tmp_{}", tmp_counter)
-            };
+            let tmp_name =
+                if tmp_counter == 0 { "tmp".to_string() } else { format!("tmp_{}", tmp_counter) };
             tmp_counter += 1;
 
             // Parse the object pattern properties
@@ -691,11 +648,7 @@ fn transform_object_destructure_state(script: &str) -> String {
                             name, tmp_name, name, default
                         );
                     }
-                    ObjectPatternProp::RenamedWithDefault {
-                        key,
-                        value,
-                        default,
-                    } => {
+                    ObjectPatternProp::RenamedWithDefault { key, value, default } => {
                         // { a: x = 5 } -> x = tmp.a ?? 5
                         let _ = write!(
                             transformed,
@@ -714,12 +667,7 @@ fn transform_object_destructure_state(script: &str) -> String {
             // +1 to skip the closing paren of $state()
             let match_end = (start_pos as i64 + paren_end as i64 + offset + 1) as usize;
 
-            result = format!(
-                "{}{}{}",
-                &result[..match_start],
-                transformed,
-                &result[match_end..]
-            );
+            result = format!("{}{}{}", &result[..match_start], transformed, &result[match_end..]);
 
             let old_len = (full_match.len() + paren_end + 1) as i64;
             let new_len = transformed.len() as i64;
@@ -733,19 +681,9 @@ fn transform_object_destructure_state(script: &str) -> String {
 #[derive(Debug)]
 enum ObjectPatternProp {
     Simple(String),
-    Renamed {
-        key: String,
-        value: String,
-    },
-    WithDefault {
-        name: String,
-        default: String,
-    },
-    RenamedWithDefault {
-        key: String,
-        value: String,
-        default: String,
-    },
+    Renamed { key: String, value: String },
+    WithDefault { name: String, default: String },
+    RenamedWithDefault { key: String, value: String, default: String },
     Rest(String),
 }
 
@@ -794,17 +732,10 @@ fn parse_single_object_prop(prop: &str) -> ObjectPatternProp {
         if let Some(eq_idx) = rest.find('=') {
             let value = rest[..eq_idx].trim().to_string();
             let default = rest[eq_idx + 1..].trim().to_string();
-            return ObjectPatternProp::RenamedWithDefault {
-                key,
-                value,
-                default,
-            };
+            return ObjectPatternProp::RenamedWithDefault { key, value, default };
         }
 
-        return ObjectPatternProp::Renamed {
-            key,
-            value: rest.to_string(),
-        };
+        return ObjectPatternProp::Renamed { key, value: rest.to_string() };
     }
 
     // Check for default value: "name = default"
@@ -848,23 +779,16 @@ fn transform_array_destructure_state(script: &str) -> String {
             if has_rest {
                 let _ = write!(transformed, "{}\t$$array = $.to_array(tmp)", indent);
             } else {
-                let _ = write!(
-                    transformed,
-                    "{}\t$$array = $.to_array(tmp, {})",
-                    indent,
-                    vars.len()
-                );
+                let _ =
+                    write!(transformed, "{}\t$$array = $.to_array(tmp, {})", indent, vars.len());
             }
 
             for (i, var) in vars.iter().enumerate() {
                 let var = var.trim();
                 if var.starts_with("...") {
                     let rest_name = var.trim_start_matches("...");
-                    let _ = write!(
-                        transformed,
-                        ",\n{}\t{} = $$array.slice({})",
-                        indent, rest_name, i
-                    );
+                    let _ =
+                        write!(transformed, ",\n{}\t{} = $$array.slice({})", indent, rest_name, i);
                 } else if var.contains('=') {
                     let parts: Vec<&str> = var.splitn(2, '=').collect();
                     let name = parts[0].trim();
@@ -938,7 +862,7 @@ fn find_matching_paren_for_state(s: &str) -> Option<usize> {
     let mut string_char = ' ';
 
     for (i, c) in s.char_indices() {
-        if (c == '"' || c == '\'' || c == '`') && (i == 0 || s.as_bytes()[i - 1] != b'\\') {
+        if (c == '"' || c == '\'' || c == '`') && !is_escaped(s.as_bytes(), i) {
             if !in_string {
                 in_string = true;
                 string_char = c;
@@ -1006,97 +930,14 @@ fn transform_state_snapshot_server(script: &str, dev: bool) -> String {
                     result = replacement;
                     search_from = new_len;
                 } else {
-                    result = format!(
-                        "{}$.snapshot({}",
-                        &result[..abs_pos],
-                        &result[after_prefix..]
-                    );
+                    result =
+                        format!("{}$.snapshot({}", &result[..abs_pos], &result[after_prefix..]);
                     search_from = abs_pos + "$.snapshot(".len();
                 }
             }
         } else {
             search_from = abs_pos + prefix.len();
         }
-    }
-
-    result
-}
-
-/// Strip `$.snapshot(arg)` → `arg` when the call is the COMPLETE initializer of a
-/// variable declarator (`const|let|var NAME = $.snapshot(arg)`), mirroring upstream's
-/// `compileModule` server output. On the server-module path the client transform has
-/// already lowered `$state.snapshot(x)` → `$.snapshot(x)`; upstream keeps `$.snapshot`
-/// in every position EXCEPT a plain variable-declarator init, where the snapshot is
-/// redundant (the value is already a server-side plain value) and collapses to the bare
-/// argument:
-///   `const prev = $state.snapshot(this.rect)` → `const prev = this.rect`
-///   `return $state.snapshot(this.rect)`       → `return $.snapshot(this.rect)`  (kept)
-///   `this.other = $state.snapshot(this.rect)` → `this.other = $.snapshot(this.rect)` (kept)
-/// Only a single-declarator `const|let|var NAME = <whole-init>` is stripped — plain
-/// assignments (`x = …`, `obj.y = …`) and partial inits (`= cond ? snapshot(x) : y`)
-/// keep `$.snapshot`.
-pub(super) fn strip_snapshot_declarator_init_module(script: &str) -> String {
-    let needle = "$.snapshot(";
-    let mut result = script.to_string();
-    let mut search_from = 0;
-
-    while let Some(pos) = result[search_from..].find(needle) {
-        let abs_pos = search_from + pos;
-        let after_needle = abs_pos + needle.len();
-
-        // The text immediately before must be `const|let|var IDENT =` with nothing
-        // else between the `=` and the `$.snapshot(` (i.e. snapshot is the whole init).
-        let before = result[..abs_pos].trim_end();
-        let is_declarator_init = before.strip_suffix('=').is_some_and(|head| {
-            // Reject compound / comparison operators ending in `=` (`==`, `<=`, `=>`…).
-            let h = head.trim_end();
-            if h.ends_with('=')
-                || h.ends_with('!')
-                || h.ends_with('<')
-                || h.ends_with('>')
-                || head.ends_with('>')
-            {
-                return false;
-            }
-            // `head` should now end with the declarator name; the token before that
-            // name must be a `const`/`let`/`var` keyword (single-declarator form).
-            let name_start = h
-                .rfind(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$'))
-                .map(|i| i + 1)
-                .unwrap_or(0);
-            let name = &h[name_start..];
-            if name.is_empty() {
-                return false;
-            }
-            let kw = h[..name_start].trim_end();
-            kw.ends_with("const") || kw.ends_with("let") || kw.ends_with("var")
-        });
-
-        if !is_declarator_init {
-            search_from = after_needle;
-            continue;
-        }
-
-        let Some(content_end) = find_matching_paren_for_state(&result[after_needle..]) else {
-            search_from = after_needle;
-            continue;
-        };
-        let close = after_needle + content_end;
-        // The snapshot must be the WHOLE init: the next non-whitespace char after the
-        // closing paren is a declarator terminator (`;`, `,`, newline) or EOF.
-        let after_close = result[close + 1..].trim_start();
-        let whole_init = after_close.is_empty()
-            || after_close.starts_with(';')
-            || after_close.starts_with(',')
-            || after_close.starts_with('\n');
-        if !whole_init {
-            search_from = after_needle;
-            continue;
-        }
-
-        let content = result[after_needle..close].to_string();
-        result = format!("{}{}{}", &result[..abs_pos], content, &result[close + 1..]);
-        search_from = abs_pos + content.len();
     }
 
     result
@@ -1330,6 +1171,7 @@ fn wrap_derived_reads_in_script(script: &str, extra_derived: &FxHashSet<String>)
         script,
         &derived_names,
         &derived_var_names,
+        &derived_declarators,
         extra_derived,
     ) {
         return out;
@@ -2363,9 +2205,7 @@ fn wrap_derived_reads_in_script_inner_with_shadow(
             let is_shadowed = shadow_ranges
                 .get(name)
                 .map(|ranges| {
-                    ranges
-                        .iter()
-                        .any(|&(s, e)| absolute_start >= s && absolute_start < e)
+                    ranges.iter().any(|&(s, e)| absolute_start >= s && absolute_start < e)
                 })
                 .unwrap_or(false);
             let is_own_declarator_lhs = declarator_lhs_positions.contains(&absolute_start);
@@ -2479,19 +2319,10 @@ fn is_derived_read_position(bytes: &[u8], start: usize, end: usize) -> bool {
     // `var foo`, `function foo`, `class foo`. Look back for the keyword.
     if let Some(b) = prev_non_ws {
         // Skip if previous token is one of these keywords.
-        let kw_end = (0..start)
-            .rev()
-            .find(|&i| !bytes[i].is_ascii_whitespace())
-            .map(|i| i + 1)
-            .unwrap_or(0);
+        let kw_end =
+            (0..start).rev().find(|&i| !bytes[i].is_ascii_whitespace()).map(|i| i + 1).unwrap_or(0);
         let _ = b;
-        for kw in [
-            &b"let"[..],
-            &b"const"[..],
-            &b"var"[..],
-            &b"function"[..],
-            &b"class"[..],
-        ] {
+        for kw in [&b"let"[..], &b"const"[..], &b"var"[..], &b"function"[..], &b"class"[..]] {
             if kw_end >= kw.len() && bytes[kw_end - kw.len()..kw_end] == *kw {
                 // Word boundary check on the left side.
                 if kw_end == kw.len()
@@ -2506,9 +2337,8 @@ fn is_derived_read_position(bytes: &[u8], start: usize, end: usize) -> bool {
         }
     }
     // What follows the identifier?
-    let next_non_ws = (end..bytes.len())
-        .find(|&i| !bytes[i].is_ascii_whitespace())
-        .map(|i| bytes[i]);
+    let next_non_ws =
+        (end..bytes.len()).find(|&i| !bytes[i].is_ascii_whitespace()).map(|i| bytes[i]);
     match next_non_ws {
         // `foo(...)`. Two cases:
         // - `foo()` (empty call) is already a getter invocation (or text a prior
@@ -2737,30 +2567,19 @@ fn compute_shadow_ranges(
             if entered {
                 // Step into the placeholder; mark the frame so the closing
                 // `}` resumes template-text scanning.
-                stack.push(Frame {
-                    open: i,
-                    declared: Vec::new(),
-                    template_placeholder: true,
-                });
+                stack.push(Frame { open: i, declared: Vec::new(), template_placeholder: true });
             }
             continue;
         }
         if b == b'{' {
-            stack.push(Frame {
-                open: i,
-                declared: Vec::new(),
-                template_placeholder: false,
-            });
+            stack.push(Frame { open: i, declared: Vec::new(), template_placeholder: false });
             i += 1;
             continue;
         }
         if b == b'}' {
             if let Some(frame) = stack.pop() {
                 for name in &frame.declared {
-                    ranges
-                        .entry(name.clone())
-                        .or_default()
-                        .push((frame.open, i));
+                    ranges.entry(name.clone()).or_default().push((frame.open, i));
                 }
                 if frame.template_placeholder {
                     // Back inside the surrounding template literal's text.
@@ -3089,11 +2908,7 @@ fn compute_shadow_ranges(
                     // `function updateLeft(left) {…}` must not wrap the
                     // param `left` even when an outer derived is named
                     // `left`.
-                    stack.push(Frame {
-                        open,
-                        declared: params,
-                        template_placeholder: false,
-                    });
+                    stack.push(Frame { open, declared: params, template_placeholder: false });
                     i = m + 1;
                     continue;
                 } else if is_arrow {
@@ -3207,11 +3022,8 @@ fn declarator_pattern_only(decl: &str) -> &str {
             if !preceded_by_ident {
                 // Check for `of ` or `in ` (keyword + whitespace/end).
                 let rest = &bytes[i..];
-                let kw_len = if rest.starts_with(b"of") || rest.starts_with(b"in") {
-                    Some(2)
-                } else {
-                    None
-                };
+                let kw_len =
+                    if rest.starts_with(b"of") || rest.starts_with(b"in") { Some(2) } else { None };
                 if let Some(kl) = kw_len {
                     // Ensure what follows is not an identifier char (word boundary).
                     let after = i + kl;
@@ -3574,11 +3386,7 @@ fn expand_destructured_derived(script: &str) -> String {
             arg_expr.to_string()
         } else {
             let n = d_counter.fetch_add(1, Ordering::Relaxed);
-            let name = if n == 0 {
-                "$$d".to_string()
-            } else {
-                format!("$$d_{}", n)
-            };
+            let name = if n == 0 { "$$d".to_string() } else { format!("$$d_{}", n) };
             // Initializer: `$.derived(...)` — for `.by` we pass the value
             // directly; for plain `$derived(expr)` we wrap in `() => expr`.
             let init = if is_by {
@@ -3669,11 +3477,7 @@ fn extract_paths_walk(
                 } else {
                     p
                 };
-                if key.starts_with('[') {
-                    None
-                } else {
-                    Some(format!("\"{}\"", key))
-                }
+                if key.starts_with('[') { None } else { Some(format!("\"{}\"", key)) }
             })
             .collect();
 
@@ -3684,11 +3488,8 @@ fn extract_paths_walk(
             }
             if let Some(rest_name) = prop.strip_prefix("...") {
                 let rest_name = rest_name.trim();
-                let rest_expr = format!(
-                    "$.exclude_from_object({}, [{}])",
-                    initial,
-                    exclude_keys.join(", ")
-                );
+                let rest_expr =
+                    format!("$.exclude_from_object({}, [{}])", initial, exclude_keys.join(", "));
                 if is_plain_identifier(rest_name) {
                     paths.push((rest_name.to_string(), rest_expr));
                 } else {
@@ -3727,17 +3528,10 @@ fn extract_paths_walk(
         let elements = split_top_level(inner, b',');
         // Determine whether the last element is a rest. If so, the
         // upstream call omits the second `to_array` arg (capacity).
-        let has_rest = elements
-            .last()
-            .map(|e| e.trim().starts_with("..."))
-            .unwrap_or(false);
+        let has_rest = elements.last().map(|e| e.trim().starts_with("...")).unwrap_or(false);
         let array_name = {
             let n = derived_array_counter.fetch_add(1, Ordering::Relaxed);
-            if n == 0 {
-                "$$derived_array".to_string()
-            } else {
-                format!("$$derived_array_{}", n)
-            }
+            if n == 0 { "$$derived_array".to_string() } else { format!("$$derived_array_{}", n) }
         };
         let to_array_call = if has_rest {
             format!("$.to_array({})", initial)
@@ -3812,18 +3606,9 @@ fn handle_value_pattern(
     if value_pat.starts_with('{') || value_pat.starts_with('[') {
         // Could have a trailing default after the matching bracket.
         let (sub_pattern, default) = split_pattern_default(value_pat);
-        let effective = if let Some(d) = default {
-            build_fallback_text(member, d)
-        } else {
-            member.to_string()
-        };
-        extract_paths_walk(
-            sub_pattern,
-            &effective,
-            inserts,
-            paths,
-            derived_array_counter,
-        );
+        let effective =
+            if let Some(d) = default { build_fallback_text(member, d) } else { member.to_string() };
+        extract_paths_walk(sub_pattern, &effective, inserts, paths, derived_array_counter);
     } else if let Some(eq) = find_top_level_equals(value_pat) {
         // `key: name = default`
         let name = value_pat[..eq].trim();
@@ -4037,11 +3822,7 @@ fn is_plain_identifier(s: &str) -> bool {
 /// True if [start, end) is a word — i.e., no identifier char immediately
 /// before `start` or after `end - 1`.
 fn is_word_boundary(bytes: &[u8], start: usize, end: usize) -> bool {
-    let before = if start == 0 {
-        None
-    } else {
-        Some(bytes[start - 1])
-    };
+    let before = if start == 0 { None } else { Some(bytes[start - 1]) };
     let after = bytes.get(end).copied();
     let before_ok = match before {
         Some(b) => !(b.is_ascii_alphanumeric() || b == b'_' || b == b'$'),
@@ -4129,27 +3910,38 @@ fn unthunk_no_arg_ident_call(expr: &str) -> Option<&str> {
     if id_trimmed.is_empty() {
         return None;
     }
-    if !id_trimmed
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
-    {
+    if !id_trimmed.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$') {
         return None;
     }
-    if !id_trimmed
-        .chars()
-        .next()
-        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_' || c == '$')
-    {
+    if !id_trimmed.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_' || c == '$') {
         return None;
     }
     // Reject reserved words that can't be used as identifiers in this slot.
-    if matches!(
-        id_trimmed,
-        "true" | "false" | "null" | "undefined" | "void" | "new" | "this"
-    ) {
+    if matches!(id_trimmed, "true" | "false" | "null" | "undefined" | "void" | "new" | "this") {
         return None;
     }
     Some(id_trimmed)
+}
+
+/// The rune argument as it goes inside `$.derived(…)`, verbatim except for an
+/// object literal's wrapping parens — and a newline when the argument ends
+/// inside a `//` comment, which would otherwise swallow the closing paren the
+/// caller appends.
+fn rune_field_value(value: &str) -> String {
+    let value = value.trim();
+    let mut out = String::with_capacity(value.len() + 3);
+    let needs_paren = value.starts_with('{');
+    if needs_paren {
+        out.push('(');
+    }
+    out.push_str(value);
+    if crate::compiler::phases::phase3_transform::shared::js_scan::ends_inside_line_comment(&out) {
+        out.push('\n');
+    }
+    if needs_paren {
+        out.push(')');
+    }
+    out
 }
 
 /// Emit the server replacement for a single rune call, given the raw text
@@ -4287,9 +4079,7 @@ fn transform_rune_call_multiline(script: &str, prefix: &str) -> String {
             let potential: String = chars[i..i + prefix_len].iter().collect();
             if potential == prefix {
                 // Check if this occurrence is inside a shadowed scope
-                let is_shadowed = shadow_ranges
-                    .iter()
-                    .any(|&(start, end)| i >= start && i < end);
+                let is_shadowed = shadow_ranges.iter().any(|&(start, end)| i >= start && i < end);
 
                 if is_shadowed {
                     // Don't transform - keep the original text
@@ -4307,7 +4097,7 @@ fn transform_rune_call_multiline(script: &str, prefix: &str) -> String {
                 while end < chars.len() && depth > 0 {
                     let c = chars[end];
 
-                    if (c == '"' || c == '\'' || c == '`') && (end == 0 || chars[end - 1] != '\\') {
+                    if (c == '"' || c == '\'' || c == '`') && !is_escaped_char(&chars, end) {
                         if !in_string {
                             in_string = true;
                             string_char = c;
@@ -4359,7 +4149,7 @@ fn find_rune_shadow_ranges(script: &str, rune_name: &str) -> Vec<(usize, usize)>
         if chars[i] == '"' || chars[i] == '\'' || chars[i] == '`' {
             let quote = chars[i];
             i += 1;
-            while i < len && !(chars[i] == quote && (i == 0 || chars[i - 1] != '\\')) {
+            while i < len && (chars[i] != quote || is_escaped_char(&chars, i)) {
                 i += 1;
             }
             if i < len {
@@ -4432,7 +4222,7 @@ fn find_rune_shadow_ranges(script: &str, rune_name: &str) -> Vec<(usize, usize)>
                                 while body_end < len && brace_depth > 0 {
                                     let c = chars[body_end];
                                     if (c == '"' || c == '\'' || c == '`')
-                                        && (body_end == 0 || chars[body_end - 1] != '\\')
+                                        && !is_escaped_char(&chars, body_end)
                                     {
                                         if !in_str {
                                             in_str = true;
@@ -4468,9 +4258,7 @@ fn find_rune_shadow_ranges(script: &str, rune_name: &str) -> Vec<(usize, usize)>
             let mut str_char = ' ';
             while paren_end < len && depth > 0 {
                 let c = chars[paren_end];
-                if (c == '"' || c == '\'' || c == '`')
-                    && (paren_end == 0 || chars[paren_end - 1] != '\\')
-                {
+                if (c == '"' || c == '\'' || c == '`') && !is_escaped_char(&chars, paren_end) {
                     if !in_str {
                         in_str = true;
                         str_char = c;
@@ -4511,7 +4299,7 @@ fn find_rune_shadow_ranges(script: &str, rune_name: &str) -> Vec<(usize, usize)>
                         while body_end < len && brace_depth > 0 {
                             let c = chars[body_end];
                             if (c == '"' || c == '\'' || c == '`')
-                                && (body_end == 0 || chars[body_end - 1] != '\\')
+                                && !is_escaped_char(&chars, body_end)
                             {
                                 if !in_str2 {
                                     in_str2 = true;
@@ -4679,27 +4467,31 @@ fn update_member_brace_depth(
     paren: &mut i32,
     param_brace: &mut i32,
 ) -> bool {
-    let mut in_str = false;
-    let mut str_ch = ' ';
+    let bytes = line.as_bytes();
     let mut closed = false;
-    for ch in line.chars() {
-        if in_str {
-            if ch == str_ch {
-                in_str = false;
+    let mut prev: Option<u8> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        // Brackets inside a comment or literal are text: counting them closed a
+        // method body early at a `// … } …` comment and dropped every member
+        // after it (#2253).
+        if let Some((next, is_comment)) =
+            crate::compiler::phases::phase3_transform::shared::js_scan::skip_opaque(bytes, i, prev)
+        {
+            if !is_comment {
+                prev = Some(b'x');
             }
+            i = next;
             continue;
         }
+        let ch = bytes[i];
         match ch {
-            '\'' | '"' | '`' => {
-                in_str = true;
-                str_ch = ch;
-            }
-            '(' | '[' => *paren += 1,
-            ')' | ']' => *paren -= 1,
-            '{' if *paren > 0 => *param_brace += 1,
-            '}' if *paren > 0 => *param_brace -= 1,
-            '{' if *paren == 0 => *depth += 1,
-            '}' if *paren == 0 => {
+            b'(' | b'[' => *paren += 1,
+            b')' | b']' => *paren -= 1,
+            b'{' if *paren > 0 => *param_brace += 1,
+            b'}' if *paren > 0 => *param_brace -= 1,
+            b'{' if *paren == 0 => *depth += 1,
+            b'}' if *paren == 0 => {
                 if *param_brace > 0 {
                     // This `}` closes a brace that was opened inside a param list
                     // (e.g. the `{...}` destructure in `constructor({a,b}) {`).
@@ -4714,6 +4506,10 @@ fn update_member_brace_depth(
             }
             _ => {}
         }
+        if !ch.is_ascii_whitespace() {
+            prev = Some(ch);
+        }
+        i += 1;
     }
     closed
 }
@@ -4865,10 +4661,44 @@ fn strip_ts_field_modifiers(lhs: &str) -> &str {
     s
 }
 
+/// Net bracket depth of `s`, counting only bytes that are code.
+///
+/// The class-member accumulators below stop when their depth reaches zero, so a
+/// `)` inside a comment ends a field early and drops everything after it.
+/// Callers pass the whole accumulated text, not one line, so a block comment
+/// that spans lines is closed by the same scan that opened it.
+fn code_bracket_depth(s: &str) -> i32 {
+    let mut depth = 0i32;
+    for (_, byte) in
+        crate::compiler::phases::phase3_transform::shared::js_scan::code_bytes(s.as_bytes())
+    {
+        match byte {
+            b'(' | b'{' | b'[' => depth += 1,
+            b')' | b'}' | b']' => depth -= 1,
+            _ => {}
+        }
+    }
+    depth
+}
+
+/// Return the assignment, rune and rune-call offsets when a rune is the whole
+/// initializer of a class field or constructor assignment. Upstream reads the
+/// initializer AST, so the spelling between `=` and the rune is immaterial.
+fn class_rune_initializer<'a>(text: &str, runes: &'a [&'a str]) -> Option<(usize, usize, &'a str)> {
+    let eq = find_assignment_eq(text)?;
+    let rune_pos = skip_ws_and_comments(text, eq + 1);
+    let rest = &text[rune_pos..];
+    let rune = runes
+        .iter()
+        .copied()
+        .find(|rune| rest.strip_prefix(rune).is_some_and(|after| after.starts_with('(')))?;
+    Some((eq, rune_pos, rune))
+}
+
 /// Transform class fields with $derived runes for server-side.
 pub(crate) fn transform_class_fields_server(script: &str) -> String {
     let script_bytes = script.as_bytes();
-    if memmem::find(script_bytes, b"class ").is_none()
+    if memmem::find(script_bytes, b"class").is_none()
         || (memmem::find(script_bytes, b"$derived(").is_none()
             && memmem::find(script_bytes, b"$derived.by(").is_none()
             && memmem::find(script_bytes, b"$state(").is_none()
@@ -4877,36 +4707,48 @@ pub(crate) fn transform_class_fields_server(script: &str) -> String {
         return script.to_string();
     }
 
-    let Some(class_pos) = memmem::find(script_bytes, b"class ") else {
+    // Both offsets have to come from the lexical scan: a `class ` inside a
+    // comment or a string used to become a "class header" whose "body" was the
+    // next function, lowering its locals into private class fields in statement
+    // position — output no JS parser accepts (#2986).
+    let Some(header) = find_class_header(script) else {
         return script.to_string();
     };
+    let class_pos = header.keyword;
+    let brace_pos = header.body_brace - class_pos;
 
     let after_class = &script[class_pos..];
-    let Some(brace_pos) = after_class.find('{') else {
-        return script.to_string();
+    // A superclass can be an inline class expression, whose own body upstream
+    // reaches through the ordinary walk (#3072).
+    let heritage_header;
+    let class_header: &str = match header.heritage_start {
+        Some(hs) => {
+            heritage_header = format!(
+                "{}{}{{",
+                &script[class_pos..hs],
+                transform_class_fields_server(&script[hs..header.body_brace])
+            );
+            &heritage_header
+        }
+        None => &after_class[..brace_pos + 1],
     };
 
-    let class_header = &after_class[..brace_pos + 1];
+    let class_body_start = header.body_brace + 1;
+    // Lexically aware match: a `}` inside a comment, string, template or regex
+    // (e.g. `// returns { ok }`) must not close the class body and silently
+    // delete every member after it (#2253).
+    let class_body_end = crate::compiler::phases::phase1_parse::utils::find_matching_bracket(
+        script,
+        class_body_start,
+        '{',
+    )
+    .unwrap_or(class_body_start);
 
-    let class_body_start = class_pos + brace_pos + 1;
-    let mut brace_depth = 1;
-    let mut class_body_end = class_body_start;
-
-    for (i, c) in script[class_body_start..].char_indices() {
-        match c {
-            '{' => brace_depth += 1,
-            '}' => {
-                brace_depth -= 1;
-                if brace_depth == 0 {
-                    class_body_end = class_body_start + i;
-                    break;
-                }
-            }
-            _ => {}
-        }
-    }
-
-    let class_body = &script[class_body_start..class_body_end];
+    // The member scan below is line-based, so members sharing a physical line
+    // must first be broken apart or everything after the first one is dropped
+    // (issue #2087).
+    let normalized_body = split_class_members_onto_lines(&script[class_body_start..class_body_end]);
+    let class_body: &str = &normalized_body;
 
     #[derive(Debug, Clone)]
     enum ClassMember {
@@ -4947,7 +4789,6 @@ pub(crate) fn transform_class_fields_server(script: &str) -> String {
     // For multiline derived fields: accumulate text until parens balance
     let mut in_derived_field = false;
     let mut derived_accum = String::new();
-    let mut derived_paren_depth: i32 = 0;
     let mut derived_field_name = String::new();
     let mut derived_field_is_private = false;
     let mut derived_field_is_by = false;
@@ -4959,7 +4800,6 @@ pub(crate) fn transform_class_fields_server(script: &str) -> String {
     // client module transform, which then privatizes the public field.
     let mut in_state_field = false;
     let mut state_accum = String::new();
-    let mut state_paren_depth: i32 = 0;
     let mut state_field_name = String::new();
 
     // For multiline plain (non-rune) field initializers: accumulate lines until
@@ -4967,7 +4807,7 @@ pub(crate) fn transform_class_fields_server(script: &str) -> String {
     // where the `{` is inside the initializer and spans multiple lines.
     let mut in_plain_field = false;
     let mut plain_field_lines: Vec<String> = Vec::new();
-    let mut plain_field_depth: i32 = 0;
+    let mut plain_field_is_conditional = false;
 
     // For block comments (`/** … */` / `/* … */`) inside class bodies: accumulate
     // lines until the closing `*/` and push them as a `ClassMember::Comment` so the
@@ -5012,34 +4852,63 @@ pub(crate) fn transform_class_fields_server(script: &str) -> String {
 
     while line_idx < all_lines.len() {
         let line = all_lines[line_idx];
-        let trimmed = line.trim();
+        let initial_trimmed = line.trim();
         line_idx += 1;
+
+        // A field initializer may begin on the next physical line. Look ahead
+        // only while the text after its assignment is still entirely whitespace
+        // or comments, and consume those lines only once the first token is a
+        // rune. This leaves ordinary multiline fields to the existing scanner.
+        let mut joined_line = None;
+        if !in_derived_field
+            && !in_state_field
+            && !in_plain_field
+            && !in_block
+            && !in_block_comment
+            && initializer_starts_later(initial_trimmed)
+        {
+            let mut candidate = initial_trimmed.to_string();
+            let mut next_idx = line_idx;
+            while next_idx < all_lines.len() {
+                candidate.push('\n');
+                candidate.push_str(all_lines[next_idx].trim());
+                let Some(eq) = find_assignment_eq(&candidate) else {
+                    break;
+                };
+                let init = skip_ws_and_comments(&candidate, eq + 1);
+                if init == candidate.len() {
+                    next_idx += 1;
+                    continue;
+                }
+                if class_rune_initializer(
+                    &candidate,
+                    &["$derived.by", "$derived", "$state.raw", "$state"],
+                )
+                .is_some()
+                {
+                    line_idx = next_idx + 1;
+                    joined_line = Some(candidate);
+                }
+                break;
+            }
+        }
+        let trimmed = joined_line.as_deref().unwrap_or(initial_trimmed);
 
         // Continue accumulating multiline derived field
         if in_derived_field {
             derived_accum.push('\n');
             derived_accum.push_str(trimmed);
-            for c in trimmed.chars() {
-                match c {
-                    '(' | '{' | '[' => derived_paren_depth += 1,
-                    ')' | '}' | ']' => derived_paren_depth -= 1,
-                    _ => {}
-                }
-            }
-            if derived_paren_depth <= 0 {
+            if code_bracket_depth(&derived_accum) <= 0 {
                 in_derived_field = false;
                 // Now process the complete multiline derived field
                 let full_text = derived_accum.clone();
-                let derived_pattern = if derived_field_is_by {
-                    "$derived.by("
-                } else {
-                    "$derived("
-                };
+                let derived_pattern =
+                    if derived_field_is_by { "$derived.by(" } else { "$derived(" };
                 if let Some(derived_pos) = full_text.find(derived_pattern) {
                     let value_start = derived_pos + derived_pattern.len();
                     let after_paren = &full_text[value_start..];
                     if let Some(value_end) = find_matching_paren_server(after_paren) {
-                        let value = after_paren[..value_end].to_string();
+                        let value = strip_trailing_arg_comma(&after_paren[..value_end]).to_string();
                         let sanitized_name = sanitize_identifier(&derived_field_name);
                         let private_name = if derived_field_is_private {
                             format!("#{}", sanitized_name)
@@ -5047,12 +4916,7 @@ pub(crate) fn transform_class_fields_server(script: &str) -> String {
                             backing_private(&derived_field_name)
                         };
 
-                        let value_str = value.trim();
-                        let wrapped_value = if value_str.starts_with('{') {
-                            format!("({})", value_str)
-                        } else {
-                            value_str.to_string()
-                        };
+                        let wrapped_value = rune_field_value(&value);
 
                         let transformed_line = if derived_field_is_by {
                             format!("{} = $.derived({})", private_name, wrapped_value)
@@ -5076,26 +4940,16 @@ pub(crate) fn transform_class_fields_server(script: &str) -> String {
         if in_state_field {
             state_accum.push('\n');
             state_accum.push_str(trimmed);
-            for c in trimmed.chars() {
-                match c {
-                    '(' | '{' | '[' => state_paren_depth += 1,
-                    ')' | '}' | ']' => state_paren_depth -= 1,
-                    _ => {}
-                }
-            }
-            if state_paren_depth <= 0 {
+            if code_bracket_depth(&state_accum) <= 0 {
                 in_state_field = false;
                 let full_text = state_accum.clone();
-                let state_pattern = if full_text.contains("$state.raw(") {
-                    "$state.raw("
-                } else {
-                    "$state("
-                };
+                let state_pattern =
+                    if full_text.contains("$state.raw(") { "$state.raw(" } else { "$state(" };
                 if let Some(sp) = full_text.find(state_pattern) {
                     let value_start = sp + state_pattern.len();
                     let after_paren = &full_text[value_start..];
                     if let Some(value_end) = find_matching_paren_server(after_paren) {
-                        let value = after_paren[..value_end].trim();
+                        let value = strip_trailing_arg_comma(&after_paren[..value_end]).trim();
                         has_state_fields = true;
                         if value.is_empty() {
                             members.push(ClassMember::Field(state_field_name.clone()));
@@ -5116,22 +4970,17 @@ pub(crate) fn transform_class_fields_server(script: &str) -> String {
         // single Field member so the emitter can write it verbatim.
         if in_plain_field {
             plain_field_lines.push(line.to_string());
-            for c in trimmed.chars() {
-                match c {
-                    '(' | '{' | '[' => plain_field_depth += 1,
-                    ')' | '}' | ']' => plain_field_depth -= 1,
-                    _ => {}
-                }
-            }
-            if plain_field_depth <= 0 {
+            if code_bracket_depth(&plain_field_lines.join("\n")) <= 0
+                && (!plain_field_is_conditional || trimmed.starts_with(':'))
+            {
                 in_plain_field = false;
+                plain_field_is_conditional = false;
                 // Emit the full multi-line field as a single Field entry whose
                 // text is the source lines joined. The emitter handles it
                 // specially when it sees newlines inside the Field value.
                 let field_text = plain_field_lines.join("\n");
                 members.push(ClassMember::Field(field_text));
                 plain_field_lines.clear();
-                plain_field_depth = 0;
             }
             continue;
         }
@@ -5308,13 +5157,18 @@ pub(crate) fn transform_class_fields_server(script: &str) -> String {
         // (issue #648)
         let is_method_start = trimmed.contains('(')
             && trimmed.contains('{')
-            && trimmed
-                .find('=')
-                .is_none_or(|eq_pos| trimmed.find('(').is_some_and(|p| p < eq_pos))
+            && trimmed.find('=').is_none_or(|eq_pos| trimmed.find('(').is_some_and(|p| p < eq_pos))
             && !trimmed.starts_with("//")
             && !trimmed.starts_with("/*");
 
-        if is_method_start {
+        // A `static { … }` initialization block has no parameter list, so the
+        // method test above (which needs a `(`) never fired and the block's body
+        // was emitted line by line as fields — each with a `;` appended, comment
+        // lines included.
+        let is_static_block_start =
+            trimmed.strip_prefix("static").is_some_and(|rest| rest.trim_start().starts_with('{'));
+
+        if is_method_start || is_static_block_start {
             in_block = true;
             block_is_arrow_fn = false;
             block_depth = 0;
@@ -5337,11 +5191,9 @@ pub(crate) fn transform_class_fields_server(script: &str) -> String {
             continue;
         }
 
-        let is_derived_field = memmem::find(trimmed_bytes, b"= $derived(").is_some()
-            || memmem::find(trimmed_bytes, b"=$derived(").is_some()
-            || memmem::find(trimmed_bytes, b"= $derived.by(").is_some()
-            || memmem::find(trimmed_bytes, b"=$derived.by(").is_some();
-        if is_derived_field && let Some(eq_pos) = trimmed.find('=') {
+        if let Some((eq_pos, derived_pos, derived_rune)) =
+            class_rune_initializer(trimmed, &["$derived.by", "$derived"])
+        {
             // Strip TypeScript field modifiers (readonly, public, private, protected, …)
             // so that e.g. `readonly props = $derived.by(…)` yields name="props" not
             // "readonly props". The `#` ergonomic-private prefix is preserved.
@@ -5349,19 +5201,14 @@ pub(crate) fn transform_class_fields_server(script: &str) -> String {
             let is_private = lhs_bare.starts_with('#');
             let name = lhs_bare.trim_start_matches('#').to_string();
 
-            let (derived_pattern, is_derived_by) =
-                if memmem::find(trimmed_bytes, b"$derived.by(").is_some() {
-                    ("$derived.by(", true)
-                } else {
-                    ("$derived(", false)
-                };
-
-            if let Some(derived_pos) = memmem::find(trimmed_bytes, derived_pattern.as_bytes()) {
-                let value_start = derived_pos + derived_pattern.len();
+            let is_derived_by = derived_rune == "$derived.by";
+            let derived_pattern_len = derived_rune.len() + 1;
+            {
+                let value_start = derived_pos + derived_pattern_len;
                 let after_paren = &trimmed[value_start..];
 
                 if let Some(value_end) = find_matching_paren_server(after_paren) {
-                    let value = after_paren[..value_end].to_string();
+                    let value = strip_trailing_arg_comma(&after_paren[..value_end]).to_string();
                     let sanitized_name = sanitize_identifier(&name);
                     let private_name = if is_private {
                         format!("#{}", sanitized_name)
@@ -5369,12 +5216,7 @@ pub(crate) fn transform_class_fields_server(script: &str) -> String {
                         backing_private(&name)
                     };
 
-                    let value_str = value.trim();
-                    let wrapped_value = if value_str.starts_with('{') {
-                        format!("({})", value_str)
-                    } else {
-                        value_str.to_string()
-                    };
+                    let wrapped_value = rune_field_value(&value);
 
                     let transformed_line = if is_derived_by {
                         format!("{} = $.derived({})", private_name, wrapped_value)
@@ -5394,14 +5236,6 @@ pub(crate) fn transform_class_fields_server(script: &str) -> String {
                     // Multiline derived field - accumulate until parens balance
                     in_derived_field = true;
                     derived_accum = trimmed.to_string();
-                    derived_paren_depth = 0;
-                    for c in trimmed.chars() {
-                        match c {
-                            '(' | '{' | '[' => derived_paren_depth += 1,
-                            ')' | '}' | ']' => derived_paren_depth -= 1,
-                            _ => {}
-                        }
-                    }
                     derived_field_name = name;
                     derived_field_is_private = is_private;
                     derived_field_is_by = is_derived_by;
@@ -5409,26 +5243,15 @@ pub(crate) fn transform_class_fields_server(script: &str) -> String {
                 }
             }
         }
-        let is_state_field = memmem::find(trimmed_bytes, b"= $state(").is_some()
-            || memmem::find(trimmed_bytes, b"=$state(").is_some()
-            || memmem::find(trimmed_bytes, b"= $state.raw(").is_some()
-            || memmem::find(trimmed_bytes, b"=$state.raw(").is_some();
-        if is_state_field && let Some(eq_pos) = trimmed.find('=') {
-            let (state_pattern, state_pos) =
-                if let Some(pos) = memmem::find(trimmed_bytes, b"$state.raw(") {
-                    ("$state.raw(", pos)
-                } else if let Some(pos) = memmem::find(trimmed_bytes, b"$state(") {
-                    ("$state(", pos)
-                } else {
-                    members.push(ClassMember::Field(trimmed.to_string()));
-                    continue;
-                };
+        if let Some((eq_pos, state_pos, state_rune)) =
+            class_rune_initializer(trimmed, &["$state.raw", "$state"])
+        {
             let field_name = trimmed[..eq_pos].trim();
-            let value_start = state_pos + state_pattern.len();
+            let value_start = state_pos + state_rune.len() + 1;
             let after_paren = &trimmed[value_start..];
 
             if let Some(value_end) = find_matching_paren_server(after_paren) {
-                let value = after_paren[..value_end].trim();
+                let value = strip_trailing_arg_comma(&after_paren[..value_end]).trim();
                 has_state_fields = true;
                 if value.is_empty() {
                     members.push(ClassMember::Field(field_name.to_string()));
@@ -5441,14 +5264,6 @@ pub(crate) fn transform_class_fields_server(script: &str) -> String {
                 // parens balance, then unwrap (see the `in_state_field` block).
                 in_state_field = true;
                 state_accum = trimmed.to_string();
-                state_paren_depth = 0;
-                for c in trimmed.chars() {
-                    match c {
-                        '(' | '{' | '[' => state_paren_depth += 1,
-                        ')' | '}' | ']' => state_paren_depth -= 1,
-                        _ => {}
-                    }
-                }
                 state_field_name = field_name.to_string();
                 continue;
             }
@@ -5459,19 +5274,24 @@ pub(crate) fn transform_class_fields_server(script: &str) -> String {
         // lines (e.g. `bundler = new Bundler({\n  ...\n})`). Accumulate until
         // the depth returns to 0 so the full initializer is emitted verbatim
         // instead of just the first line with a spurious `;` appended.
-        let mut field_bracket_depth: i32 = 0;
-        for c in trimmed.chars() {
-            match c {
-                '(' | '{' | '[' => field_bracket_depth += 1,
-                ')' | '}' | ']' => field_bracket_depth -= 1,
-                _ => {}
-            }
-        }
-        if field_bracket_depth > 0 {
+        let field_bracket_depth = code_bracket_depth(trimmed);
+        let next_nonempty_lines: Vec<&str> = all_lines[line_idx..]
+            .iter()
+            .filter_map(|next| {
+                let next = next.trim();
+                (!next.is_empty()).then_some(next)
+            })
+            .take(2)
+            .collect();
+        let starts_plain_field_conditional =
+            next_nonempty_lines.first().is_some_and(|next| next.starts_with('?'))
+                || (trimmed.ends_with('=')
+                    && next_nonempty_lines.get(1).is_some_and(|next| next.starts_with('?')));
+        if field_bracket_depth > 0 || starts_plain_field_conditional {
             in_plain_field = true;
+            plain_field_is_conditional = starts_plain_field_conditional;
             plain_field_lines.clear();
             plain_field_lines.push(line.to_string());
-            plain_field_depth = field_bracket_depth;
         } else {
             members.push(ClassMember::Field(trimmed.to_string()));
         }
@@ -5487,35 +5307,26 @@ pub(crate) fn transform_class_fields_server(script: &str) -> String {
             let mut new_lines: Vec<String> = Vec::new();
             for line in lines.iter() {
                 let trimmed = line.trim();
-                let tb = trimmed.as_bytes();
                 // Preserve original indentation prefix
                 let indent_prefix: String =
                     line.chars().take_while(|c| c.is_whitespace()).collect();
 
                 if trimmed.starts_with("this.")
-                    && (memmem::find(tb, b"= $derived(").is_some()
-                        || memmem::find(tb, b"=$derived(").is_some()
-                        || memmem::find(tb, b"= $derived.by(").is_some()
-                        || memmem::find(tb, b"=$derived.by(").is_some())
-                    && let Some(eq_pos) = trimmed.find('=')
+                    && let Some((eq_pos, derived_pos, derived_rune)) =
+                        class_rune_initializer(trimmed, &["$derived.by", "$derived"])
                 {
                     let lhs = trimmed[5..eq_pos].trim();
                     let is_private = lhs.starts_with('#');
                     let name = lhs.trim_start_matches('#').to_string();
 
-                    let (derived_pattern, is_derived_by) =
-                        if memmem::find(tb, b"$derived.by(").is_some() {
-                            ("$derived.by(", true)
-                        } else {
-                            ("$derived(", false)
-                        };
-
-                    if let Some(derived_pos) = memmem::find(tb, derived_pattern.as_bytes()) {
-                        let value_start = derived_pos + derived_pattern.len();
+                    let is_derived_by = derived_rune == "$derived.by";
+                    {
+                        let value_start = derived_pos + derived_rune.len() + 1;
                         let after_paren = &trimmed[value_start..];
 
                         if let Some(value_end) = find_matching_paren_server(after_paren) {
-                            let value = after_paren[..value_end].to_string();
+                            let value =
+                                strip_trailing_arg_comma(&after_paren[..value_end]).to_string();
                             let sanitized = sanitize_identifier(&name);
                             let private_ref = if is_private {
                                 format!("#{}", sanitized)
@@ -5550,29 +5361,15 @@ pub(crate) fn transform_class_fields_server(script: &str) -> String {
                 }
 
                 if trimmed.starts_with("this.")
-                    && (memmem::find(tb, b"= $state(").is_some()
-                        || memmem::find(tb, b"=$state(").is_some()
-                        || memmem::find(tb, b"= $state.raw(").is_some()
-                        || memmem::find(tb, b"=$state.raw(").is_some())
-                    && let Some(eq_pos) = trimmed.find('=')
+                    && let Some((eq_pos, state_pos, state_rune)) =
+                        class_rune_initializer(trimmed, &["$state.raw", "$state"])
                 {
                     let lhs = trimmed[5..eq_pos].trim();
-
-                    let (state_pattern, state_pos) =
-                        if let Some(pos) = memmem::find(tb, b"$state.raw(") {
-                            ("$state.raw(", pos)
-                        } else if let Some(pos) = memmem::find(tb, b"$state(") {
-                            ("$state(", pos)
-                        } else {
-                            new_lines.push(line.to_string());
-                            continue;
-                        };
-
-                    let value_start = state_pos + state_pattern.len();
+                    let value_start = state_pos + state_rune.len() + 1;
                     let after_paren = &trimmed[value_start..];
 
                     if let Some(value_end) = find_matching_paren_server(after_paren) {
-                        let value = after_paren[..value_end].trim();
+                        let value = strip_trailing_arg_comma(&after_paren[..value_end]).trim();
                         has_state_fields = true;
 
                         if value.is_empty() {
@@ -5622,19 +5419,12 @@ pub(crate) fn transform_class_fields_server(script: &str) -> String {
         if after_class_transformed == after_class_body {
             return script.to_string();
         }
-        return format!(
-            "{}{}",
-            &script[..class_body_end + 1],
-            after_class_transformed
-        );
+        return format!("{}{}", &script[..class_body_end + 1], after_class_transformed);
     }
 
     let mut new_class_body = String::new();
 
-    for field in derived_fields
-        .iter()
-        .filter(|f| f.constructor_declared && !f.is_private)
-    {
+    for field in derived_fields.iter().filter(|f| f.constructor_declared && !f.is_private) {
         let private_name = backing_private(&field.name);
 
         let _ = writeln!(new_class_body, "\t\t{};", private_name);
@@ -5689,9 +5479,8 @@ pub(crate) fn transform_class_fields_server(script: &str) -> String {
                     format!("{};", line)
                 };
                 let _ = writeln!(new_class_body, "\t\t{}", line_with_semi);
-                for field in derived_fields
-                    .iter()
-                    .filter(|f| !f.constructor_declared && !f.is_private)
+                for field in
+                    derived_fields.iter().filter(|f| !f.constructor_declared && !f.is_private)
                 {
                     let private_name = backing_private(&field.name);
                     // Check exact match: the line starts with the private name and the
@@ -5718,67 +5507,14 @@ pub(crate) fn transform_class_fields_server(script: &str) -> String {
                 }
             }
             ClassMember::Method(lines) => {
-                let is_constructor = lines
-                    .first()
-                    .is_some_and(|l| memmem::find(l.trim().as_bytes(), b"constructor(").is_some());
-
                 let method_text = lines.join("\n");
-                let mut transformed =
-                    transform_private_derived_accesses_server(&method_text, &derived_private_names);
-
-                // In constructors, convert assignments to derived private fields:
-                // `this.#field = value` → `this.#field(value)`
-                // This only applies when the value is NOT a $.derived() call
-                // (those are already handled by the constructor scanning above)
-                if is_constructor && !derived_private_names.is_empty() {
-                    for private_name in &derived_private_names {
-                        let assign_pattern = format!("this.{} = ", private_name);
-                        let mut new_transformed = String::new();
-                        let mut remaining = transformed.as_str();
-
-                        while let Some(pos) = remaining.find(&assign_pattern) {
-                            new_transformed.push_str(&remaining[..pos]);
-                            let after_assign = &remaining[pos + assign_pattern.len()..];
-
-                            // Check if the value is a $.derived() call - if so, leave as-is
-                            let value_trimmed = after_assign.trim_start();
-                            if value_trimmed.starts_with("$.derived(") {
-                                new_transformed.push_str(&assign_pattern);
-                                remaining = after_assign;
-                                continue;
-                            }
-
-                            // Find the end of the value (semicolon at the same nesting level)
-                            let mut depth = 0;
-                            let mut value_end = None;
-                            for (i, c) in after_assign.char_indices() {
-                                match c {
-                                    '(' | '{' | '[' => depth += 1,
-                                    ')' | '}' | ']' => depth -= 1,
-                                    ';' if depth == 0 => {
-                                        value_end = Some(i);
-                                        break;
-                                    }
-                                    _ => {}
-                                }
-                            }
-
-                            if let Some(end) = value_end {
-                                let value = after_assign[..end].trim();
-                                let _ =
-                                    write!(new_transformed, "this.{}({});", private_name, value);
-                                remaining = &after_assign[end + 1..];
-                            } else {
-                                // No semicolon found, leave as-is
-                                new_transformed.push_str(&assign_pattern);
-                                remaining = after_assign;
-                            }
-                        }
-
-                        new_transformed.push_str(remaining);
-                        transformed = new_transformed;
-                    }
-                }
+                let transformed = rewrite_private_derived_writes_server(
+                    &transform_private_derived_accesses_server(
+                        &method_text,
+                        &derived_private_names,
+                    ),
+                    &derived_private_names,
+                );
 
                 // Skip the usual blank-line separator when a block comment
                 // directly precedes this method (the comment's trailing `\n`
@@ -5797,8 +5533,10 @@ pub(crate) fn transform_class_fields_server(script: &str) -> String {
                 // Field/Method arms already do this; ArrowFn previously emitted
                 // verbatim, leaving `this.#<derived>` reads uncalled.
                 let arrow_text = lines.join("\n");
-                let transformed =
-                    transform_private_derived_accesses_server(&arrow_text, &derived_private_names);
+                let transformed = rewrite_private_derived_writes_server(
+                    &transform_private_derived_accesses_server(&arrow_text, &derived_private_names),
+                    &derived_private_names,
+                );
                 new_class_body.push_str(&transformed);
                 new_class_body.push('\n');
                 last_was_comment = false;
@@ -5825,6 +5563,117 @@ pub(crate) fn transform_class_fields_server(script: &str) -> String {
         before_class, class_header, new_class_body, after_class_transformed
     );
 
+    result
+}
+
+/// Split `= …` / `+= …` / `>>>= …` off the text following an assignment target,
+/// returning the operator without its trailing `=` (empty for a plain `=`) and
+/// the rest. `==`, `===` and `=>` are not assignments.
+fn split_assignment_operator(after: &str) -> Option<(&str, &str)> {
+    // Longest first: `>>>=` also starts with `>>=`, `||=` with `|=`.
+    const COMPOUND: &[&str] = &[
+        ">>>=", "<<=", ">>=", "**=", "||=", "&&=", "??=", "+=", "-=", "*=", "/=", "%=", "&=", "|=",
+        "^=",
+    ];
+    let trimmed = after.trim_start();
+    for op in COMPOUND {
+        if let Some(rest) = trimmed.strip_prefix(op) {
+            return Some((&op[..op.len() - 1], rest));
+        }
+    }
+    let rest = trimmed.strip_prefix('=')?;
+    if rest.starts_with('=') || rest.starts_with('>') {
+        return None;
+    }
+    Some(("", rest))
+}
+
+fn ends_with_this_receiver(code: &str) -> bool {
+    let Some(head) = code.strip_suffix("this") else {
+        return false;
+    };
+    !head.chars().next_back().is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '$')
+}
+
+/// Byte offset of the `;` that ends a value, or `None` if the value runs past
+/// the end of its enclosing bracket — an unbalanced closer means the scan
+/// started somewhere this rewrite cannot reason about.
+fn value_end_semicolon(value: &str) -> Option<usize> {
+    let mut depth = 0i32;
+    for (i, c) in
+        crate::compiler::phases::phase3_transform::shared::js_scan::code_bytes(value.as_bytes())
+    {
+        match c {
+            b'(' | b'{' | b'[' => depth += 1,
+            b')' | b'}' | b']' => {
+                depth -= 1;
+                if depth < 0 {
+                    return None;
+                }
+            }
+            b';' if depth == 0 => return Some(i),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// A private `$derived` field holds a callable on the server, so a write to it
+/// is a setter call: `this.#f = v` → `this.#f(v)`, `this.#f += 1` →
+/// `this.#f(this.#f() + 1)`. Reads are already wrapped when this runs, so the
+/// compound operand is spelled with the call form.
+///
+/// `this` only — upstream lowers any other receiver to an assignment to a call
+/// expression, which is not JavaScript, and rsvelte reproduces that rather than
+/// inventing a form upstream never emits.
+fn rewrite_private_derived_writes_server(code: &str, derived_private_names: &[String]) -> String {
+    if derived_private_names.is_empty() {
+        return code.to_string();
+    }
+    let mut result = code.to_string();
+    for private_name in derived_private_names {
+        let target = format!("this.{private_name}");
+        let mut rewritten = String::new();
+        let mut remaining = result.as_str();
+        while let Some(pos) = remaining.find(&target) {
+            rewritten.push_str(&remaining[..pos]);
+            let after = &remaining[pos + target.len()..];
+            let mut keep = || {
+                rewritten.push_str(&target);
+            };
+            if after.chars().next().is_some_and(|c| c.is_alphanumeric() || c == '_') {
+                keep();
+                remaining = after;
+                continue;
+            }
+            let Some((operator, rest)) = split_assignment_operator(after) else {
+                keep();
+                remaining = after;
+                continue;
+            };
+            let value = rest.trim_start();
+            // The field's own declaration keeps its initializer.
+            if operator.is_empty() && value.starts_with("$.derived(") {
+                keep();
+                remaining = after;
+                continue;
+            }
+            let Some(end) = value_end_semicolon(value) else {
+                keep();
+                remaining = after;
+                continue;
+            };
+            let operand = value[..end].trim();
+            if operator.is_empty() {
+                let _ = write!(rewritten, "{target}({operand})");
+            } else {
+                let _ = write!(rewritten, "{target}({target}() {operator} {operand})");
+            }
+            remaining = &value[end..];
+        }
+        rewritten.push_str(remaining);
+        result = rewritten;
+    }
     result
 }
 
@@ -5865,9 +5714,13 @@ fn transform_private_derived_accesses_server(
                 continue;
             }
 
-            let is_assignment = {
-                let trimmed_after = after_match.trim_start();
-                trimmed_after.starts_with('=') && !trimmed_after.starts_with("==")
+            // A compound target is lowered to a setter call afterwards, but only
+            // through `this`: upstream wraps every other receiver, and matching
+            // its `inst.#f() += 1` is the recorded divergence.
+            let is_assignment = match split_assignment_operator(after_match) {
+                Some(("", _)) => true,
+                Some(_) => ends_with_this_receiver(&new_result),
+                None => false,
             };
 
             // A READ of a private `$derived` field is always rewritten to a call
@@ -5897,12 +5750,35 @@ fn transform_private_derived_accesses_server(
     result
 }
 
+/// Strip an argument-list trailing comma from an extracted rune-call argument
+/// (`$state(expr,)` → `expr`). The slice ends at the call's matching `)`, so a
+/// trailing CODE `,` can only be the argument list's, never part of the
+/// expression; without this the unwrapped field prints `expr,;`.
+fn strip_trailing_arg_comma(value: &str) -> &str {
+    let mut last_code: Option<(usize, u8)> = None;
+    for (i, c) in
+        crate::compiler::phases::phase3_transform::shared::js_scan::code_bytes(value.as_bytes())
+    {
+        if !c.is_ascii_whitespace() {
+            last_code = Some((i, c));
+        }
+    }
+    match last_code {
+        Some((i, b',')) => value[..i].trim_end(),
+        _ => value,
+    }
+}
+
 fn find_matching_paren_server(s: &str) -> Option<usize> {
     let mut depth = 1;
-    for (i, c) in s.char_indices() {
+    // Lexical: a bracket inside a comment or literal is text, and counting it
+    // ended the rune's argument early (#2434).
+    for (i, c) in
+        crate::compiler::phases::phase3_transform::shared::js_scan::code_bytes(s.as_bytes())
+    {
         match c {
-            '(' | '{' | '[' => depth += 1,
-            ')' | '}' | ']' => {
+            b'(' | b'{' | b'[' => depth += 1,
+            b')' | b'}' | b']' => {
                 depth -= 1;
                 if depth == 0 {
                     return Some(i);
@@ -5920,10 +5796,7 @@ fn find_matching_paren_server(s: &str) -> Option<usize> {
 /// re-inserts them positionally), so the comments inside the removed range
 /// must be re-emitted in place.
 pub(crate) fn extract_comments_from_snippet(snippet: &str) -> Vec<String> {
-    extract_comments_from_snippet_with_pos(snippet)
-        .into_iter()
-        .map(|(_, c)| c)
-        .collect()
+    extract_comments_from_snippet_with_pos(snippet).into_iter().map(|(_, c)| c).collect()
 }
 
 /// Like `extract_comments_from_snippet`, but also returns each comment's byte
@@ -5952,9 +5825,7 @@ pub(crate) fn extract_comments_from_snippet_with_pos(snippet: &str) -> Vec<(usiz
                 i += 1;
             }
             b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'/' => {
-                let eol = memchr::memchr(b'\n', &bytes[i..])
-                    .map(|p| i + p)
-                    .unwrap_or(bytes.len());
+                let eol = memchr::memchr(b'\n', &bytes[i..]).map(|p| i + p).unwrap_or(bytes.len());
                 comments.push((i, snippet[i..eol].trim_end().to_string()));
                 i = eol;
             }
@@ -6097,9 +5968,8 @@ fn transform_reexported_prop_declarations(
                         let indent = &line[..line.len() - trimmed.len()];
                         for part in &parts {
                             let part_name = part.trim_end_matches(';').trim();
-                            if let Some((_, prop_name)) = reexported_props
-                                .iter()
-                                .find(|(local, _)| local == part_name)
+                            if let Some((_, prop_name)) =
+                                reexported_props.iter().find(|(local, _)| local == part_name)
                             {
                                 let _ = write!(
                                     result,
@@ -6117,11 +5987,7 @@ fn transform_reexported_prop_declarations(
                     reexported_props.iter().find(|(local, _)| local == name)
                 {
                     let indent = &line[..line.len() - trimmed.len()];
-                    let _ = write!(
-                        result,
-                        "{}{} {} = $$props['{}'];",
-                        indent, kw, name, prop_name
-                    );
+                    let _ = write!(result, "{}{} {} = $$props['{}'];", indent, kw, name, prop_name);
                     result.push('\n');
                     continue;
                 }
@@ -6139,39 +6005,24 @@ fn transform_reexported_prop_declarations(
 }
 
 /// Find assignment `=` in a simple declarator (not inside parentheses, brackets, etc.)
+/// Byte offset of the top-level `=`; callers slice `s` with it.
 fn find_simple_assignment(s: &str) -> Option<usize> {
-    let chars: Vec<char> = s.chars().collect();
+    let bytes = s.as_bytes();
     let mut depth = 0;
-    let mut in_string = false;
-    let mut string_char = ' ';
 
-    for (i, &c) in chars.iter().enumerate() {
-        if (c == '"' || c == '\'' || c == '`') && (i == 0 || chars[i - 1] != '\\') {
-            if !in_string {
-                in_string = true;
-                string_char = c;
-            } else if c == string_char {
-                in_string = false;
-            }
-            continue;
-        }
-
-        if in_string {
-            continue;
-        }
-
+    for (i, c) in crate::compiler::phases::phase3_transform::shared::js_scan::code_bytes(bytes) {
         match c {
-            '(' | '[' | '{' => depth += 1,
-            ')' | ']' | '}' => depth -= 1,
-            '=' if depth == 0 => {
-                let prev = if i > 0 { Some(chars[i - 1]) } else { None };
-                let next = chars.get(i + 1).copied();
-                if prev != Some('=')
-                    && prev != Some('!')
-                    && prev != Some('<')
-                    && prev != Some('>')
-                    && next != Some('=')
-                    && next != Some('>')
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            b'=' if depth == 0 => {
+                let prev = i.checked_sub(1).map(|k| bytes[k]);
+                let next = bytes.get(i + 1).copied();
+                if prev != Some(b'=')
+                    && prev != Some(b'!')
+                    && prev != Some(b'<')
+                    && prev != Some(b'>')
+                    && next != Some(b'=')
+                    && next != Some(b'>')
                 {
                     return Some(i);
                 }
@@ -6181,309 +6032,6 @@ fn find_simple_assignment(s: &str) -> Option<usize> {
     }
 
     None
-}
-
-/// Split comma-separated variable declarations into individual statements.
-/// e.g., `const a = 1, b = 2, c = 3;` -> `const a = 1;\nconst b = 2;\nconst c = 3;`
-///
-/// This matches the official Svelte compiler's AST-based VariableDeclaration splitting
-/// where each declarator becomes its own statement.
-///
-/// Handles both single-line and multi-line declarations:
-/// ```js
-/// let x = 'x',
-///     y = 'y',
-///     z = 'z';
-/// ```
-/// becomes:
-/// ```js
-/// let x = 'x';
-/// let y = 'y';
-/// let z = 'z';
-/// ```
-pub(crate) fn split_comma_separated_declarations(script: &str) -> String {
-    let mut result = String::new();
-    let lines: Vec<&str> = script.lines().collect();
-    let mut i = 0;
-    // Track brace nesting depth to only split top-level declarations.
-    // The official Svelte compiler only splits declarations at the top level of the
-    // instance script (via the VariableDeclaration visitor), not inside nested functions.
-    let mut brace_depth: i32 = 0;
-
-    while i < lines.len() {
-        let line = lines[i];
-        let trimmed = line.trim();
-        let indent = &line[..line.len() - line.trim_start().len()];
-
-        // Check if this line starts at top level (before counting this line's braces)
-        let is_top_level = brace_depth == 0;
-
-        // Update brace depth tracking using a simple char scan.
-        // This is approximate (doesn't handle braces inside strings/comments)
-        // but works well for typical Svelte instance script code.
-        let mut in_string = false;
-        let mut string_char = ' ';
-        let mut prev_char = ' ';
-        let mut in_template = false;
-        for ch in trimmed.chars() {
-            if in_string {
-                if ch == string_char && prev_char != '\\' {
-                    in_string = false;
-                }
-            } else if in_template {
-                if ch == '`' && prev_char != '\\' {
-                    in_template = false;
-                } else if ch == '{' {
-                    brace_depth += 1;
-                } else if ch == '}' {
-                    brace_depth -= 1;
-                }
-            } else if ch == '\'' || ch == '"' {
-                in_string = true;
-                string_char = ch;
-            } else if ch == '`' {
-                in_template = true;
-            } else if ch == '{' {
-                brace_depth += 1;
-            } else if ch == '}' {
-                brace_depth -= 1;
-            }
-            prev_char = ch;
-        }
-
-        // Check if this is a const/let/var declaration
-        let is_export = trimmed.starts_with("export ");
-        let decl_trimmed = if is_export {
-            trimmed.strip_prefix("export ").unwrap().trim_start()
-        } else {
-            trimmed
-        };
-
-        let keyword = if decl_trimmed.starts_with("const ") {
-            Some("const")
-        } else if decl_trimmed.starts_with("let ") {
-            Some("let")
-        } else if decl_trimmed.starts_with("var ") {
-            Some("var")
-        } else {
-            None
-        };
-
-        if let Some(kw) = keyword
-            && is_top_level
-        {
-            // Accumulate multi-line declaration.
-            // A declaration continues across lines if the line doesn't end with `;`
-            // and we haven't reached a balanced state (all brackets closed + semicolon).
-            let first_rest = decl_trimmed[kw.len()..].trim_start();
-            let mut full_decl = first_rest.to_string();
-            let mut line_idx = i;
-
-            // Check if the declaration is complete (ends with `;` at balanced depth)
-            while !is_declaration_complete(&full_decl) && line_idx + 1 < lines.len() {
-                line_idx += 1;
-                full_decl.push(' ');
-                full_decl.push_str(lines[line_idx].trim());
-            }
-
-            let rest = full_decl.trim_end_matches(';');
-
-            // Split by top-level commas
-            let parts = split_top_level_commas(rest);
-
-            if parts.len() > 1 {
-                // Multiple declarators - split into individual statements
-                let prefix = if is_export {
-                    format!("export {} ", kw)
-                } else {
-                    format!("{} ", kw)
-                };
-                for (j, part) in parts.iter().enumerate() {
-                    let part = part.trim();
-                    if !part.is_empty() {
-                        if j > 0 {
-                            result.push('\n');
-                        }
-                        result.push_str(indent);
-                        result.push_str(&prefix);
-                        result.push_str(part);
-                        result.push(';');
-                    }
-                }
-                result.push('\n');
-                i = line_idx + 1;
-                continue;
-            }
-        }
-
-        result.push_str(line);
-        result.push('\n');
-        i += 1;
-    }
-
-    // Remove trailing newline to match input behavior
-    if result.ends_with('\n') {
-        result.pop();
-    }
-
-    result
-}
-
-/// Check if a declaration string is complete.
-/// A declaration is complete if all brackets are balanced AND either:
-/// 1. It ends with `;`, OR
-/// 2. It doesn't end with a continuation token (operator, comma, etc.)
-fn is_declaration_complete(s: &str) -> bool {
-    let trimmed = s.trim();
-    if trimmed.is_empty() {
-        return false;
-    }
-
-    // Check that all brackets/parens/braces are balanced
-    let balanced = are_brackets_balanced(trimmed);
-
-    // If brackets are not balanced, definitely not complete
-    if !balanced {
-        return false;
-    }
-
-    // If ends with semicolon and balanced, it's complete
-    if trimmed.ends_with(';') {
-        return true;
-    }
-
-    // If balanced but no semicolon, check if it ends with a continuation token
-    // that would indicate the declaration continues on the next line
-    let ends_with_continuation = trimmed.ends_with(',')
-        || trimmed.ends_with('+')
-        || trimmed.ends_with('-')
-        || trimmed.ends_with('*')
-        || trimmed.ends_with('/')
-        || trimmed.ends_with('%')
-        || trimmed.ends_with('&')
-        || trimmed.ends_with('|')
-        || trimmed.ends_with('^')
-        || trimmed.ends_with('?')
-        || trimmed.ends_with('=')
-        || trimmed.ends_with("&&")
-        || trimmed.ends_with("||")
-        || trimmed.ends_with("=>");
-
-    !ends_with_continuation
-}
-
-/// Check if all brackets/parens/braces are balanced in the string.
-fn are_brackets_balanced(s: &str) -> bool {
-    let mut depth = 0i32;
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    let len = bytes.len();
-    while i < len {
-        match bytes[i] {
-            b'(' | b'[' | b'{' => depth += 1,
-            b')' | b']' | b'}' => depth -= 1,
-            b'\'' | b'"' => {
-                let quote = bytes[i];
-                i += 1;
-                while i < len && bytes[i] != quote {
-                    if bytes[i] == b'\\' {
-                        i += 1;
-                    }
-                    i += 1;
-                }
-            }
-            b'`' => {
-                i += 1;
-                let mut tmpl_depth = 0i32;
-                while i < len {
-                    if bytes[i] == b'`' && tmpl_depth == 0 {
-                        break;
-                    }
-                    if bytes[i] == b'\\' {
-                        i += 1;
-                    } else if bytes[i] == b'$' && i + 1 < len && bytes[i + 1] == b'{' {
-                        tmpl_depth += 1;
-                        i += 1;
-                    } else if bytes[i] == b'}' && tmpl_depth > 0 {
-                        tmpl_depth -= 1;
-                    }
-                    i += 1;
-                }
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    depth == 0
-}
-
-/// Split a string by top-level commas, respecting nesting.
-fn split_top_level_commas(s: &str) -> Vec<&str> {
-    let mut parts = Vec::new();
-    let mut depth = 0i32;
-    let mut start = 0;
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    let len = bytes.len();
-
-    while i < len {
-        // Skip line comments: `//...` until end of line
-        if bytes[i] == b'/' && i + 1 < len && bytes[i + 1] == b'/' {
-            while i < len && bytes[i] != b'\n' {
-                i += 1;
-            }
-            continue;
-        }
-        // Skip block comments: `/* ... */`
-        if bytes[i] == b'/' && i + 1 < len && bytes[i + 1] == b'*' {
-            i += 2;
-            while i + 1 < len && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
-                i += 1;
-            }
-            i = (i + 2).min(len);
-            continue;
-        }
-        match bytes[i] {
-            b'(' | b'[' | b'{' => depth += 1,
-            b')' | b']' | b'}' => depth -= 1,
-            b'\'' | b'"' => {
-                let quote = bytes[i];
-                i += 1;
-                while i < len && bytes[i] != quote {
-                    if bytes[i] == b'\\' {
-                        i += 1;
-                    }
-                    i += 1;
-                }
-            }
-            b'`' => {
-                i += 1;
-                let mut tmpl_depth = 0i32;
-                while i < len {
-                    if bytes[i] == b'`' && tmpl_depth == 0 {
-                        break;
-                    }
-                    if bytes[i] == b'\\' {
-                        i += 1;
-                    } else if bytes[i] == b'$' && i + 1 < len && bytes[i + 1] == b'{' {
-                        tmpl_depth += 1;
-                        i += 1;
-                    } else if bytes[i] == b'}' && tmpl_depth > 0 {
-                        tmpl_depth -= 1;
-                    }
-                    i += 1;
-                }
-            }
-            b',' if depth == 0 => {
-                parts.push(&s[start..i]);
-                start = i + 1;
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    parts.push(&s[start..]);
-    parts
 }
 
 /// Extract simple identifier names from a destructuring pattern (for checking if reexported)
@@ -6523,11 +6071,7 @@ fn extract_destructured_names_simple(pattern: &str) -> Vec<String> {
                 // Simple rename: key: name or key: name = default
                 let name = if let Some(eq_pos) = value.find('=') {
                     let before_eq = value[..eq_pos].trim();
-                    if !before_eq.contains('=') {
-                        before_eq
-                    } else {
-                        value
-                    }
+                    if !before_eq.contains('=') { before_eq } else { value }
                 } else {
                     value
                 };
@@ -6539,11 +6083,7 @@ fn extract_destructured_names_simple(pattern: &str) -> Vec<String> {
             // Simple name or name = default
             let name = if let Some(eq_pos) = part.find('=') {
                 let before_eq = part[..eq_pos].trim();
-                if !before_eq.contains('=') {
-                    before_eq
-                } else {
-                    part
-                }
+                if !before_eq.contains('=') { before_eq } else { part }
             } else {
                 part
             };
@@ -6594,8 +6134,7 @@ fn find_colon_at_depth_0(s: &str) -> Option<usize> {
 fn is_simple_identifier_name(s: &str) -> bool {
     let s = s.trim();
     !s.is_empty()
-        && s.chars()
-            .all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+        && s.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '$')
         && !s.chars().next().unwrap().is_numeric()
 }
 
@@ -6629,11 +6168,7 @@ fn flatten_destructured_let_ssr(
     let pattern_end = find_pattern_end_simple(trimmed)?;
     let pattern = &trimmed[..pattern_end];
     let rhs_part = trimmed[pattern_end..].trim();
-    let rhs = rhs_part
-        .strip_prefix('=')?
-        .trim()
-        .trim_end_matches(';')
-        .trim();
+    let rhs = rhs_part.strip_prefix('=')?.trim().trim_end_matches(';').trim();
 
     let mut declarations = Vec::new();
     declarations.push(format!("tmp = {}", rhs));
@@ -6646,9 +6181,8 @@ fn flatten_destructured_let_ssr(
     // form for all leaves when it does.
     let mut leaf_names = Vec::new();
     collect_destructure_leaf_names(pattern, &mut leaf_names);
-    let force_fallback = leaf_names
-        .iter()
-        .any(|n| reexported_props.iter().any(|(local, _)| local == n));
+    let force_fallback =
+        leaf_names.iter().any(|n| reexported_props.iter().any(|(local, _)| local == n));
 
     flatten_destructured_let_ssr_inner(
         pattern,
@@ -6805,10 +6339,7 @@ fn push_leaf_declaration(
         }
         None => {
             if let Some(default_val) = default_value {
-                declarations.push(format!(
-                    "{} = {} ?? {}",
-                    binding_name, new_path, default_val
-                ));
+                declarations.push(format!("{} = {} ?? {}", binding_name, new_path, default_val));
             } else {
                 declarations.push(format!("{} = {}", binding_name, new_path));
             }
@@ -7217,6 +6748,28 @@ mod destructure_helper_tests {
 mod class_field_server_tests {
     use super::transform_class_fields_server;
 
+    #[test]
+    fn rune_field_separator_does_not_select_the_client_setter_shape() {
+        for separator in [" ", "", "  ", "\t", "\n\t\t\t", " /* c */ ", "\u{a0}", "\u{feff}"] {
+            let input =
+                format!("class K {{\n\tv = $state(1);\n\td ={separator}$derived(this.v * 2);\n}}");
+            let out = transform_class_fields_server(&input);
+
+            assert!(
+                out.contains("set d($$value)"),
+                "server setter was missed for separator {separator:?}:\n{out}"
+            );
+            assert!(
+                out.contains("return this.#d($$value);"),
+                "server setter return was missed for separator {separator:?}:\n{out}"
+            );
+            assert!(
+                !out.contains("set d(value)"),
+                "client setter leaked for separator {separator:?}:\n{out}"
+            );
+        }
+    }
+
     /// Upstream ClassBody.js emits the setter as:
     ///   b.method('set', b.key(name), [b.id('$$value')],
     ///            [b.return(b.call(member, b.id('$$value')))])
@@ -7284,10 +6837,7 @@ mod class_field_server_tests {
             out.contains("return this.#snippetProps($$value);"),
             "snippetProps setter body must have return:\n{out}"
         );
-        assert!(
-            out.contains("set props($$value)"),
-            "props setter param must be $$value:\n{out}"
-        );
+        assert!(out.contains("set props($$value)"), "props setter param must be $$value:\n{out}");
         assert!(
             out.contains("return this.#props($$value);"),
             "props setter body must have return:\n{out}"
@@ -7350,10 +6900,7 @@ mod class_field_server_tests {
         let out = transform_class_fields_server(input);
 
         // The backing private field should be `#props`, not `#readonly_props` or similar.
-        assert!(
-            out.contains("#props"),
-            "backing private field #props not found:\n{out}"
-        );
+        assert!(out.contains("#props"), "backing private field #props not found:\n{out}");
 
         // The getter must exist with the unmodified name `props`.
         assert!(
@@ -7362,10 +6909,7 @@ mod class_field_server_tests {
         );
 
         // The setter must use `$$value` (not `value`) and have `return`.
-        assert!(
-            out.contains("set props($$value)"),
-            "setter param must be $$value:\n{out}"
-        );
+        assert!(out.contains("set props($$value)"), "setter param must be $$value:\n{out}");
         assert!(
             out.contains("return this.#props($$value);"),
             "setter body must have `return this.#props($$value);`:\n{out}"
@@ -7473,10 +7017,7 @@ mod class_field_server_tests {
             "setter body must have `return this.#props($$value);`, got:\n{out}"
         );
         // No client-shaped setter should leak through.
-        assert!(
-            !out.contains("set props(value)"),
-            "client-shaped setter leaked through:\n{out}"
-        );
+        assert!(!out.contains("set props(value)"), "client-shaped setter leaked through:\n{out}");
     }
 
     /// Regression test: ToggleGroupItemState pattern — readonly isPressed with
@@ -7541,10 +7082,7 @@ mod class_field_server_tests {
             out.contains("set snippetProps($$value)"),
             "snippetProps setter must use $$value, got:\n{out}"
         );
-        assert!(
-            out.contains("set props($$value)"),
-            "props setter must use $$value, got:\n{out}"
-        );
+        assert!(out.contains("set props($$value)"), "props setter must use $$value, got:\n{out}");
         assert!(
             out.contains("return this.#props($$value);"),
             "props setter must have return, got:\n{out}"
@@ -7553,10 +7091,7 @@ mod class_field_server_tests {
             !out.contains("set isPressed(value)"),
             "client-shaped isPressed setter leaked:\n{out}"
         );
-        assert!(
-            !out.contains("set props(value)"),
-            "client-shaped props setter leaked:\n{out}"
-        );
+        assert!(!out.contains("set props(value)"), "client-shaped props setter leaked:\n{out}");
     }
 
     /// Regression: a class with NO $derived/$state fields between two classes
@@ -7584,10 +7119,7 @@ class Last {
         let out = transform_class_fields_server(input);
 
         // First class: correctly lowered.
-        assert!(
-            out.contains("set value($$value)"),
-            "First.value setter must use $$value:\n{out}"
-        );
+        assert!(out.contains("set value($$value)"), "First.value setter must use $$value:\n{out}");
         // Last class: must also be lowered even though Middle had no rune fields.
         assert!(
             out.contains("set result($$value)"),
@@ -7598,5 +7130,24 @@ class Last {
             !out.contains("set value(value)") && !out.contains("set result(value)"),
             "client-shaped setter leaked through:\n{out}"
         );
+    }
+}
+
+#[cfg(test)]
+mod simple_assignment_unit_tests {
+    use super::find_simple_assignment;
+
+    #[test]
+    fn assignment_position_is_a_byte_offset() {
+        for src in ["x = 1", "ああ = 1", "café = 'x'"] {
+            let pos = find_simple_assignment(src).unwrap();
+            assert_eq!(pos, src.find('=').unwrap(), "src {src:?}");
+            assert_eq!(src[..pos].trim(), src.split('=').next().unwrap().trim());
+        }
+    }
+
+    #[test]
+    fn commented_equals_is_not_an_assignment() {
+        assert_eq!(find_simple_assignment("x /* = */ 1"), None);
     }
 }

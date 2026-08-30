@@ -56,10 +56,7 @@ pub fn transform_private_member_mutate_root_ast(
             &MODULE_PRIVATE_MEMBER_MUTATE_ALLOC,
             src,
             SourceType::mjs(),
-            ParseOptions {
-                allow_return_outside_function: true,
-                ..ParseOptions::default()
-            },
+            ParseOptions { allow_return_outside_function: true, ..ParseOptions::default() },
             true,
             |program| {
                 let mut collector = PrivateMemberMutateCollector {
@@ -102,8 +99,7 @@ impl<'a> PrivateMemberMutateCollector<'a> {
         if let Some((s, e)) = root {
             let span_text = &self.source[s as usize..e as usize];
             if self.state_qualified.iter().any(|q| q.as_str() == span_text) {
-                self.replacements
-                    .push((s, e, format!("$.get({})", span_text)));
+                self.replacements.push((s, e, format!("$.get({})", span_text)));
             }
         }
     }
@@ -258,9 +254,6 @@ mod tests {
             &ssv(&["this.#m"]),
         )
         .unwrap();
-        assert_eq!(
-            transform_private_member_mutate_root_ast(&once, &ssv(&["this.#m"])),
-            None
-        );
+        assert_eq!(transform_private_member_mutate_root_ast(&once, &ssv(&["this.#m"])), None);
     }
 }

@@ -29,6 +29,50 @@ use crate::error::{ParseError, ParseResult};
 
 use super::ParseOptions;
 
+/// Substring searchers used once per file; building one is not free, so they
+/// are shared instead of reconstructed per parse.
+static SCRIPT_TAG_FINDER: std::sync::LazyLock<memchr::memmem::Finder<'static>> =
+    std::sync::LazyLock::new(|| memchr::memmem::Finder::new(b"<script"));
+static HTML_COMMENT_FINDER: std::sync::LazyLock<memchr::memmem::Finder<'static>> =
+    std::sync::LazyLock::new(|| memchr::memmem::Finder::new(b"<!--"));
+static LANG_FINDER: std::sync::LazyLock<memchr::memmem::Finder<'static>> =
+    std::sync::LazyLock::new(|| memchr::memmem::Finder::new(b"lang"));
+static COMMENT_END_FINDER: std::sync::LazyLock<memchr::memmem::Finder<'static>> =
+    std::sync::LazyLock::new(|| memchr::memmem::Finder::new(b"-->"));
+
+/// ECMAScript `WhiteSpace + LineTerminator` — the set every whitespace decision
+/// in upstream's parser consults, whether through `is_whitespace(cc)` in
+/// `1-parse/index.js`, a `\s` regex or `String.prototype.trim*`. Rust's
+/// `char::is_whitespace` is the Unicode `White_Space` property, which has the
+/// same 25 members but excludes `U+FEFF` and includes `U+0085`.
+pub fn is_js_whitespace(c: char) -> bool {
+    matches!(
+        c,
+        '\u{9}'..='\u{d}'
+            | '\u{20}'
+            | '\u{a0}'
+            | '\u{1680}'
+            | '\u{2000}'..='\u{200a}'
+            | '\u{2028}'
+            | '\u{2029}'
+            | '\u{202f}'
+            | '\u{205f}'
+            | '\u{3000}'
+            | '\u{feff}'
+    )
+}
+
+/// ASCII fast path for `is_js_whitespace`, derived from it rather than restated;
+/// every non-ASCII byte answers `false` so the caller decodes and asks again.
+pub(crate) fn is_js_whitespace_byte(b: u8) -> bool {
+    b.is_ascii() && is_js_whitespace(b as char)
+}
+
+/// Byte length of `source` after upstream's `template.trimEnd()`.
+fn js_trim_end_len(source: &str) -> usize {
+    source.trim_end_matches(is_js_whitespace).len()
+}
+
 /// Last auto-closed tag information.
 ///
 /// Corresponds to `LastAutoClosedTag` in `svelte/packages/svelte/src/compiler/phases/1-parse/index.js`.
@@ -49,6 +93,10 @@ pub struct Parser<'a> {
     pub(crate) bytes: &'a [u8],
     /// Current byte position in the source.
     pub(crate) index: usize,
+    /// Index just past the last non-whitespace char. Nothing at or after it can
+    /// be anything but trailing whitespace, so `remaining_is_whitespace_only`
+    /// rejects every earlier position without scanning.
+    pub(crate) content_end: usize,
     /// Parser options.
     pub(crate) options: ParseOptions,
     /// Stack of open elements/blocks for validation.
@@ -56,13 +104,17 @@ pub struct Parser<'a> {
     /// Line offsets for location calculation.
     pub(crate) line_offsets: Vec<usize>,
     /// Parsed instance script (context="default").
-    pub(crate) instance_script: Option<Script>,
+    pub(crate) instance_script: Option<Script<'a>>,
     /// Parsed module script (context="module").
-    pub(crate) module_script: Option<Script>,
+    pub(crate) module_script: Option<Script<'a>>,
     /// Parsed stylesheet.
     pub(crate) stylesheet: Option<StyleSheet>,
     /// Parsed svelte:options.
-    pub(crate) svelte_options: Option<SvelteOptions>,
+    pub(crate) svelte_options: Option<SvelteOptions<'a>>,
+    /// The `<svelte:options>` element as collected, before validation — upstream
+    /// validates it once the whole template has been parsed.
+    pub(crate) svelte_options_raw:
+        Option<crate::compiler::phases::phase1_parse::read::options::SvelteOptionsRaw<'a>>,
     /// Pending comments that could become leading comments for a script.
     pub(crate) pending_leading_comments: Vec<String>,
     /// Whether we're in TypeScript mode.
@@ -82,6 +134,11 @@ pub struct Parser<'a> {
     /// `generics="T extends { foo: number }"`) are plain text, never JS
     /// expressions — and must not raise `js_parse_error`.
     pub(crate) in_root_script_or_style: bool,
+    /// Whether `<svelte:options>` attributes are currently being parsed.
+    /// `read_options` inspects their values (`runes={false}`,
+    /// `customElement={{…}}`) during the parse itself, so they can never be
+    /// deferred into `Expression::Lazy`.
+    pub(crate) in_svelte_options: bool,
     /// Meta tags (e.g., svelte:head, svelte:options).
     ///
     /// Corresponds to `meta_tags` field in JavaScript Parser.
@@ -90,6 +147,11 @@ pub struct Parser<'a> {
     ///
     /// Corresponds to `last_auto_closed_tag` field in JavaScript Parser.
     pub(crate) last_auto_closed_tag: Option<LastAutoClosedTag>,
+    /// Offset of the `<` whose tag already closed an element implicitly.
+    /// Upstream pops exactly once per new tag; rsvelte re-enters the check from
+    /// each enclosing element's read loop, so without this one tag would walk
+    /// the whole ancestor chain.
+    pub(crate) implicit_close_at: Option<usize>,
     /// Parser-level warnings (e.g., element_implicitly_closed).
     pub(crate) parse_warnings: Vec<crate::ast::template::ParseWarning>,
     /// JS-style comments collected across the parse. Mirrors upstream
@@ -104,32 +166,42 @@ pub struct Parser<'a> {
     pub(crate) root_comments: std::cell::RefCell<Vec<crate::ast::template::JsComment>>,
     /// Arena allocator for JsNode instances created during parsing.
     pub(crate) arena: ParseArena,
+    /// Current template nesting depth, bounded by [`MAX_NESTING_DEPTH`].
+    pub(crate) depth: u32,
+}
+
+/// Maximum nesting depth accepted by the parser, for both template markup and
+/// the CSS inside `<style>`.
+///
+/// Nothing in the source bounds this recursion, so without the cap deeply
+/// nested input overflows the stack — an abort no embedder can contain, since
+/// a stack overflow is not a panic. Upstream Svelte needs no equivalent limit
+/// because a JS engine turns the same input into a catchable `RangeError`.
+///
+/// 128 is generous but conservative: the deepest component in the Svelte repo
+/// (4,461 files) and in this one nests 21 levels, while a whole compile at the
+/// limit stays under ~0.5 MiB of stack in a release build and ~2 MiB in a debug
+/// build — inside the 1 MiB a wasm build gets, the 2 MiB of a spawned worker,
+/// and the 8 MiB of a default main thread.
+pub const MAX_NESTING_DEPTH: u32 = 128;
+
+impl Parser<'_> {
+    #[inline]
+    pub(crate) fn should_defer_template_parse(&self) -> bool {
+        !self.script_ts && self.options.defer_script_parse
+    }
 }
 
 /// An entry on the parser stack.
 #[derive(Debug, Clone)]
 pub enum StackEntry {
     Root,
-    Element {
-        name: CompactString,
-        start: u32,
-        element_type: ElementType,
-    },
-    IfBlock {
-        start: u32,
-    },
-    EachBlock {
-        start: u32,
-    },
-    AwaitBlock {
-        start: u32,
-    },
-    KeyBlock {
-        start: u32,
-    },
-    SnippetBlock {
-        start: u32,
-    },
+    Element { name: CompactString, start: u32, element_type: ElementType },
+    IfBlock { start: u32 },
+    EachBlock { start: u32 },
+    AwaitBlock { start: u32 },
+    KeyBlock { start: u32 },
+    SnippetBlock { start: u32 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -160,22 +232,18 @@ impl<'a> Parser<'a> {
         // a previous (possibly errored) parse on this thread.
         let _ = crate::compiler::phases::phase1_parse::read::expression::take_expr_comments();
 
-        // Calculate line offsets for location calculation using SIMD-accelerated memchr.
-        // Skip entirely in compilation mode where line/column info is never used.
+        // Calculate line offsets for directive `name_loc` values. Compilation
+        // omits expression locations, but name locations remain part of the
+        // typed AST and are cheap enough to retain unconditionally.
         let bytes = source.as_bytes();
-        let line_offsets = if options.skip_expression_loc {
-            Vec::new()
-        } else {
-            let mut offsets = Vec::with_capacity(bytes.len() / 40 + 1); // rough estimate
-            offsets.push(0);
-            let mut pos = 0;
-            while let Some(offset) = memchr::memchr(b'\n', &bytes[pos..]) {
-                let abs = pos + offset;
-                offsets.push(abs + 1);
-                pos = abs + 1;
-            }
-            offsets
-        };
+        let mut line_offsets = Vec::with_capacity(bytes.len() / 40 + 1); // rough estimate
+        line_offsets.push(0);
+        let mut pos = 0;
+        while let Some(offset) = memchr::memchr(b'\n', &bytes[pos..]) {
+            let abs = pos + offset;
+            line_offsets.push(abs + 1);
+            pos = abs + 1;
+        }
 
         // Detect TypeScript mode by looking for lang="ts" in script tags
         // Corresponds to the TypeScript detection logic in JavaScript Parser constructor.
@@ -189,6 +257,7 @@ impl<'a> Parser<'a> {
             source,
             bytes: source.as_bytes(),
             index: 0,
+            content_end: js_trim_end_len(source),
             options,
             stack,
             line_offsets,
@@ -196,15 +265,19 @@ impl<'a> Parser<'a> {
             module_script: None,
             stylesheet: None,
             svelte_options: None,
+            svelte_options_raw: None,
             pending_leading_comments: Vec::new(),
             ts,
             script_ts: false,
             in_root_script_or_style: false,
+            in_svelte_options: false,
             meta_tags: FxHashMap::default(),
             last_auto_closed_tag: None,
+            implicit_close_at: None,
             parse_warnings: Vec::new(),
             root_comments: std::cell::RefCell::new(Vec::new()),
             arena: ParseArena::new(),
+            depth: 0,
         }
     }
 
@@ -214,36 +287,40 @@ impl<'a> Parser<'a> {
         self.source = source;
         self.bytes = source.as_bytes();
         self.index = 0;
+        self.content_end = js_trim_end_len(source);
         self.options = options;
 
         self.stack.clear();
         self.stack.push(StackEntry::Root);
 
-        // Recompute line offsets only if needed
+        // Recompute line offsets for directive name locations. Expression
+        // parsers still receive an empty slice in compilation mode.
         self.line_offsets.clear();
-        if !options.skip_expression_loc {
-            self.line_offsets.push(0);
-            let bytes = source.as_bytes();
-            let mut pos = 0;
-            while let Some(offset) = memchr::memchr(b'\n', &bytes[pos..]) {
-                let abs = pos + offset;
-                self.line_offsets.push(abs + 1);
-                pos = abs + 1;
-            }
+        self.line_offsets.push(0);
+        let bytes = source.as_bytes();
+        let mut pos = 0;
+        while let Some(offset) = memchr::memchr(b'\n', &bytes[pos..]) {
+            let abs = pos + offset;
+            self.line_offsets.push(abs + 1);
+            pos = abs + 1;
         }
 
         self.ts = options.force_typescript || Self::detect_typescript_mode(source);
         self.script_ts = false;
         self.in_root_script_or_style = false;
+        self.in_svelte_options = false;
         self.instance_script = None;
         self.module_script = None;
         self.stylesheet = None;
         self.svelte_options = None;
+        self.svelte_options_raw = None;
         self.pending_leading_comments.clear();
         self.meta_tags.clear();
         self.last_auto_closed_tag = None;
+        self.implicit_close_at = None;
         self.parse_warnings.clear();
         self.root_comments.borrow_mut().clear();
+        self.depth = 0;
         let _ = crate::compiler::phases::phase1_parse::read::expression::take_expr_comments();
         self.arena = ParseArena::new(); // Fresh arena per file
     }
@@ -255,30 +332,47 @@ impl<'a> Parser<'a> {
         let bytes = source.as_bytes();
         let len = bytes.len();
 
-        // Use memchr to quickly find '<' characters, then check for <script
-        let mut pos = 0;
-        while let Some(offset) = memchr::memchr(b'<', &bytes[pos..]) {
-            let i = pos + offset;
-            pos = i + 1;
+        // Every positive answer needs a literal `lang` attribute, so one cheap
+        // pass rules out the two scans below for the whole no-`lang` majority.
+        if LANG_FINDER.find(bytes).is_none() {
+            return false;
+        }
 
-            // Skip HTML comments: <!-- ... -->
-            if i + 3 < len && bytes[i + 1] == b'!' && bytes[i + 2] == b'-' && bytes[i + 3] == b'-' {
-                if let Some(end_offset) = memchr::memmem::find(&bytes[i + 4..], b"-->") {
-                    pos = i + 4 + end_offset + 3;
-                } else {
+        // Jump straight between `<script` occurrences; HTML-comment spans are
+        // resolved lazily so a commented-out script is still ignored.
+        let script_finder = &*SCRIPT_TAG_FINDER;
+        let comment_finder = &*HTML_COMMENT_FINDER;
+        let mut comment_pos = 0usize;
+        let mut script_pos = 0usize;
+
+        'outer: while let Some(offset) = script_finder.find(&bytes[script_pos..]) {
+            let i = script_pos + offset;
+
+            while comment_pos <= i {
+                let Some(coffset) = comment_finder.find(&bytes[comment_pos..]) else {
+                    comment_pos = len + 1;
+                    break;
+                };
+                let comment_start = comment_pos + coffset;
+                if comment_start > i {
+                    comment_pos = comment_start;
                     break;
                 }
-                continue;
+                let comment_end = match COMMENT_END_FINDER.find(&bytes[comment_start + 4..]) {
+                    Some(end_offset) => comment_start + 4 + end_offset + 3,
+                    None => len,
+                };
+                comment_pos = comment_end;
+                if comment_end > i {
+                    script_pos = comment_end;
+                    continue 'outer;
+                }
             }
+
+            script_pos = i + 7;
 
             // Check for <script followed by whitespace or >
             if i + 7 < len
-                && bytes[i + 1] == b's'
-                && bytes[i + 2] == b'c'
-                && bytes[i + 3] == b'r'
-                && bytes[i + 4] == b'i'
-                && bytes[i + 5] == b'p'
-                && bytes[i + 6] == b't'
                 && (bytes[i + 7] == b' '
                     || bytes[i + 7] == b'\t'
                     || bytes[i + 7] == b'\n'
@@ -328,9 +422,7 @@ impl<'a> Parser<'a> {
                     }
                     j += 1;
                 }
-                if j < len {
-                    pos = j + 1;
-                }
+                script_pos = if j < len { j + 1 } else { len };
             }
         }
 
@@ -341,19 +433,12 @@ impl<'a> Parser<'a> {
     /// Returns empty slice when skip_expression_loc is enabled (compilation mode),
     /// which causes create_loc functions to return Value::Null instead of allocating objects.
     pub fn expression_line_offsets(&self) -> &[usize] {
-        if self.options.skip_expression_loc {
-            &[]
-        } else {
-            &self.line_offsets
-        }
+        if self.options.skip_expression_loc { &[] } else { &self.line_offsets }
     }
 
     /// Get source location for a position.
     pub fn get_location(&self, pos: usize) -> SourceLocation {
-        let line = self
-            .line_offsets
-            .partition_point(|&offset| offset <= pos)
-            .saturating_sub(1);
+        let line = self.line_offsets.partition_point(|&offset| offset <= pos).saturating_sub(1);
         let line_start = self.line_offsets.get(line).copied().unwrap_or(0);
         let column = pos - line_start;
 
@@ -375,16 +460,15 @@ impl<'a> Parser<'a> {
     #[inline]
     pub fn create_name_loc(&self, start: usize, end: usize) -> SourceLocation {
         // Inline get_location to avoid two separate binary searches
-        let start_line = self
-            .line_offsets
-            .partition_point(|&offset| offset <= start)
-            .saturating_sub(1);
+        let start_line =
+            self.line_offsets.partition_point(|&offset| offset <= start).saturating_sub(1);
         let start_line_start = self.line_offsets.get(start_line).copied().unwrap_or(0);
 
-        let end_line = self
-            .line_offsets
-            .partition_point(|&offset| offset <= end)
-            .saturating_sub(1);
+        let end_line = if self.line_offsets.get(start_line + 1).is_none_or(|&offset| end < offset) {
+            start_line
+        } else {
+            self.line_offsets.partition_point(|&offset| offset <= end).saturating_sub(1)
+        };
         let end_line_start = self.line_offsets.get(end_line).copied().unwrap_or(0);
 
         SourceLocation {
@@ -401,15 +485,11 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Create name_loc, returning None when skip_expression_loc is enabled (compilation mode).
-    /// This avoids expensive binary searches for line/column when the data is never used.
+    /// Create the directive `name_loc`. Unlike expression locations, this is
+    /// retained in compilation mode because typed consumers read it directly.
     #[inline]
     pub fn create_name_loc_optional(&self, start: usize, end: usize) -> Option<SourceLocation> {
-        if self.options.skip_expression_loc {
-            None
-        } else {
-            Some(self.create_name_loc(start, end))
-        }
+        Some(self.create_name_loc(start, end))
     }
 
     // =========================================================================
@@ -509,13 +589,14 @@ impl<'a> Parser<'a> {
         let mut i = self.index + 1;
         while i < self.bytes.len() {
             let b = self.bytes[i];
-            if b == b' ' || b == b'\t' || b == b'\n' || b == b'\r' {
+            if b.is_ascii() {
+                if !is_js_whitespace_byte(b) {
+                    return Some(i);
+                }
                 i += 1;
-            } else if b < 0x80 {
-                return Some(i);
             } else {
                 let c = self.source[i..].chars().next().unwrap_or('\0');
-                if c.is_whitespace() {
+                if is_js_whitespace(c) {
                     i += c.len_utf8();
                 } else {
                     return Some(i);
@@ -537,8 +618,37 @@ impl<'a> Parser<'a> {
         }
         match self.bytes.get(i + 1) {
             Some(b'*') | Some(b'/') => None,
+            _ if self.options.reparse_leading_slash_expression && !self.block_close_shaped(i) => {
+                None
+            }
             _ => Some(i),
         }
+    }
+
+    /// Whether the `/` at `slash` starts something shaped like a block close —
+    /// `/` + ws* + word + ws* + `}`. Only consulted under
+    /// `reparse_leading_slash_expression`: anything else after `{/` (e.g. the
+    /// regex in `{/^x/y.test(a)}`, which the JS printer legally emits by
+    /// stripping the parens off `{(/^x/y).test(a)}`) is then re-read as an
+    /// expression tag instead of an unclosable block close.
+    pub fn block_close_shaped(&self, slash: usize) -> bool {
+        let mut j = slash + 1;
+        while j < self.bytes.len() && is_js_whitespace_byte(self.bytes[j]) {
+            j += 1;
+        }
+        let word_start = j;
+        while j < self.bytes.len()
+            && (self.bytes[j].is_ascii_alphanumeric() || self.bytes[j] == b'_')
+        {
+            j += 1;
+        }
+        if j == word_start {
+            return false;
+        }
+        while j < self.bytes.len() && is_js_whitespace_byte(self.bytes[j]) {
+            j += 1;
+        }
+        self.bytes.get(j) == Some(&b'}')
     }
 
     /// If the parser is positioned at a block continuation marker — `{` +
@@ -557,6 +667,28 @@ impl<'a> Parser<'a> {
             return None;
         }
         Some(i)
+    }
+
+    /// `(close, continuation)` markers, sharing the single whitespace skip.
+    #[inline]
+    pub fn match_block_markers(&self) -> (bool, bool) {
+        let Some(i) = self.index_after_open_brace_ws() else {
+            return (false, false);
+        };
+        match self.bytes[i] {
+            b'/' => (
+                !matches!(self.bytes.get(i + 1), Some(b'*') | Some(b'/'))
+                    && (!self.options.reparse_leading_slash_expression
+                        || self.block_close_shaped(i)),
+                false,
+            ),
+            b':' => (
+                false,
+                !(self.bytes.get(i + 1) == Some(&b'/')
+                    && matches!(self.bytes.get(i + 2), Some(b'*') | Some(b'/'))),
+            ),
+            _ => (false, false),
+        }
     }
 
     /// Consume a string if it matches.
@@ -635,19 +767,36 @@ impl<'a> Parser<'a> {
 
     /// Skip whitespace.
     #[inline]
+    /// Whether the character starting at byte `i` is JS whitespace. Byte-level
+    /// scans need this because a multi-byte character's lead byte answers
+    /// nothing on its own.
+    pub(crate) fn is_js_whitespace_at(&self, i: usize) -> bool {
+        match self.bytes.get(i) {
+            None => false,
+            Some(&b) if b.is_ascii() => is_js_whitespace_byte(b),
+            _ => self.source[i..].chars().next().is_some_and(is_js_whitespace),
+        }
+    }
+
+    /// Byte index of the first non-whitespace character at or after `i`.
+    pub(crate) fn skip_js_whitespace_from(&self, mut i: usize) -> usize {
+        while self.is_js_whitespace_at(i) {
+            i += self.source[i..].chars().next().map_or(1, char::len_utf8);
+        }
+        i
+    }
+
     pub fn skip_whitespace(&mut self) {
-        // Fast path for ASCII whitespace (space, tab, newline, carriage return)
         while self.index < self.bytes.len() {
             let b = self.bytes[self.index];
-            if b == b' ' || b == b'\t' || b == b'\n' || b == b'\r' {
+            if b.is_ascii() {
+                if !is_js_whitespace_byte(b) {
+                    break;
+                }
                 self.index += 1;
-            } else if b < 0x80 {
-                // ASCII non-whitespace: done
-                break;
             } else {
-                // Non-ASCII: check for Unicode whitespace via char
                 let c = self.source[self.index..].chars().next().unwrap_or('\0');
-                if c.is_whitespace() {
+                if is_js_whitespace(c) {
                     self.index += c.len_utf8();
                 } else {
                     break;
@@ -708,23 +857,32 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Read an identifier.
+    /// Read an identifier. Mirrors upstream's `read_identifier`, which uses
+    /// acorn's `isIdentifierStart` / `isIdentifierChar` and so accepts every
+    /// `ID_Continue` character — combining marks and ZWNJ/ZWJ included.
     #[inline]
     pub fn read_identifier(&mut self) -> CompactString {
         let start = self.index;
 
-        // Fast path: ASCII identifier characters (a-z, A-Z, 0-9, _, $)
+        let Some(first) = self.source[start..].chars().next() else {
+            return CompactString::default();
+        };
+        if !oxc_syntax::identifier::is_identifier_start(first) {
+            return CompactString::default();
+        }
+        self.index += first.len_utf8();
+
         while self.index < self.bytes.len() {
             let b = self.bytes[self.index];
-            if b.is_ascii_alphanumeric() || b == b'_' || b == b'$' {
-                self.index += 1;
-            } else if b < 0x80 {
-                // ASCII non-identifier char: done
-                break;
+            if b.is_ascii() {
+                if oxc_syntax::identifier::is_identifier_part_ascii(b as char) {
+                    self.index += 1;
+                } else {
+                    break;
+                }
             } else {
-                // Non-ASCII: check via char
                 let c = self.source[self.index..].chars().next().unwrap_or('\0');
-                if c.is_alphanumeric() {
+                if oxc_syntax::identifier::is_identifier_part_unicode(c) {
                     self.index += c.len_utf8();
                 } else {
                     break;
@@ -741,23 +899,18 @@ impl<'a> Parser<'a> {
     pub fn read_tag_name(&mut self) -> &str {
         let start = self.index;
 
-        // Fast path: tag name characters are ASCII (stop at whitespace, >, /, =)
+        // Mirrors upstream `read_until(/(\s|\/|>)/)`; `=` additionally ends a
+        // name so `<p=` does not swallow the rest of the tag.
         while self.index < self.bytes.len() {
             let b = self.bytes[self.index];
-            if b == b' '
-                || b == b'\t'
-                || b == b'\n'
-                || b == b'\r'
-                || b == b'>'
-                || b == b'/'
-                || b == b'='
-            {
-                break;
-            } else if b < 0x80 {
+            if b.is_ascii() {
+                if is_js_whitespace_byte(b) || b == b'>' || b == b'/' || b == b'=' {
+                    break;
+                }
                 self.index += 1;
             } else {
                 let c = self.source[self.index..].chars().next().unwrap_or('\0');
-                if c.is_whitespace() {
+                if is_js_whitespace(c) {
                     break;
                 }
                 self.index += c.len_utf8();
@@ -772,25 +925,17 @@ impl<'a> Parser<'a> {
     pub fn read_attribute_name(&mut self) -> &str {
         let start = self.index;
 
-        // Fast path: attribute name characters are ASCII (stop at whitespace, =, >, /, ", ')
+        // Mirrors upstream `read_until(/[\s=\/>"']/)`.
         while self.index < self.bytes.len() {
             let b = self.bytes[self.index];
-            if b == b' '
-                || b == b'\t'
-                || b == b'\n'
-                || b == b'\r'
-                || b == b'='
-                || b == b'>'
-                || b == b'/'
-                || b == b'"'
-                || b == b'\''
-            {
-                break;
-            } else if b < 0x80 {
+            if b.is_ascii() {
+                if is_js_whitespace_byte(b) || matches!(b, b'=' | b'>' | b'/' | b'"' | b'\'') {
+                    break;
+                }
                 self.index += 1;
             } else {
                 let c = self.source[self.index..].chars().next().unwrap_or('\0');
-                if c.is_whitespace() {
+                if is_js_whitespace(c) {
                     break;
                 }
                 self.index += c.len_utf8();
@@ -800,27 +945,9 @@ impl<'a> Parser<'a> {
         &self.source[start..self.index]
     }
 
-    /// Peek at the next n characters.
-    pub fn peek_chars(&self, n: usize) -> String {
-        self.source[self.index..].chars().take(n).collect()
-    }
-
-    /// Check if the svelte:options has customElement set.
-    pub fn has_custom_element_option(&self) -> bool {
-        if let Some(opts) = &self.svelte_options {
-            opts.custom_element.is_some()
-        } else {
-            false
-        }
-    }
-
     /// Check if we're in runes mode via svelte:options.
     pub fn is_runes_mode(&self) -> bool {
-        if let Some(opts) = &self.svelte_options {
-            opts.runes == Some(true)
-        } else {
-            false
-        }
+        if let Some(opts) = &self.svelte_options { opts.runes == Some(true) } else { false }
     }
 
     // =========================================================================
@@ -874,9 +1001,7 @@ impl<'a> Parser<'a> {
             if self.options.loose {
                 return Ok(String::new());
             }
-            return Err(ParseError::UnexpectedEof {
-                span: (self.source.len(), self.source.len()),
-            });
+            return Err(ParseError::UnexpectedEof { span: (self.source.len(), self.source.len()) });
         }
 
         let start = self.index;
@@ -897,35 +1022,17 @@ impl<'a> Parser<'a> {
     ///
     /// Corresponds to `require_whitespace()` in JavaScript Parser.
     pub fn require_whitespace(&mut self) -> ParseResult<()> {
-        if self.is_eof() || !self.current_char().is_whitespace() {
+        if self.is_eof() || !is_js_whitespace(self.current_char()) {
             return Err(ParseError::svelte(
                 "expected_whitespace",
                 "Expected whitespace",
-                (self.index, self.index + 1),
+                // Upstream passes a bare index, so `start` and `end` coincide.
+                (self.index, self.index),
             ));
         }
 
         self.skip_whitespace();
         Ok(())
-    }
-
-    /// Handle an acorn error.
-    ///
-    /// Corresponds to `acorn_error()` in JavaScript Parser.
-    pub fn acorn_error(&self, pos: usize, message: &str) -> ParseError {
-        // Remove position indicator from message (e.g., " (10:5)")
-        let clean_message = message
-            .trim_end_matches(|c: char| c == ')' || c.is_ascii_digit() || c == ':' || c == '(');
-
-        ParseError::svelte("js_parse_error", clean_message, (pos, pos + 1))
-    }
-
-    /// Allow whitespace (skip it if present).
-    ///
-    /// Corresponds to `allow_whitespace()` in JavaScript Parser.
-    /// This is just an alias for `skip_whitespace()`.
-    pub fn allow_whitespace(&mut self) {
-        self.skip_whitespace();
     }
 
     /// Scan forward from the current position to find the matching closing brace.
@@ -945,5 +1052,109 @@ impl<'a> Parser<'a> {
         )
         .unwrap_or(self.bytes.len());
         self.index
+    }
+
+    /// The index of the `}` that closes a mustache opened before `expr_start`,
+    /// or the `expected_token` upstream raises when the template holds none.
+    ///
+    /// Upstream never searches for the brace: `read_expression` lets acorn
+    /// consume one expression and `eat('}', true)` then demands the brace
+    /// wherever that stopped — the first token acorn left behind, or the end of
+    /// the right-trimmed template when it consumed everything.
+    pub(crate) fn find_mustache_close(&self, expr_start: usize) -> ParseResult<usize> {
+        if let Some(end) = crate::compiler::phases::phase1_parse::utils::find_matching_bracket(
+            self.source,
+            expr_start,
+            '{',
+        ) {
+            let candidate = &self.source[expr_start..end];
+            let swallowed_block_close = candidate.rfind('{').is_some_and(|block_open| {
+                let block_name = candidate[block_open + 1..].trim();
+                matches!(block_name, "/if" | "/each" | "/await" | "/key" | "/snippet")
+                    && memchr::memmem::find(&candidate.as_bytes()[..block_open], b"</").is_some()
+            });
+            // In malformed markup such as `{@const c = 1<b>x</b>{/if}`, the
+            // lexical bracket scan reads `</b>` as the start of a regexp and
+            // the slash in `{/if}` as its end. The final `}` then looks like
+            // this mustache's close. Let the recovery below report the HTML
+            // close-tag position Acorn uses instead.
+            if self.options.loose || !swallowed_block_close {
+                return Ok(end);
+            }
+        }
+        // Loose mode keeps recovering so a half-typed document still yields a tree.
+        if self.options.loose {
+            return Ok(self.bytes.len());
+        }
+        use crate::compiler::phases::phase1_parse::read::expression::{
+            check_js_parse_error_with_pos, trailing_token_offset,
+        };
+        let from = expr_start.min(self.content_end);
+        let rest = &self.source[from..self.content_end];
+        if rest.trim_matches(is_js_whitespace).is_empty() {
+            return Err(ParseError::expected_token("}", self.content_end));
+        }
+        // A dangling optional-chain marker makes the structural bracket scan
+        // fail before `read_expression` gets its normal slice. Acorn consumes
+        // the marker and points at the closing mustache delimiter.
+        if let Some(close) = memchr::memchr(b'}', rest.as_bytes())
+            && rest[..close].trim_end_matches(is_js_whitespace).ends_with("?.")
+        {
+            let at = from + close;
+            return Err(ParseError::svelte(
+                "js_parse_error",
+                "Unexpected token".to_string(),
+                (at, at),
+            ));
+        }
+        if let Some(self_close) = memchr::memmem::find(rest.as_bytes(), b"/>") {
+            let before_self_close = rest[..self_close].trim_matches(is_js_whitespace);
+            // With no expression before `/>`, upstream's expression reader
+            // reaches the slash and the enclosing attribute reader reports the
+            // missing `}` at the `>`. There is no valid prefix to probe in this
+            // case, so treat it like the complete-expression path below.
+            if before_self_close.is_empty()
+                || check_js_parse_error_with_pos(before_self_close, self.ts).is_none()
+            {
+                return Err(ParseError::expected_token("}", from + self_close + 1));
+            }
+        }
+        // Acorn continues `1</div>` as `1 < /div...` and reports immediately
+        // after the `/` that starts the unterminated regexp. OXC's bare-program
+        // recovery instead stops at `<`, so preserve the expression-reader
+        // coordinate used by upstream for an enclosing close tag.
+        if let Some(close_tag) = memchr::memmem::find(rest.as_bytes(), b"</") {
+            // With two close tags the two `/` bytes form a complete regexp;
+            // acorn then consumes the remaining tag text and fails at EOF.
+            let after_first = close_tag + 2;
+            let at = if memchr::memmem::find(&rest.as_bytes()[after_first..], b"</").is_some() {
+                self.content_end
+            } else {
+                from + after_first
+            };
+            return Err(ParseError::svelte(
+                "js_parse_error",
+                "Unexpected token".to_string(),
+                (at, at),
+            ));
+        }
+        // A complete leading expression leaves the brace demanded at the first
+        // token acorn did not consume. Check this after the close-tag form:
+        // when a broken mustache is followed by an enclosing `{/block}`, OXC's
+        // recovery can treat the block close as trailing input even though
+        // acorn is still lexing the preceding `</tag>` as an unterminated
+        // regexp and throws there.
+        if let Some(offset) = trailing_token_offset(rest, self.ts)
+            && check_js_parse_error_with_pos(&rest[..offset], self.ts).is_none()
+        {
+            return Err(ParseError::expected_token("}", from + offset));
+        }
+        // Otherwise acorn never got an expression out of the rest of the file,
+        // so upstream reports the JS parser's own error rather than the brace.
+        if let Some((message, pos)) = check_js_parse_error_with_pos(rest, self.ts) {
+            let at = from + pos;
+            return Err(ParseError::svelte("js_parse_error", message, (at, at)));
+        }
+        Err(ParseError::expected_token("}", self.content_end))
     }
 }

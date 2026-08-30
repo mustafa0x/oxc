@@ -19,6 +19,7 @@
 use crate::ast::template::DeclarationTag;
 use crate::compiler::phases::phase3_transform::client::types::*;
 use crate::compiler::phases::phase3_transform::js_ast::nodes::{JsExpr, JsStatement};
+use crate::compiler::utils::is_escaped;
 
 /// Visit a declaration tag.
 ///
@@ -38,11 +39,7 @@ pub fn declaration_tag(node: &DeclarationTag, context: &mut ComponentContext) {
     let raw = &source[start..end];
     // Strip the surrounding `{` and `}`. Conservative: only strip a single
     // `{` / `}` pair on each side.
-    let body = raw
-        .strip_prefix('{')
-        .and_then(|s| s.strip_suffix('}'))
-        .unwrap_or(raw)
-        .trim();
+    let body = raw.strip_prefix('{').and_then(|s| s.strip_suffix('}')).unwrap_or(raw).trim();
     if body.is_empty() {
         return;
     }
@@ -91,7 +88,13 @@ pub fn declaration_tag(node: &DeclarationTag, context: &mut ComponentContext) {
     // for the keyword, locate the top-level `=`, then strip the top-level `:`
     // annotation from the LHS pattern.
     // Mirrors upstream's reliance on OXC's TS-aware parse/emit.
-    let body_stripped = strip_ts_annotation_body(body);
+    let body_stripped = if context.state.analysis.is_typescript {
+        std::borrow::Cow::Owned(crate::compiler::phases::phase2_analyze::types::strip_typescript(
+            body,
+        ))
+    } else {
+        strip_ts_annotation_body(body)
+    };
     let body = body_stripped.trim();
 
     // Ensure the statement ends with `;` so the rune-rewriting pipeline (which
@@ -111,29 +114,41 @@ pub fn declaration_tag(node: &DeclarationTag, context: &mut ComponentContext) {
     );
 
     // The instance-script pipeline wraps instance-state reads but is unaware of
-    // the enclosing each block's item bindings. Inside `{#each boxes as box}` a
-    // `{const area = box.width}` must read the reactive item as `$.get(box)`
-    // (mirroring the template-expression transform's each-item handling). Only
-    // REACTIVE each-items qualify — a non-reactive item (e.g. keyed by itself,
-    // `{#each xs as n (n)}`) stays bare. Reactive items are exactly those with a
-    // registered read transform in `context.state.transform` (each_block.rs only
-    // inserts one when `EACH_ITEM_REACTIVE` is set).
-    let reactive_each_names: Vec<String> = context
+    // reactive bindings introduced by the surrounding template scope. Inside
+    // `{#each boxes as box}`, `{const area = box.width}` must read the reactive
+    // item as `$.get(box)`. Likewise, inside
+    // `{#await promise then { default: value }}`, `{const rows = use(value)}`
+    // must read the derived await binding as `$.get(value)`. Without the latter,
+    // the declaration receives the signal object instead of the resolved value.
+    //
+    // Only reactive each-items qualify — a non-reactive item (e.g. keyed by
+    // itself, `{#each xs as n (n)}`) stays bare. Await bindings always have a
+    // registered read transform and are recorded in `await_binding_names` by
+    // await_block.rs. The OXC semantic rewrite below preserves shadowing inside
+    // callbacks declared by the initializer.
+    let mut template_get_names: Vec<String> = context
         .state
         .each_item_names
         .iter()
         .filter(|n| context.state.transform.contains_key(n.as_str()))
         .map(|n| n.to_string())
         .collect();
-    let transformed = if reactive_each_names.is_empty() {
+    for name in context.state.await_binding_names.keys() {
+        if context.state.transform.contains_key(name.as_str()) && !template_get_names.contains(name)
+        {
+            template_get_names.push(name.clone());
+        }
+    }
+    let transformed = if template_get_names.is_empty() {
         transformed
     } else {
         crate::compiler::phases::phase3_transform::client::expression_utils::wrap_state_vars_in_expr(
             &transformed,
-            &reactive_each_names,
+            &template_get_names,
             &[],
             &[],
         )
+        .into_owned()
     };
 
     let trimmed = transformed.trim();
@@ -210,9 +225,7 @@ fn try_emit_async_declaration(
     let has_blocker = {
         let bm = context.state.blocker_map.borrow();
         let cbm = context.state.const_blocker_map.borrow();
-        init_refs
-            .iter()
-            .any(|r| bm.contains_key(r) || cbm.contains_key(r))
+        init_refs.iter().any(|r| bm.contains_key(r) || cbm.contains_key(r))
     };
     // Route through the async-declaration lowering when the initializer awaits,
     // depends on an async binding, OR an async group is already open in this
@@ -257,11 +270,7 @@ fn try_emit_async_declaration(
             .zip(id.get("end").and_then(|v| v.as_u64()))
             .and_then(|(st, en)| {
                 let (st, en) = (st as usize, en as usize);
-                if st < en && en <= src.len() {
-                    Some(src[st..en].trim().to_string())
-                } else {
-                    None
-                }
+                if st < en && en <= src.len() { Some(src[st..en].trim().to_string()) } else { None }
             })
             .unwrap_or_else(|| super::const_tag::render_pattern_text(id));
         super::const_tag::add_async_declaration_multi(
@@ -429,7 +438,7 @@ fn body_has_top_level_comma(body: &str) -> bool {
     while i < bytes.len() {
         let c = bytes[i];
         if in_string {
-            if c == string_ch && (i == 0 || bytes[i - 1] != b'\\') {
+            if c == string_ch && !is_escaped(bytes, i) {
                 in_string = false;
             }
         } else {

@@ -6,6 +6,7 @@
 
 use super::super::AnalysisError;
 use super::super::errors;
+use super::super::pattern_ids::base_identifier_name;
 use super::super::warnings;
 use super::VisitorContext;
 use super::attribute;
@@ -263,20 +264,19 @@ pub(super) fn is_tag_valid_with_parent(child_tag: &str, parent_tag: &str) -> Opt
             // Check special child tags that require specific parents
             match child_tag {
                 "body" | "caption" | "col" | "colgroup" | "frameset" | "frame" | "head"
-                | "html" => Some(format!(
-                    "`<{}>` cannot be a child of `<{}>",
-                    child_tag, parent_tag
-                )),
+                | "html" => {
+                    Some(format!("`<{}>` cannot be a child of `<{}>`", child_tag, parent_tag))
+                }
                 "thead" | "tbody" | "tfoot" => Some(format!(
-                    "`<{}>` must be the child of a `<table>`, not a `<{}>",
+                    "`<{}>` must be the child of a `<table>`, not a `<{}>`",
                     child_tag, parent_tag
                 )),
                 "td" | "th" => Some(format!(
-                    "`<{}>` must be the child of a `<tr>`, not a `<{}>",
+                    "`<{}>` must be the child of a `<tr>`, not a `<{}>`",
                     child_tag, parent_tag
                 )),
                 "tr" => Some(format!(
-                    "`<tr>` must be the child of a `<thead>`, `<tbody>`, or `<tfoot>`, not a `<{}>",
+                    "`<tr>` must be the child of a `<thead>`, `<tbody>`, or `<tfoot>`, not a `<{}>`",
                     parent_tag
                 )),
                 _ => None,
@@ -340,10 +340,7 @@ fn get_disallowed_descendant(
 /// direct parent — not every ancestor — otherwise a valid nested list like
 /// `<ul><li><ul><li>` falsely reports `<li>` as a descendant of `<li>` (H-082).
 fn is_direct_only_disallowed(ancestor_tag: &str) -> bool {
-    matches!(
-        ancestor_tag,
-        "li" | "thead" | "tbody" | "tfoot" | "tr" | "td" | "th"
-    )
+    matches!(ancestor_tag, "li" | "thead" | "tbody" | "tfoot" | "tr" | "td" | "th")
 }
 
 /// Tags that "reset" a disallowed-descendant rule for `ancestor_tag`, mirroring
@@ -358,35 +355,6 @@ fn get_descendant_reset_by(ancestor_tag: &str) -> Option<&'static [&'static str]
         _ => None,
     }
 }
-
-/// Check if a tag is valid with an ancestor.
-/// Returns an error message if invalid, or None if valid.
-fn is_tag_valid_with_ancestor(child_tag: &str, ancestors: &[String]) -> Option<String> {
-    // Custom elements can be anything
-    if child_tag.contains('-') {
-        return None;
-    }
-
-    let ancestor_tag = ancestors.last()?;
-
-    // Custom elements can be anything
-    if ancestor_tag.contains('-') {
-        return None;
-    }
-
-    // Check descendant rules
-    if let Some(disallowed) = get_disallowed_descendant(ancestor_tag, child_tag)
-        && disallowed.contains(&child_tag)
-    {
-        return Some(format!(
-            "`<{}>` cannot be a descendant of `<{}>`",
-            child_tag, ancestor_tag
-        ));
-    }
-
-    None
-}
-
 /// Create a synthetic attribute for the textarea value.
 ///
 /// Corresponds to `create_attribute` in nodes.js.
@@ -431,15 +399,16 @@ fn create_textarea_value_attribute(nodes: Vec<TemplateNode>) -> Attribute {
 }
 
 /// Visit a regular element.
-pub fn visit(
-    element: &mut RegularElement,
-    context: &mut VisitorContext,
+pub fn visit<'a, 'b: 'a>(
+    element: &mut RegularElement<'b>,
+    context: &mut VisitorContext<'a>,
 ) -> Result<(), AnalysisError> {
     // Validate the element
-    validate_element(element, context)?;
+    validate_element(&element.attributes, context)?;
 
     // Check accessibility
-    let a11y_warnings = a11y_check(element, &context.element_ancestors);
+    let a11y_warnings =
+        a11y_check(&super::shared::a11y::A11yElement::regular(element), &context.a11y_ancestors());
     for mut warning in a11y_warnings {
         if warning.start.is_none() {
             warning.start = Some(element.start);
@@ -455,318 +424,21 @@ pub fn visit(
     // and pushes to context.state.analysis.elements
     // We'll track this in context.analysis directly for now
 
-    // Track element name for CSS unused selector detection
-    context
-        .analysis
-        .css
-        .used_elements
-        .insert(element.name.to_string());
-
-    // Build DOM structure for CSS sibling combinator detection
+    let collect_css = context.analysis.css.has_css;
     let parent_idx = context.current_parent_idx();
     let is_root_child = parent_idx.is_none();
 
-    // Extract classes and ID from attributes
-    let mut element_classes = FxHashSet::default();
-    let mut element_id: Option<String> = None;
-    let mut static_attributes: Vec<(String, Option<String>)> = Vec::new();
-    let mut dynamic_attribute_names: FxHashSet<String> = FxHashSet::default();
-    let mut has_spread = false;
-    let mut has_class_directive = false;
-    let mut class_directive_names: FxHashSet<String> = FxHashSet::default();
-    let mut has_style_directive = false;
+    let mut css_facts = super::shared::element::CssAttributeFacts::default();
 
-    // Track class names and IDs from attributes
-    for attr in &element.attributes {
-        if let Attribute::Attribute(attr_node) = attr {
-            // Track static attribute name/value for CSS attribute selector matching
-            match &attr_node.value {
-                AttributeValue::True(_) => {
-                    // Boolean attribute like `<details open>`
-                    static_attributes.push((attr_node.name.to_string(), None));
-                }
-                AttributeValue::Sequence(parts) => {
-                    // Check if all parts are static text
-                    let mut all_static = true;
-                    let mut value = String::new();
-                    for part in parts {
-                        if let AttributeValuePart::Text(text) = part {
-                            value.push_str(&text.data);
-                        } else {
-                            all_static = false;
-                            break;
-                        }
-                    }
-                    if all_static {
-                        static_attributes.push((attr_node.name.to_string(), Some(value)));
-                    } else {
-                        // Has dynamic parts - try to determine possible values
-                        // for CSS attribute selector matching
-                        let mut all_resolved = true;
-                        let mut computed_values: Vec<String> = vec![String::new()];
-                        for part in parts {
-                            match part {
-                                AttributeValuePart::Text(text) => {
-                                    for v in &mut computed_values {
-                                        v.push_str(&text.data);
-                                    }
-                                }
-                                AttributeValuePart::ExpressionTag(expr_tag) => {
-                                    let expr_json = expr_tag.expression.as_json();
-                                    use super::super::css::get_possible_values;
-                                    if let Some(possible_vals) =
-                                        get_possible_values(expr_json, false)
-                                    {
-                                        if possible_vals.len() > 20 {
-                                            // Too many combinations, bail out
-                                            all_resolved = false;
-                                            break;
-                                        }
-                                        let prev = computed_values.clone();
-                                        computed_values.clear();
-                                        for pv in &prev {
-                                            for ev in &possible_vals {
-                                                computed_values.push(format!("{}{}", pv, ev));
-                                            }
-                                        }
-                                        if computed_values.len() > 100 {
-                                            all_resolved = false;
-                                            break;
-                                        }
-                                    } else {
-                                        all_resolved = false;
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                        if all_resolved && !computed_values.is_empty() {
-                            for value in &computed_values {
-                                static_attributes
-                                    .push((attr_node.name.to_string(), Some(value.clone())));
-                            }
-                        } else {
-                            dynamic_attribute_names.insert(attr_node.name.to_string());
-                        }
-                    }
-                }
-                _ => {
-                    // Expression or other dynamic value
-                    // Try to statically determine the value for CSS attribute selector matching
-                    if let AttributeValue::Expression(expr_tag) = &attr_node.value {
-                        let expr_json = expr_tag.expression.as_json();
-                        use super::super::css::get_possible_values;
-                        if let Some(possible_values) = get_possible_values(expr_json, false) {
-                            // We can determine the possible values statically
-                            for value in &possible_values {
-                                static_attributes
-                                    .push((attr_node.name.to_string(), Some(value.to_string())));
-                            }
-                        } else {
-                            dynamic_attribute_names.insert(attr_node.name.to_string());
-                        }
-                    } else {
-                        dynamic_attribute_names.insert(attr_node.name.to_string());
-                    }
-                }
-            }
+    if collect_css {
+        context.analysis.css.used_elements.insert(element.name.to_string());
+        css_facts =
+            super::shared::element::collect_css_attribute_facts(&element.attributes, context);
+    }
 
-            match attr_node.name.as_str() {
-                "class" => {
-                    // Extract class names from attribute value using combinatorial expansion
-                    // to correctly handle string concatenation like class="foo{expr}bar"
-                    match &attr_node.value {
-                        AttributeValue::Sequence(parts) => {
-                            // Combinatorial expansion matching the official Svelte compiler.
-                            // We maintain partial strings and combine them with each chunk's
-                            // possible values, tracking whitespace boundaries.
-                            let mut possible_values: FxHashSet<String> = FxHashSet::default();
-                            let mut prev_values: Vec<String> = Vec::new();
-                            let mut bail_out = false;
-
-                            for part in parts {
-                                let current_possible: Option<Vec<String>> = match part {
-                                    AttributeValuePart::Text(text) => {
-                                        Some(vec![text.data.to_string()])
-                                    }
-                                    AttributeValuePart::ExpressionTag(expr_tag) => {
-                                        let expr_json = expr_tag.expression.as_json();
-                                        use super::super::css::get_possible_values;
-                                        get_possible_values(expr_json, true)
-                                    }
-                                };
-
-                                if current_possible.is_none() {
-                                    bail_out = true;
-                                    break;
-                                }
-                                let current_vals = current_possible.unwrap();
-
-                                if prev_values.is_empty() {
-                                    // First chunk
-                                    for cv in &current_vals {
-                                        if cv.ends_with(char::is_whitespace) {
-                                            possible_values.insert(cv.clone());
-                                        } else {
-                                            prev_values.push(cv.clone());
-                                        }
-                                    }
-                                    if prev_values.len() < current_vals.len() {
-                                        prev_values.push(" ".to_string());
-                                    }
-                                } else {
-                                    // Categorize new values by whitespace boundaries
-                                    let mut starts_with_space = Vec::new();
-                                    let mut remaining = Vec::new();
-                                    for cv in &current_vals {
-                                        if cv.starts_with(char::is_whitespace) {
-                                            starts_with_space.push(cv.clone());
-                                        } else {
-                                            remaining.push(cv.clone());
-                                        }
-                                    }
-
-                                    if !remaining.is_empty() {
-                                        if !starts_with_space.is_empty() {
-                                            // Some values start with space - previous values are complete
-                                            for pv in &prev_values {
-                                                possible_values.insert(pv.clone());
-                                            }
-                                        }
-                                        // Combine prev_values with remaining (no-space) values
-                                        let mut combined = Vec::new();
-                                        for pv in &prev_values {
-                                            for rv in &remaining {
-                                                combined.push(format!("{}{}", pv, rv));
-                                            }
-                                        }
-                                        prev_values = combined;
-                                        for sv in &starts_with_space {
-                                            if sv.ends_with(char::is_whitespace) {
-                                                possible_values.insert(sv.clone());
-                                            } else {
-                                                prev_values.push(sv.clone());
-                                            }
-                                        }
-                                    } else {
-                                        // All values start with space
-                                        for pv in &prev_values {
-                                            possible_values.insert(pv.clone());
-                                        }
-                                        prev_values.clear();
-                                        for sv in &starts_with_space {
-                                            if sv.ends_with(char::is_whitespace) {
-                                                possible_values.insert(sv.clone());
-                                            } else {
-                                                prev_values.push(sv.clone());
-                                            }
-                                        }
-                                    }
-                                    if prev_values.len() < current_vals.len() {
-                                        prev_values.push(" ".to_string());
-                                    }
-                                    if prev_values.len() > 20 {
-                                        // Exponential growth, bail out
-                                        bail_out = true;
-                                        break;
-                                    }
-                                }
-                            }
-
-                            if bail_out {
-                                context.analysis.css.has_dynamic_classes = true;
-                            } else {
-                                // Add remaining prev_values
-                                for pv in &prev_values {
-                                    possible_values.insert(pv.clone());
-                                }
-                                // Extract class names from all possible values
-                                for value in &possible_values {
-                                    for class_name in value.split_whitespace() {
-                                        if !class_name.is_empty() {
-                                            context
-                                                .analysis
-                                                .css
-                                                .used_classes
-                                                .insert(class_name.to_string());
-                                            element_classes.insert(class_name.to_string());
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        AttributeValue::Expression(expr_tag) => {
-                            // Expression as attribute value: class={{ ... }}
-                            // Use the cached JSON view of the expression to analyze it
-                            let expr_json = expr_tag.expression.as_json();
-                            use super::super::css::get_possible_values;
-                            if let Some(possible_values) = get_possible_values(expr_json, true) {
-                                // We can statically determine the classes
-                                for value in &possible_values {
-                                    for class_name in value.split_whitespace() {
-                                        context
-                                            .analysis
-                                            .css
-                                            .used_classes
-                                            .insert(class_name.to_string());
-                                        element_classes.insert(class_name.to_string());
-                                    }
-                                }
-                            } else {
-                                // Unknown expression - mark as dynamic
-                                context.analysis.css.has_dynamic_classes = true;
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                "id" => {
-                    match &attr_node.value {
-                        AttributeValue::Sequence(parts) => {
-                            // An interpolated id (`id="a{x}"`) has an unknown runtime
-                            // value, so it could match any #id selector.
-                            let has_dynamic_part = parts
-                                .iter()
-                                .any(|p| matches!(p, AttributeValuePart::ExpressionTag(_)));
-                            if has_dynamic_part {
-                                context.analysis.css.has_dynamic_ids = true;
-                            } else {
-                                for part in parts {
-                                    if let AttributeValuePart::Text(text) = part {
-                                        let id = text.data.trim();
-                                        if !id.is_empty() {
-                                            context.analysis.css.used_ids.insert(id.to_string());
-                                            element_id = Some(id.to_string());
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        // `id={expr}` or the `{id}` shorthand: dynamic, unknown value.
-                        AttributeValue::Expression(_) => {
-                            context.analysis.css.has_dynamic_ids = true;
-                        }
-                        _ => {}
-                    }
-                }
-                _ => {}
-            }
-        } else if let Attribute::SpreadAttribute(spread) = attr {
-            // Visit spread attribute to set has_dynamic_classes
-            has_spread = true;
-            spread_attribute::visit(spread, context)?;
-        } else if let Attribute::BindDirective(bind) = attr {
-            // bind:name is a dynamic attribute
-            dynamic_attribute_names.insert(bind.name.to_string());
-        } else if let Attribute::ClassDirective(class_dir) = attr {
-            has_class_directive = true;
-            class_directive_names.insert(class_dir.name.to_string());
-            // `class:name` matches a `.name` class selector exactly (the official
-            // `attribute_matches` returns true for ClassDirective with `~=`), so
-            // track the directive name as a class on this element.
-            element_classes.insert(class_dir.name.to_string());
-        } else if let Attribute::StyleDirective(_) = attr {
-            has_style_directive = true;
+    for attr in &mut element.attributes {
+        if let Attribute::SpreadAttribute(spread) = attr {
+            spread_attribute::visit(spread, context, true)?;
         }
     }
 
@@ -777,7 +449,7 @@ pub fn visit(
             if let Attribute::Attribute(attr_node) = attr
                 && attr_node.name == "value"
             {
-                return Err(errors::textarea_invalid_content());
+                return Err(errors::textarea_invalid_content().at(element.start, element.end));
             }
         }
 
@@ -809,14 +481,10 @@ pub fn visit(
             if let TemplateNode::Text(text) = first {
                 // Clone the text node and modify it
                 let mut modified_text = text.clone();
-                modified_text.data = REGEX_STARTS_WITH_NEWLINE
-                    .replace(&modified_text.data, "")
-                    .to_string()
-                    .into();
-                modified_text.raw = REGEX_STARTS_WITH_NEWLINE
-                    .replace(&modified_text.raw, "")
-                    .to_string()
-                    .into();
+                modified_text.data =
+                    REGEX_STARTS_WITH_NEWLINE.replace(&modified_text.data, "").to_string().into();
+                modified_text.raw =
+                    REGEX_STARTS_WITH_NEWLINE.replace(&modified_text.raw, "").to_string().into();
                 element.fragment.nodes[0] = TemplateNode::Text(modified_text);
             }
 
@@ -848,27 +516,23 @@ pub fn visit(
     // Check if component name binding exists and warn if unused
     // This warns when someone imports a component but uses a lowercase name,
     // which makes it look like an HTML element
-    let binding = context
-        .analysis
-        .root
-        .scope
-        .declarations
-        .get(element.name.as_str());
+    let binding = context.analysis.root.scope.declarations.get(element.name.as_str());
 
     if let Some(&binding_idx) = binding {
         let binding = &context.analysis.root.bindings[binding_idx];
         if binding.declaration_kind == super::super::DeclarationKind::Import
             && binding.references.is_empty()
+            && !context.analysis.root.preanalysis_template_references.contains(&binding_idx)
         {
-            context.emit_warning(warnings::component_name_lowercase(&element.name));
+            context.emit_warning(
+                warnings::component_name_lowercase(&element.name).at(element.start, element.end),
+            );
         }
     }
 
     // Check for spread attributes
-    let _has_spread = element
-        .attributes
-        .iter()
-        .any(|attr| matches!(attr, Attribute::SpreadAttribute(_)));
+    let _has_spread =
+        element.attributes.iter().any(|attr| matches!(attr, Attribute::SpreadAttribute(_)));
 
     // Determine if element is SVG
     // Following the official Svelte compiler logic:
@@ -923,9 +587,11 @@ pub fn visit(
             let only_warn = current_block_depth > parent_block_depth;
 
             if only_warn {
-                context.emit_warning(warnings::node_invalid_placement_ssr(&message));
+                context.emit_warning(
+                    warnings::node_invalid_placement_ssr(&message).at(element.start, element.end),
+                );
             } else {
-                return Err(errors::node_invalid_placement(&message));
+                return Err(errors::node_invalid_placement(&message).at(element.start, element.end));
             }
         }
 
@@ -951,18 +617,27 @@ pub fn visit(
                 // between an outer `<dd>` and an inner `<dt>`), the descendant
                 // restriction no longer applies. Mirrors upstream's `reset_by`
                 // walk in `is_tag_valid_with_ancestor` (#721).
+                // A custom element in between resets it too — upstream bails out of
+                // the `reset_by` walk on any intervening name containing a hyphen.
                 if let Some(reset_by) = get_descendant_reset_by(ancestor_name)
                     && context.element_ancestors[i + 1..]
                         .iter()
-                        .any(|a| reset_by.contains(&a.as_str()))
+                        .any(|a| reset_by.contains(&a.as_str()) || a.contains('-'))
                 {
                     continue;
                 }
 
-                let message = format!(
-                    "`<{}>` cannot be a descendant of `<{}>`",
-                    element.name, ancestor_name
-                );
+                // Upstream routes the immediate parent through
+                // `is_tag_valid_with_parent`, which words it as a child relation.
+                let relation = if !is_direct_parent {
+                    "a descendant of"
+                } else if is_direct_only_disallowed(ancestor_name) {
+                    "a direct child of"
+                } else {
+                    "a child of"
+                };
+                let message =
+                    format!("`<{}>` cannot be {} `<{}>`", element.name, relation, ancestor_name);
 
                 // Check if there's a block between us and this ancestor
                 let ancestor_block_depth =
@@ -976,9 +651,11 @@ pub fn visit(
         // Now emit warnings or return errors
         for (message, only_warn) in ancestor_warnings {
             if only_warn {
-                context.emit_warning(warnings::node_invalid_placement_ssr(&message));
+                context.emit_warning(
+                    warnings::node_invalid_placement_ssr(&message).at(element.start, element.end),
+                );
             } else {
-                return Err(errors::node_invalid_placement(&message));
+                return Err(errors::node_invalid_placement(&message).at(element.start, element.end));
             }
         }
     }
@@ -997,61 +674,64 @@ pub fn visit(
                 && !is_svg(node_name)
                 && !is_mathml(node_name)
             {
-                context.emit_warning(warnings::element_invalid_self_closing_tag(node_name));
+                context.emit_warning(
+                    // Void/SVG/MathML classification uses the local name, but
+                    // upstream preserves the source spelling in the message.
+                    warnings::element_invalid_self_closing_tag(&element.name)
+                        .at(element.start, element.end),
+                );
             }
         }
     }
 
-    // Check if the element's fragment contains opaque content (render tags, slots, components)
-    // that can inject unknown element children at runtime
-    let has_opaque_content = element.fragment.nodes.iter().any(|node| {
-        use crate::ast::template::TemplateNode;
-        matches!(
-            node,
-            TemplateNode::RenderTag(_)
-                | TemplateNode::Component(_)
-                | TemplateNode::SlotElement(_)
-                | TemplateNode::SvelteComponent(_)
-                | TemplateNode::SvelteSelf(_)
-                | TemplateNode::HtmlTag(_)
-        )
-    });
-
-    // Create and track DOM element for CSS sibling combinator detection
-    let dom_element = super::super::types::CssDomElement {
-        tag_name: element.name.to_string(),
-        classes: element_classes,
-        id: element_id,
-        static_attributes,
-        dynamic_attribute_names,
-        has_spread,
-        has_class_directive,
-        class_directive_names,
-        has_style_directive,
-        parent_idx,
-        children_idx: Vec::new(),
-        is_root_child,
-        possible_prev_adjacent: Vec::new(),
-        possible_next_adjacent: Vec::new(),
-        possible_prev_general: Vec::new(),
-        possible_next_general: Vec::new(),
-        has_content: !element.fragment.nodes.is_empty(),
-        has_opaque_content,
-        is_dynamic_tag: false,
-        prev_is_opaque_boundary: false,
-        prev_has_opaque_boundary: false,
+    let element_idx = if collect_css {
+        let has_opaque_content = element.fragment.nodes.iter().any(|node| {
+            use crate::ast::template::TemplateNode;
+            matches!(
+                node,
+                TemplateNode::RenderTag(_)
+                    | TemplateNode::Component(_)
+                    | TemplateNode::SlotElement(_)
+                    | TemplateNode::SvelteComponent(_)
+                    | TemplateNode::SvelteSelf(_)
+                    | TemplateNode::HtmlTag(_)
+            )
+        });
+        let dom_element = super::super::types::CssDomElement {
+            tag_name: element.name.to_string(),
+            classes: css_facts.classes,
+            id: css_facts.id,
+            static_attributes: css_facts.static_attributes,
+            dynamic_attribute_names: css_facts.dynamic_attribute_names,
+            has_spread: css_facts.has_spread,
+            has_class_directive: css_facts.has_class_directive,
+            class_directive_names: css_facts.class_directive_names,
+            has_style_directive: css_facts.has_style_directive,
+            parent_idx,
+            children_idx: Vec::new(),
+            is_root_child,
+            possible_prev_adjacent: Vec::new(),
+            possible_next_adjacent: Vec::new(),
+            possible_prev_general: Vec::new(),
+            possible_next_general: Vec::new(),
+            has_content: !element.fragment.nodes.is_empty(),
+            has_opaque_content,
+            is_dynamic_tag: false,
+            snippet_name: context.current_snippet_name(),
+            sibling_walk_incomplete: false,
+            prev_is_opaque_boundary: false,
+            prev_has_opaque_boundary: false,
+        };
+        let element_idx = context.add_dom_element(dom_element);
+        if let Some(parent_idx) = parent_idx
+            && parent_idx < context.analysis.css.dom_structure.elements.len()
+        {
+            context.analysis.css.dom_structure.elements[parent_idx].children_idx.push(element_idx);
+        }
+        element_idx
+    } else {
+        usize::MAX
     };
-
-    let element_idx = context.add_dom_element(dom_element);
-
-    // Update parent's children list
-    if let Some(parent_idx) = parent_idx
-        && parent_idx < context.analysis.css.dom_structure.elements.len()
-    {
-        context.analysis.css.dom_structure.elements[parent_idx]
-            .children_idx
-            .push(element_idx);
-    }
 
     // Visit attributes and directives
     // We need to validate bind directives with the element context
@@ -1068,17 +748,9 @@ pub fn visit(
                         context.uses_event_attributes = true;
                         context.analysis.uses_event_attributes = true;
                     }
-                    // attribute_quoted check for custom elements
-                    if is_custom_element_node(element)
-                        && let crate::ast::template::AttributeValue::Sequence(parts) =
-                            &attr_node.value
-                        && parts.len() == 1
-                        && matches!(
-                            &parts[0],
-                            crate::ast::template::AttributeValuePart::ExpressionTag(_)
-                        )
-                    {
-                        context.emit_warning(warnings::attribute_quoted());
+                    super::shared::attribute::record_event_attribute_arrow(context, attr_node);
+                    if is_custom_element_node(element) {
+                        super::shared::attribute::warn_attribute_quoted(context, attr_node);
                     }
                 }
                 // Mutable re-borrow so the visitor can populate
@@ -1108,8 +780,8 @@ pub fn visit(
                 // `class_directive::visit` can populate `directive.metadata`.
             }
             Attribute::StyleDirective(_) => {
-                // Re-borrow the style directive for the visit call
-                if let Attribute::StyleDirective(style_dir) = &element.attributes[i] {
+                // Re-borrow the style directive mutably so analysis can populate metadata.
+                if let Attribute::StyleDirective(style_dir) = &mut element.attributes[i] {
                     super::style_directive::visit(style_dir, context)?;
                 }
             }
@@ -1138,19 +810,6 @@ pub fn visit(
     for attr in &mut element.attributes {
         match attr {
             Attribute::OnDirective(on) => {
-                // In runes mode, warn about deprecated event directive usage
-                // on RegularElement (not components). This is done here because
-                // on_directive::visit doesn't have access to the parent type.
-                // Reference: svelte/packages/svelte/src/compiler/phases/2-analyze/visitors/OnDirective.js
-                if context.analysis.runes {
-                    context.emit_warning(warnings::event_directive_deprecated(&on.name));
-                }
-
-                // Track event directive for mixed_event_handler_syntaxes check
-                // This is a RegularElement, so we track it
-                if context.event_directive_node.is_none() {
-                    context.event_directive_node = Some(on.name.to_string());
-                }
                 on_directive::visit(on, context)?;
             }
             Attribute::ClassDirective(class_dir) => {
@@ -1179,21 +838,20 @@ pub fn visit(
     // Track custom elements as slot owners
     let is_custom_element = element.name.contains('-');
     if is_custom_element {
-        context
-            .slot_owner_ancestors
-            .push(super::SlotOwnerType::CustomElement);
+        context.slot_owner_ancestors.push(super::SlotOwnerType::CustomElement);
     }
 
-    // Push this element index to DOM element stack for tracking children
-    context.dom_element_stack.push(element_idx);
+    if collect_css {
+        context.dom_element_stack.push(element_idx);
+    }
 
     // Push None to each_block_stack to indicate we're no longer directly in an EachBlock
     context.each_block_stack.push(None);
 
-    // Clear is_direct_child_of_component since we're now inside an element
-    let was_direct_child = context.is_direct_child_of_component;
+    // Clear direct_component_parent since we're now inside an element
+    let was_direct_child = context.direct_component_parent;
     let was_direct_snippet = context.is_direct_child_of_snippet;
-    context.is_direct_child_of_component = false;
+    context.direct_component_parent = super::DirectComponentParent::None;
     context.is_direct_child_of_snippet = false;
 
     // Push fragment owner type for const_tag placement validation
@@ -1239,9 +897,27 @@ pub fn visit(
                 let root_id =
                     extract_binding_root_identifier(&bind.expression, context.parse_arena);
                 if let Some(ref root_name) = root_id {
-                    // Get the binding for this identifier using the instance scope
-                    let scope_idx = context.analysis.root.instance_scope_index;
-                    let binding_idx = context.analysis.root.get_binding(root_name, scope_idx);
+                    // Resolve from the scope containing the select (upstream's
+                    // `context.state.scope`), not the instance scope: an each-item
+                    // declared in a block scope wrapping the select (e.g.
+                    // `{#each columns as col}<select bind:value={sel[col.key]}>`)
+                    // is a valid indirect binding upstream and must be reachable
+                    // through the ancestor chain.
+                    let scope_idx = context.scope;
+                    // Upstream `scope.get('$store')` returns null (a store
+                    // auto-subscription is not a real scope binding), so a
+                    // `bind:value={$store}` root never gets indirect bindings;
+                    // rsvelte synthesizes a StoreSub binding, so skip it here.
+                    let binding_idx = context
+                        .analysis
+                        .root
+                        .get_binding(root_name, scope_idx)
+                        .filter(|&i| {
+                            !matches!(
+                                context.analysis.root.bindings[i].kind,
+                                crate::compiler::phases::phase2_analyze::scope::BindingKind::StoreSub
+                            )
+                        });
 
                     if let Some(binding_idx) = binding_idx {
                         // Collect scope references that have template references.
@@ -1271,12 +947,8 @@ pub fn visit(
                             let mut cur = Some(scope_idx);
                             while let Some(si) = cur {
                                 ancestor_scopes.insert(si);
-                                cur = context
-                                    .analysis
-                                    .root
-                                    .all_scopes
-                                    .get(si)
-                                    .and_then(|s| s.parent);
+                                cur =
+                                    context.analysis.root.all_scopes.get(si).and_then(|s| s.parent);
                             }
                         }
                         let mut indirect_with_pos: Vec<(u32, String)> = Vec::new();
@@ -1390,15 +1062,16 @@ pub fn visit(
     // Pop fragment owner type
     context.fragment_owner_stack.pop();
 
-    // Restore is_direct_child_of_component
-    context.is_direct_child_of_component = was_direct_child;
+    // Restore direct_component_parent
+    context.direct_component_parent = was_direct_child;
     context.is_direct_child_of_snippet = was_direct_snippet;
 
     // Pop from each_block_stack
     context.each_block_stack.pop();
 
-    // Pop this element from DOM element stack
-    context.dom_element_stack.pop();
+    if collect_css {
+        context.dom_element_stack.pop();
+    }
 
     // Pop slot owner if this was a custom element
     if is_custom_element {
@@ -1434,15 +1107,6 @@ pub fn visit(
 
     Ok(())
 }
-
-/// Alias for visit function.
-pub fn visit_regular_element(
-    element: &mut RegularElement,
-    context: &mut VisitorContext,
-) -> Result<(), AnalysisError> {
-    visit(element, context)
-}
-
 /// Extract the root identifier name from a binding expression.
 /// For `selected` -> "selected", for `selected.done` -> "selected",
 /// for `items[0]` -> "items".
@@ -1452,23 +1116,7 @@ fn extract_binding_root_identifier(
     arena: &crate::ast::arena::ParseArena,
 ) -> Option<String> {
     let node = expr.as_node();
-    extract_binding_root_identifier_node(&node, arena)
-}
-
-fn extract_binding_root_identifier_node(
-    node: &crate::ast::typed_expr::JsNode,
-    arena: &crate::ast::arena::ParseArena,
-) -> Option<String> {
-    use crate::ast::typed_expr::JsNode;
-    match node {
-        JsNode::Identifier { name, .. } => Some(name.to_string()),
-        JsNode::MemberExpression { object, .. } => {
-            // Recurse through the typed arena instead of materializing the
-            // whole MemberExpression chain into a Value.
-            extract_binding_root_identifier_node(arena.get_js_node(*object), arena)
-        }
-        _ => None,
-    }
+    base_identifier_name(&node, arena)
 }
 
 /// Recursively collect component-tag references within a fragment subtree, in
@@ -1539,15 +1187,4 @@ fn collect_subtree_component_refs(
         }
     }
     walk(&fragment.nodes, out);
-}
-
-fn extract_binding_root_identifier_json(value: &serde_json::Value) -> Option<String> {
-    match value.get("type").and_then(|t| t.as_str())? {
-        "Identifier" => value.get("name").and_then(|n| n.as_str()).map(String::from),
-        "MemberExpression" => {
-            let object = value.get("object")?;
-            extract_binding_root_identifier_json(object)
-        }
-        _ => None,
-    }
 }

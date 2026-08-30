@@ -117,6 +117,16 @@ fn is_valid_code(code: &str) -> bool {
     VALID_WARNING_CODES.contains(&code)
 }
 
+/// The full set of compiler/validator/a11y warning codes rsvelte can emit.
+///
+/// This is the single source of truth consumed by external tooling (e.g. the
+/// `@rsvelte/oxlint-plugin` rule catalog) to enumerate the diagnostic ids that
+/// come from the compiler warning wrap rather than from a native lint
+/// [`RuleMeta`](crate::compiler) rule.
+pub fn valid_warning_codes() -> &'static [&'static str] {
+    VALID_WARNING_CODES
+}
+
 /// Map of legacy warning codes to new codes.
 /// Corresponds to `replacements` in Svelte's extract_svelte_ignore.js.
 fn get_replacement(code: &str) -> Option<&'static str> {
@@ -155,7 +165,7 @@ pub struct SvelteIgnoreResult {
 ///
 /// A vector of warning codes to ignore.
 pub fn extract_svelte_ignore(text: &str, runes: bool) -> Vec<String> {
-    extract_svelte_ignore_with_warnings(text, runes).ignores
+    extract_svelte_ignore_with_warnings(0, text, runes).ignores
 }
 
 /// Extract svelte-ignore codes from a comment, returning both ignores and warnings.
@@ -166,14 +176,19 @@ pub fn extract_svelte_ignore(text: &str, runes: bool) -> Vec<String> {
 /// - Unrecognized codes emit `unknown_code` warnings with optional fuzzy match suggestions
 ///
 /// Corresponds to `extract_svelte_ignore` in Svelte's extract_svelte_ignore.js.
-pub fn extract_svelte_ignore_with_warnings(text: &str, runes: bool) -> SvelteIgnoreResult {
+///
+/// `offset` is the source position of `text` (the comment's `start + 4`), so the
+/// `legacy_code` / `unknown_code` warnings can point at the offending code itself.
+pub fn extract_svelte_ignore_with_warnings(
+    offset: u32,
+    text: &str,
+    runes: bool,
+) -> SvelteIgnoreResult {
     let Some(captures) = SVELTE_IGNORE_REGEX.find(text) else {
-        return SvelteIgnoreResult {
-            ignores: Vec::new(),
-            warnings: Vec::new(),
-        };
+        return SvelteIgnoreResult { ignores: Vec::new(), warnings: Vec::new() };
     };
 
+    let rest_offset = offset + captures.end() as u32;
     let rest = &text[captures.end()..];
     let mut ignores = Vec::new();
     let mut emit_warnings = Vec::new();
@@ -186,7 +201,10 @@ pub fn extract_svelte_ignore_with_warnings(text: &str, runes: bool) -> SvelteIgn
         }
 
         for caps in RUNES_CODE_REGEX.captures_iter(rest) {
-            let code = &caps[1];
+            let code_match = caps.get(1).unwrap();
+            let code = code_match.as_str();
+            let start = rest_offset + code_match.start() as u32;
+            let end = start + code.len() as u32;
 
             if is_valid_code(code) {
                 // Directly recognized code
@@ -199,12 +217,13 @@ pub fn extract_svelte_ignore_with_warnings(text: &str, runes: bool) -> SvelteIgn
 
                 if is_valid_code(&replacement) {
                     // Legacy code with a valid replacement
-                    emit_warnings.push(warnings::legacy_code(code, &replacement));
+                    emit_warnings.push(warnings::legacy_code(code, &replacement).at(start, end));
                 } else {
                     // Unknown code - try fuzzy matching
                     let codes_vec: Vec<&str> = VALID_WARNING_CODES.to_vec();
                     let suggestion = fuzzymatch(code, &codes_vec);
-                    emit_warnings.push(warnings::unknown_code(code, suggestion.as_deref()));
+                    emit_warnings
+                        .push(warnings::unknown_code(code, suggestion.as_deref()).at(start, end));
                 }
             }
 
@@ -236,8 +255,5 @@ pub fn extract_svelte_ignore_with_warnings(text: &str, runes: bool) -> SvelteIgn
         }
     }
 
-    SvelteIgnoreResult {
-        ignores,
-        warnings: emit_warnings,
-    }
+    SvelteIgnoreResult { ignores, warnings: emit_warnings }
 }

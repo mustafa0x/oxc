@@ -147,10 +147,6 @@ impl ExternalPluginStore {
         (&plugin.name, &external_rule.name)
     }
 
-    pub fn plugin_names(&self) -> impl Iterator<Item = &str> {
-        self.plugins.iter().map(|plugin| plugin.name.as_str())
-    }
-
     /// Add options to the store and return its [`ExternalOptionsId`].
     /// If `options` is empty, returns [`ExternalOptionsId::NONE`] without adding to the store.
     pub fn add_options(

@@ -14,7 +14,7 @@ use oxc_allocator::{Allocator, free_fixed_size_allocator};
 use oxc_linter::{
     ExternalLinter, ExternalLinterCreateWorkspaceCb, ExternalLinterDestroyWorkspaceCb,
     ExternalLinterLintFileCb, ExternalLinterLoadPluginCb, ExternalLinterSetupRuleConfigsCb,
-    LintFilePayload, LintFileSuccessPayload, LoadPluginResult,
+    LintFileResult, LoadPluginResult,
 };
 
 use crate::{
@@ -141,7 +141,7 @@ fn wrap_setup_rule_configs(cb: JsSetupRuleConfigsCb) -> ExternalLinterSetupRuleC
 /// Result returned by `lintFile` JS callback.
 #[derive(Clone, Debug, Deserialize)]
 pub enum LintFileReturnValue {
-    Success(LintFileSuccessPayload),
+    Success(Vec<LintFileResult>),
     Failure(String),
 }
 
@@ -161,24 +161,17 @@ fn wrap_lint_file(cb: JsLintFileCb) -> ExternalLinterLintFileCb {
               options_ids: Vec<u32>,
               settings_json: String,
               globals_json: String,
-              language_options_ids: Vec<u32>,
               workspace_uri: Option<String>,
-              source_text: Option<String>,
               allocator: &Allocator| {
             let (tx, rx) = channel();
 
-            let (buffer_id, buffer) = if source_text.is_some() {
-                (0, None)
-            } else {
-                // SAFETY: This function is only called when an `ExternalLinter` exists.
-                // When that is the case, the `AllocatorPool` used to create `Allocator`s is created with
-                // `AllocatorPool::new_fixed_size`, so all `Allocator`s are created via `FixedSizeAllocator`.
-                // This is somewhat sketchy, as we don't have a type-level guarantee of this invariant,
-                // but it does hold at present.
-                // TODO: Close this soundness hole with type-level guarantees.
-                let (buffer_id, buffer) = unsafe { get_buffer(allocator) };
-                (buffer_id, buffer)
-            };
+            // SAFETY: This function is only called when an `ExternalLinter` exists.
+            // When that is the case, the `AllocatorPool` used to create `Allocator`s is created with
+            // `AllocatorPool::new_fixed_size`, so all `Allocator`s are created via `FixedSizeAllocator`.
+            // This is somewhat sketchy, as we don't have a type-level guarantee of this invariant,
+            // but it does hold at present.
+            // TODO: Close this soundness hole with type-level guarantees.
+            let (buffer_id, buffer) = unsafe { get_buffer(allocator) };
 
             // Send data to JS
             let status = cb.call_with_return_value(
@@ -190,9 +183,7 @@ fn wrap_lint_file(cb: JsLintFileCb) -> ExternalLinterLintFileCb {
                     options_ids,
                     settings_json,
                     globals_json,
-                    language_options_ids,
                     workspace_uri,
-                    source_text,
                 )),
                 ThreadsafeFunctionCallMode::NonBlocking,
                 move |result, _env| {
@@ -207,13 +198,13 @@ fn wrap_lint_file(cb: JsLintFileCb) -> ExternalLinterLintFileCb {
 
             if status == Status::Ok {
                 match rx.recv() {
-                    // `lintFile` returns `null` when there are no diagnostics and no parser comments to round-trip.
-                    Ok(Ok(None)) => Ok(LintFilePayload::default()),
+                    // `lintFile` returns `null` if no diagnostics reported, and no error occurred
+                    Ok(Ok(None)) => Ok(Vec::new()),
                     // `lintFile` returns JSON string if diagnostics reported, or an error occurred
                     Ok(Ok(Some(json))) => {
                         match serde_json::from_str(&json) {
                             // Diagnostics reported
-                            Ok(LintFileReturnValue::Success(payload)) => Ok(payload.into()),
+                            Ok(LintFileReturnValue::Success(diagnostics)) => Ok(diagnostics),
                             // Error occurred on JS side
                             Ok(LintFileReturnValue::Failure(err)) => Err(err),
                             // JSON deserialization failure.

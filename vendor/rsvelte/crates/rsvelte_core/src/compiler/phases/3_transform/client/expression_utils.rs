@@ -1,7 +1,19 @@
 //! Expression parsing, shadowing detection, and identifier analysis utilities.
 
 use memchr::memmem;
+use oxc_allocator::Allocator;
+use oxc_ast::ast::{ArrowFunctionExpression, AwaitExpression, Class, Function, Statement};
+use oxc_ast_visit::Visit;
+use oxc_parser::Parser;
+use oxc_span::SourceType;
+use std::borrow::Cow;
 use std::fmt::Write as _;
+
+use crate::compiler::phases::phase3_transform::shared::js_scan::skip_opaque;
+use crate::compiler::phases::phase3_transform::shared::offsets::{ByteOffset, CharOffset};
+use crate::compiler::utils::{is_escaped, is_escaped_char};
+
+use super::scan_index::ScanIndex;
 
 /// Collapse a multi-line expression to a single line, matching esrap's behavior.
 /// Strip TypeScript generic type parameters from rune calls.
@@ -32,14 +44,10 @@ pub(super) fn extract_var_name_before_rune(before_rune: &str) -> String {
     // object literals from previously transformed code.
     let current_line_start = before_eq.rfind('\n').map_or(0, |p| p + 1);
     let current_line = &before_eq[current_line_start..];
-    let before_type = if let Some(colon_offset) = current_line.rfind(':') {
+    let before_type = if let Some(colon_offset) = rfind_unquoted_colon(current_line) {
         let colon_pos = current_line_start + colon_offset;
         let candidate = before_eq[..colon_pos].trim_end();
-        if candidate
-            .chars()
-            .last()
-            .is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '$')
-        {
+        if candidate.chars().last().is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '$') {
             candidate
         } else {
             before_eq
@@ -62,11 +70,30 @@ pub(super) fn extract_var_name_before_rune(before_rune: &str) -> String {
     {
         start -= 1;
     }
-    if start < end {
-        chars[start..end].iter().collect()
-    } else {
-        String::new()
+    if start < end { chars[start..end].iter().collect() } else { String::new() }
+}
+
+fn rfind_unquoted_colon(source: &str) -> Option<usize> {
+    let bytes = source.as_bytes();
+    let mut quote = None;
+    let mut escaped = false;
+    let mut found = None;
+    for (index, byte) in bytes.iter().copied().enumerate() {
+        if let Some(delimiter) = quote {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == delimiter {
+                quote = None;
+            }
+        } else if matches!(byte, b'\'' | b'\"' | b'`') {
+            quote = Some(byte);
+        } else if byte == b':' {
+            found = Some(index);
+        }
     }
+    found
 }
 
 ///
@@ -129,11 +156,7 @@ pub(super) fn collapse_to_single_line(content: &str) -> String {
     };
 
     // Only use collapsed form if it fits within the 60-char threshold
-    if collapsed.len() <= 60 {
-        collapsed
-    } else {
-        content.to_string()
-    }
+    if collapsed.len() <= 60 { collapsed } else { content.to_string() }
 }
 
 /// Determine if an expression needs parentheses when used on the right side
@@ -298,37 +321,91 @@ pub(super) fn ends_with_braceless_control_header(prefix: &str) -> bool {
     false
 }
 
+/// [`ends_with_braceless_control_header`] answered from the statement's final
+/// line alone, or `None` when the verdict genuinely depends on earlier lines.
+///
+/// The full predicate only ever reads a suffix, so joining the accumulated
+/// lines is wasted unless the header's `(` opens on an earlier line.
+pub(super) fn braceless_control_header_from_last_line(last: &str) -> Option<bool> {
+    let t = last.trim_end();
+    if t.is_empty() {
+        return None;
+    }
+    if !t.ends_with(')') {
+        return Some(ends_with_keyword(t, "else") || ends_with_keyword(t, "do"));
+    }
+    let open = matching_open_paren(t)?;
+    let before = t[..open].trim_end();
+    if before.is_empty() {
+        return None;
+    }
+    Some(["if", "for", "while", "switch", "catch"].iter().any(|kw| ends_with_keyword(before, kw)))
+}
+
+/// Whether the code before a line break ends with a binary operator. No
+/// statement can, so its right operand is on the next line — automatic
+/// semicolon insertion does not apply.
+///
+/// These are the operators currently handled, not every binary operator: `-` and
+/// `/` are still missing, because `a--` ends a statement and `/` also closes a
+/// block comment, so neither can be decided by suffix matching. A line ending in
+/// either still emits invalid output; deciding them needs a token-aware scan.
+pub(super) fn ends_with_binary_operator(code: &str) -> bool {
+    let last_line = code.rsplit('\n').next().unwrap_or(code);
+    // A comment can end in an operator too (`// a || b`), and it is not one.
+    let t = match super::props_transforms::find_line_comment_position(last_line) {
+        Some(pos) => last_line[..pos].trim_end(),
+        None => last_line.trim_end(),
+    };
+    // `in` and `instanceof` are words: a bare suffix match also fires on the
+    // identifier `margin`, swallowing the next line — wrong code, which no
+    // parser catches, where the bug this guards against is merely unparseable.
+    if ends_with_keyword(t, "in") || ends_with_keyword(t, "instanceof") {
+        return true;
+    }
+    // Single-byte tails cover their doubled forms too: `**`, `<<`, `>>`, `||`,
+    // `&&`, `??`, and the `=>` whose body starts on the next line. `<`/`>`/`|`/`&`
+    // also end a TS annotation (`let m: Map<string, number>`), which is a complete
+    // statement — safe only because `remove_typescript_nodes` has already stripped
+    // annotations by the time this runs, not because the tails are unambiguous.
+    matches!(
+        t.as_bytes().last(),
+        Some(b'*' | b'%' | b'<' | b'>' | b'|' | b'&' | b'^' | b',' | b'?')
+    ) || t.ends_with("==")
+        || t.ends_with("!=")
+        || t.ends_with("<=")
+        || t.ends_with(">=")
+        || (t.ends_with('+') && !t.ends_with("++"))
+}
+
 pub(super) fn find_statement_end_client(s: &str) -> usize {
+    let bytes = s.as_bytes();
+    let len = bytes.len();
     let mut depth = 0;
-    let mut in_string = false;
-    let mut string_char = ' ';
-    let mut prev_char = '\0';
+    // Last significant code byte, needed to tell a regex literal from a division.
+    let mut prev: Option<u8> = None;
+    let mut i = 0;
 
-    // Use char_indices() to get BYTE positions (not char positions),
-    // so the returned index can be used directly for byte-level string slicing.
-    // Using char-position indices with multibyte UTF-8 strings causes off-by-one bugs
-    // for strings containing characters like 'é', '中', etc.
-    for (byte_pos, c) in s.char_indices() {
-        // Handle string literals
-        if (c == '"' || c == '\'' || c == '`') && prev_char != '\\' {
-            if !in_string {
-                in_string = true;
-                string_char = c;
-            } else if c == string_char {
-                in_string = false;
+    // Byte positions throughout: the returned index is used to slice `s`, and
+    // every delimiter tested for is ASCII, so a UTF-8 continuation byte (always
+    // >= 0x80) can never be mistaken for one.
+    while i < len {
+        // A `;` or `)` inside a string, comment or regex literal is text. Reading
+        // one as the end of the statement truncated the initializer mid-comment
+        // and left the injected `)` inside the comment body.
+        if let Some((next, is_comment)) = skip_opaque(bytes, i, prev) {
+            if !is_comment {
+                prev = Some(b'x');
             }
-            prev_char = c;
+            i = next;
             continue;
         }
-
-        if in_string {
-            prev_char = c;
-            continue;
-        }
+        let c = bytes[i];
+        let byte_pos = i;
 
         match c {
-            '(' | '[' | '{' => depth += 1,
-            ')' | ']' | '}' => {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => {
                 if depth > 0 {
                     depth -= 1;
                 } else {
@@ -337,44 +414,45 @@ pub(super) fn find_statement_end_client(s: &str) -> usize {
                     return byte_pos;
                 }
             }
-            ';' if depth == 0 => return byte_pos,
+            b';' if depth == 0 => return byte_pos,
             // Newline at depth 0 ends the statement (JavaScript ASI)
             // UNLESS the next non-whitespace character continues the expression
             // (e.g., `?` or `:` for ternary, `.` for chain, binary operators).
-            '\n' if depth == 0 => {
-                let rest = &s[byte_pos + 1..];
-                let next = rest
-                    .bytes()
+            b'\n' if depth == 0 => {
+                let next = bytes[byte_pos + 1..]
+                    .iter()
                     .find(|b| !matches!(b, b' ' | b'\t' | b'\r' | b'\n'))
-                    .map(|b| b as char);
+                    .copied();
                 if let Some(nc) = next {
                     if matches!(
                         nc,
-                        '?' | ':'
-                            | '.'
-                            | '+'
-                            | '-'
-                            | '*'
-                            | '/'
-                            | '%'
-                            | '&'
-                            | '|'
-                            | '^'
-                            | '<'
-                            | '>'
-                            | '='
-                            | ','
+                        b'?' | b':'
+                            | b'.'
+                            | b'+'
+                            | b'-'
+                            | b'*'
+                            | b'/'
+                            | b'%'
+                            | b'&'
+                            | b'|'
+                            | b'^'
+                            | b'<'
+                            | b'>'
+                            | b'='
+                            | b','
                             // `(`, `[`, and a backtick after a newline continue the
                             // expression per JS ASI rules (`foo\n(bar)` is `foo(bar)`,
                             // `a\n[i]` is `a[i]`). Without these, a multi-line
                             // initializer whose continuation line starts with `(`
                             // (e.g. `let x =\n  (cond ? a : b) || c`) is truncated to
                             // an empty expression.
-                            | '('
-                            | '['
-                            | '`'
+                            | b'('
+                            | b'['
+                            | b'`'
                     ) {
                         // continuation; keep scanning
+                    } else if ends_with_binary_operator(&s[..byte_pos]) {
+                        // The right operand is on the next line; keep scanning.
                     } else if ends_with_braceless_control_header(&s[..byte_pos]) {
                         // A brace-less control-flow header (`if (cond)`, `else`,
                         // `for (...)`, `while (...)`, `do`) takes the following
@@ -391,10 +469,13 @@ pub(super) fn find_statement_end_client(s: &str) -> usize {
             }
             _ => {}
         }
-        prev_char = c;
+        if !c.is_ascii_whitespace() {
+            prev = Some(c);
+        }
+        i += 1;
     }
 
-    s.len()
+    len
 }
 
 /// Incrementally update expression depth counters by scanning only the given line.
@@ -454,7 +535,7 @@ pub(super) fn update_expression_depths(
             && c == b'$'
             && i + 1 < len
             && bytes[i + 1] == b'{'
-            && (i == 0 || bytes[i - 1] != b'\\')
+            && !is_escaped(bytes, i)
         {
             template_interp_stack.push(0);
             *in_string = None;
@@ -464,7 +545,7 @@ pub(super) fn update_expression_depths(
         }
 
         // Handle string literals
-        if (c == b'"' || c == b'\'' || c == b'`') && (i == 0 || bytes[i - 1] != b'\\') {
+        if (c == b'"' || c == b'\'' || c == b'`') && !is_escaped(bytes, i) {
             if let Some(string_char) = *in_string {
                 if c == string_char as u8 {
                     *in_string = None;
@@ -628,14 +709,14 @@ pub(super) fn is_expression_incomplete(
 /// (function params, for-loop vars, nested lets). Returns the input
 /// unchanged when nothing matches (no state-var reference in `expr`)
 /// or when parsing fails — those are no-op cases, not regressions.
-pub(super) fn wrap_state_vars_in_expr(
-    expr: &str,
+pub(super) fn wrap_state_vars_in_expr<'a>(
+    expr: &'a str,
     state_vars: &[String],
     non_reactive_vars: &[String],
     _proxy_vars: &[String],
-) -> String {
+) -> Cow<'a, str> {
     super::state_reads_ast::transform_state_reads_ast(expr, state_vars, non_reactive_vars)
-        .unwrap_or_else(|| expr.to_string())
+        .map_or(Cow::Borrowed(expr), Cow::Owned)
 }
 
 /// Check if a variable at the given position is shadowed by a function parameter.
@@ -663,16 +744,17 @@ pub(super) fn wrap_state_vars_in_expr(
 /// indicate this scope is a for-loop body with the variable declared in the init.
 /// Convert a byte position in a string to a character index.
 /// Returns the character index for the given byte offset.
-pub(super) fn byte_pos_to_char_index(s: &str, byte_pos: usize) -> usize {
-    s[..byte_pos].chars().count()
+pub(super) fn byte_pos_to_char_index(s: &str, byte_pos: ByteOffset) -> CharOffset {
+    CharOffset::new(byte_pos.before(s).chars().count())
 }
 
 /// Also check if we're directly inside the for-loop header (between the `for (` and `)`).
 pub(super) fn is_shadowed_by_for_loop_var(
     chars: &[char],
-    var_start: usize,
+    var_start: CharOffset,
     var_name: &str,
 ) -> bool {
+    let var_start = var_start.get();
     // First, check if we're inside a for-loop HEADER (init, test, or update section)
     // where the variable is declared as `let`/`const` in the init.
     // Scan backwards to find an unmatched `(` that might be a for-loop's opening paren.
@@ -819,16 +901,242 @@ pub(super) fn is_shadowed_by_for_loop_var(
     false
 }
 
+/// Compares an index answer against the backward scan it replaces, so agreement
+/// has a denominator instead of only a failure count. Off unless
+/// `RSVELTE_INDEX_ORACLE` is set.
+fn oracle_check(answer: bool, by_scan: impl FnOnce() -> bool) {
+    if super::super::profile::index_oracle_enabled() {
+        super::super::profile::record_index_oracle(answer == by_scan());
+    }
+}
+
 pub(super) fn is_shadowed_by_function_param(
+    index: &ScanIndex,
     chars: &[char],
     var_start: usize,
     var_name: &str,
 ) -> bool {
+    let answer = is_shadowed_by_function_param_indexed(index, chars, var_start, var_name);
+    oracle_check(answer, || is_shadowed_by_function_param_by_scan(chars, var_start, var_name));
+    answer
+}
+
+fn is_shadowed_by_function_param_indexed(
+    index: &ScanIndex,
+    chars: &[char],
+    var_start: usize,
+    var_name: &str,
+) -> bool {
+    // `var_len` only ever indexes `chars`, so it must be a character count.
+    let var_len = var_name.chars().count();
+
+    // Concise arrow bodies: `(a, b) => expr` and `(a, b) => (expr)`.
+    if let Some(arrow) = enclosing_concise_arrow(index, chars, var_start)
+        && arrow_params_contain(index, chars, arrow, var_name, var_len)
+    {
+        return true;
+    }
+
+    // Enclosing block scopes, innermost first.
+    let mut brace = index.enclosing_brace(var_start);
+    while let Some(open) = brace {
+        brace = index.enclosing_brace(open);
+        // `${` opens a template interpolation, not a scope.
+        if open > 0 && chars[open - 1] == '$' {
+            continue;
+        }
+        if block_declares_param(index, chars, open, var_name, var_len) {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// The `=>` of the arrow function whose *body* directly contains `var_start`, as
+/// the backward scan in [`is_shadowed_by_function_param_by_scan`] locates it:
+/// walk outwards through call parentheses, stopping at the first brace (any
+/// nesting), the first `=>` at the current parenthesis level, or a grouping `(`.
+fn enclosing_concise_arrow(index: &ScanIndex, chars: &[char], var_start: usize) -> Option<usize> {
+    let mut pos = var_start;
+    loop {
+        let brace = index.prev_brace(pos);
+        let arrow = index.prev_arrow(pos);
+        let open = index.enclosing_paren(pos);
+        // Whichever candidate sits closest to `pos` is the one a right-to-left
+        // scan reaches first.
+        let nearest = [brace, arrow, open].into_iter().flatten().max()?;
+
+        if Some(nearest) == brace {
+            return None;
+        }
+        if Some(nearest) == arrow {
+            return Some(nearest);
+        }
+
+        // A `(` at the current level: `=> (` is an arrow body in parentheses, a
+        // call/member `(` is skipped over, anything else ends the scan.
+        let mut before = nearest;
+        while before > 0 && chars[before - 1].is_whitespace() {
+            before -= 1;
+        }
+        if before >= 2 && chars[before - 1] == '>' && chars[before - 2] == '=' {
+            return Some(before - 1);
+        }
+        if before > 0 && (is_identifier_char(chars[before - 1]) || chars[before - 1] == ')') {
+            pos = nearest;
+            continue;
+        }
+        return None;
+    }
+}
+
+/// Whether the parameter list of the arrow whose `>` sits at `arrow` binds `var_name`.
+fn arrow_params_contain(
+    index: &ScanIndex,
+    chars: &[char],
+    arrow: usize,
+    var_name: &str,
+    var_len: usize,
+) -> bool {
+    let mut k = arrow - 1; // at '='
+    while k > 0 && chars[k - 1].is_whitespace() {
+        k -= 1;
+    }
+    if k > 0 && chars[k - 1] == ')' {
+        let close_idx = k - 1;
+        if let Some(open) = index.opener_of(close_idx) {
+            return param_list_binds(&chars[open + 1..close_idx], var_name, var_len);
+        }
+        return false;
+    }
+    if k > 0 && is_identifier_char(chars[k - 1]) {
+        // Single param arrow: `x => expr`
+        let end = k;
+        let mut start = k;
+        while start > 0 && is_identifier_char(chars[start - 1]) {
+            start -= 1;
+        }
+        let param: String = chars[start..end].iter().collect();
+        return param == var_name;
+    }
+    false
+}
+
+/// Whether `params` (the text between a parameter list's parentheses) contains
+/// `var_name` as a standalone identifier — `(_, count)`, `(count)`, `(count = d)`.
+fn param_list_binds(params: &[char], var_name: &str, var_len: usize) -> bool {
+    let mut k = 0;
+    while k < params.len() {
+        while k < params.len() && params[k].is_whitespace() {
+            k += 1;
+        }
+        if k + var_len <= params.len() {
+            let potential: String = params[k..k + var_len].iter().collect();
+            if potential == var_name {
+                let before_ok = k == 0 || !is_identifier_char(params[k - 1]);
+                let after_ok =
+                    k + var_len >= params.len() || !is_identifier_char(params[k + var_len]);
+                if before_ok && after_ok {
+                    return true;
+                }
+            }
+        }
+        k += 1;
+    }
+    false
+}
+
+/// Whether the block opening at `brace` is a function body binding `var_name`.
+fn block_declares_param(
+    index: &ScanIndex,
+    chars: &[char],
+    brace: usize,
+    var_name: &str,
+    var_len: usize,
+) -> bool {
+    // Skip whitespace before the {
+    let mut j = brace;
+    while j > 0 && chars[j - 1].is_whitespace() {
+        j -= 1;
+    }
+
+    // Arrow functions with a parenthesized object body: `(params) => ({…})`
+    if j > 0 && chars[j - 1] == '(' {
+        let mut k = j - 1;
+        while k > 0 && chars[k - 1].is_whitespace() {
+            k -= 1;
+        }
+        if k >= 2 && chars[k - 2] == '=' && chars[k - 1] == '>' {
+            j = k - 2;
+            while j > 0 && chars[j - 1].is_whitespace() {
+                j -= 1;
+            }
+        }
+    }
+
+    // Also skip `=>` for arrow functions: `(params) => {`
+    if j >= 2 && chars[j - 2] == '=' && chars[j - 1] == '>' {
+        j -= 2;
+        while j > 0 && chars[j - 1].is_whitespace() {
+            j -= 1;
+        }
+    }
+
+    // A `)` here would be the end of a parameter list.
+    if j == 0 || chars[j - 1] != ')' {
+        return false;
+    }
+    let close_paren_idx = j - 1;
+    let Some(open_idx) = index.opener_of(close_paren_idx) else {
+        return false;
+    };
+    if !param_list_binds(&chars[open_idx + 1..close_paren_idx], var_name, var_len) {
+        return false;
+    }
+
+    // The variable is in the parentheses — now confirm they are a parameter list
+    // and not a control-flow head.
+    let mut m = open_idx;
+    while m > 0 && chars[m - 1].is_whitespace() {
+        m -= 1;
+    }
+
+    for keyword in ["if", "while", "for", "switch", "with", "catch"] {
+        let kw_len = keyword.len();
+        if m >= kw_len {
+            let prefix: String = chars[m - kw_len..m].iter().collect();
+            if prefix == keyword && (m == kw_len || !is_identifier_char(chars[m - kw_len - 1])) {
+                return false;
+            }
+        }
+    }
+
+    if m > 0 {
+        if m >= 8 {
+            let prefix: String = chars[m - 8..m].iter().collect();
+            if prefix == "function" {
+                return true;
+            }
+        }
+        // A method definition like `update(count) {`.
+        if is_identifier_char(chars[m - 1]) {
+            return true;
+        }
+    }
+
+    // Bare `(…)` is only a function when an `=>` separates it from the block;
+    // otherwise it is grouping.
+    let between: String = chars[close_paren_idx + 1..brace].iter().collect();
+    between.trim().starts_with("=>")
+}
+
+fn is_shadowed_by_function_param_by_scan(chars: &[char], var_start: usize, var_name: &str) -> bool {
     // Strategy: scan backwards from var_start to find the nearest enclosing function scope.
     // If we find a function with this variable as a parameter, it's shadowed.
     // We need to track brace depth to understand scope nesting.
 
-    let var_len = var_name.len();
+    let var_len = var_name.chars().count();
 
     // Check for concise arrow functions: (a, b) => expr or (a, b) => (expr)
     // Scan backwards from var_start to find `=>`, tracking paren depth, then check params.
@@ -1022,9 +1330,8 @@ pub(super) fn is_shadowed_by_function_param(
 
                         // First, check if our variable is in the parameter list
                         // Extract text between ( and ) - not including the parens themselves
-                        let param_text: String = chars[open_idx + 1..close_paren_idx]
-                            .iter()
-                            .collect::<String>();
+                        let param_text: String =
+                            chars[open_idx + 1..close_paren_idx].iter().collect::<String>();
 
                         // Check if var_name appears as a standalone identifier in the parameter list
                         // We need to handle patterns like: (_, count), (count), (count = default)
@@ -1133,25 +1440,6 @@ pub(super) fn is_shadowed_by_function_param(
     false
 }
 
-/// Check if chars at position `end` are preceded by the given pattern string.
-/// Compares chars[end - pattern.len() .. end] against the ASCII pattern.
-#[allow(dead_code)]
-#[inline]
-pub(super) fn chars_match(chars: &[char], end: usize, pattern: &str) -> bool {
-    let pat_bytes = pattern.as_bytes();
-    let pat_len = pat_bytes.len();
-    if end < pat_len {
-        return false;
-    }
-    let start = end - pat_len;
-    for (j, &b) in pat_bytes.iter().enumerate() {
-        if chars[start + j] != b as char {
-            return false;
-        }
-    }
-    true
-}
-
 /// Check if a variable at the given position is a shorthand property in an object literal.
 /// This detects patterns like:
 /// - `{ foo, bar }` - shorthand properties
@@ -1160,6 +1448,7 @@ pub(super) fn chars_match(chars: &[char], end: usize, pattern: &str) -> bool {
 /// The variable should NOT be wrapped with $.get() if it's a shorthand property name,
 /// because `{ $.get(foo) }` is invalid JavaScript.
 pub(super) fn is_shorthand_object_property(
+    index: &ScanIndex,
     chars: &[char],
     var_start: usize,
     var_len: usize,
@@ -1184,7 +1473,112 @@ pub(super) fn is_shorthand_object_property(
 
     // Now we need to verify this is inside an object literal
     // by checking what's before the variable.
-    is_object_literal_property_position(chars, var_start)
+    is_object_literal_property_position(index, chars, var_start)
+}
+
+/// Check whether the identifier at `var_start` occupies a *binding* slot of a
+/// destructuring pattern that is a function parameter — `({ foo }) => …`,
+/// `([foo]) => …`, `function f({ a: { foo } })`. Such a slot declares a new
+/// local, so neither the `foo()` wrap nor the `foo: foo()` shorthand expansion
+/// may apply; both spell an invalid binding pattern.
+///
+/// Walks outward one bracket at a time, requiring each level to sit in a
+/// binding slot of its parent, so a default value (`({ a = foo }) => …`,
+/// `((o = { foo }) => o)`) and a computed key (`({ [foo]: v }) => …`) — both
+/// real reads — stay out.
+pub(super) fn is_destructured_param_binding(
+    index: &ScanIndex,
+    chars: &[char],
+    var_start: usize,
+) -> bool {
+    let mut pos = var_start;
+    let mut child_is_bracket = false;
+    let mut inside_pattern = false;
+
+    loop {
+        let Some(open) = index.enclosing_any(pos) else {
+            return false;
+        };
+        let prev = prev_binding_slot_char(chars, pos);
+        match chars[open] {
+            // A `[` opening right after `{` or `,` is a computed key, whose
+            // contents are read rather than bound.
+            '{' => {
+                let ok = match prev {
+                    Some('{' | ',') => !child_is_bracket,
+                    Some(':') => true,
+                    _ => false,
+                };
+                if !ok {
+                    return false;
+                }
+            }
+            '[' => {
+                if !matches!(prev, Some('[' | ',')) {
+                    return false;
+                }
+            }
+            '(' => {
+                return inside_pattern
+                    && matches!(prev, Some('(' | ','))
+                    && is_function_param_list(index, chars, open);
+            }
+            _ => return false,
+        }
+        inside_pattern = true;
+        child_is_bracket = chars[open] == '[';
+        pos = open;
+    }
+}
+
+/// The character before `pos` that decides its slot, skipping whitespace and a
+/// rest marker (`{ ...foo }` binds `foo` exactly as `{ foo }` does).
+fn prev_binding_slot_char(chars: &[char], pos: usize) -> Option<char> {
+    let mut j = pos;
+    while j > 0 && chars[j - 1].is_whitespace() {
+        j -= 1;
+    }
+    if j >= 3 && chars[j - 3..j].iter().all(|&c| c == '.') {
+        j -= 3;
+        while j > 0 && chars[j - 1].is_whitespace() {
+            j -= 1;
+        }
+    }
+    (j > 0).then(|| chars[j - 1])
+}
+
+/// Whether the group opened at `open` is a function parameter list: an arrow's
+/// (`) =>`) or a `function` expression/declaration's.
+fn is_function_param_list(index: &ScanIndex, chars: &[char], open: usize) -> bool {
+    if let Some(close) = index.closer_of(open).filter(|&c| chars[c] == ')') {
+        let mut k = close + 1;
+        while k < chars.len() && chars[k].is_whitespace() {
+            k += 1;
+        }
+        if k + 1 < chars.len() && chars[k] == '=' && chars[k + 1] == '>' {
+            return true;
+        }
+    }
+
+    // `function (…)` / `function name (…)`; a bare identifier before `(` is a
+    // call, not a definition.
+    let mut j = open;
+    for _ in 0..2 {
+        while j > 0 && chars[j - 1].is_whitespace() {
+            j -= 1;
+        }
+        let end = j;
+        while j > 0 && is_identifier_char(chars[j - 1]) {
+            j -= 1;
+        }
+        if chars[j..end].iter().copied().eq("function".chars()) {
+            return true;
+        }
+        if j == end {
+            return false;
+        }
+    }
+    false
 }
 
 /// Check if a variable at the given position is the KEY of an explicit
@@ -1197,7 +1591,12 @@ pub(super) fn is_shorthand_object_property(
 /// object-literal-context check is shared via
 /// [`is_object_literal_property_position`], which also excludes ternary
 /// `cond ? a : b` (there `a` is not preceded by `{`/`,`).
-pub(super) fn is_explicit_property_key(chars: &[char], var_start: usize, var_len: usize) -> bool {
+pub(super) fn is_explicit_property_key(
+    index: &ScanIndex,
+    chars: &[char],
+    var_start: usize,
+    var_len: usize,
+) -> bool {
     let var_end = var_start + var_len;
 
     // Skip whitespace after the variable.
@@ -1216,13 +1615,66 @@ pub(super) fn is_explicit_property_key(chars: &[char], var_start: usize, var_len
         return false;
     }
 
-    is_object_literal_property_position(chars, var_start)
+    is_object_literal_property_position(index, chars, var_start)
 }
 
 /// Shared backward heuristic: returns true when the identifier at `var_start`
 /// sits in object-literal property position — preceded (ignoring whitespace)
 /// by `{` or `,` inside an object literal (not a block statement or array).
-fn is_object_literal_property_position(chars: &[char], var_start: usize) -> bool {
+fn is_object_literal_property_position(
+    index: &ScanIndex,
+    chars: &[char],
+    var_start: usize,
+) -> bool {
+    let mut j = var_start;
+    while j > 0 && chars[j - 1].is_whitespace() {
+        j -= 1;
+    }
+    if j == 0 {
+        return false;
+    }
+
+    let answer = match chars[j - 1] {
+        '{' => {
+            let mut m = j - 1;
+            while m > 0 && chars[m - 1].is_whitespace() {
+                m -= 1;
+            }
+            if m == 0 {
+                // `{` at the very start of the expression: an object literal (say
+                // inside `$derived()` arguments) or a block statement such as
+                // `$: { tasks, tasks_touched++; }`. Only the latter has a
+                // semicolon at the group's own depth.
+                !index.leading_brace_has_semicolon()
+            } else {
+                let before = chars[m - 1];
+                // `n` is the tail of `return`, spelled out just below.
+                matches!(before, '=' | ':' | '(' | '[' | ',' | '?' | '|' | '&' | '!' | 'n')
+                    || (m >= 6 && chars[m - 6..m].iter().collect::<String>() == "return")
+            }
+        }
+        ',' => {
+            // Object or array element? Whichever enclosing bracket sits closest
+            // decides; each bracket kind is matched independently, as the scan
+            // this replaces counted them.
+            let at = j - 1;
+            let brace = index.enclosing_brace(at);
+            let bracket = index.enclosing_bracket(at);
+            let paren = index.enclosing_paren(at);
+            [brace, bracket, paren]
+                .into_iter()
+                .flatten()
+                .max()
+                .is_some_and(|nearest| Some(nearest) == brace)
+        }
+        _ => false,
+    };
+
+    oracle_check(answer, || is_object_literal_property_position_by_scan(chars, var_start));
+    answer
+}
+
+fn is_object_literal_property_position_by_scan(chars: &[char], var_start: usize) -> bool {
     let mut j = var_start;
     // Skip whitespace before the variable
     while j > 0 && chars[j - 1].is_whitespace() {
@@ -1356,361 +1808,6 @@ fn is_object_literal_property_position(chars: &[char], var_start: usize) -> bool
     false
 }
 
-/// Check if a destructuring pattern starting at position `open_pos` (with the given
-/// open/close bracket chars) is followed by an assignment operator `=`.
-///
-/// This handles patterns like:
-/// - `({ x } = obj)` - object destructuring assignment
-/// - `([x] = arr)` - array destructuring assignment
-/// - `({ d, e, g: [f.w, f.v] } = ...)` - nested destructuring assignment
-///
-/// Starting from `open_pos` (the opening `{` or `[`), we scan forward to find the
-/// matching closing bracket, then check if `=` follows (not `==` or `===`).
-#[allow(dead_code)]
-pub(super) fn is_destructuring_assignment_at(
-    chars: &[char],
-    open_pos: usize,
-    open_char: char,
-    close_char: char,
-) -> bool {
-    let mut depth = 1;
-    let mut k = open_pos + 1;
-    let mut in_string: Option<char> = None;
-
-    // Find the matching closing bracket/brace
-    while k < chars.len() && depth > 0 {
-        let c = chars[k];
-
-        // Handle string literals
-        if in_string.is_none() && (c == '\'' || c == '"' || c == '`') {
-            in_string = Some(c);
-            k += 1;
-            continue;
-        }
-        if let Some(quote) = in_string {
-            if c == quote {
-                // Check for escape
-                let mut backslashes = 0;
-                let mut m = k;
-                while m > 0 && chars[m - 1] == '\\' {
-                    backslashes += 1;
-                    m -= 1;
-                }
-                if backslashes % 2 == 0 {
-                    in_string = None;
-                }
-            }
-            k += 1;
-            continue;
-        }
-
-        if c == open_char {
-            depth += 1;
-        } else if c == close_char {
-            depth -= 1;
-        }
-        k += 1;
-    }
-
-    if depth != 0 {
-        return false; // Unmatched brackets
-    }
-
-    // k is now right after the closing bracket/brace
-    // Skip whitespace
-    while k < chars.len() && chars[k].is_whitespace() {
-        k += 1;
-    }
-
-    if k >= chars.len() {
-        return false;
-    }
-
-    // Check for `=` but not `==` or `===`
-    if chars[k] == '=' {
-        if k + 1 < chars.len() && chars[k + 1] == '=' {
-            return false; // It's == or ===
-        }
-        return true;
-    }
-
-    false
-}
-
-/// Check if a variable at the given position is on the left side of an assignment
-/// or is a variable declaration.
-/// This detects patterns like:
-/// - `varname = expr` - simple assignment
-/// - `varname += expr` - compound assignment
-/// - `let varname;` - declaration without initializer
-/// - `let varname = expr` - declaration with initializer
-/// - `({ varname } = obj)` - object destructuring assignment
-/// - `([varname] = arr)` - array destructuring assignment
-///
-/// The variable should NOT be wrapped with $.get() if it's an assignment target
-/// or a declaration.
-#[allow(dead_code)]
-pub(super) fn is_on_left_side_of_assignment(
-    chars: &[char],
-    var_start: usize,
-    var_len: usize,
-) -> bool {
-    // Check if preceded by `let `, `const `, or `var ` (variable declaration)
-    // This handles cases like `let container;` or `let container = expr`
-    // The keyword includes the trailing space, so "let " has length 4.
-    // For input like "let container;", var_start is at 'c' (position 4),
-    // so we check chars[0..4] which should equal "let ".
-    let is_declaration = {
-        // Check for declaration keywords directly before the variable
-        // No need to skip whitespace - the keyword pattern includes the space
-        let check_keyword = |keyword: &str| -> bool {
-            let kw_len = keyword.len();
-            if var_start >= kw_len {
-                let prefix: String = chars[var_start - kw_len..var_start].iter().collect();
-                if prefix == keyword {
-                    // Make sure it's a standalone keyword (not part of a larger identifier)
-                    // i.e., either at start of string or preceded by non-identifier char
-                    var_start == kw_len
-                        || (var_start > kw_len
-                            && !is_identifier_char(chars[var_start - kw_len - 1]))
-                } else {
-                    false
-                }
-            } else {
-                false
-            }
-        };
-
-        check_keyword("let ") || check_keyword("const ") || check_keyword("var ")
-    };
-
-    if is_declaration {
-        return true;
-    }
-
-    // Check if the variable is inside a destructuring pattern in a declaration or assignment.
-    // Declaration: `let { a } = ...` or `let [a, b] = ...` or `const { x: { y: a } } = ...`
-    // Assignment: `({ x } = obj)` or `([x] = arr)` or `({ d, e } = expr)`
-    // We walk backwards tracking brace/bracket depth to find the opening `{` or `[`,
-    // then check if it's preceded by a declaration keyword (declaration case),
-    // or if the matching closing bracket/brace is followed by `=` (assignment case).
-    let is_in_destructuring_pattern = {
-        let mut j = var_start;
-        let mut brace_depth = 0;
-        let mut bracket_depth = 0;
-        let mut in_string: Option<char> = None;
-        let mut found = false;
-
-        // Walk backwards from the variable position
-        while j > 0 {
-            j -= 1;
-            let c = chars[j];
-
-            // Handle string boundaries (walking backwards)
-            if in_string.is_none() && (c == '\'' || c == '"' || c == '`') {
-                // Check if this quote is escaped
-                let mut backslashes = 0;
-                let mut k = j;
-                while k > 0 && chars[k - 1] == '\\' {
-                    backslashes += 1;
-                    k -= 1;
-                }
-                if backslashes % 2 == 0 {
-                    in_string = Some(c);
-                }
-                continue;
-            } else if in_string == Some(c) {
-                // Check if this quote is escaped
-                let mut backslashes = 0;
-                let mut k = j;
-                while k > 0 && chars[k - 1] == '\\' {
-                    backslashes += 1;
-                    k -= 1;
-                }
-                if backslashes % 2 == 0 {
-                    in_string = None;
-                }
-                continue;
-            }
-
-            // Skip if inside a string
-            if in_string.is_some() {
-                continue;
-            }
-
-            match c {
-                '}' => brace_depth += 1,
-                '{' => {
-                    if brace_depth > 0 {
-                        brace_depth -= 1;
-                    } else {
-                        // Found the opening brace at our depth level
-                        // Check if it's preceded by a declaration keyword
-                        let mut k = j;
-                        // Skip whitespace before the brace
-                        while k > 0 && chars[k - 1].is_whitespace() {
-                            k -= 1;
-                        }
-                        // Check for declaration keywords (without trailing space since we've
-                        // already skipped the whitespace between keyword and brace)
-                        if k >= 3 {
-                            let prefix: String = chars[k - 3..k].iter().collect();
-                            if prefix == "let" || prefix == "var" {
-                                // Make sure it's a standalone keyword
-                                if k == 3 || !is_identifier_char(chars[k - 4]) {
-                                    found = true;
-                                    break;
-                                }
-                            }
-                        }
-                        if k >= 5 {
-                            let prefix: String = chars[k - 5..k].iter().collect();
-                            if prefix == "const" {
-                                // Make sure it's a standalone keyword
-                                if k == 5 || !is_identifier_char(chars[k - 6]) {
-                                    found = true;
-                                    break;
-                                }
-                            }
-                        }
-                        // Not a declaration - check if this is a destructuring assignment
-                        // Find the matching closing `}` and check if `=` follows
-                        if is_destructuring_assignment_at(chars, j, '{', '}') {
-                            found = true;
-                        }
-                        break;
-                    }
-                }
-                ']' => bracket_depth += 1,
-                '[' => {
-                    if bracket_depth > 0 {
-                        bracket_depth -= 1;
-                    } else {
-                        // Found the opening bracket at our depth level
-                        // Check if it's preceded by a declaration keyword
-                        let mut k = j;
-                        // Skip whitespace before the bracket
-                        while k > 0 && chars[k - 1].is_whitespace() {
-                            k -= 1;
-                        }
-                        // Check for declaration keywords (without trailing space since we've
-                        // already skipped the whitespace between keyword and bracket)
-                        if k >= 3 {
-                            let prefix: String = chars[k - 3..k].iter().collect();
-                            if prefix == "let" || prefix == "var" {
-                                // Make sure it's a standalone keyword
-                                if k == 3 || !is_identifier_char(chars[k - 4]) {
-                                    found = true;
-                                    break;
-                                }
-                            }
-                        }
-                        if k >= 5 {
-                            let prefix: String = chars[k - 5..k].iter().collect();
-                            if prefix == "const" {
-                                // Make sure it's a standalone keyword
-                                if k == 5 || !is_identifier_char(chars[k - 6]) {
-                                    found = true;
-                                    break;
-                                }
-                            }
-                        }
-                        // Not a declaration - check if this is a destructuring assignment
-                        // BUT first check if the `[` is a computed property access (NOT destructuring).
-                        // A computed property access is `obj[key]` where `[` is preceded by
-                        // an identifier char, `)`, `]`, or `}` (expression-continuation tokens).
-                        // In that case, the variable inside `[...]` is NOT a destructuring target.
-                        let is_computed_property = if k > 0 {
-                            let prev_char = chars[k - 1];
-                            is_identifier_char(prev_char)
-                                || prev_char == ')'
-                                || prev_char == ']'
-                                || prev_char == '}'
-                        } else {
-                            false
-                        };
-
-                        if !is_computed_property {
-                            // Find the matching closing `]` and check if `=` follows
-                            if is_destructuring_assignment_at(chars, j, '[', ']') {
-                                found = true;
-                            }
-                        }
-                        break;
-                    }
-                }
-                // Stop at statement boundaries if we're not inside a destructuring
-                ';' | '\n' if brace_depth == 0 && bracket_depth == 0 => break,
-                _ => {}
-            }
-        }
-        found
-    };
-
-    if is_in_destructuring_pattern {
-        return true;
-    }
-
-    let var_end = var_start + var_len;
-
-    // Skip whitespace after the variable
-    let mut k = var_end;
-    while k < chars.len() && chars[k].is_whitespace() {
-        k += 1;
-    }
-
-    if k >= chars.len() {
-        return false;
-    }
-
-    // Check for assignment operator: = += -= *= /= %= **= etc.
-    let next_char = chars[k];
-
-    if next_char == '=' {
-        // Could be = or == or ===
-        // For assignment, we only have = not followed by =
-        if k + 1 < chars.len() && chars[k + 1] == '=' {
-            // It's == or ===, not an assignment
-            return false;
-        }
-        // It's a simple assignment
-        return true;
-    }
-
-    // Check for compound assignments: += -= *= /= %= **=
-    if k + 1 < chars.len()
-        && chars[k + 1] == '='
-        && (next_char == '+' || next_char == '-' || next_char == '*' || next_char == '/')
-    {
-        // Make sure it's not !== or similar
-        if k + 2 < chars.len() && chars[k + 2] == '=' {
-            return false;
-        }
-        return true;
-    }
-
-    // Check for **=
-    if k + 2 < chars.len() && chars[k] == '*' && chars[k + 1] == '*' && chars[k + 2] == '=' {
-        return true;
-    }
-
-    // Check for ||= &&= ??= (three-char compound assignments)
-    if k + 2 < chars.len()
-        && (next_char == '|' || next_char == '&' || next_char == '?')
-        && chars[k] == chars[k + 1]
-        && chars[k + 2] == '='
-    {
-        return true;
-    }
-
-    // Check for %= (two-char compound assignment)
-    if k + 1 < chars.len() && next_char == '%' && chars[k + 1] == '=' {
-        return true;
-    }
-
-    false
-}
-
 // ============================================================================
 // Utility Functions
 // ============================================================================
@@ -1720,22 +1817,14 @@ pub(super) fn is_identifier_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_' || c == '$'
 }
 
-/// Find the position of the matching closing parenthesis.
+/// Find the position of the matching closing parenthesis, given `s` positioned
+/// just after the opening `(`.
+///
+/// Delegates to the lexical matcher: every caller uses the result to slice or
+/// delete a source range, and a `)` inside a comment, string, template or regex
+/// would cut that range mid-expression (#2601).
 pub(crate) fn find_matching_paren(s: &str) -> Option<usize> {
-    let mut depth = 1;
-    for (i, c) in s.char_indices() {
-        match c {
-            '(' => depth += 1,
-            ')' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(i);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
+    crate::compiler::phases::phase1_parse::utils::find_matching_bracket(s, 0, '(')
 }
 
 /// Extract the name of the enclosing function from the text before a block opening.
@@ -1753,9 +1842,7 @@ pub(super) fn extract_enclosing_function_name(before_block: &str) -> Option<&str
             if let Some(fn_pos) = memchr::memmem::rfind(before_params.as_bytes(), b"function ") {
                 let name_part = before_params[fn_pos + 9..].trim();
                 if !name_part.is_empty()
-                    && name_part
-                        .chars()
-                        .all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+                    && name_part.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '$')
                 {
                     return Some(name_part);
                 }
@@ -1769,25 +1856,17 @@ pub(super) fn extract_enclosing_function_name(before_block: &str) -> Option<&str
 /// For `$effect(() => { ... })`, returns `"$effect(...)"`.
 /// For `$.user_effect(() => { ... })`, returns `"$effect(...)"` (maps internal names to user-facing).
 /// Returns None if no call expression context is found.
-pub(super) fn extract_trace_call_label<'a>(
-    _before_block: &str,
-    source: &'a str,
-) -> Option<&'a str> {
-    // Look for the $inspect.trace() call in the source to find its context
-    if let Some(trace_pos) = memmem::find(source.as_bytes(), b"$inspect.trace(") {
-        // Walk backwards to find the enclosing call expression
-        let before = &source[..trace_pos];
-        // Look for `$effect(` or `$effect.pre(` pattern
-        // The arrow function `() => {` immediately precedes the block containing $inspect.trace
-        for rune in &["$effect.pre", "$effect"] {
-            if memmem::find(before.as_bytes(), rune.as_bytes()).is_some() {
-                // Find the position to compute line/col
-                return Some(if *rune == "$effect.pre" {
-                    "$effect.pre(...)"
-                } else {
-                    "$effect(...)"
-                });
-            }
+pub(super) fn extract_trace_call_label(source: &str, trace_pos: usize) -> Option<&'static str> {
+    // Walk backwards to find the enclosing call expression. This fallback is
+    // retained for transformed programs where the AST parent context is not
+    // available; `trace_pos` identifies the current call rather than always
+    // reading the first `$inspect.trace` in the component.
+    let before = &source[..trace_pos];
+    // Look for `$effect(` or `$effect.pre(` pattern
+    // The arrow function `() => {` immediately precedes the block containing $inspect.trace
+    for rune in &["$effect.pre", "$effect"] {
+        if memmem::find(before.as_bytes(), rune.as_bytes()).is_some() {
+            return Some(if *rune == "$effect.pre" { "$effect.pre(...)" } else { "$effect(...)" });
         }
     }
     None
@@ -1795,13 +1874,16 @@ pub(super) fn extract_trace_call_label<'a>(
 
 /// Find source location for the function/arrow containing $inspect.trace().
 pub(super) fn find_trace_source_location(
-    _before_block: &str,
     source: &str,
-    _label: &str,
+    trace_pos: usize,
+    in_class_method: bool,
 ) -> Option<(usize, usize)> {
-    // Find $inspect.trace() in source and then find the enclosing function/arrow
-    if let Some(trace_pos) = memmem::find(source.as_bytes(), b"$inspect.trace(") {
-        let before = &source[..trace_pos];
+    if trace_pos <= source.len() {
+        // The scans below read backwards for code punctuation, so prose in a
+        // comment between the function head and the trace call would otherwise
+        // answer for it.
+        let before = blank_comments(&source[..trace_pos]);
+        let before = before.as_str();
 
         // Walk backwards past whitespace and the opening { to find the arrow =>
         // or function keyword
@@ -1829,16 +1911,89 @@ pub(super) fn find_trace_source_location(
             }
         }
 
-        // Look for `function` keyword
-        if let Some(fn_pos) = memchr::memmem::rfind(trimmed.as_bytes(), b"function ") {
-            let before_pos = &source[..fn_pos];
+        // ESTree represents a class method's value as a FunctionExpression
+        // whose source location begins at the opening parameter paren. It has
+        // neither an arrow nor a `function` keyword for the text fallback to
+        // find, so use the AST-carried host classification to select this arm.
+        if in_class_method
+            && trimmed.ends_with(')')
+            && let Some(open_paren) = rfind_matching_paren(trimmed, trimmed.len() - 1)
+        {
+            let before_pos = &source[..open_paren];
             let line = before_pos.matches('\n').count() + 1;
             let last_nl = before_pos.rfind('\n').map(|p| p + 1).unwrap_or(0);
-            let col = fn_pos - last_nl;
+            let col = open_paren - last_nl;
+            return Some((line, col));
+        }
+
+        // Look for `function` keyword
+        if let Some(fn_pos) = memchr::memmem::rfind(trimmed.as_bytes(), b"function ") {
+            // ESTree's Function span starts at the preceding `async` keyword,
+            // including when whitespace or a comment separates the two.
+            let before_function = before[..fn_pos].trim_end();
+            let fn_start = before_function
+                .strip_suffix("async")
+                .filter(|prefix| {
+                    prefix.as_bytes().last().is_none_or(|byte| {
+                        !byte.is_ascii_alphanumeric() && *byte != b'_' && *byte != b'$'
+                    })
+                })
+                .map_or(fn_pos, |prefix| prefix.len());
+            let before_pos = &source[..fn_start];
+            let line = before_pos.matches('\n').count() + 1;
+            let last_nl = before_pos.rfind('\n').map(|p| p + 1).unwrap_or(0);
+            let col = fn_start - last_nl;
             return Some((line, col));
         }
     }
     None
+}
+
+/// Replace every comment byte with a space, keeping newlines and byte offsets,
+/// so a backward scan for code cannot land inside prose.
+fn blank_comments(source: &str) -> String {
+    let bytes = source.as_bytes();
+    let mut out = bytes.to_vec();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            quote @ (b'\'' | b'"' | b'`') => {
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\\' {
+                        i += 2;
+                        continue;
+                    }
+                    let closed = bytes[i] == quote;
+                    i += 1;
+                    if closed {
+                        break;
+                    }
+                }
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    out[i] = b' ';
+                    i += 1;
+                }
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                let start = i;
+                i += 2;
+                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                i = (i + 2).min(bytes.len());
+                for byte in &mut out[start..i] {
+                    if *byte != b'\n' {
+                        *byte = b' ';
+                    }
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    String::from_utf8(out).unwrap_or_else(|_| source.to_string())
 }
 
 /// Find the matching opening parenthesis for a closing `)` at the given position.
@@ -1858,65 +2013,6 @@ pub(super) fn rfind_matching_paren(s: &str, close_pos: usize) -> Option<usize> {
             }
             _ => {}
         }
-    }
-    None
-}
-
-/// Find the position of the matching closing brace `}` for a string that starts
-/// right after the opening `{`. Returns the index of the `}` within the string.
-/// Handles nested braces, strings, and comments.
-///
-/// No longer called by any client transform — `$inspect.trace`, which was
-/// its last user, now does the same scope-finding through the OXC AST in
-/// `ast_state_transform::try_rewrite_inspect_trace_function_body`. The
-/// function is left here `#[allow(dead_code)]` because `svelte2tsx` and
-/// other modules still keep their own brace-matching helpers and we may
-/// want to point them at a single shared implementation in a follow-up.
-#[allow(dead_code)]
-pub(super) fn find_matching_brace(s: &str) -> Option<usize> {
-    let mut depth = 1i32;
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'{' => depth += 1,
-            b'}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(i);
-                }
-            }
-            // Skip string literals
-            b'\'' | b'"' | b'`' => {
-                let quote = bytes[i];
-                i += 1;
-                while i < bytes.len() {
-                    if bytes[i] == b'\\' {
-                        i += 1; // skip escaped char
-                    } else if bytes[i] == quote {
-                        break;
-                    }
-                    i += 1;
-                }
-            }
-            // Skip single-line comments
-            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'/' => {
-                i += 2;
-                while i < bytes.len() && bytes[i] != b'\n' {
-                    i += 1;
-                }
-            }
-            // Skip multi-line comments
-            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
-                i += 2;
-                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
-                    i += 1;
-                }
-                i += 1; // skip past */
-            }
-            _ => {}
-        }
-        i += 1;
     }
     None
 }
@@ -1972,13 +2068,6 @@ pub(super) fn expression_needs_proxy(expr: &str) -> bool {
     // `trimmed.starts_with("new ")` (and the call/identifier checks) miss.
     let trimmed = strip_leading_comments(expr.trim()).trim();
 
-    // `await expr` needs proxy because the resolved value could be an object/array.
-    // In the official Svelte compiler, AwaitExpression is not in the list of types
-    // that return false from should_proxy, so it always returns true.
-    if trimmed.starts_with("await ") {
-        return true;
-    }
-
     // Arrow functions and function expressions don't need proxy wrapping
     // They're functions themselves, not objects/arrays
     // Check for patterns like:
@@ -1989,6 +2078,16 @@ pub(super) fn expression_needs_proxy(expr: &str) -> bool {
         return false;
     }
 
+    // `should_proxy`'s early-return list holds `ArrowFunctionExpression` and
+    // `FunctionExpression` but not `ClassExpression`, so a class expression is
+    // proxied like any other constructor-valued initializer.
+    if is_class_expression(trimmed) {
+        return true;
+    }
+
+    // These prefixes settle the node type on their own, and must be decided
+    // before the operator sniffs below: TS generics such as `new Map<K, V>()`
+    // otherwise read as a top-level relational operator.
     // Object literal
     if trimmed.starts_with('{') {
         return true;
@@ -2001,6 +2100,37 @@ pub(super) fn expression_needs_proxy(expr: &str) -> bool {
 
     // new expression
     if trimmed.starts_with("new ") {
+        return true;
+    }
+
+    // Ternary/conditional expressions (a ? b : c) need proxy if either branch
+    // could produce a proxyable value. In the official Svelte compiler,
+    // ConditionalExpression is not in the list of types that return false from
+    // should_proxy, so it always returns true.
+    // Check for ternary expressions by looking for '?' at the top level
+    if contains_top_level_ternary(trimmed) {
+        return true;
+    }
+
+    // Logical expressions with ||, && or ?? always need proxy.
+    // In the official Svelte compiler, LogicalExpression is not in the
+    // should_proxy whitelist, so it always returns true regardless of operands.
+    // e.g., `pData ?? defaultValue`, `expr || fallback`, `a === undefined && !b`
+    if contains_top_level_logical(trimmed) {
+        return true;
+    }
+
+    // BinaryExpression is on should_proxy's no-proxy list, so `foo() + 1` is
+    // false even though its left operand is a call. Conditional and logical
+    // operators bind looser, hence the ordering above.
+    if is_top_level_binary_expression(trimmed) {
+        return false;
+    }
+
+    // `await expr` needs proxy because the resolved value could be an object/array.
+    // In the official Svelte compiler, AwaitExpression is not in the list of types
+    // that return false from should_proxy, so it always returns true.
+    if trimmed.starts_with("await ") {
         return true;
     }
 
@@ -2042,21 +2172,107 @@ pub(super) fn expression_needs_proxy(expr: &str) -> bool {
         return true;
     }
 
-    // Ternary/conditional expressions (a ? b : c) need proxy if either branch
-    // could produce a proxyable value. In the official Svelte compiler,
-    // ConditionalExpression is not in the list of types that return false from
-    // should_proxy, so it always returns true.
-    // Check for ternary expressions by looking for '?' at the top level
-    if contains_top_level_ternary(trimmed) {
-        return true;
-    }
+    false
+}
 
-    // Logical expressions with || or ?? always need proxy.
-    // In the official Svelte compiler, LogicalExpression is not in the
-    // should_proxy whitelist, so it always returns true regardless of operands.
-    // e.g., `pData ?? defaultValue`, `expr || fallback`
-    if contains_top_level_logical(trimmed) {
-        return true;
+/// Check if an expression is a `BinaryExpression` at the top level — an infix
+/// arithmetic, equality, bitwise or shift operator outside any bracket or
+/// string. `&&`, `||` and `??` are `LogicalExpression`s and are excluded, as
+/// are assignment operators and `=>`.
+pub(super) fn is_top_level_binary_expression(expr: &str) -> bool {
+    let bytes = expr.as_bytes();
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut string_char = b'\0';
+    let mut prev_significant: Option<u8> = None;
+
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+
+        if in_string {
+            if c == string_char && !is_escaped(bytes, i) {
+                in_string = false;
+                prev_significant = Some(c);
+            }
+            i += 1;
+            continue;
+        }
+
+        match c {
+            b'\'' | b'"' | b'`' => {
+                in_string = true;
+                string_char = c;
+                i += 1;
+                continue;
+            }
+            b'(' | b'[' | b'{' => {
+                depth += 1;
+                prev_significant = Some(c);
+                i += 1;
+                continue;
+            }
+            b')' | b']' | b'}' => {
+                depth = depth.saturating_sub(1);
+                prev_significant = Some(c);
+                i += 1;
+                continue;
+            }
+            _ => {}
+        }
+
+        // Only an operator with a completed operand to its left is infix; a
+        // leading `-`/`!` is a UnaryExpression, which is on the same no-proxy
+        // list anyway.
+        let infix = matches!(
+            prev_significant,
+            Some(p) if p.is_ascii_alphanumeric()
+                || matches!(p, b'_' | b'$' | b')' | b']' | b'}' | b'\'' | b'"' | b'`')
+        );
+        if depth == 0 && infix {
+            let next = bytes.get(i + 1).copied();
+            match c {
+                // `==`/`===` are binary; `=>` and a bare `=` are not.
+                b'=' => return next == Some(b'='),
+                b'!' if next == Some(b'=') => return true,
+                b'+' | b'-' | b'*' | b'/' | b'%' | b'&' | b'|' | b'^' => {
+                    if (c == b'&' && next == Some(b'&')) || (c == b'|' && next == Some(b'|')) {
+                        return false;
+                    }
+                    let after = if c == b'*' && next == Some(b'*') { 2 } else { 1 };
+                    // Compound assignment (`+=`, `**=`, ...) is an AssignmentExpression.
+                    return bytes.get(i + after) != Some(&b'=');
+                }
+                b'<' | b'>' => {
+                    let mut j = i;
+                    while bytes.get(j) == Some(&c) {
+                        j += 1;
+                    }
+                    // Shift assignment (`<<=`, `>>=`, `>>>=`).
+                    return !(j > i + 1 && bytes.get(j) == Some(&b'='));
+                }
+                // The word operators `in` / `instanceof`, only when the previous
+                // character is whitespace so they cannot be part of an identifier.
+                b'i' if i > 0 && bytes[i - 1].is_ascii_whitespace() => {
+                    let mut j = i;
+                    while bytes
+                        .get(j)
+                        .is_some_and(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'$'))
+                    {
+                        j += 1;
+                    }
+                    if matches!(&expr[i..j], "in" | "instanceof") {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if !c.is_ascii_whitespace() {
+            prev_significant = Some(c);
+        }
+        i += 1;
     }
 
     false
@@ -2074,10 +2290,7 @@ pub(super) fn expression_needs_proxy_with_scope(expr: &str, non_proxy_vars: &[St
     }
     // Handle `$.get(ident)` — the transform pattern for state/derived reads.
     // Trace through to the underlying identifier and check the non-proxy list.
-    if let Some(inside) = trimmed
-        .strip_prefix("$.get(")
-        .and_then(|s| s.strip_suffix(')'))
-    {
+    if let Some(inside) = trimmed.strip_prefix("$.get(").and_then(|s| s.strip_suffix(')')) {
         let inner = inside.trim();
         if is_simple_identifier(inner) && non_proxy_vars.iter().any(|v| v == inner) {
             return false;
@@ -2097,8 +2310,7 @@ pub(super) fn is_simple_identifier(expr: &str) -> bool {
         return false;
     }
     // All chars must be alphanumeric, underscore, or $
-    expr.chars()
-        .all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+    expr.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '$')
 }
 
 /// Check if an expression is a member expression (e.g., foo.bar, foo.bar.baz)
@@ -2203,14 +2415,15 @@ pub(super) fn is_member_expression(expr: &str) -> bool {
         if part.is_empty() {
             return false;
         }
+        let part = part.strip_prefix('#').unwrap_or(part);
+        if part.is_empty() {
+            return false;
+        }
         let first = part.chars().next().unwrap();
         if !first.is_alphabetic() && first != '_' && first != '$' {
             return false;
         }
-        if !part
-            .chars()
-            .all(|c| c.is_alphanumeric() || c == '_' || c == '$')
-        {
+        if !part.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '$') {
             return false;
         }
     }
@@ -2287,7 +2500,7 @@ pub(super) fn contains_top_level_ternary(expr: &str) -> bool {
         let c = bytes[i];
 
         if in_string {
-            if c == string_char && (i == 0 || bytes[i - 1] != b'\\') {
+            if c == string_char && !is_escaped(bytes, i) {
                 in_string = false;
             }
             i += 1;
@@ -2332,7 +2545,7 @@ pub(super) fn contains_top_level_logical(expr: &str) -> bool {
         let c = bytes[i];
 
         if in_string {
-            if c == string_char && (i == 0 || bytes[i - 1] != b'\\') {
+            if c == string_char && !is_escaped(bytes, i) {
                 in_string = false;
             }
             i += 1;
@@ -2348,9 +2561,13 @@ pub(super) fn contains_top_level_logical(expr: &str) -> bool {
             b')' | b']' | b'}' if depth > 0 => {
                 depth -= 1;
             }
-            // Any top-level || or ?? means the expression is a LogicalExpression,
+            // Any top-level ||, && or ?? means the expression is a LogicalExpression,
             // which always needs proxy in the official Svelte compiler.
             b'|' if depth == 0 && i + 1 < bytes.len() && bytes[i + 1] == b'|' => {
+                return true;
+            }
+            // A single `&` is a bitwise BinaryExpression, which never needs proxy.
+            b'&' if depth == 0 && i + 1 < bytes.len() && bytes[i + 1] == b'&' => {
                 return true;
             }
             b'?' if depth == 0 && i + 1 < bytes.len() && bytes[i + 1] == b'?' => {
@@ -2364,14 +2581,21 @@ pub(super) fn contains_top_level_logical(expr: &str) -> bool {
 }
 
 /// Check if an expression is a function expression (arrow function or function keyword).
+/// Does `expr` open with a `class` expression — `class {`, `class Foo {`,
+/// `class extends Base {`? The keyword must stand alone, so `classes.map(…)`
+/// is not one.
+pub(super) fn is_class_expression(expr: &str) -> bool {
+    let Some(rest) = expr.trim_start().strip_prefix("class") else {
+        return false;
+    };
+    rest.starts_with('{') || rest.starts_with(char::is_whitespace)
+}
+
 pub(super) fn is_function_expression(expr: &str) -> bool {
     let trimmed = expr.trim();
 
     // Check for async prefix
-    let without_async = trimmed
-        .strip_prefix("async ")
-        .map(|s| s.trim())
-        .unwrap_or(trimmed);
+    let without_async = trimmed.strip_prefix("async ").map(|s| s.trim()).unwrap_or(trimmed);
 
     // Check for function keyword
     if let Some(after_fn) = without_async.strip_prefix("function") {
@@ -2472,7 +2696,7 @@ pub(super) fn is_top_level_function_call(expr: &str) -> bool {
         if c.is_alphanumeric() || c == '_' || c == '$' {
             seen_ident_char = true;
             i += 1;
-        } else if c == '.' && seen_ident_char {
+        } else if seen_ident_char && (c == '.' || (c == '#' && i > 0 && chars[i - 1] == '.')) {
             i += 1;
         } else if c.is_whitespace() && seen_ident_char {
             // Whitespace is only part of the path when followed by `.`.
@@ -2500,9 +2724,7 @@ pub(super) fn is_top_level_function_call(expr: &str) -> bool {
         // Check it's not a keyword
         let ident: String = chars[..i].iter().collect();
         let last_part = ident.split('.').next_back().unwrap_or(&ident);
-        let keywords = [
-            "if", "while", "for", "switch", "catch", "with", "function", "async",
-        ];
+        let keywords = ["if", "while", "for", "switch", "catch", "with", "function", "async"];
         if keywords.contains(&last_part) {
             return false;
         }
@@ -2522,6 +2744,49 @@ pub(super) fn is_top_level_function_call(expr: &str) -> bool {
 /// - `foo(await 1)` -> true
 /// - `async () => { return await 1; }` -> false (await is inside async function)
 pub(super) fn contains_direct_await_in_expression(expr: &str) -> bool {
+    let found = direct_await_from_ast(expr).unwrap_or_else(|| scan_for_direct_await(expr));
+    #[cfg(feature = "measure-await")]
+    crate::measure_await::record(expr, found);
+    found
+}
+
+/// Parse the expression before falling back to the legacy scanner. An `await`
+/// owned by a nested function must not make its enclosing `$derived` async.
+fn direct_await_from_ast(expr: &str) -> Option<bool> {
+    let wrapped = format!("({expr});");
+    let allocator = Allocator::default();
+    let parsed = Parser::new(&allocator, &wrapped, SourceType::mjs()).parse();
+    if parsed.panicked || !parsed.diagnostics.is_empty() {
+        return None;
+    }
+    let Statement::ExpressionStatement(statement) = parsed.program.body.first()? else {
+        return None;
+    };
+
+    struct DirectAwaitScan {
+        found: bool,
+    }
+
+    impl<'a> Visit<'a> for DirectAwaitScan {
+        fn visit_await_expression(&mut self, _: &AwaitExpression<'a>) {
+            self.found = true;
+        }
+
+        fn visit_function(&mut self, _: &Function<'a>, _: oxc_syntax::scope::ScopeFlags) {}
+
+        fn visit_arrow_function_expression(&mut self, _: &ArrowFunctionExpression<'a>) {}
+
+        fn visit_class(&mut self, _: &Class<'a>) {}
+    }
+
+    let mut scan = DirectAwaitScan { found: false };
+    scan.visit_expression(&statement.expression);
+    Some(scan.found)
+}
+
+fn scan_for_direct_await(expr: &str) -> bool {
+    const AWAIT: [char; 5] = ['a', 'w', 'a', 'i', 't'];
+
     let chars: Vec<char> = expr.chars().collect();
     let mut i = 0;
     let mut in_string = false;
@@ -2541,7 +2806,7 @@ pub(super) fn contains_direct_await_in_expression(expr: &str) -> bool {
             i += 1;
             continue;
         }
-        if in_string && c == string_char && (i == 0 || chars[i - 1] != '\\') {
+        if in_string && c == string_char && !is_escaped_char(&chars, i) {
             in_string = false;
             i += 1;
             continue;
@@ -2551,37 +2816,13 @@ pub(super) fn contains_direct_await_in_expression(expr: &str) -> bool {
             continue;
         }
 
-        // Check for 'async' keyword followed by function definition
-        if i + 5 <= chars.len() {
-            let word: String = chars[i..i + 5].iter().collect();
-            if word == "async" {
-                // Check if this is followed by function or arrow syntax
-                let rest: String = chars[i + 5..].iter().collect();
-                let rest_trimmed = rest.trim_start();
-                if rest_trimmed.starts_with("(")
-                    || rest_trimmed.starts_with("function")
-                    || chars[i + 5..]
-                        .iter()
-                        .collect::<String>()
-                        .trim_start()
-                        .starts_with("=>")
-                {
-                    // We found an async function, track depth when we see '{'
-                    // For now, just note we're in async context
-                }
-            }
-        }
-
         // Check for 'await' keyword at top level
-        if i + 5 <= chars.len() && async_fn_depth == 0 {
-            let word: String = chars[i..i + 5].iter().collect();
-            if word == "await" {
-                // Make sure it's a word boundary
-                let before_ok = i == 0 || !is_identifier_char(chars[i - 1]);
-                let after_ok = i + 5 >= chars.len() || !is_identifier_char(chars[i + 5]);
-                if before_ok && after_ok {
-                    return true;
-                }
+        if i + 5 <= chars.len() && async_fn_depth == 0 && chars[i..i + 5] == AWAIT {
+            // Make sure it's a word boundary
+            let before_ok = i == 0 || !is_identifier_char(chars[i - 1]);
+            let after_ok = i + 5 >= chars.len() || !is_identifier_char(chars[i + 5]);
+            if before_ok && after_ok {
+                return true;
             }
         }
 
@@ -2611,11 +2852,7 @@ pub(super) fn contains_direct_await_in_expression(expr: &str) -> bool {
                     {
                         let between = &before_trimmed[async_pos + 5..];
                         // Should be: "async x =>" pattern
-                        if between
-                            .trim()
-                            .chars()
-                            .all(|c| is_identifier_char(c) || c == ' ')
-                        {
+                        if between.trim().chars().all(|c| is_identifier_char(c) || c == ' ') {
                             async_fn_depth += 1;
                         }
                     }
@@ -2666,7 +2903,7 @@ pub(super) fn strip_top_level_await_from_expr(expr: &str) -> String {
 ///
 /// The rule: if the `await expr` is not the entirety of the expression (i.e., there's
 /// more code after it), wrap with `$.save()` and add `()` invocation after the await.
-pub(super) fn wrap_await_with_save_in_async_derived(expr: &str) -> String {
+pub(crate) fn wrap_await_with_save_in_async_derived(expr: &str) -> String {
     let trimmed = expr.trim();
     let chars: Vec<char> = trimmed.chars().collect();
     let len = chars.len();
@@ -2763,6 +3000,21 @@ pub(super) fn wrap_await_with_save_in_async_derived(expr: &str) -> String {
 
                 while j < len {
                     match chars[j] {
+                        '\'' | '"' | '`' => {
+                            let quote = chars[j];
+                            j += 1;
+                            while j < len {
+                                if chars[j] == '\\' {
+                                    j += 2;
+                                } else if chars[j] == quote {
+                                    j += 1;
+                                    break;
+                                } else {
+                                    j += 1;
+                                }
+                            }
+                            continue;
+                        }
                         '(' => paren_depth += 1,
                         ')' => {
                             if paren_depth == 0 {
@@ -2805,15 +3057,34 @@ pub(super) fn wrap_await_with_save_in_async_derived(expr: &str) -> String {
                 // Check if there's more expression after this await+arg
                 let remaining: String = chars[j..].iter().collect();
                 let remaining_trimmed = remaining.trim();
-                let has_more_after = !remaining_trimmed.is_empty()
-                    && remaining_trimmed != ")"
-                    && remaining_trimmed != "))"
-                    && remaining_trimmed != ";";
+                let tracked_argument = await_arg_trimmed
+                    .strip_prefix("$.track_reactivity_loss(")
+                    .and_then(|argument| argument.strip_suffix(')'));
+                let remaining_after_tracking = tracked_argument
+                    .and_then(|_| remaining_trimmed.strip_prefix(")()"))
+                    .unwrap_or(remaining_trimmed)
+                    .trim();
+                let has_more_after = !remaining_after_tracking.is_empty()
+                    && remaining_after_tracking != ")"
+                    && remaining_after_tracking != "))"
+                    && remaining_after_tracking != ";"
+                    && !remaining_after_tracking.starts_with(':');
 
                 if has_more_after {
                     // Wrap with $.save: `await expr` -> `(await $.save(expr))()`
-                    let _ = write!(result, "(await $.save({}))()", await_arg_trimmed);
-                    i = j;
+                    if tracked_argument.is_some() && remaining_trimmed.starts_with(")()") {
+                        result.pop();
+                    }
+                    let _ = write!(
+                        result,
+                        "(await $.save({}))()",
+                        tracked_argument.unwrap_or(await_arg_trimmed)
+                    );
+                    i = if tracked_argument.is_some() && remaining_trimmed.starts_with(")()") {
+                        j + 3
+                    } else {
+                        j
+                    };
                 } else {
                     // Last expression - keep as is
                     result.push_str("await ");
@@ -2833,14 +3104,50 @@ pub(super) fn wrap_await_with_save_in_async_derived(expr: &str) -> String {
 
 #[cfg(test)]
 mod proxy_detection_tests {
-    use super::{expression_needs_proxy, strip_leading_comments};
+    use super::{
+        expression_needs_proxy, is_top_level_binary_expression, strip_leading_comments,
+        wrap_await_with_save_in_async_derived,
+    };
+
+    #[test]
+    fn save_wrapping_leaves_dev_await_tracking_intact() {
+        let input = "(await $.track_reactivity_loss(p))()";
+        assert_eq!(wrap_await_with_save_in_async_derived(input), input);
+    }
+
+    #[test]
+    fn save_wrapping_replaces_non_final_dev_await_tracking() {
+        assert_eq!(
+            wrap_await_with_save_in_async_derived(
+                "(await $.track_reactivity_loss(p))() + (await $.track_reactivity_loss(q))()"
+            ),
+            "(await $.save(p))() + (await $.track_reactivity_loss(q))()"
+        );
+    }
+
+    #[test]
+    fn save_wrapping_keeps_literal_punctuation_inside_await_argument() {
+        assert_eq!(
+            wrap_await_with_save_in_async_derived("(await 'https://svelte.dev') + suffix"),
+            "((await $.save('https://svelte.dev'))()) + suffix"
+        );
+        assert_eq!(
+            wrap_await_with_save_in_async_derived("(await `Hello, ${name}!`) + suffix"),
+            "((await $.save(`Hello, ${name}!`))()) + suffix"
+        );
+    }
+
+    #[test]
+    fn save_wrapping_does_not_wrap_a_conditional_consequent() {
+        assert_eq!(
+            wrap_await_with_save_in_async_derived("selected ? await selected : null"),
+            "selected ? await selected: null"
+        );
+    }
 
     #[test]
     fn strips_leading_block_and_line_comments() {
-        assert_eq!(
-            strip_leading_comments("/* @__PURE__ */ new Map()"),
-            "new Map()"
-        );
+        assert_eq!(strip_leading_comments("/* @__PURE__ */ new Map()"), "new Map()");
         assert_eq!(strip_leading_comments("// x\nfoo"), "foo");
         assert_eq!(strip_leading_comments("  /*a*/ /*b*/ x"), "x");
         assert_eq!(strip_leading_comments("plain"), "plain");
@@ -2855,5 +3162,77 @@ mod proxy_detection_tests {
         assert!(expression_needs_proxy("/* @__PURE__ */ createThing()"));
         // Functions still don't need a proxy even behind a comment.
         assert!(!expression_needs_proxy("/* c */ () => 1"));
+    }
+
+    #[test]
+    fn binary_expressions_never_need_proxy() {
+        for expr in [
+            "$.get(runs) + 1",
+            "a * 2",
+            "count() - 1",
+            "'a' + 'b'",
+            "a === undefined",
+            "a !== b",
+            "a > 1",
+            "a << 2",
+            "a & 3",
+            "a ** 2",
+            "(await mk()) + 1",
+            "mk() instanceof Map",
+            "'k' in obj",
+        ] {
+            assert!(!expression_needs_proxy(expr), "{expr}");
+        }
+    }
+
+    #[test]
+    fn non_binary_operators_still_need_proxy() {
+        for expr in [
+            "a ?? {}",
+            "a || []",
+            "a && b",
+            "mk() ? {} : []",
+            "a < b ? {} : []",
+            "new Map()",
+            "await mk()",
+            "mk({ a: 1 })",
+            "{ a: 1 + 2 }",
+            "[1, 2].concat([3])",
+            "thing.list.map((x) => x * 2)",
+        ] {
+            assert!(expression_needs_proxy(expr), "{expr}");
+        }
+    }
+
+    #[test]
+    fn assignment_and_arrow_are_not_binary() {
+        for expr in ["a = b", "a += 1", "a >>= 1", "a ||= b", "(x) => x + 1", "-a", "!mk()"] {
+            assert!(!is_top_level_binary_expression(expr), "{expr}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod await_scan_tests {
+    use super::{contains_direct_await_in_expression, extract_var_name_before_rune};
+
+    #[test]
+    fn ignores_await_owned_by_nested_functions() {
+        let cases = [
+            "async () => { return await x }",
+            "async function () { return await x }",
+            "async x => await x",
+            "class C { async m() { return await x } }",
+        ];
+        for expr in cases {
+            assert!(!contains_direct_await_in_expression(expr), "{expr:?}");
+        }
+        assert!(contains_direct_await_in_expression("await x"));
+    }
+
+    #[test]
+    fn extracts_later_declarator_after_dev_location() {
+        let before = "const a = await $.async_derived(fn, 'a', 'x.svelte.js:3:10'), b = ";
+        assert_eq!(extract_var_name_before_rune(before), "b");
     }
 }

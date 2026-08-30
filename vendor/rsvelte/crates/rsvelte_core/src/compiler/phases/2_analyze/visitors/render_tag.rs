@@ -8,6 +8,7 @@ use super::VisitorContext;
 use super::shared::fragment::mark_subtree_dynamic;
 use super::shared::utils::validate_opening_tag;
 use crate::ast::template::{ExpressionMetadata, RenderTag, TemplateNode};
+use crate::ast::typed_expr::JsNode;
 use crate::compiler::phases::phase2_analyze::{AnalysisError, BindingKind, errors};
 
 /// Visit a render tag.
@@ -16,25 +17,25 @@ pub fn visit(tag: &mut RenderTag, context: &mut VisitorContext) -> Result<(), An
     validate_opening_tag(tag.start as usize, &context.analysis.source, '@')?;
 
     // Store the path to this node
-    tag.metadata.path = context
-        .path
-        .iter()
-        .map(|node| node_type_string(node))
-        .collect();
+    tag.metadata.path = context.path.iter().map(|node| node_type_string(node)).collect();
 
-    // Unwrap optional chaining if present (use JSON to avoid arena dependency)
-    let expr_json = tag.expression.as_json();
-    let expression_json =
-        if expr_json.get("type").and_then(|t| t.as_str()) == Some("ChainExpression") {
-            expr_json.get("expression").unwrap_or(expr_json)
-        } else {
-            expr_json
-        };
+    let arena = context.parse_arena;
+
+    // Unwrap optional chaining if present
+    let expr_node = tag.expression.as_node_ref();
+    let expression_node = match expr_node {
+        JsNode::ChainExpression { expression, .. } => arena.get_js_node(*expression),
+        _ => expr_node,
+    };
 
     // Get the callee from the call expression
-    let callee_json = expression_json
-        .get("callee")
-        .ok_or_else(errors::render_tag_invalid_expression)?;
+    let (callee_id, arguments_range) = match expression_node {
+        JsNode::CallExpression { callee, arguments, .. }
+        | JsNode::NewExpression { callee, arguments, .. } => (*callee, *arguments),
+        _ => return Err(errors::render_tag_invalid_expression()),
+    };
+    let callee_node = arena.get_js_node(callee_id);
+    let arguments = arena.get_js_children(arguments_range);
 
     // Check if the callee is an Identifier and look up its binding via the
     // lexical scope chain starting at the current template scope.
@@ -42,36 +43,29 @@ pub fn visit(tag: &mut RenderTag, context: &mut VisitorContext) -> Result<(), An
     // scope chain from the render site's own scope, not the merged root scope.
     // Using root.scope.declarations (flat global map) would wrongly "find"
     // an out-of-scope inner snippet and mark it as non-dynamic.
-    let callee_type = callee_json.get("type").and_then(|t| t.as_str());
-    let callee_name = callee_json.get("name").and_then(|n| n.as_str());
-    let binding = if callee_type == Some("Identifier") {
-        if let Some(name) = callee_name {
-            context
-                .analysis
-                .root
-                .get_binding(name, context.scope)
-                .filter(|&idx| {
-                    // The scope builder merges all child-scope declarations into
-                    // all_scopes[0] for backward compatibility.  A raw get_binding walk
-                    // therefore finds bindings declared in *descendant* scopes (e.g. `y`
-                    // declared inside snippet x's body) when the lookup starts from an
-                    // ancestor scope (e.g. the enclosing <div>).  Filter those out:
-                    // only accept a binding if its declared scope is an ancestor of (or
-                    // equal to) the current render-site scope — mirroring upstream
-                    // `scope.get(name)` which traverses `parent` links, never children.
-                    let declared_scope = context.analysis.root.bindings[idx].scope_index;
-                    context
-                        .analysis
-                        .root
-                        .is_scope_ancestor_of(declared_scope, context.scope)
-                })
-                .map(|idx| &context.analysis.root.bindings[idx])
-        } else {
-            None
-        }
-    } else {
-        None
+    let callee_name = match callee_node {
+        JsNode::Identifier { name, .. } => Some(name.as_str()),
+        _ => None,
     };
+    let binding = callee_name.and_then(|name| {
+        context
+            .analysis
+            .root
+            .get_binding(name, context.scope)
+            .filter(|&idx| {
+                // The scope builder merges all child-scope declarations into
+                // all_scopes[0] for backward compatibility.  A raw get_binding walk
+                // therefore finds bindings declared in *descendant* scopes (e.g. `y`
+                // declared inside snippet x's body) when the lookup starts from an
+                // ancestor scope (e.g. the enclosing <div>).  Filter those out:
+                // only accept a binding if its declared scope is an ancestor of (or
+                // equal to) the current render-site scope — mirroring upstream
+                // `scope.get(name)` which traverses `parent` links, never children.
+                let declared_scope = context.analysis.root.bindings[idx].scope_index;
+                context.analysis.root.is_scope_ancestor_of(declared_scope, context.scope)
+            })
+            .map(|idx| &context.analysis.root.bindings[idx])
+    });
 
     // Determine if this render tag is dynamic
     // It's dynamic if:
@@ -105,52 +99,55 @@ pub fn visit(tag: &mut RenderTag, context: &mut VisitorContext) -> Result<(), An
     // content, so mark this as an opaque boundary for sibling detection.
     context.analysis.css.has_opaque_elements = true;
 
+    if let Some(name) = callee_name {
+        let site = crate::compiler::phases::phase2_analyze::types::CssRenderSite {
+            parent_idx: context.current_parent_idx(),
+            snippet_name: context.current_snippet_name(),
+        };
+        context
+            .analysis
+            .css
+            .dom_structure
+            .snippet_render_sites
+            .entry(name.to_string())
+            .or_default()
+            .push(site);
+    }
+
     // Validate arguments - no spread elements allowed
-    let arguments_json = expression_json.get("arguments").and_then(|a| a.as_array());
-    if let Some(args) = arguments_json {
-        for arg in args {
-            if arg.get("type").and_then(|t| t.as_str()) == Some("SpreadElement") {
-                return Err(errors::render_tag_invalid_spread_argument());
-            }
+    for arg in arguments {
+        if let JsNode::SpreadElement { start, end, .. } = arg {
+            return Err(errors::render_tag_invalid_spread_argument().at(*start, *end));
         }
     }
 
     // Check for invalid .bind(), .apply(), .call() usage
-    if callee_type == Some("MemberExpression")
-        && let Some(property) = callee_json.get("property")
-        && property.get("type").and_then(|t| t.as_str()) == Some("Identifier")
-        && let Some(name) = property.get("name").and_then(|n| n.as_str())
-        && matches!(name, "bind" | "apply" | "call")
+    if let JsNode::MemberExpression { property, .. } = callee_node
+        && let JsNode::Identifier { name, .. } = arena.get_js_node(*property)
+        && matches!(name.as_str(), "bind" | "apply" | "call")
     {
-        return Err(errors::render_tag_invalid_call_expression());
+        return Err(errors::render_tag_invalid_call_expression().at(tag.start, tag.end));
     }
 
     // Mark the subtree as dynamic (render tags inject dynamic content)
     mark_subtree_dynamic(&context.path);
 
     // Visit the callee expression and track its metadata
-    super::shared::utils::walk_js_expression(callee_json, context, &mut tag.metadata.expression)?;
+    super::shared::utils::walk_js_expression_node(
+        callee_node,
+        context,
+        &mut tag.metadata.expression,
+    )?;
 
     // Visit each argument and track its metadata
-    if let Some(args) = arguments_json {
-        for arg in args {
-            let mut arg_metadata = ExpressionMetadata::default();
-            super::shared::utils::walk_js_expression(arg, context, &mut arg_metadata)?;
-            tag.metadata.arguments.push(arg_metadata);
-        }
+    for arg in arguments {
+        let mut arg_metadata = ExpressionMetadata::default();
+        super::shared::utils::walk_js_expression_node(arg, context, &mut arg_metadata)?;
+        tag.metadata.arguments.push(arg_metadata);
     }
 
     Ok(())
 }
-
-/// Alias for visit function.
-pub fn visit_render_tag(
-    tag: &mut RenderTag,
-    context: &mut VisitorContext,
-) -> Result<(), AnalysisError> {
-    visit(tag, context)
-}
-
 /// Check if a binding unambiguously resolves to a specific snippet declaration,
 /// or is external to the current component.
 ///

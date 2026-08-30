@@ -1,5 +1,5 @@
 //! Server `SnippetBlock` visitor — the Rust port of
-//! `3-transform/server/visitors/SnippetBlock.js` (non-dev path).
+//! `3-transform/server/visitors/SnippetBlock.js`.
 //!
 //! Upstream (写经):
 //! ```js
@@ -11,7 +11,10 @@
 //!     );
 //!     const statements = node.metadata.can_hoist ? context.state.hoisted
 //!                                                 : context.state.init;
-//!     // dev: validate_snippet_args + prevent_snippet_stringification (KNOWN GAP)
+//!     if (dev) {
+//!         fn.body.body.unshift(b.stmt(b.call('$.validate_snippet_args', b.id('$$renderer'))));
+//!         statements.push(b.stmt(b.call('$.prevent_snippet_stringification', fn.id)));
+//!     }
 //!     statements.push(fn);
 //! }
 //! ```
@@ -27,14 +30,13 @@
 //! template.
 //!
 //! The dev-mode `$.validate_snippet_args` prologue and
-//! `$.prevent_snippet_stringification` registration are KNOWN GAPs.
 
 use crate::ast::template::SnippetBlock;
 use crate::compiler::phases::phase3_transform::server::ast::ServerTransformState;
 use serde_json::Value;
 
 /// Visit a `{#snippet name(params)}...{/snippet}` block.
-pub fn visit_snippet_block<'a>(node: &SnippetBlock, state: &mut ServerTransformState<'a>) {
+pub fn visit_snippet_block<'a>(node: &SnippetBlock<'a>, state: &mut ServerTransformState<'a>) {
     let b = state.b;
 
     // Snippet name — `node.expression` is the name identifier.
@@ -43,6 +45,58 @@ pub fn visit_snippet_block<'a>(node: &SnippetBlock, state: &mut ServerTransformS
         .identifier_name()
         .map(|s| s.to_string())
         .unwrap_or_else(|| "snippet".to_string());
+
+    let fn_decl = build_snippet_function(node, &name, state);
+
+    // 写经 upstream `fn.___snippet = true`: record the snippet's function name so
+    // the `uses_component_bindings` settle-loop assembly can hoist this
+    // declaration ahead of `$$render_inner` (snippet functions render OUTSIDE the
+    // re-render loop).
+    state.snippet_names.insert(name.clone());
+
+    // 写经 `node.metadata.can_hoist ? state.hoisted : state.init`: a hoistable
+    // snippet (no instance-state reference) goes to module scope; otherwise it
+    // is emitted into the enclosing fragment's template body. In dev mode the
+    // guard and declaration share upstream's `state.init` placement.
+    // Upstream `can_hoist = is_root_level && body_refs_only_own_params`. Our
+    // analyze does NOT bump its depth counters for `<svelte:boundary>`, so a
+    // snippet that sits directly inside a boundary's children fragment (e.g.
+    // `{#snippet children()}` in `<svelte:boundary>`) wrongly reports
+    // `can_hoist == true`. Re-impose the root-level gate with the server-side
+    // `fragment_depth` (root fragment = 1; any nested block / boundary body ≥ 2)
+    // so a boundary-nested snippet is emitted INLINE in the boundary block rather
+    // than hoisted to module scope — mirroring the same gate the SvelteBoundary
+    // visitor applies to the `failed` snippet.
+    if node.metadata.can_hoist && state.fragment_depth <= 1 {
+        if state.options.dev {
+            state
+                .hoisted
+                .push(b.stmt(b.call("$.prevent_snippet_stringification", vec![b.id(&name)])));
+        }
+        state.hoisted.push(fn_decl);
+    } else {
+        if state.options.dev {
+            state.template.push(super::shared::TemplateEntry::HoistableDecl(
+                b.stmt(b.call("$.prevent_snippet_stringification", vec![b.id(&name)])),
+            ));
+        }
+        state.template.push(super::shared::TemplateEntry::HoistableDecl(fn_decl));
+    }
+}
+
+/// Build `function <name>($$renderer, ...params) { <body> }` for a snippet.
+///
+/// All three server call sites go through this: the `SnippetBlock` visitor, a
+/// component-child slot snippet and a `<svelte:boundary>` `failed` / `pending`
+/// snippet. They must agree on both halves — a parameter reconstructed by name
+/// alone drops a destructuring pattern, and a missing shadow frame lets a body
+/// read of a parameter constant-fold to the same-named component binding.
+pub(super) fn build_snippet_function<'a>(
+    node: &SnippetBlock<'a>,
+    name: &str,
+    state: &mut ServerTransformState<'a>,
+) -> oxc_ast::ast::Statement<'a> {
+    let b = state.b;
 
     // -- parameters ---------------------------------------------------------
     // 写经 upstream: `[b.id('$$renderer'), ...node.parameters]` — the declared
@@ -58,10 +112,21 @@ pub fn visit_snippet_block<'a>(node: &SnippetBlock, state: &mut ServerTransformS
             param_srcs.push(s);
         }
     }
-    let params = state
+    let mut params = state
         .reparse_params(&param_srcs)
         // Fallback (unreachable for valid input): `($$renderer)` only.
         .unwrap_or_else(|| b.params(vec![b.id_pat("$$renderer")], None));
+    let mut parameter_region_start = node.expression.end().unwrap_or(node.start + 9);
+    for (param, formal) in node.parameters.iter().zip(params.items.iter_mut().skip(1)) {
+        if let (Some(start), Some(end)) = (param.start(), param.end()) {
+            state.place_template_pattern_comments(
+                (parameter_region_start, end),
+                (start, end),
+                &mut formal.pattern,
+            );
+            parameter_region_start = end;
+        }
+    }
 
     // The snippet PARAMETERS shadow any same-named component-level `$derived` /
     // `$store` binding inside the body (upstream `context.state.scope` resolves a
@@ -73,50 +138,29 @@ pub fn visit_snippet_block<'a>(node: &SnippetBlock, state: &mut ServerTransformS
     for param in &node.parameters {
         collect_param_pattern_names(param, &mut shadow);
     }
+    // Push to BOTH shadow sets (mirroring the each-block visitor): a snippet
+    // parameter is a runtime value, so a body read of a param that shadows a
+    // same-named component binding must NOT constant-fold to the outer
+    // binding's value (`{#snippet row(count)}` + instance `count = $state('x')`
+    // rendered `x` for every `{@render row(…)}`).
+    state.slot_let_shadows.push(shadow.clone());
     state.shadowed_names.push(shadow);
 
     // Body: render the fragment as a `{ ... }` block, then reuse its statements
     // as the function body.
     // SnippetBlock body IS an `is_text_first` parent (upstream `clean_nodes`).
-    let body_block = super::shared::build_fragment_body(&node.body, true, true, state);
+    let saved_scope = state.enter_template_scope(node.start);
+    let mut body_block = super::shared::build_fragment_body(&node.body.nodes, true, true, state);
+    state.restore_scope(saved_scope);
+    if state.options.dev {
+        body_block.insert(0, b.stmt(b.call("$.validate_snippet_args", vec![b.id("$$renderer")])));
+    }
     let fn_body = b.body(body_block);
 
     state.shadowed_names.pop();
+    state.slot_let_shadows.pop();
 
-    let fn_decl = b.function_declaration(&name, params, fn_body, false);
-
-    // 写经 upstream `fn.___snippet = true`: record the snippet's function name so
-    // the `uses_component_bindings` settle-loop assembly can hoist this
-    // declaration ahead of `$$render_inner` (snippet functions render OUTSIDE the
-    // re-render loop).
-    state.snippet_names.insert(name.clone());
-
-    // 写经 `node.metadata.can_hoist ? state.hoisted : state.init`: a hoistable
-    // snippet (no instance-state reference) goes to module scope; otherwise it
-    // is emitted INLINE at its source position in the enclosing fragment's
-    // template stream. The text-based oracle this pipeline matches does not keep a
-    // separate `init` buffer — it prints a non-hoistable snippet function exactly
-    // where it appears in the child run, so a `{@const}` declared before the
-    // `{#snippet}` precedes it (`function` hoisting makes the order irrelevant at
-    // runtime, but byte-parity requires source order). `function` declarations
-    // flush the joinable text run (like a `{@const}`), so the rendered `push`
-    // calls that surround them stay in place.
-    // Upstream `can_hoist = is_root_level && body_refs_only_own_params`. Our
-    // analyze does NOT bump its depth counters for `<svelte:boundary>`, so a
-    // snippet that sits directly inside a boundary's children fragment (e.g.
-    // `{#snippet children()}` in `<svelte:boundary>`) wrongly reports
-    // `can_hoist == true`. Re-impose the root-level gate with the server-side
-    // `fragment_depth` (root fragment = 1; any nested block / boundary body ≥ 2)
-    // so a boundary-nested snippet is emitted INLINE in the boundary block rather
-    // than hoisted to module scope — mirroring the same gate the SvelteBoundary
-    // visitor applies to the `failed` snippet.
-    if node.metadata.can_hoist && state.fragment_depth <= 1 {
-        state.hoisted.push(fn_decl);
-    } else {
-        state
-            .template
-            .push(super::shared::TemplateEntry::HoistableDecl(fn_decl));
-    }
+    b.function_declaration(name, params, fn_body, false)
 }
 
 /// Collect every binding identifier name introduced by a snippet / slot
@@ -213,11 +257,7 @@ pub(super) fn extract_snippet_param(expr: &crate::ast::js::Expression, source: &
                     // inner `2, 3` span — re-wrap it in parens to preserve the
                     // comma-expression semantics in parameter position.
                     let right_type = right_val.get("type").and_then(Value::as_str).unwrap_or("");
-                    if right_type == "SequenceExpression" {
-                        format!("({val})")
-                    } else {
-                        val
-                    }
+                    if right_type == "SequenceExpression" { format!("({val})") } else { val }
                 } else {
                     String::new()
                 }

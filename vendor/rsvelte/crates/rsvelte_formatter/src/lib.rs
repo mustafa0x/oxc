@@ -5,16 +5,11 @@
 //!
 //! - `<script>` / `<script context="module">`: re-parse the body with
 //!   `oxc_parser` and format via `oxc_formatter::Formatter`.
-//! - `<style>`: TODO (verbatim for now).
-//! - markup + `{expr}`: TODO (verbatim for now).
-//!
-//! The current skeleton only handles `<script>` bodies; the rest of the
-//! source is passed through unchanged. Subsequent iterations will add
-//! CSS formatting and markup Doc IR composition.
+//! - `<style>`: formatted via the `oxc_formatter_css` engine (see
+//!   `options::StyleFormatter`).
+//! - markup + `{expr}`: normalized by the `markup` / `expression` passes and
+//!   the `collapse` child-layout pass.
 
-// Milestone-1 `printChildren` port: built and unit-tested, wired into the markup
-// printer in a follow-up (docs/fmt-layout-port-plan.md), so its API is unused for now.
-#[allow(dead_code)]
 mod children;
 mod collapse;
 mod doc;
@@ -25,15 +20,19 @@ mod json;
 mod markup;
 mod options;
 mod prettier_ignore;
+mod private_in_guard;
 mod reindent;
+mod scratch;
 mod script;
 mod sort_order;
 mod style;
 mod style_css;
+mod tailwind_sort;
+mod width;
 
 pub use error::FormatError;
 pub use json::{JsonVariant, format_json_source};
-pub use options::{FormatOptions, StyleFormatter};
+pub use options::{AttributeFormatOptions, ClassSorter, FormatOptions, StyleFormatter};
 pub use script::format_js_source;
 pub use sort_order::SortOrderSpec;
 pub use style::reindent;
@@ -43,12 +42,24 @@ pub use style_css::{
 };
 
 // Re-exports so consumers don't need to depend on `oxc_formatter` directly.
-pub use oxc_formatter::{JsFormatOptions, Semicolons, SortImportsOptions};
+pub use oxc_formatter::{JsFormatOptions, SortImportsOptions};
 pub use oxc_formatter_core::{IndentStyle, IndentWidth, LineWidth};
 pub use oxc_formatter_css::CssFormatOptions;
 pub use oxc_formatter_json::JsonFormatOptions;
 
 use rsvelte_core::{ParseOptions, parse};
+
+/// Convert an in-memory source offset to the AST's fixed-width position type.
+///
+/// A source exceeding `u32::MAX` bytes cannot be represented by the parser's
+/// position model, so continuing would corrupt every following edit.
+pub(crate) fn source_offset(offset: usize) -> u32 {
+    u32::try_from(offset).expect("source offset exceeds the parser's u32 position range")
+}
+
+pub(crate) fn formatter_width(width: usize) -> u16 {
+    u16::try_from(width).unwrap_or(u16::MAX)
+}
 
 /// Whether a text node's (decoded) data is insignificant whitespace.
 ///
@@ -59,71 +70,128 @@ use rsvelte_core::{ParseOptions, parse};
 /// empty fragment. Matches `trim().is_empty()` for every other input (empty
 /// string and pure ASCII-whitespace both return `true`).
 pub(crate) fn is_blank_text(s: &str) -> bool {
-    s.chars()
-        .all(|c| matches!(c, ' ' | '\t' | '\n' | '\r' | '\u{0b}' | '\u{0c}'))
+    s.chars().all(|c| matches!(c, ' ' | '\t' | '\n' | '\r' | '\u{0b}' | '\u{0c}'))
+}
+
+/// Reusable scratch buffers for [`format_with_arenas`], letting a hot loop
+/// over many files amortize the per-file allocations.
+///
+/// Cleared (not freed) at each `format_with_arenas` entry, so a worker thread reuses one instance's
+/// capacity across every file it formats.
+#[derive(Default)]
+pub struct Arenas {
+    edits: Vec<(u32, u32, String)>,
+}
+
+impl Arenas {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
 }
 
 /// Format a Svelte source string.
 ///
 /// On success returns the formatted source. On failure returns the parse
 /// or formatting error, leaving the source untouched.
+///
+/// # Errors
+///
+/// Returns [`FormatError`] when parsing or formatting the source fails.
 pub fn format(source: &str, options: &FormatOptions) -> Result<String, FormatError> {
-    // A plain `<script>` (no `lang="ts"`) may still contain TypeScript: oxfmt /
-    // prettier-plugin-svelte parse Svelte `<script>` as TS by default, so e.g.
-    // `import type { X }` or `let c: typeof C<any>` are valid input there. Try a
-    // normal (JS) parse first; only when that fails retry forcing TS, so the vast
-    // majority of components (valid JS, or already `lang="ts"`) are untouched and
-    // cannot regress — only previously-erroring TS-in-plain-`<script>` files gain
-    // formatting. The TS retry sets `is_typescript` on the scripts, so the
-    // dialect detection below threads TS through every template expression too.
-    // A `<style lang="scss|less|postcss|…">` body is not plain CSS, so parsing it
-    // as CSS would abort the whole-file parse (`css_expected_identifier` on `//`
-    // comments, `$variables`, maps, …). prettier-plugin-svelte treats these as
-    // opaque preprocessor input and leaves them untouched; mirror that by skipping
-    // the CSS parse for non-CSS `lang` blocks (the body is left verbatim below).
-    let parse_options = ParseOptions {
+    format_with_arenas(source, options, &mut Arenas::new())
+}
+
+/// [`format()`] over caller-owned scratch buffers. A loop formatting many files
+/// keeps one [`Arenas`] and passes it each call, reusing its capacity instead
+/// of reallocating per file.
+///
+/// The initial parse defers `<script>` bodies and template expressions (the
+/// formatter re-parses both from source anyway, so the eager phase-1 oxc→JsNode
+/// work is waste). Deferring means the phase-1 parse no longer surfaces the
+/// TS-in-plain-`<script>` signal that drove the old JS-first / force-TS retry
+/// (#682); that signal now comes from the script/expression re-parse, so a
+/// dialect-sensitive failure re-runs the whole format forcing TS — identical
+/// output, only the trigger moved.
+///
+/// # Errors
+///
+/// Returns [`FormatError`] when parsing or formatting the source fails.
+pub fn format_with_arenas(
+    source: &str,
+    options: &FormatOptions,
+    arenas: &mut Arenas,
+) -> Result<String, FormatError> {
+    // `parse` strips a leading BOM, so every span it hands back is relative to
+    // the stripped text; slicing the unstripped source with one is three bytes
+    // off. Prettier keeps the BOM in its output, so it goes back on afterwards.
+    let stripped = rsvelte_core::remove_bom(source);
+    let formatted = match format_attempt(stripped, options, arenas, false) {
+        Err(e) if e.is_dialect_sensitive() => format_attempt(stripped, options, arenas, true),
+        other => other,
+    }?;
+    Ok(if stripped.len() == source.len() { formatted } else { format!("\u{feff}{formatted}") })
+}
+
+fn normalize_file_edges(out: &mut String) {
+    let lead = out.len() - out.trim_start_matches([' ', '\t', '\r', '\n']).len();
+    if lead > 0 {
+        out.drain(..lead);
+    }
+    let trimmed_len = out.trim_end_matches([' ', '\t', '\r', '\n']).len();
+    out.truncate(trimmed_len);
+    if !out.is_empty() {
+        out.push('\n');
+    }
+}
+
+fn formatter_parse_options(force_typescript: bool) -> ParseOptions {
+    ParseOptions {
         skip_non_css_lang_style: true,
+        skip_expression_loc: true,
+        defer_script_parse: true,
+        force_typescript,
         ..ParseOptions::default()
-    };
-    let root = match parse(source, parse_options) {
-        Ok(root) => root,
-        Err(_) => parse(
-            source,
-            ParseOptions {
-                force_typescript: true,
-                ..parse_options
-            },
-        )
-        .map_err(FormatError::from_parse)?,
-    };
+    }
+}
 
-    let mut edits: Vec<(u32, u32, String)> = Vec::new();
-
-    // A component is TypeScript if either `<script>` block declares
-    // `lang="ts"`. Template `{expr}` / attribute / pattern source must then
-    // be parsed in the same dialect as the script body, so `{value as
-    // string}` and friends round-trip instead of erroring as JS (#682).
-    // Thread the flag via a per-document clone — the shared `&FormatOptions`
-    // is never mutated, so parallel `format()` calls stay independent.
+fn document_options(
+    root: &rsvelte_core::ast::template::Root<'_>,
+    options: &FormatOptions,
+) -> Option<FormatOptions> {
     let typescript = [root.instance.as_deref(), root.module.as_deref()]
         .into_iter()
         .flatten()
         .any(|script| script.is_typescript);
-    let ts_options;
-    let options = if typescript && !options.typescript {
-        ts_options = FormatOptions {
-            typescript: true,
-            ..options.clone()
-        };
-        &ts_options
-    } else {
-        options
-    };
+    (typescript && !options.typescript)
+        .then(|| FormatOptions { typescript: true, ..options.clone() })
+}
 
-    for script in [root.instance.as_deref(), root.module.as_deref()]
-        .into_iter()
-        .flatten()
-    {
+fn format_attempt(
+    source: &str,
+    options: &FormatOptions,
+    arenas: &mut Arenas,
+    force_typescript: bool,
+) -> Result<String, FormatError> {
+    // Free the previous file's throwaway expression/script parses; this file's
+    // parses reuse the same arena chunk (see `scratch`).
+    scratch::reset();
+    // Drop the previous file's memoized expression results.
+    expression::clear_expr_memo();
+
+    let parse_options = formatter_parse_options(force_typescript);
+    let root = parse(source, &rsvelte_core::Allocator::default(), parse_options)
+        .map_err(FormatError::from_parse)?;
+
+    // Reuse the arena's edit buffer: take it out (leaving the arena empty),
+    // refill it below, and hand it back before returning on the success path.
+    let mut edits: Vec<(u32, u32, String)> = std::mem::take(&mut arenas.edits);
+    edits.clear();
+
+    let ts_options = document_options(&root, options);
+    let options = ts_options.as_ref().unwrap_or(options);
+
+    for script in [root.instance.as_deref(), root.module.as_deref()].into_iter().flatten() {
         if let Some((start, end, formatted)) = script::format_script(source, script, options)? {
             edits.push((start, end, formatted));
         }
@@ -183,38 +251,22 @@ pub fn format(source: &str, options: &FormatOptions) -> Result<String, FormatErr
         sections.push((so.style, c.start, c.end));
     }
     let has_markup = root.fragment.nodes.iter().any(|n| {
-        !matches!(n, rsvelte_core::ast::template::TemplateNode::Text(t) if crate::is_blank_text(t.data.as_str()))
+        !matches!(n, rsvelte_core::ast::template::TemplateNode::Text(t) if crate::is_blank_text(t.data.as_ref()))
     });
-    let reorder_spans: Vec<(u8, usize, usize)> =
-        if sections.len() > 1 || (sections.len() == 1 && has_markup) {
-            let remap = |pos: u32| -> usize {
-                let delta: isize = edits
-                    .iter()
-                    .filter(|(_, end, _)| *end <= pos)
-                    .map(|(start, end, repl)| repl.len() as isize - (*end - *start) as isize)
-                    .sum();
-                (pos as isize + delta) as usize
-            };
-            sections
-                .iter()
-                .map(|&(p, s, e)| (p, remap(s), remap(e)))
-                .collect()
-        } else {
-            Vec::new()
-        };
 
-    // Apply edits from the back so earlier offsets remain valid.
+    // Resolve overlapping edits ONCE, before both the section remap and the
+    // application, so the two never disagree. Two passes (markup.rs and indent.rs)
+    // can emit an edit for the same span — e.g. markup.rs replaces a whitespace
+    // body + close tag with `\n{indent}</tag>` at the same `[start, end)` that
+    // indent.rs would normalise to `\n{indent}`. Markup edits are pushed first
+    // (line 100 before line 105), so after the stable descending sort they appear
+    // before indent edits with the same start; the first one wins and the overlap
+    // is dropped here. Computing the remap from this resolved set (rather than the
+    // raw edits) is essential: a *skipped* edit must not contribute to the section
+    // offset delta, otherwise a length-changing markup edit that superseded an
+    // indent edit would shift the section boundary past the output end (#1707).
     edits.sort_by_key(|(start, _, _)| std::cmp::Reverse(*start));
-    let mut out = source.to_string();
-    // Track the range of the last applied non-zero-length edit so we can skip
-    // any subsequent edit whose range overlaps it.  Two passes (markup.rs and
-    // indent.rs) can both emit an edit for the same span — e.g. markup.rs
-    // replaces trailing whitespace with `</tag>` at the same `[start, end)`
-    // that indent.rs would normalise to `\n{indent}`.  Markup edits are pushed
-    // first (lib.rs line 100 before line 105), so after the stable descending
-    // sort they appear before indent edits with the same start.  The first one
-    // wins; the second is skipped here to avoid a double-replace that would
-    // clobber the first replacement.
+    let mut applied: Vec<(u32, u32, String)> = Vec::with_capacity(edits.len());
     let mut last_applied: (u32, u32) = (u32::MAX, u32::MAX);
     for (start, end, new_text) in edits {
         let (la_s, la_e) = last_applied;
@@ -227,13 +279,47 @@ pub fn format(source: &str, options: &FormatOptions) -> Result<String, FormatErr
         if overlaps {
             continue;
         }
-        out.replace_range(start as usize..end as usize, &new_text);
         // Only update the guard for non-zero-length edits (range replacements).
         // Zero-length inserts don't "own" a range.
         if end > start {
             last_applied = (start, end);
         }
+        applied.push((start, end, new_text));
     }
+
+    // Snapshot + remap the top-level section spans through the RESOLVED edits, so
+    // the reorder post-pass can run on the formatted output WITHOUT re-parsing it.
+    // An edit never straddles a top-level element boundary, so a boundary's new
+    // offset is its original offset plus the net length change of every applied
+    // edit ending at or before it. Only remap when reordering could change
+    // something (more than one top-level unit); otherwise the pass is skipped.
+    let reorder_spans: Vec<(u8, usize, usize)> =
+        if sections.len() > 1 || (sections.len() == 1 && has_markup) {
+            let remap = |pos: u32| -> usize {
+                let delta: i128 = applied
+                    .iter()
+                    .filter(|(_, end, _)| *end <= pos)
+                    .map(|(start, end, repl)| {
+                        i128::try_from(repl.len()).expect("replacement length exceeds i128 range")
+                            - i128::from(*end - *start)
+                    })
+                    .sum();
+                usize::try_from(i128::from(pos) + delta)
+                    .expect("remapped section offset is outside usize range")
+            };
+            sections.iter().map(|&(p, s, e)| (p, remap(s), remap(e))).collect()
+        } else {
+            Vec::new()
+        };
+
+    // Apply the resolved edits via the forward-splice pass (memmove-light vs a
+    // back-to-front `replace_range` loop, and it keeps the deterministic
+    // zero-length-insert-before-range ordering). `applied` is already
+    // overlap-resolved (for #1707's correct section remap), so apply_edits'
+    // in-pass overlap check is a no-op here; it drains `applied`.
+    let mut out = apply_edits(source, &mut applied);
+    // Return the drained buffer to the arena so its capacity is reused.
+    arenas.edits = applied;
 
     // Post-pass: reorder top-level sections into prettier's canonical order
     // (options → module script → instance script → markup → styles) and
@@ -244,23 +330,137 @@ pub fn format(source: &str, options: &FormatOptions) -> Result<String, FormatErr
         out = sort_order::reorder_sections(&out, reorder_spans, so.markup, so.reorder);
     }
 
-    // Post-pass: collapse pure-text elements onto one line when they fit.
-    out = collapse::collapse_pure_text_elements(&out, options)?;
+    // Post-pass: collapse pure-text elements onto one line when they fit. Skip
+    // its full re-parse when the source tree has no element a collapse pass could
+    // reflow (checked here so the cheap gate reuses this parse instead of paying
+    // collapse's own).
+    let has_collapse_candidate = collapse::fragment_has_collapse_candidate(&root.fragment);
+    out = collapse::collapse_pure_text_elements(&out, options, has_collapse_candidate);
 
-    // Start the file at content: prettier / oxfmt strip leading blank lines and
-    // indentation before the first node (e.g. a markdown code block that begins
-    // with a blank line, or a leading newline before `<svelte:options>`).
-    let lead = out.len() - out.trim_start_matches([' ', '\t', '\r', '\n']).len();
-    if lead > 0 {
-        out.drain(..lead);
-    }
-
-    // End the file with exactly one newline (prettier / oxfmt `insertFinalNewline`).
-    let trimmed_len = out.trim_end_matches([' ', '\t', '\r', '\n']).len();
-    out.truncate(trimmed_len);
-    if !out.is_empty() {
-        out.push('\n');
-    }
+    normalize_file_edges(&mut out);
 
     Ok(out)
+}
+
+/// Splice the collected edits into `source` in one forward pass, draining
+/// `edits` (left empty for buffer reuse).
+///
+/// Edits are `(start, end, replacement)` in original-source byte offsets. The
+/// overlap and ordering rules the edit passes depend on:
+///
+/// - Two intersecting non-zero-length edits: the larger-start one wins, the
+///   other is dropped. In practice only markup.rs vs indent.rs on an identical
+///   span collide today.
+/// - At a shared start, a zero-length insert is spliced **before** a surviving
+///   range edit (insert-then-replace) — e.g. indent.rs's `\n{indent}` lands
+///   before markup.rs's rewritten open tag. This is decided explicitly here,
+///   not left to the old back-to-front loop's incidental behaviour (which, for
+///   this exact shape, dropped the insert and consumed a source byte). The
+///   corpus doesn't currently produce this shape, so making it explicit leaves
+///   every corpus output byte-identical; the unit tests below lock in the
+///   intended semantics.
+/// - Multiple inserts at one position emit in push order, so markup's
+///   synthetic close tag precedes indent.rs's separator at the same offset.
+fn apply_edits(source: &str, edits: &mut Vec<(u32, u32, String)>) -> String {
+    // Select survivors in descending-start order so the overlap tie-break
+    // matches the historical back-to-front `replace_range` loop.
+    edits.sort_by_key(|(start, _, _)| std::cmp::Reverse(*start));
+    let mut last_applied: (u32, u32) = (u32::MAX, u32::MAX);
+    let mut survivors: Vec<(u32, u32, String)> = Vec::with_capacity(edits.len());
+    for (start, end, new_text) in edits.drain(..) {
+        let (la_s, la_e) = last_applied;
+        let incoming_nonempty = end > start;
+        let applied_nonempty = la_e > la_s;
+        // Two non-zero-length edits overlap when their ranges intersect. A
+        // zero-length insert consumes no bytes, so it never conflicts and never
+        // owns a range (it leaves `last_applied` untouched).
+        let overlaps = applied_nonempty && incoming_nonempty && start < la_e && end > la_s;
+        if overlaps {
+            continue;
+        }
+        if end > start {
+            last_applied = (start, end);
+        }
+        survivors.push((start, end, new_text));
+    }
+
+    // Survivors are in descending start with same-start entries in push order
+    // (both sorts above are stable). The stable re-sort to ascending start
+    // therefore keeps push order at a shared position and pins two rules: a
+    // zero-length insert precedes a range edit at the same start, and two
+    // coincident inserts emit in the order their passes pushed them — markup
+    // structure (a synthetic close tag) before indentation whitespace.
+    survivors.sort_by_key(|(start, end, _)| (*start, u8::from(*end > *start)));
+
+    let out_cap = source.len() + survivors.iter().map(|(_, _, t)| t.len()).sum::<usize>();
+    let mut out = String::with_capacity(out_cap);
+    let mut cursor = 0usize;
+    for (start, end, new_text) in &survivors {
+        let (s, e) = (*start as usize, *end as usize);
+        // Emit the untouched gap before this edit, then its replacement. A
+        // zero-length insert (e == s) leaves the cursor put, so a range edit
+        // sharing that start still emits immediately after the insert.
+        if s > cursor {
+            out.push_str(&source[cursor..s]);
+            cursor = s;
+        }
+        out.push_str(new_text);
+        if e > cursor {
+            cursor = e;
+        }
+    }
+    out.push_str(&source[cursor..]);
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::apply_edits;
+
+    fn apply(source: &str, mut edits: Vec<(u32, u32, String)>) -> String {
+        apply_edits(source, &mut edits)
+    }
+
+    fn e(start: u32, end: u32, text: &str) -> (u32, u32, String) {
+        (start, end, text.to_string())
+    }
+
+    #[test]
+    fn insert_before_surviving_range_at_shared_start() {
+        // indent.rs's zero-length `\n{indent}` insert and markup.rs's open-tag
+        // rewrite both anchored at one node start: the insert must land before
+        // the rewritten tag (insert-then-replace), deterministically regardless
+        // of which pass pushed first.
+        let src = "abcXXXXyz"; // bytes [3, 7) == "XXXX"
+        let expected = "abc\n  RWyz";
+        assert_eq!(apply(src, vec![e(3, 7, "RW"), e(3, 3, "\n  ")]), expected);
+        assert_eq!(apply(src, vec![e(3, 3, "\n  "), e(3, 7, "RW")]), expected);
+    }
+
+    #[test]
+    fn insert_at_range_end_stays_after() {
+        // A zero-length insert at a range edit's END emits after the range —
+        // the already-correct touching case, locked in here.
+        let src = "abcXXXXyz";
+        assert_eq!(apply(src, vec![e(3, 7, "RW"), e(7, 7, "!")]), "abcRW!yz");
+        assert_eq!(apply(src, vec![e(7, 7, "!"), e(3, 7, "RW")]), "abcRW!yz");
+    }
+
+    #[test]
+    fn multiple_inserts_at_one_position_keep_push_order() {
+        // A markup pass pushes before the indent pass, so a synthetic close tag
+        // lands before the separator that follows it.
+        assert_eq!(apply("abcd", vec![e(2, 2, "1"), e(2, 2, "2")]), "ab12cd");
+    }
+
+    #[test]
+    fn overlapping_ranges_larger_start_wins() {
+        // The overlap rule drops the smaller-start edit of an intersecting pair.
+        assert_eq!(apply("abcdef", vec![e(1, 4, "X"), e(2, 5, "Y")]), "abYf");
+    }
+
+    #[test]
+    fn disjoint_edits_splice_in_order() {
+        assert_eq!(apply("hello world", vec![e(0, 5, "HELLO"), e(6, 11, "WORLD")]), "HELLO WORLD");
+    }
 }

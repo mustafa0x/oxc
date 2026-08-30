@@ -94,17 +94,10 @@ pub fn use_directive(node: &UseDirective, context: &mut ComponentContext) -> JsS
             binding,
             context.state.analysis,
         );
-        let is_exported = context
-            .state
-            .analysis
-            .exports
-            .iter()
-            .any(|e| e.name == *name);
+        let is_exported = context.state.analysis.exports.iter().any(|e| e.name == *name);
         if !is_source && !is_exported {
             action_name = JsExpr::Member(JsMemberExpression {
-                object: context
-                    .arena
-                    .alloc_expr(JsExpr::Identifier("$$props".into())),
+                object: context.arena.alloc_expr(JsExpr::Identifier("$$props".into())),
                 property: JsMemberProperty::Identifier(name.clone()),
                 computed: false,
                 optional: false,
@@ -146,11 +139,8 @@ pub fn use_directive(node: &UseDirective, context: &mut ComponentContext) -> JsS
     }
 
     // Build the $.action() call
-    let action_call = b::call(
-        &context.arena,
-        b::member_path(&context.arena, "$.action"),
-        action_args,
-    );
+    let action_call =
+        b::call(&context.arena, b::member_path(&context.arena, "$.action"), action_args);
 
     let mut statement = b::stmt(&context.arena, action_call);
 

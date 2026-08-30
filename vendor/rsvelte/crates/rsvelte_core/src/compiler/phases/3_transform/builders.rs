@@ -15,53 +15,14 @@
 //! Spans are always the dummy [`oxc_span::SPAN`]: esrap formats structurally,
 //! so spans do not affect comment-free output.
 
-use oxc_allocator::{Allocator, Box as ArenaBox, GetAllocator, Vec as ArenaVec};
-use oxc_ast::builder::{AstBuild, GetAstBuilder};
+use oxc_allocator::{ArenaBox, ArenaVec};
 use oxc_ast::ast::*;
+use oxc_ast::builder::AstBuilder;
 use oxc_span::{SPAN, Span};
-use oxc_syntax::node::NodeId;
 pub use oxc_syntax::number::NumberBase;
 pub use oxc_syntax::operator::{
     AssignmentOperator, BinaryOperator, LogicalOperator, UnaryOperator, UpdateOperator,
 };
-
-/// Copyable builder provider for rsvelte's value-style `B` helper.
-///
-/// Oxc's new `AstBuilder` intentionally is not `Copy`, while rsvelte's
-/// transform helpers pass their builder facade by value. The node constructors
-/// only require the `GetAstBuilder`/`GetAllocator` traits, so retaining the
-/// allocator reference here preserves that API without enabling Oxc's removed
-/// legacy builder methods.
-#[derive(Clone, Copy)]
-pub struct AstBuilder<'a> {
-    pub allocator: &'a Allocator,
-}
-
-impl<'a> AstBuilder<'a> {
-    pub fn new(allocator: &'a Allocator) -> Self {
-        Self { allocator }
-    }
-}
-
-impl<'a> GetAllocator<'a> for AstBuilder<'a> {
-    fn allocator(&self) -> &'a Allocator {
-        self.allocator
-    }
-}
-
-impl<'a> AstBuild<'a> for AstBuilder<'a> {
-    fn node_id(&self) -> NodeId {
-        NodeId::DUMMY
-    }
-}
-
-impl<'a> GetAstBuilder<'a> for AstBuilder<'a> {
-    type Builder = Self;
-
-    fn builder(&self) -> &Self {
-        self
-    }
-}
 
 /// A `Copy` wrapper over [`AstBuilder`] exposing the upstream `b.*` helpers.
 ///
@@ -69,7 +30,7 @@ impl<'a> GetAstBuilder<'a> for AstBuilder<'a> {
 /// `Copy`, holding only a reference to the allocator).
 #[derive(Clone, Copy)]
 pub struct B<'a> {
-    pub ab: AstBuilder<'a>,
+    alloc: &'a oxc_allocator::Allocator,
 }
 
 /// Anything that can be coerced to an [`Expression`] in callee / object
@@ -101,16 +62,21 @@ impl<'a> IntoExpr<'a> for &String {
 impl<'a> B<'a> {
     #[inline]
     pub fn new(allocator: &'a oxc_allocator::Allocator) -> Self {
-        B {
-            ab: AstBuilder::new(allocator),
-        }
+        B { alloc: allocator }
+    }
+
+    /// A fresh [`AstBuilder`] over this arena. Upstream's builder is no longer
+    /// `Copy`, so `B` carries the allocator and hands one out on demand.
+    #[inline]
+    pub fn ab(&self) -> AstBuilder<'a> {
+        AstBuilder::new(self.alloc)
     }
 
     /// Allocate `s` into the oxc arena, yielding an `&'a str` (which satisfies
     /// the `Into<Atom<'a>>` bounds the builder methods take).
     #[inline]
     pub fn str(self, s: &str) -> &'a str {
-        self.ab.allocator.alloc_str(s)
+        self.alloc.alloc_str(s)
     }
 
     // -- identifiers & literals --------------------------------------------
@@ -119,43 +85,43 @@ impl<'a> B<'a> {
     /// dotted "identifiers" like `"$.derived"` are valid (matching upstream).
     #[inline]
     pub fn id(self, name: &str) -> Expression<'a> {
-        Expression::new_identifier(SPAN, self.str(name), &self.ab)
+        Expression::new_identifier(SPAN, self.str(name), &self.ab())
     }
 
     /// An [`IdentifierName`] (for static member property / meta-property keys).
     #[inline]
     pub fn id_name(self, name: &str) -> IdentifierName<'a> {
-        IdentifierName::new(SPAN, self.str(name), &self.ab)
+        IdentifierName::new(SPAN, self.str(name), &self.ab())
     }
 
     /// A string literal expression with the default (printer-chosen) quoting.
     #[inline]
     pub fn string(self, value: &str) -> Expression<'a> {
-        Expression::new_string_literal(SPAN, self.str(value), None, &self.ab)
+        Expression::new_string_literal(SPAN, self.str(value), None, &self.ab())
     }
 
     /// A numeric literal expression (decimal).
     #[inline]
     pub fn number(self, value: f64) -> Expression<'a> {
-        Expression::new_numeric_literal(SPAN, value, None, NumberBase::Decimal, &self.ab)
+        Expression::new_numeric_literal(SPAN, value, None, NumberBase::Decimal, &self.ab())
     }
 
     /// A boolean literal expression.
     #[inline]
     pub fn bool(self, value: bool) -> Expression<'a> {
-        Expression::new_boolean_literal(SPAN, value, &self.ab)
+        Expression::new_boolean_literal(SPAN, value, &self.ab())
     }
 
     /// `null`.
     #[inline]
     pub fn null(self) -> Expression<'a> {
-        Expression::new_null_literal(SPAN, &self.ab)
+        Expression::new_null_literal(SPAN, &self.ab())
     }
 
     /// `this`.
     #[inline]
     pub fn this(self) -> Expression<'a> {
-        Expression::ThisExpression(ThisExpression::boxed(SPAN, &self.ab))
+        Expression::ThisExpression(ThisExpression::boxed(SPAN, &self.ab()))
     }
 
     /// `void 0`.
@@ -165,7 +131,7 @@ impl<'a> B<'a> {
             SPAN,
             UnaryOperator::Void,
             self.number(0.0),
-            &self.ab,
+            &self.ab(),
         ))
     }
 
@@ -173,7 +139,7 @@ impl<'a> B<'a> {
     /// otherwise a string-literal key (upstream `b.key`).
     pub fn key(self, name: &str) -> PropertyKey<'a> {
         if is_valid_identifier(name) {
-            PropertyKey::new_static_identifier(SPAN, self.str(name), &self.ab)
+            PropertyKey::new_static_identifier(SPAN, self.str(name), &self.ab())
         } else {
             PropertyKey::from(self.string(name))
         }
@@ -186,9 +152,13 @@ impl<'a> B<'a> {
     pub fn member(self, object: impl IntoExpr<'a>, property: &str) -> Expression<'a> {
         let object = object.into_expr(self);
         let property = self.id_name(property);
-        Expression::from(MemberExpression::StaticMemberExpression(
-            StaticMemberExpression::boxed(SPAN, object, property, false, &self.ab),
-        ))
+        Expression::from(MemberExpression::StaticMemberExpression(StaticMemberExpression::boxed(
+            SPAN,
+            object,
+            property,
+            false,
+            &self.ab(),
+        )))
     }
 
     /// `object[property]` (computed, non-optional).
@@ -199,17 +169,7 @@ impl<'a> B<'a> {
         property: Expression<'a>,
     ) -> Expression<'a> {
         Expression::from(MemberExpression::ComputedMemberExpression(
-            ComputedMemberExpression::boxed(SPAN, object, property, false, &self.ab),
-        ))
-    }
-
-    /// Build a static [`MemberExpression`] node (not wrapped as `Expression`),
-    /// for callers needing the member form directly.
-    #[inline]
-    pub fn member_node(self, object: Expression<'a>, property: &str) -> MemberExpression<'a> {
-        let property = self.id_name(property);
-        MemberExpression::StaticMemberExpression(StaticMemberExpression::boxed(
-            SPAN, object, property, false, &self.ab,
+            ComputedMemberExpression::boxed(SPAN, object, property, false, &self.ab()),
         ))
     }
 
@@ -232,27 +192,10 @@ impl<'a> B<'a> {
         Expression::CallExpression(CallExpression::boxed(
             SPAN,
             callee,
-            oxc_ast::builder::NONE,
+            None,
             args,
             false,
-            &self.ab,
-        ))
-    }
-
-    /// `callee(args…)` taking pre-built [`Argument`]s (for spreads).
-    pub fn call_args(
-        self,
-        callee: impl IntoExpr<'a>,
-        args: ArenaVec<'a, Argument<'a>>,
-    ) -> Expression<'a> {
-        let callee = callee.into_expr(self);
-        Expression::CallExpression(CallExpression::boxed(
-            SPAN,
-            callee,
-            oxc_ast::builder::NONE,
-            args,
-            false,
-            &self.ab,
+            &self.ab(),
         ))
     }
 
@@ -266,10 +209,8 @@ impl<'a> B<'a> {
         while matches!(args.last(), Some(None)) {
             args.pop();
         }
-        let args: Vec<Expression<'a>> = args
-            .into_iter()
-            .map(|a| a.unwrap_or_else(|| self.void0()))
-            .collect();
+        let args: Vec<Expression<'a>> =
+            args.into_iter().map(|a| a.unwrap_or_else(|| self.void0())).collect();
         self.call(callee, args)
     }
 
@@ -281,14 +222,28 @@ impl<'a> B<'a> {
         args: Vec<Expression<'a>>,
     ) -> Expression<'a> {
         use oxc_ast::ast::ChainElement;
-        let callee = callee.into_expr(self);
+        let mut callee = callee.into_expr(self);
+        // Upstream's callee is a chain *element* (`unwrap_optional(…).callee`), never a
+        // nested `ChainExpression`; reparsing the callee text re-adds that wrapper, and
+        // keeping it would close the chain and print `(a?.b)?.()` instead of `a?.b?.()`.
+        if let Expression::ChainExpression(chain) = callee {
+            callee = match chain.unbox().expression {
+                ChainElement::CallExpression(c) => Expression::CallExpression(c),
+                ChainElement::TSNonNullExpression(e) => Expression::TSNonNullExpression(e),
+                ChainElement::ComputedMemberExpression(m) => {
+                    Expression::ComputedMemberExpression(m)
+                }
+                ChainElement::StaticMemberExpression(m) => Expression::StaticMemberExpression(m),
+                ChainElement::PrivateFieldExpression(m) => Expression::PrivateFieldExpression(m),
+            };
+        }
         let args = self.args(args);
-        let call = CallExpression::boxed(SPAN, callee, oxc_ast::builder::NONE, args, true, &self.ab);
+        let call = CallExpression::boxed(SPAN, callee, None, args, true, &self.ab());
         // Wrap in a ChainExpression so esrap prints the `?.()` chain form.
         Expression::ChainExpression(ChainExpression::boxed(
             SPAN,
             ChainElement::CallExpression(call),
-            &self.ab,
+            &self.ab(),
         ))
     }
 
@@ -296,28 +251,16 @@ impl<'a> B<'a> {
     pub fn new_expr(self, callee: impl IntoExpr<'a>, args: Vec<Expression<'a>>) -> Expression<'a> {
         let callee = callee.into_expr(self);
         let args = self.args(args);
-        Expression::NewExpression(NewExpression::boxed(
-            SPAN,
-            callee,
-            oxc_ast::builder::NONE,
-            args,
-            &self.ab,
-        ))
+        Expression::NewExpression(NewExpression::boxed(SPAN, callee, None, args, &self.ab()))
     }
 
     /// Convert a `Vec<Expression>` into an arena `Vec<Argument>`.
     pub fn args(self, exprs: Vec<Expression<'a>>) -> ArenaVec<'a, Argument<'a>> {
-        let mut out = ArenaVec::with_capacity_in(exprs.len(), &self.ab);
+        let mut out = ArenaVec::with_capacity_in(exprs.len(), &self.ab());
         for e in exprs {
             out.push(Argument::from(e));
         }
         out
-    }
-
-    /// A spread argument `...expr` (for use with [`B::call_args`]).
-    #[inline]
-    pub fn spread_arg(self, expr: Expression<'a>) -> Argument<'a> {
-        Argument::new_spread_element(SPAN, expr, &self.ab)
     }
 
     // -- operators ----------------------------------------------------------
@@ -329,7 +272,7 @@ impl<'a> B<'a> {
         left: Expression<'a>,
         right: Expression<'a>,
     ) -> Expression<'a> {
-        Expression::BinaryExpression(BinaryExpression::boxed(SPAN, left, op, right, &self.ab))
+        Expression::BinaryExpression(BinaryExpression::boxed(SPAN, left, op, right, &self.ab()))
     }
 
     #[inline]
@@ -339,60 +282,48 @@ impl<'a> B<'a> {
         left: Expression<'a>,
         right: Expression<'a>,
     ) -> Expression<'a> {
-        Expression::LogicalExpression(LogicalExpression::boxed(SPAN, left, op, right, &self.ab))
+        Expression::LogicalExpression(LogicalExpression::boxed(SPAN, left, op, right, &self.ab()))
     }
 
     #[inline]
     pub fn unary(self, op: UnaryOperator, argument: Expression<'a>) -> Expression<'a> {
-        Expression::UnaryExpression(UnaryExpression::boxed(SPAN, op, argument, &self.ab))
-    }
-
-    #[inline]
-    pub fn conditional(
-        self,
-        test: Expression<'a>,
-        consequent: Expression<'a>,
-        alternate: Expression<'a>,
-    ) -> Expression<'a> {
-        Expression::ConditionalExpression(ConditionalExpression::boxed(
-            SPAN, test, consequent, alternate, &self.ab,
-        ))
+        Expression::UnaryExpression(UnaryExpression::boxed(SPAN, op, argument, &self.ab()))
     }
 
     #[inline]
     pub fn await_expr(self, argument: Expression<'a>) -> Expression<'a> {
-        Expression::AwaitExpression(AwaitExpression::boxed(SPAN, argument, &self.ab))
+        Expression::AwaitExpression(AwaitExpression::boxed(SPAN, argument, &self.ab()))
     }
 
     pub fn sequence(self, expressions: Vec<Expression<'a>>) -> Expression<'a> {
-        let mut out = ArenaVec::with_capacity_in(expressions.len(), &self.ab);
+        let mut out = ArenaVec::with_capacity_in(expressions.len(), &self.ab());
         for e in expressions {
             out.push(e);
         }
-        Expression::SequenceExpression(SequenceExpression::boxed(SPAN, out, &self.ab))
+        Expression::SequenceExpression(SequenceExpression::boxed(SPAN, out, &self.ab()))
     }
 
     // -- array & object -----------------------------------------------------
 
     /// `[elements…]`. `None` entries become elisions (holes).
     pub fn array(self, elements: Vec<Option<Expression<'a>>>) -> Expression<'a> {
-        let mut out = ArenaVec::with_capacity_in(elements.len(), &self.ab);
+        let mut out = ArenaVec::with_capacity_in(elements.len(), &self.ab());
         for el in elements {
             match el {
-                None => out.push(ArrayExpressionElement::new_elision(SPAN, &self.ab)),
+                None => out.push(ArrayExpressionElement::new_elision(SPAN, &self.ab())),
                 Some(e) => out.push(ArrayExpressionElement::from(e)),
             }
         }
-        Expression::ArrayExpression(ArrayExpression::boxed(SPAN, out, &self.ab))
+        Expression::ArrayExpression(ArrayExpression::boxed(SPAN, out, &self.ab()))
     }
 
     /// `{ properties… }`.
     pub fn object(self, properties: Vec<ObjectPropertyKind<'a>>) -> Expression<'a> {
-        let mut out = ArenaVec::with_capacity_in(properties.len(), &self.ab);
+        let mut out = ArenaVec::with_capacity_in(properties.len(), &self.ab());
         for p in properties {
             out.push(p);
         }
-        Expression::ObjectExpression(ObjectExpression::boxed(SPAN, out, &self.ab))
+        Expression::ObjectExpression(ObjectExpression::boxed(SPAN, out, &self.ab()))
     }
 
     /// `name: value` object property (upstream `b.init`).
@@ -406,7 +337,7 @@ impl<'a> B<'a> {
             false,
             false,
             false,
-            &self.ab,
+            &self.ab(),
         ))
     }
 
@@ -422,13 +353,20 @@ impl<'a> B<'a> {
         computed: bool,
     ) -> ObjectPropertyKind<'a> {
         ObjectPropertyKind::ObjectProperty(ObjectProperty::boxed(
-            SPAN, kind, key, value, method, shorthand, computed, &self.ab,
+            SPAN,
+            kind,
+            key,
+            value,
+            method,
+            shorthand,
+            computed,
+            &self.ab(),
         ))
     }
 
     /// `...expr` spread property.
     pub fn spread(self, argument: Expression<'a>) -> ObjectPropertyKind<'a> {
-        ObjectPropertyKind::SpreadProperty(SpreadElement::boxed(SPAN, argument, &self.ab))
+        ObjectPropertyKind::SpreadProperty(SpreadElement::boxed(SPAN, argument, &self.ab()))
     }
 
     /// `get name() { body }` (upstream `b.get`).
@@ -443,7 +381,7 @@ impl<'a> B<'a> {
             false,
             false,
             false,
-            &self.ab,
+            &self.ab(),
         ))
     }
 
@@ -460,7 +398,7 @@ impl<'a> B<'a> {
             false,
             false,
             false,
-            &self.ab,
+            &self.ab(),
         ))
     }
 
@@ -469,7 +407,7 @@ impl<'a> B<'a> {
     /// A simple identifier binding pattern.
     #[inline]
     pub fn id_pat(self, name: &str) -> BindingPattern<'a> {
-        BindingPattern::new_binding_identifier(SPAN, self.str(name), &self.ab)
+        BindingPattern::new_binding_identifier(SPAN, self.str(name), &self.ab())
     }
 
     /// `{ name: value }` — a single-property object **binding pattern**
@@ -479,9 +417,9 @@ impl<'a> B<'a> {
         self,
         properties: Vec<(String, BindingPattern<'a>)>,
     ) -> BindingPattern<'a> {
-        let mut props = ArenaVec::with_capacity_in(properties.len(), &self.ab);
+        let mut props = ArenaVec::with_capacity_in(properties.len(), &self.ab());
         for (name, value) in properties {
-            let key = PropertyKey::new_static_identifier(SPAN, self.str(&name), &self.ab);
+            let key = PropertyKey::new_static_identifier(SPAN, self.str(&name), &self.ab());
             // `shorthand` is purely cosmetic for esrap output; mark it true when
             // the value is the same identifier as the key so `{ x }` prints
             // shorthand rather than `{ x: x }`.
@@ -489,11 +427,9 @@ impl<'a> B<'a> {
                 &value,
                 BindingPattern::BindingIdentifier(id) if id.name.as_str() == name
             );
-            props.push(BindingProperty::new(
-                SPAN, key, value, shorthand, false, &self.ab,
-            ));
+            props.push(BindingProperty::new(SPAN, key, value, shorthand, false, &self.ab()));
         }
-        BindingPattern::new_object_pattern(SPAN, props, oxc_ast::builder::NONE, &self.ab)
+        BindingPattern::new_object_pattern(SPAN, props, None, &self.ab())
     }
 
     /// Reinterpret an `Expression` as a `BindingPattern`, mirroring upstream's
@@ -511,7 +447,7 @@ impl<'a> B<'a> {
             Expression::Identifier(id) => self.id_pat(id.name.as_str()),
             Expression::ObjectExpression(obj) => {
                 let props_vec = obj.unbox().properties;
-                let mut props = ArenaVec::with_capacity_in(props_vec.len(), &self.ab);
+                let mut props = ArenaVec::with_capacity_in(props_vec.len(), &self.ab());
                 let mut rest = None;
                 for member in props_vec {
                     match member {
@@ -523,27 +459,32 @@ impl<'a> B<'a> {
                             let value = self.expr_to_pattern(p.value, "undefined");
                             let shorthand = p.shorthand;
                             props.push(BindingProperty::new(
-                                SPAN, key, value, shorthand, p.computed, &self.ab,
+                                SPAN,
+                                key,
+                                value,
+                                shorthand,
+                                p.computed,
+                                &self.ab(),
                             ));
                         }
                         OPK::SpreadProperty(s) => {
                             let inner = self.expr_to_pattern(s.unbox().argument, "undefined");
-                            rest = Some(BindingRestElement::boxed(SPAN, inner, &self.ab));
+                            rest = Some(BindingRestElement::boxed(SPAN, inner, &self.ab()));
                         }
                     }
                 }
-                BindingPattern::new_object_pattern(SPAN, props, rest, &self.ab)
+                BindingPattern::new_object_pattern(SPAN, props, rest, &self.ab())
             }
             Expression::ArrayExpression(arr) => {
                 let elements = arr.unbox().elements;
-                let mut out = ArenaVec::with_capacity_in(elements.len(), &self.ab);
+                let mut out = ArenaVec::with_capacity_in(elements.len(), &self.ab());
                 let mut rest = None;
                 for el in elements {
                     match el {
                         ArrayExpressionElement::Elision(_) => out.push(None),
                         ArrayExpressionElement::SpreadElement(s) => {
                             let inner = self.expr_to_pattern(s.unbox().argument, "undefined");
-                            rest = Some(BindingRestElement::boxed(SPAN, inner, &self.ab));
+                            rest = Some(BindingRestElement::boxed(SPAN, inner, &self.ab()));
                         }
                         other => {
                             let e = Expression::try_from(other)
@@ -552,10 +493,112 @@ impl<'a> B<'a> {
                         }
                     }
                 }
-                BindingPattern::new_array_pattern(SPAN, out, rest, &self.ab)
+                BindingPattern::new_array_pattern(SPAN, out, rest, &self.ab())
             }
-            Expression::AssignmentExpression(_) => self.id_pat(default_name),
+            // `let:x={y = 1}` / `[y = 1]` parses as an assignment; as a pattern it
+            // is the default-value form, so the left side keeps the bound name.
+            Expression::AssignmentExpression(assign)
+                if assign.operator == AssignmentOperator::Assign =>
+            {
+                let assign = assign.unbox();
+                let left = self.target_to_pattern(assign.left, default_name);
+                BindingPattern::new_assignment_pattern(SPAN, left, assign.right, &self.ab())
+            }
             _ => self.id_pat(default_name),
+        }
+    }
+
+    /// The left of a reinterpreted assignment: oxc already parsed it as an
+    /// assignment target, which is the same tree a binding pattern needs.
+    fn target_to_pattern(
+        self,
+        target: AssignmentTarget<'a>,
+        default_name: &str,
+    ) -> BindingPattern<'a> {
+        use oxc_ast::ast::AssignmentTargetProperty as ATP;
+        match target {
+            AssignmentTarget::AssignmentTargetIdentifier(id) => self.id_pat(&id.name),
+            AssignmentTarget::ArrayAssignmentTarget(arr) => {
+                let arr = arr.unbox();
+                let mut out = ArenaVec::with_capacity_in(arr.elements.len(), &self.ab());
+                for el in arr.elements {
+                    out.push(el.map(|e| self.maybe_default_to_pattern(e, "undefined")));
+                }
+                let rest = arr.rest.map(|r| {
+                    let inner = self.target_to_pattern(r.unbox().target, "undefined");
+                    BindingRestElement::boxed(SPAN, inner, &self.ab())
+                });
+                BindingPattern::new_array_pattern(SPAN, out, rest, &self.ab())
+            }
+            AssignmentTarget::ObjectAssignmentTarget(obj) => {
+                let obj = obj.unbox();
+                let mut props = ArenaVec::with_capacity_in(obj.properties.len(), &self.ab());
+                for prop in obj.properties {
+                    let (key, value, shorthand, computed) = match prop {
+                        ATP::AssignmentTargetPropertyIdentifier(p) => {
+                            let p = p.unbox();
+                            let name = self.str(&p.binding.name);
+                            let mut value = self.id_pat(&p.binding.name);
+                            if let Some(init) = p.init {
+                                value = BindingPattern::new_assignment_pattern(
+                                    SPAN,
+                                    value,
+                                    init,
+                                    &self.ab(),
+                                );
+                            }
+                            (
+                                PropertyKey::StaticIdentifier(IdentifierName::boxed(
+                                    SPAN,
+                                    name,
+                                    &self.ab(),
+                                )),
+                                value,
+                                true,
+                                false,
+                            )
+                        }
+                        ATP::AssignmentTargetPropertyProperty(p) => {
+                            let p = p.unbox();
+                            let value = self.maybe_default_to_pattern(p.binding, "undefined");
+                            (p.name, value, false, p.computed)
+                        }
+                    };
+                    props.push(BindingProperty::new(
+                        SPAN,
+                        key,
+                        value,
+                        shorthand,
+                        computed,
+                        &self.ab(),
+                    ));
+                }
+                let rest = obj.rest.map(|r| {
+                    let inner = self.target_to_pattern(r.unbox().target, "undefined");
+                    BindingRestElement::boxed(SPAN, inner, &self.ab())
+                });
+                BindingPattern::new_object_pattern(SPAN, props, rest, &self.ab())
+            }
+            _ => self.id_pat(default_name),
+        }
+    }
+
+    fn maybe_default_to_pattern(
+        self,
+        target: oxc_ast::ast::AssignmentTargetMaybeDefault<'a>,
+        default_name: &str,
+    ) -> BindingPattern<'a> {
+        use oxc_ast::ast::AssignmentTargetMaybeDefault as MD;
+        match target {
+            MD::AssignmentTargetWithDefault(d) => {
+                let d = d.unbox();
+                let left = self.target_to_pattern(d.binding, default_name);
+                BindingPattern::new_assignment_pattern(SPAN, left, d.init, &self.ab())
+            }
+            other => match AssignmentTarget::try_from(other) {
+                Ok(t) => self.target_to_pattern(t, default_name),
+                Err(_) => self.id_pat(default_name),
+            },
         }
     }
 
@@ -571,30 +614,31 @@ impl<'a> B<'a> {
         patterns: Vec<BindingPattern<'a>>,
         rest: Option<BindingPattern<'a>>,
     ) -> FormalParameters<'a> {
-        let mut items = ArenaVec::with_capacity_in(patterns.len(), &self.ab);
+        let mut items = ArenaVec::with_capacity_in(patterns.len(), &self.ab());
         for pat in patterns {
             items.push(FormalParameter::new(
                 SPAN,
-                ArenaVec::new_in(&self.ab),
+                ArenaVec::new_in(&self.ab()),
                 pat,
-                oxc_ast::builder::NONE,
-                oxc_ast::builder::NONE,
+                None,
+                None,
                 false,
                 None,
                 false,
                 false,
-                &self.ab,
+                &self.ab(),
             ));
         }
         let rest: Option<oxc_allocator::Box<'a, oxc_ast::ast::FormalParameterRest<'a>>> =
             rest.map(|pat| {
-                let rest_el: BindingRestElement<'a> = BindingRestElement::new(SPAN, pat, &self.ab);
+                let rest_el: BindingRestElement<'a> =
+                    BindingRestElement::new(SPAN, pat, &self.ab());
                 FormalParameterRest::boxed(
                     SPAN,
-                    ArenaVec::new_in(&self.ab),
+                    ArenaVec::new_in(&self.ab()),
                     rest_el,
-                    oxc_ast::builder::NONE,
-                    &self.ab,
+                    None,
+                    &self.ab(),
                 )
             });
         FormalParameters::new(
@@ -602,14 +646,14 @@ impl<'a> B<'a> {
             FormalParameterKind::ArrowFormalParameters,
             items,
             rest,
-            &self.ab,
+            &self.ab(),
         )
     }
 
     /// Build a [`FunctionBody`] from a list of statements.
     pub fn body(self, statements: Vec<Statement<'a>>) -> FunctionBody<'a> {
-        let stmts = ArenaVec::from_iter_in(statements, &self.ab);
-        FunctionBody::new(SPAN, ArenaVec::new_in(&self.ab), stmts, &self.ab)
+        let stmts = ArenaVec::from_iter_in(statements, &self.ab());
+        FunctionBody::new(SPAN, ArenaVec::new_in(&self.ab()), stmts, &self.ab())
     }
 
     /// `(params) => body` / `async (params) => body`. `body_is_expression`
@@ -623,14 +667,26 @@ impl<'a> B<'a> {
     ) -> Expression<'a> {
         Expression::ArrowFunctionExpression(ArrowFunctionExpression::boxed(
             SPAN,
-            body_is_expression,
             is_async,
-            oxc_ast::builder::NONE,
-            params,
-            oxc_ast::builder::NONE,
-            body,
-            &self.ab,
+            None,
+            ArenaBox::new_in(params, &self.ab()),
+            None,
+            self.arrow_body(body, body_is_expression),
+            &self.ab(),
         ))
+    }
+
+    /// oxc models a concise arrow body as the bare expression, so unwrap the
+    /// single `ExpressionStatement` callers still pass as a `FunctionBody`.
+    fn arrow_body(self, mut body: FunctionBody<'a>, is_expression: bool) -> ArrowFunctionBody<'a> {
+        if is_expression
+            && body.statements.len() == 1
+            && matches!(body.statements[0], Statement::ExpressionStatement(_))
+            && let Some(Statement::ExpressionStatement(es)) = body.statements.pop()
+        {
+            return ArrowFunctionBody::from(es.unbox().expression);
+        }
+        ArrowFunctionBody::FunctionBody(ArenaBox::new_in(body, &self.ab()))
     }
 
     /// `(params) => expr` — concise-body arrow.
@@ -640,7 +696,8 @@ impl<'a> B<'a> {
         expr: Expression<'a>,
         is_async: bool,
     ) -> Expression<'a> {
-        let stmt = Statement::ExpressionStatement(ExpressionStatement::boxed(SPAN, expr, &self.ab));
+        let stmt =
+            Statement::ExpressionStatement(ExpressionStatement::boxed(SPAN, expr, &self.ab()));
         let body = self.body(vec![stmt]);
         self.arrow(params, body, true, is_async)
     }
@@ -648,14 +705,20 @@ impl<'a> B<'a> {
     /// `() => expr`, collapsing `() => f()` to `f` (upstream `b.thunk` +
     /// `unthunk` for the zero-parameter case).
     pub fn thunk(self, expr: Expression<'a>, is_async: bool) -> Expression<'a> {
-        if !is_async
-            && let Expression::CallExpression(call) = &expr
-            && !call.optional
-            && call.arguments.is_empty()
-            && let Expression::Identifier(idref) = &call.callee
-        {
-            // `() => f()` collapses to `f`.
-            return self.id(idref.name.as_str());
+        if !is_async && let Expression::CallExpression(call) = expr {
+            if !call.optional
+                && call.arguments.is_empty()
+                && matches!(&call.callee, Expression::Identifier(_))
+            {
+                // `() => f()` collapses to `f` — reusing the callee node, so a
+                // located `f` keeps anchoring comments (upstream `unthunk`).
+                return call.unbox().callee;
+            }
+            return self.arrow_expr(
+                self.empty_params(),
+                Expression::CallExpression(call),
+                is_async,
+            );
         }
         self.arrow_expr(self.empty_params(), expr, is_async)
     }
@@ -674,7 +737,7 @@ impl<'a> B<'a> {
         body: FunctionBody<'a>,
         is_async: bool,
     ) -> Expression<'a> {
-        let id = id.map(|n| BindingIdentifier::new(SPAN, self.str(n), &self.ab));
+        let id = id.map(|n| BindingIdentifier::new(SPAN, self.str(n), &self.ab()));
         let func = Function::boxed(
             SPAN,
             FunctionType::FunctionExpression,
@@ -682,12 +745,12 @@ impl<'a> B<'a> {
             false,
             is_async,
             false,
-            oxc_ast::builder::NONE,
-            oxc_ast::builder::NONE,
-            params,
-            oxc_ast::builder::NONE,
-            Some(body),
-            &self.ab,
+            None,
+            None,
+            ArenaBox::new_in(params, &self.ab()),
+            None,
+            Some(ArenaBox::new_in(body, &self.ab())),
+            &self.ab(),
         );
         Expression::FunctionExpression(func)
     }
@@ -700,7 +763,7 @@ impl<'a> B<'a> {
         body: FunctionBody<'a>,
         is_async: bool,
     ) -> Statement<'a> {
-        let id = Some(BindingIdentifier::new(SPAN, self.str(name), &self.ab));
+        let id = Some(BindingIdentifier::new(SPAN, self.str(name), &self.ab()));
         let func = Function::boxed(
             SPAN,
             FunctionType::FunctionDeclaration,
@@ -708,12 +771,12 @@ impl<'a> B<'a> {
             false,
             is_async,
             false,
-            oxc_ast::builder::NONE,
-            oxc_ast::builder::NONE,
-            params,
-            oxc_ast::builder::NONE,
-            Some(body),
-            &self.ab,
+            None,
+            None,
+            ArenaBox::new_in(params, &self.ab()),
+            None,
+            Some(ArenaBox::new_in(body, &self.ab())),
+            &self.ab(),
         );
         Statement::from(oxc_ast::ast::Declaration::FunctionDeclaration(func))
     }
@@ -767,36 +830,12 @@ impl<'a> B<'a> {
         kind: VariableDeclarationKind,
         pairs: Vec<(BindingPattern<'a>, Option<Expression<'a>>)>,
     ) -> Statement<'a> {
-        let mut declarators = ArenaVec::with_capacity_in(pairs.len(), &self.ab);
+        let mut declarators = ArenaVec::with_capacity_in(pairs.len(), &self.ab());
         for (pat, init) in pairs {
-            declarators.push(VariableDeclarator::new(
-                SPAN,
-                kind,
-                pat,
-                oxc_ast::builder::NONE,
-                init,
-                false,
-                &self.ab,
-            ));
+            declarators.push(VariableDeclarator::new(SPAN, pat, None, init, false, &self.ab()));
         }
-        let decl = VariableDeclaration::boxed(SPAN, kind, declarators, false, &self.ab);
+        let decl = VariableDeclaration::boxed(SPAN, kind, declarators, false, &self.ab());
         Statement::VariableDeclaration(decl)
-    }
-
-    /// Like `var_decl_from_pairs` but emits ONE `VariableDeclaration`
-    /// statement per declarator pair (写经 the server text-oracle's
-    /// `split_comma_separated_declarations`: the official compiler prints each
-    /// top-level declarator as its own statement). A single pair yields one
-    /// statement, identical to `var_decl_from_pairs` with one element.
-    pub fn var_decls_split(
-        self,
-        kind: VariableDeclarationKind,
-        pairs: Vec<(BindingPattern<'a>, Option<Expression<'a>>)>,
-    ) -> Vec<Statement<'a>> {
-        pairs
-            .into_iter()
-            .map(|(pat, init)| self.declaration(kind, pat, init))
-            .collect()
     }
 
     fn declaration(
@@ -805,10 +844,9 @@ impl<'a> B<'a> {
         pattern: BindingPattern<'a>,
         init: Option<Expression<'a>>,
     ) -> Statement<'a> {
-        let declarator =
-            VariableDeclarator::new(SPAN, kind, pattern, oxc_ast::builder::NONE, init, false, &self.ab);
-        let decls = ArenaVec::from_value_in(declarator, &self.ab);
-        let decl = VariableDeclaration::boxed(SPAN, kind, decls, false, &self.ab);
+        let declarator = VariableDeclarator::new(SPAN, pattern, None, init, false, &self.ab());
+        let decls = ArenaVec::from_value_in(declarator, &self.ab());
+        let decl = VariableDeclaration::boxed(SPAN, kind, decls, false, &self.ab());
         Statement::VariableDeclaration(decl)
     }
 
@@ -817,19 +855,19 @@ impl<'a> B<'a> {
     /// `expr;` — expression statement.
     #[inline]
     pub fn stmt(self, expr: Expression<'a>) -> Statement<'a> {
-        Statement::ExpressionStatement(ExpressionStatement::boxed(SPAN, expr, &self.ab))
+        Statement::ExpressionStatement(ExpressionStatement::boxed(SPAN, expr, &self.ab()))
     }
 
     /// `return expr;` / `return;`.
     #[inline]
     pub fn return_stmt(self, argument: Option<Expression<'a>>) -> Statement<'a> {
-        Statement::ReturnStatement(ReturnStatement::boxed(SPAN, argument, &self.ab))
+        Statement::ReturnStatement(ReturnStatement::boxed(SPAN, argument, &self.ab()))
     }
 
     /// `{ body }` block statement.
     pub fn block(self, body: Vec<Statement<'a>>) -> Statement<'a> {
-        let stmts = ArenaVec::from_iter_in(body, &self.ab);
-        Statement::BlockStatement(BlockStatement::boxed(SPAN, stmts, &self.ab))
+        let stmts = ArenaVec::from_iter_in(body, &self.ab());
+        Statement::BlockStatement(BlockStatement::boxed(SPAN, stmts, &self.ab()))
     }
 
     /// `if (test) consequent else alternate`.
@@ -839,14 +877,12 @@ impl<'a> B<'a> {
         consequent: Statement<'a>,
         alternate: Option<Statement<'a>>,
     ) -> Statement<'a> {
-        Statement::IfStatement(IfStatement::boxed(
-            SPAN, test, consequent, alternate, &self.ab,
-        ))
+        Statement::IfStatement(IfStatement::boxed(SPAN, test, consequent, alternate, &self.ab()))
     }
 
     /// `do body while (test);` (upstream `b.do_while`).
     pub fn do_while(self, test: Expression<'a>, body: Statement<'a>) -> Statement<'a> {
-        Statement::DoWhileStatement(DoWhileStatement::boxed(SPAN, body, test, &self.ab))
+        Statement::DoWhileStatement(DoWhileStatement::boxed(SPAN, body, test, &self.ab()))
     }
 
     /// `!argument` — logical-NOT unary (upstream `b.unary('!', ...)`).
@@ -858,7 +894,7 @@ impl<'a> B<'a> {
     /// `;` empty statement.
     #[inline]
     pub fn empty(self) -> Statement<'a> {
-        Statement::EmptyStatement(EmptyStatement::boxed(SPAN, &self.ab))
+        Statement::EmptyStatement(EmptyStatement::boxed(SPAN, &self.ab()))
     }
 
     /// A *kept* `;` empty statement — one the esrap printer must NOT elide.
@@ -878,13 +914,13 @@ impl<'a> B<'a> {
     /// body-sequence comment-resync logic treats them as separate nodes.
     #[inline]
     pub fn empty_kept(self, start: u32) -> Statement<'a> {
-        Statement::EmptyStatement(EmptyStatement::boxed(Span::new(start, u32::MAX), &self.ab))
+        Statement::EmptyStatement(EmptyStatement::boxed(Span::new(start, u32::MAX), &self.ab()))
     }
 
     /// `debugger;` statement (upstream `b.debugger`).
     #[inline]
     pub fn debugger(self) -> Statement<'a> {
-        Statement::DebuggerStatement(DebuggerStatement::boxed(SPAN, &self.ab))
+        Statement::DebuggerStatement(DebuggerStatement::boxed(SPAN, &self.ab()))
     }
 
     /// `target++` / `target--` / `++target` / `--target` (upstream `b.update`).
@@ -899,14 +935,14 @@ impl<'a> B<'a> {
             Expression::Identifier(id) => SimpleAssignmentTarget::new_assignment_target_identifier(
                 SPAN,
                 self.str(id.name.as_str()),
-                &self.ab,
+                &self.ab(),
             ),
             other => match MemberExpression::try_from(other) {
                 Ok(member) => SimpleAssignmentTarget::from(member),
                 Err(_) => panic!("update target must be an identifier or member expression"),
             },
         };
-        Expression::UpdateExpression(UpdateExpression::boxed(SPAN, op, prefix, st, &self.ab))
+        Expression::UpdateExpression(UpdateExpression::boxed(SPAN, op, prefix, st, &self.ab()))
     }
 
     /// A multi-declarator variable declaration node (the boxed form, suitable as
@@ -916,20 +952,12 @@ impl<'a> B<'a> {
         kind: VariableDeclarationKind,
         decls: Vec<(&str, Option<Expression<'a>>)>,
     ) -> oxc_allocator::Box<'a, oxc_ast::ast::VariableDeclaration<'a>> {
-        let mut declarators = ArenaVec::with_capacity_in(decls.len(), &self.ab);
+        let mut declarators = ArenaVec::with_capacity_in(decls.len(), &self.ab());
         for (name, init) in decls {
             let pat = self.id_pat(name);
-            declarators.push(VariableDeclarator::new(
-                SPAN,
-                kind,
-                pat,
-                oxc_ast::builder::NONE,
-                init,
-                false,
-                &self.ab,
-            ));
+            declarators.push(VariableDeclarator::new(SPAN, pat, None, init, false, &self.ab()));
         }
-        VariableDeclaration::boxed(SPAN, kind, declarators, false, &self.ab)
+        VariableDeclaration::boxed(SPAN, kind, declarators, false, &self.ab())
     }
 
     /// `for (init; test; update) body` (upstream `b.for`).
@@ -942,15 +970,13 @@ impl<'a> B<'a> {
     ) -> Statement<'a> {
         use oxc_ast::ast::ForStatementInit;
         let init = init.map(ForStatementInit::VariableDeclaration);
-        Statement::ForStatement(ForStatement::boxed(
-            SPAN, init, test, update, body, &self.ab,
-        ))
+        Statement::ForStatement(ForStatement::boxed(SPAN, init, test, update, body, &self.ab()))
     }
 
     /// `throw new Error("…")` (upstream `b.throw_error`).
     pub fn throw_error(self, message: &str) -> Statement<'a> {
         let err = self.new_expr("Error", vec![self.string(message)]);
-        Statement::ThrowStatement(ThrowStatement::boxed(SPAN, err, &self.ab))
+        Statement::ThrowStatement(ThrowStatement::boxed(SPAN, err, &self.ab()))
     }
 
     // -- imports & exports --------------------------------------------------
@@ -961,19 +987,21 @@ impl<'a> B<'a> {
     /// escaping), matching the established `module_source` convention so esrap
     /// reproduces `'svelte/internal/server'` byte-for-byte.
     pub fn import_all(self, as_name: &str, source: &str) -> Statement<'a> {
-        let local = BindingIdentifier::new(SPAN, self.str(as_name), &self.ab);
-        let mut specs = ArenaVec::with_capacity_in(1, &self.ab);
+        let local = BindingIdentifier::new(SPAN, self.str(as_name), &self.ab());
+        let mut specs = ArenaVec::with_capacity_in(1, &self.ab());
         specs.push(ImportDeclarationSpecifier::new_import_namespace_specifier(
-            SPAN, local, &self.ab,
+            SPAN,
+            local,
+            &self.ab(),
         ));
         let decl = ModuleDeclaration::new_import_declaration(
             SPAN,
             Some(specs),
             self.module_source(source),
             None,
-            oxc_ast::builder::NONE,
+            None,
             ImportOrExportKind::Value,
-            &self.ab,
+            &self.ab(),
         );
         Statement::from(decl)
     }
@@ -986,16 +1014,16 @@ impl<'a> B<'a> {
         let specifiers = if parts.is_empty() {
             None
         } else {
-            let mut specs = ArenaVec::with_capacity_in(parts.len(), &self.ab);
+            let mut specs = ArenaVec::with_capacity_in(parts.len(), &self.ab());
             for (imported, local) in parts {
                 let imported_name = self.module_export_name(imported);
-                let local_id = BindingIdentifier::new(SPAN, self.str(local), &self.ab);
+                let local_id = BindingIdentifier::new(SPAN, self.str(local), &self.ab());
                 specs.push(ImportDeclarationSpecifier::new_import_specifier(
                     SPAN,
                     imported_name,
                     local_id,
                     ImportOrExportKind::Value,
-                    &self.ab,
+                    &self.ab(),
                 ));
             }
             Some(specs)
@@ -1005,9 +1033,9 @@ impl<'a> B<'a> {
             specifiers,
             self.module_source(source),
             None,
-            oxc_ast::builder::NONE,
+            None,
             ImportOrExportKind::Value,
-            &self.ab,
+            &self.ab(),
         );
         Statement::from(decl)
     }
@@ -1030,27 +1058,32 @@ impl<'a> B<'a> {
                 return other;
             }
         };
-        let decl = ModuleDeclaration::new_export_default_declaration(SPAN, kind, &self.ab);
+        let decl = ModuleDeclaration::new_export_default_declaration(SPAN, kind, &self.ab());
         Statement::from(decl)
     }
 
     /// `export default <expr>;` (upstream `b.export_default` of an expression).
     pub fn export_default_expr(self, expr: Expression<'a>) -> Statement<'a> {
         let kind = oxc_ast::ast::ExportDefaultDeclarationKind::from(expr);
-        let decl = ModuleDeclaration::new_export_default_declaration(SPAN, kind, &self.ab);
+        let decl = ModuleDeclaration::new_export_default_declaration(SPAN, kind, &self.ab());
         Statement::from(decl)
     }
 
     /// Build a module-source `StringLiteral` emitted verbatim between single
     /// quotes (mirrors `to_oxc.rs::module_source`).
     fn module_source(self, source: &str) -> oxc_ast::ast::StringLiteral<'a> {
-        let raw = self.str(&format!("'{source}'"));
-        StringLiteral::new(SPAN, self.str(source), Some(raw.into()), &self.ab)
+        #[cfg(feature = "measure-module-source")]
+        crate::measure_module_source::record(source.len());
+        // The quoted spelling is built straight into the arena and the unquoted
+        // value is a subslice of it, so neither string is copied twice.
+        let raw = oxc_allocator::StringBuilder::from_strs_array_in(["'", source, "'"], self.alloc)
+            .into_str();
+        StringLiteral::new(SPAN, &raw[1..raw.len() - 1], Some(raw.into()), &self.ab())
     }
 
     /// Build a `ModuleExportName::IdentifierName` from a plain name.
     fn module_export_name(self, name: &str) -> oxc_ast::ast::ModuleExportName<'a> {
-        ModuleExportName::new_identifier_name(SPAN, self.str(name), &self.ab)
+        ModuleExportName::new_identifier_name(SPAN, self.str(name), &self.ab())
     }
 
     /// `target <op> value` assignment expression (upstream `b.assignment`).
@@ -1069,7 +1102,7 @@ impl<'a> B<'a> {
                 AssignmentTarget::from(SimpleAssignmentTarget::new_assignment_target_identifier(
                     SPAN,
                     self.str(id.name.as_str()),
-                    &self.ab,
+                    &self.ab(),
                 ))
             }
             other => match MemberExpression::try_from(other) {
@@ -1078,23 +1111,27 @@ impl<'a> B<'a> {
             },
         };
         Expression::AssignmentExpression(AssignmentExpression::boxed(
-            SPAN, op, lhs, value, &self.ab,
+            SPAN,
+            op,
+            lhs,
+            value,
+            &self.ab(),
         ))
     }
 
     /// Assemble a module [`Program`] from top-level
     /// statements, ready for [`rsvelte_esrap::print`].
     pub fn program(self, body: Vec<Statement<'a>>) -> oxc_ast::ast::Program<'a> {
-        let body = ArenaVec::from_iter_in(body, &self.ab);
+        let body = ArenaVec::from_iter_in(body, &self.ab());
         Program::new(
             SPAN,
             oxc_span::SourceType::mjs(),
             "",
-            ArenaVec::new_in(&self.ab),
+            ArenaVec::new_in(&self.ab()),
             None,
-            ArenaVec::new_in(&self.ab),
+            ArenaVec::new_in(&self.ab()),
             body,
-            &self.ab,
+            &self.ab(),
         )
     }
 
@@ -1104,22 +1141,22 @@ impl<'a> B<'a> {
     /// expressions. `quasis.len()` must be `expressions.len() + 1`.
     pub fn template(self, quasis: Vec<&str>, expressions: Vec<Expression<'a>>) -> Expression<'a> {
         let n = quasis.len();
-        let mut q = ArenaVec::with_capacity_in(n, &self.ab);
+        let mut q = ArenaVec::with_capacity_in(n, &self.ab());
         for (i, cooked) in quasis.iter().enumerate() {
             let raw = sanitize_template_string(cooked);
             let value = TemplateElementValue {
                 raw: self.str(&raw).into(),
                 cooked: Some(self.str(cooked).into()),
             };
-            q.push(TemplateElement::new(SPAN, value, i == n - 1, &self.ab));
+            q.push(TemplateElement::new(SPAN, value, i == n - 1, &self.ab()));
         }
-        let mut e = ArenaVec::with_capacity_in(expressions.len(), &self.ab);
+        let mut e = ArenaVec::with_capacity_in(expressions.len(), &self.ab());
         for expr in expressions {
             e.push(expr);
         }
         Expression::TemplateLiteral(ArenaBox::new_in(
-            TemplateLiteral::new(SPAN, q, e, &self.ab),
-            &self.ab,
+            TemplateLiteral::new(SPAN, q, e, &self.ab()),
+            &self.ab(),
         ))
     }
 }
@@ -1142,14 +1179,7 @@ fn sanitize_template_string(s: &str) -> String {
 
 /// Whether `name` is a valid JS identifier (so a property key can be emitted
 /// bare rather than as a string literal). Conservative ASCII check.
-fn is_valid_identifier(name: &str) -> bool {
-    let mut chars = name.chars();
-    match chars.next() {
-        Some(c) if c == '_' || c == '$' || c.is_ascii_alphabetic() => {}
-        _ => return false,
-    }
-    chars.all(|c| c == '_' || c == '$' || c.is_ascii_alphanumeric())
-}
+use crate::compiler::phases::phase3_transform::js_ast::builders::is_valid_identifier;
 
 #[cfg(test)]
 mod tests {
@@ -1264,10 +1294,7 @@ mod tests {
     fn imports_named_and_side_effect() {
         // import { render as $$_render } from "svelte/server";
         let out = print(|b| vec![b.imports(vec![("render", "$$_render")], "svelte/server")]);
-        assert_eq!(
-            out.trim(),
-            "import { render as $$_render } from 'svelte/server';"
-        );
+        assert_eq!(out.trim(), "import { render as $$_render } from 'svelte/server';");
         // side-effect import (empty parts)
         let out2 = print(|b| vec![b.imports(vec![], "svelte/internal/flags/async")]);
         assert_eq!(out2.trim(), "import 'svelte/internal/flags/async';");
@@ -1279,20 +1306,14 @@ mod tests {
         let out = print(|b| {
             let init = b.var_decl_multi_node(
                 VariableDeclarationKind::Let,
-                vec![
-                    ("i", Some(b.number(0.0))),
-                    ("$$length", Some(b.member("arr", "length"))),
-                ],
+                vec![("i", Some(b.number(0.0))), ("$$length", Some(b.member("arr", "length")))],
             );
             let test = b.binary(BinaryOperator::LessThan, b.id("i"), b.id("$$length"));
             let update = b.update(UpdateOperator::Increment, false, b.id("i"));
             let for_stmt = b.for_stmt(Some(init), Some(test), Some(update), b.block(vec![]));
             vec![for_stmt]
         });
-        assert_eq!(
-            out.trim(),
-            "for (let i = 0, $$length = arr.length; i < $$length; i++) {}"
-        );
+        assert_eq!(out.trim(), "for (let i = 0, $$length = arr.length; i < $$length; i++) {}");
     }
 
     #[test]
@@ -1301,10 +1322,7 @@ mod tests {
         let out = print(|b| {
             let pairs = vec![
                 (b.id_pat("a"), Some(b.number(1.0))),
-                (
-                    b.id_pat("b"),
-                    Some(b.call("$.derived", vec![b.thunk(b.number(2.0), false)])),
-                ),
+                (b.id_pat("b"), Some(b.call("$.derived", vec![b.thunk(b.number(2.0), false)]))),
             ];
             vec![b.var_decl_from_pairs(VariableDeclarationKind::Let, pairs)]
         });
@@ -1322,11 +1340,7 @@ mod tests {
         let allocator = oxc_allocator::Allocator::default();
         let src = "const x = $state(0);";
         let mut ret = oxc_parser::Parser::new(&allocator, src, oxc_span::SourceType::mjs()).parse();
-        assert!(
-            ret.diagnostics.is_empty(),
-            "parse errors: {:?}",
-            ret.diagnostics
-        );
+        assert!(ret.diagnostics.is_empty(), "parse errors: {:?}", ret.diagnostics);
         let b = B::new(&allocator);
 
         // Walk mutably: find the `$state(...)` call and replace its callee.

@@ -76,10 +76,39 @@ pub fn transform_prop_member_mutate_ast(
     non_bindable_prop_vars: &[String],
     prop_invalidate_bodies: &rustc_hash::FxHashMap<String, String>,
 ) -> Option<String> {
+    let spliced = || {
+        transform_prop_member_mutate_spliced(
+            source,
+            prop_vars,
+            non_bindable_prop_vars,
+            prop_invalidate_bodies,
+        )
+    };
+    ast_rewrite::dual_run::resolve("prop_member_mutate_ast:inplace", source, spliced, || {
+        transform_prop_member_mutate_in_place(
+            source,
+            prop_vars,
+            non_bindable_prop_vars,
+            prop_invalidate_bodies,
+        )
+    })
+}
+
+fn transform_prop_member_mutate_spliced(
+    source: &str,
+    prop_vars: &[String],
+    non_bindable_prop_vars: &[String],
+    prop_invalidate_bodies: &rustc_hash::FxHashMap<String, String>,
+) -> Option<String> {
     if prop_vars.is_empty() {
         return None;
     }
-    memchr::memchr(b'=', source.as_bytes())?;
+    if memchr::memchr(b'=', source.as_bytes()).is_none()
+        && memchr::memmem::find(source.as_bytes(), b"++").is_none()
+        && memchr::memmem::find(source.as_bytes(), b"--").is_none()
+    {
+        return None;
+    }
     if !prop_vars
         .iter()
         .filter(|p| !non_bindable_prop_vars.iter().any(|nb| nb == *p))
@@ -103,6 +132,7 @@ pub fn transform_prop_member_mutate_ast(
                     prop_invalidate_bodies,
                     replacements: Vec::new(),
                     skip_assignment_spans: Vec::new(),
+                    skip_update_spans: Vec::new(),
                 };
                 collector.visit_program(program);
                 collector.replacements
@@ -143,6 +173,8 @@ struct PropMemberMutateCollector<'a> {
     /// makes the rewrite idempotent for the `prop().foo = x` case,
     /// where the inner assignment's LHS is already `prop()`-rooted.
     skip_assignment_spans: Vec<(u32, u32)>,
+    /// Same, for `prop(<update>, true)` (`p(p().a++, true)`, #3048).
+    skip_update_spans: Vec<(u32, u32)>,
 }
 
 impl<'a> PropMemberMutateCollector<'a> {
@@ -193,16 +225,19 @@ impl<'a, 'ast> Visit<'ast> for PropMemberMutateCollector<'a> {
         if call.arguments.len() == 2
             && let Expression::Identifier(callee_id) = &call.callee
             && self.prop_vars.iter().any(|p| p == callee_id.name.as_str())
-            && !self
-                .non_bindable_prop_vars
-                .iter()
-                .any(|nb| nb == callee_id.name.as_str())
+            && !self.non_bindable_prop_vars.iter().any(|nb| nb == callee_id.name.as_str())
             && let Argument::BooleanLiteral(b) = &call.arguments[1]
             && b.value
-            && let Argument::AssignmentExpression(inner) = &call.arguments[0]
         {
-            self.skip_assignment_spans
-                .push((inner.span.start, inner.span.end));
+            match &call.arguments[0] {
+                Argument::AssignmentExpression(inner) => {
+                    self.skip_assignment_spans.push((inner.span.start, inner.span.end));
+                }
+                Argument::UpdateExpression(inner) => {
+                    self.skip_update_spans.push((inner.span.start, inner.span.end));
+                }
+                _ => {}
+            }
         }
 
         walk::walk_call_expression(self, call);
@@ -242,10 +277,7 @@ impl<'a, 'ast> Visit<'ast> for PropMemberMutateCollector<'a> {
         let rest_and_assignment = &outer_text[local_rest_start..];
 
         // Build the wrapped mutation: `prop(prop()<rest_and_assignment>, true)`
-        let mutation = format!(
-            "{}({}(){}, true)",
-            root_name, root_name, rest_and_assignment
-        );
+        let mutation = format!("{}({}(){}, true)", root_name, root_name, rest_and_assignment);
 
         // If the prop carries legacy indirect bindings (a `<select bind:value>`
         // referencing other variables), wrap the mutation in a sequence with
@@ -253,16 +285,274 @@ impl<'a, 'ast> Visit<'ast> for PropMemberMutateCollector<'a> {
         // Mirrors AssignmentExpression.js / the bind-directive setter path.
         let rewrite = match self.prop_invalidate_bodies.get(root_name) {
             Some(body) if !body.is_empty() => {
-                format!(
-                    "({}, $.invalidate_inner_signals(() => {{ {} }}))",
-                    mutation, body
-                )
+                format!("({}, $.invalidate_inner_signals(() => {{ {} }}))", mutation, body)
             }
             _ => mutation,
         };
 
-        self.replacements
-            .push((expr.span.start, expr.span.end, rewrite));
+        self.replacements.push((expr.span.start, expr.span.end, rewrite));
+    }
+
+    fn visit_update_expression(&mut self, expr: &UpdateExpression<'ast>) {
+        walk::walk_update_expression(self, expr);
+
+        if self.skip_update_spans.iter().any(|(s, e)| *s == expr.span.start && *e == expr.span.end)
+        {
+            return;
+        }
+
+        let object = match &expr.argument {
+            SimpleAssignmentTarget::StaticMemberExpression(m) => &m.object,
+            SimpleAssignmentTarget::ComputedMemberExpression(m) => &m.object,
+            _ => return,
+        };
+        let Some((root_name, root)) = Self::walk_object_chain_to_root(object) else {
+            return;
+        };
+        if !self.prop_vars.iter().any(|p| p == root_name) {
+            return;
+        }
+        if self.non_bindable_prop_vars.iter().any(|nb| nb == root_name) {
+            return;
+        }
+        // Both root shapes wrap: `p.a++` from a runes script, `p().a++` after
+        // the legacy prop-read rewrite. Our own wrap payload was skipped above.
+        let root_span = root.span();
+
+        // `p.a++` / `++p.a` → `p(p().a++, true)` / `p(++p().a, true)`: splice
+        // `p()` over the root, keeping prefix/suffix text verbatim.
+        let before = &self.source[expr.span.start as usize..root_span.start as usize];
+        let after = &self.source[root_span.end as usize..expr.span.end as usize];
+        let mutation = format!("{}({}{}(){}, true)", root_name, before, root_name, after);
+        let rewrite = match self.prop_invalidate_bodies.get(root_name) {
+            Some(body) if !body.is_empty() => {
+                format!("({}, $.invalidate_inner_signals(() => {{ {} }}))", mutation, body)
+            }
+            _ => mutation,
+        };
+        self.replacements.push((expr.span.start, expr.span.end, rewrite));
+    }
+}
+
+// ── in-place port ──────────────────────────────────────────────────────
+
+thread_local! {
+    static MODULE_PROP_MEMBER_MUTATE_IN_PLACE_ALLOC: RefCell<Allocator> =
+        RefCell::new(Allocator::default());
+}
+
+/// In-place equivalent of [`transform_prop_member_mutate_ast`].
+pub(crate) fn transform_prop_member_mutate_in_place(
+    source: &str,
+    prop_vars: &[String],
+    non_bindable_prop_vars: &[String],
+    prop_invalidate_bodies: &rustc_hash::FxHashMap<String, String>,
+) -> ast_rewrite::Rewrite {
+    if prop_vars.is_empty() {
+        return ast_rewrite::Rewrite::Unchanged;
+    }
+    if memchr::memchr(b'=', source.as_bytes()).is_none()
+        && memchr::memmem::find(source.as_bytes(), b"++").is_none()
+        && memchr::memmem::find(source.as_bytes(), b"--").is_none()
+    {
+        return ast_rewrite::Rewrite::Unchanged;
+    }
+    if !prop_vars
+        .iter()
+        .filter(|p| !non_bindable_prop_vars.iter().any(|nb| nb == *p))
+        .any(|s| memchr::memmem::find(source.as_bytes(), s.as_bytes()).is_some())
+    {
+        return ast_rewrite::Rewrite::Unchanged;
+    }
+
+    ast_rewrite::with_program_mut(
+        &MODULE_PROP_MEMBER_MUTATE_IN_PLACE_ALLOC,
+        source,
+        SourceType::mjs(),
+        ParseOptions::default(),
+        |allocator, program| {
+            let mut rewriter = PropMemberMutateRewriter {
+                allocator,
+                b: crate::compiler::phases::phase3_transform::builders::B::new(allocator),
+                prop_vars,
+                non_bindable_prop_vars,
+                prop_invalidate_bodies,
+                skip_assignment_spans: Vec::new(),
+                skip_update_spans: Vec::new(),
+                changed: false,
+            };
+            oxc_ast_visit::VisitMut::visit_program(&mut rewriter, program);
+            rewriter.changed
+        },
+    )
+}
+
+struct PropMemberMutateRewriter<'a, 'b> {
+    allocator: &'a Allocator,
+    b: crate::compiler::phases::phase3_transform::builders::B<'a>,
+    prop_vars: &'b [String],
+    non_bindable_prop_vars: &'b [String],
+    prop_invalidate_bodies: &'b rustc_hash::FxHashMap<String, String>,
+    skip_assignment_spans: Vec<(u32, u32)>,
+    skip_update_spans: Vec<(u32, u32)>,
+    changed: bool,
+}
+
+impl<'a> PropMemberMutateRewriter<'a, '_> {
+    fn is_bindable_prop(&self, name: &str) -> bool {
+        self.prop_vars.iter().any(|p| p == name)
+            && !self.non_bindable_prop_vars.iter().any(|nb| nb == name)
+    }
+
+    /// The leftmost `prop` / `prop()` of a member chain — the only part of a
+    /// mutation target that reads the prop itself.
+    fn chain_root<'e>(expr: &'e mut Expression<'a>) -> Option<&'e mut Expression<'a>> {
+        let mut cur = expr;
+        loop {
+            if matches!(cur, Expression::Identifier(_) | Expression::CallExpression(_)) {
+                return Some(cur);
+            }
+            cur = match cur {
+                Expression::StaticMemberExpression(m) => &mut m.object,
+                Expression::ComputedMemberExpression(m) => &mut m.object,
+                _ => return None,
+            };
+        }
+    }
+
+    fn target_root<'e>(target: &'e mut AssignmentTarget<'a>) -> Option<&'e mut Expression<'a>> {
+        match target {
+            AssignmentTarget::StaticMemberExpression(m) => Self::chain_root(&mut m.object),
+            AssignmentTarget::ComputedMemberExpression(m) => Self::chain_root(&mut m.object),
+            _ => None,
+        }
+    }
+
+    fn root_prop_name<'e>(root: &'e Expression<'a>) -> Option<&'e str> {
+        match root {
+            Expression::Identifier(id) => Some(id.name.as_str()),
+            Expression::CallExpression(call) if call.arguments.is_empty() => match &call.callee {
+                Expression::Identifier(id) => Some(id.name.as_str()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// `$.invalidate_inner_signals(() => { … })` for a prop carrying legacy
+    /// indirect bindings. The body is generated read forms, so it is parsed
+    /// into the same arena and its statements moved into the thunk.
+    fn invalidate_call(&self, prop: &str) -> Option<Expression<'a>> {
+        let body = self.prop_invalidate_bodies.get(prop)?;
+        if body.is_empty() {
+            return None;
+        }
+        let owned = self.allocator.alloc_str(body);
+        ast_rewrite::dual_run::count_parse(ast_rewrite::dual_run::current_or(file!()), owned.len());
+        let ret = oxc_parser::Parser::new(self.allocator, owned, SourceType::mjs()).parse();
+        if !ret.diagnostics.is_empty() {
+            return None;
+        }
+        let stmts: Vec<_> = ret.program.body.into_iter().collect();
+        let mut call =
+            self.b.call("$.invalidate_inner_signals", vec![self.b.thunk_block(stmts, false)]);
+        ast_rewrite::mark_synthesized_expression(&mut call);
+        Some(call)
+    }
+}
+
+impl<'a> oxc_ast_visit::VisitMut<'a> for PropMemberMutateRewriter<'a, '_> {
+    fn visit_call_expression(&mut self, call: &mut CallExpression<'a>) {
+        // Recorded pre-order so the walk reaches the inner assignment already
+        // knowing it is the payload of a wrap this pass emitted.
+        if call.arguments.len() == 2
+            && let Expression::Identifier(callee_id) = &call.callee
+            && self.is_bindable_prop(callee_id.name.as_str())
+            && let Argument::BooleanLiteral(lit) = &call.arguments[1]
+            && lit.value
+        {
+            match &call.arguments[0] {
+                Argument::AssignmentExpression(inner) => {
+                    self.skip_assignment_spans.push((inner.span.start, inner.span.end));
+                }
+                Argument::UpdateExpression(inner) => {
+                    self.skip_update_spans.push((inner.span.start, inner.span.end));
+                }
+                _ => {}
+            }
+        }
+
+        oxc_ast_visit::walk_mut::walk_call_expression(self, call);
+    }
+
+    fn visit_expression(&mut self, expr: &mut Expression<'a>) {
+        oxc_ast_visit::walk_mut::walk_expression(self, expr);
+
+        if let Expression::UpdateExpression(update) = expr {
+            let span = update.span;
+            if self.skip_update_spans.iter().any(|(s, e)| *s == span.start && *e == span.end) {
+                return;
+            }
+            let root = match &mut update.argument {
+                SimpleAssignmentTarget::StaticMemberExpression(m) => {
+                    Self::chain_root(&mut m.object)
+                }
+                SimpleAssignmentTarget::ComputedMemberExpression(m) => {
+                    Self::chain_root(&mut m.object)
+                }
+                _ => None,
+            };
+            let Some(root) = root else {
+                return;
+            };
+            let Some(prop) = Self::root_prop_name(root) else {
+                return;
+            };
+            let prop = prop.to_string();
+            if !self.is_bindable_prop(&prop) {
+                return;
+            }
+            if matches!(root, Expression::Identifier(_)) {
+                *root = self.b.call(prop.as_str(), vec![]);
+            }
+            let mutation = std::mem::replace(expr, self.b.void0());
+            let wrapped = self.b.call(prop.as_str(), vec![mutation, self.b.bool(true)]);
+            *expr = match self.invalidate_call(&prop) {
+                Some(invalidate) => self.b.sequence(vec![wrapped, invalidate]),
+                None => wrapped,
+            };
+            self.changed = true;
+            return;
+        }
+
+        let Expression::AssignmentExpression(assign) = expr else {
+            return;
+        };
+        let span = assign.span;
+        if self.skip_assignment_spans.iter().any(|(s, e)| *s == span.start && *e == span.end) {
+            return;
+        }
+        let Some(root) = Self::target_root(&mut assign.left) else {
+            return;
+        };
+        let Some(prop) = Self::root_prop_name(root) else {
+            return;
+        };
+        let prop = prop.to_string();
+        if !self.is_bindable_prop(&prop) {
+            return;
+        }
+        if matches!(root, Expression::Identifier(_)) {
+            *root = self.b.call(prop.as_str(), vec![]);
+        }
+
+        let mutation = std::mem::replace(expr, self.b.void0());
+        let wrapped = self.b.call(prop.as_str(), vec![mutation, self.b.bool(true)]);
+        *expr = match self.invalidate_call(&prop) {
+            Some(invalidate) => self.b.sequence(vec![wrapped, invalidate]),
+            None => wrapped,
+        };
+        self.changed = true;
     }
 }
 
@@ -288,7 +578,7 @@ mod tests {
             transform_prop_member_mutate_ast("field.x = {};", &ssv(&["field"]), &[], &map).unwrap();
         assert_eq!(
             out,
-            "(field(field().x = {}, true), $.invalidate_inner_signals(() => { a; b(); }));"
+            "(\n\tfield(field().x = {}, true),\n\t$.invalidate_inner_signals(() => {\n\t\ta;\n\t\tb();\n\t})\n);"
         );
     }
 
@@ -381,11 +671,13 @@ mod tests {
     }
 
     #[test]
-    fn update_expression_left_alone() {
-        // `prop.x++` is NOT this pass's concern.
-        assert!(
-            transform_prop_member_mutate_ast("prop.x++;", &ssv(&["prop"]), &[], &nm()).is_none()
-        );
+    fn update_expression_is_wrapped() {
+        let out =
+            transform_prop_member_mutate_ast("prop.x++;", &ssv(&["prop"]), &[], &nm()).unwrap();
+        assert_eq!(out, "prop(prop().x++, true);");
+        let out =
+            transform_prop_member_mutate_ast("--prop.x;", &ssv(&["prop"]), &[], &nm()).unwrap();
+        assert_eq!(out, "prop(--prop().x, true);");
     }
 
     #[test]
@@ -406,7 +698,7 @@ mod tests {
         let out =
             transform_prop_member_mutate_ast("a.x = 1; b.y = 2;", &ssv(&["a", "b"]), &[], &nm())
                 .unwrap();
-        assert_eq!(out, "a(a().x = 1, true); b(b().y = 2, true);");
+        assert_eq!(out, "a(a().x = 1, true);\nb(b().y = 2, true);");
     }
 
     #[test]
@@ -477,7 +769,7 @@ mod tests {
         // matches the text version exactly.
         let src = "console.log((a.b = true));";
         let out = transform_prop_member_mutate_ast(src, &ssv(&["a"]), &[], &nm()).unwrap();
-        assert_eq!(out, "console.log((a(a().b = true, true)));");
+        assert_eq!(out, "console.log(a(a().b = true, true));");
     }
 
     #[test]

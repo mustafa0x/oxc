@@ -1,7 +1,6 @@
 import fs from "node:fs/promises";
-import { existsSync, readdirSync, readFileSync } from "node:fs";
-import { spawnSync } from "node:child_process";
-import { dirname as pathDirname, join as pathJoin, relative as pathRelative, sep as pathSep } from "node:path";
+import { readdirSync, readFileSync } from "node:fs";
+import { join as pathJoin, relative as pathRelative, sep as pathSep } from "node:path";
 
 import { execa } from "execa";
 import { expect as defaultExpect, type ExpectStatic } from "vitest";
@@ -37,8 +36,6 @@ export interface Fixture {
     // Default: `null`.
     cwd: string | null;
 
-    // Required optional packages for this fixture. Missing packages skip the fixture. Default: `[]`.
-    requiredPackages: string[];
     // Additional arguments to run Oxlint with. Default: `[]`.
     args: string[];
     // Additional environment variables. Default: `{}`.
@@ -53,7 +50,6 @@ const DEFAULT_OPTIONS: Fixture["options"] = {
   fixSuggestions: false,
   singleThread: false,
   cwd: null,
-  requiredPackages: [],
   args: [],
   env: {},
 };
@@ -100,12 +96,6 @@ export function getFixtures(): Fixture[] {
     if (options.cwd !== null && typeof options.cwd !== "string") {
       throw new TypeError("`cwd` property in `options.json` must be a string or null");
     }
-    if (
-      !Array.isArray(options.requiredPackages) ||
-      !options.requiredPackages.every((packageName) => typeof packageName === "string")
-    ) {
-      throw new TypeError("`requiredPackages` property in `options.json` must be an array of strings");
-    }
     if (!Array.isArray(options.args) || !options.args.every((arg) => typeof arg === "string")) {
       throw new TypeError("`args` property in `options.json` must be an array of strings");
     }
@@ -122,165 +112,6 @@ export function getFixtures(): Fixture[] {
   }
 
   return fixtures;
-}
-
-const packageImportabilityCache = new Map<string, boolean>();
-const configImportabilityCache = new Map<string, string[]>();
-
-const CONFIG_IMPORT_CHECK_FILENAMES = [
-  "oxlint.config.ts",
-  "oxlint.config.js",
-  "vite.config.ts",
-  "vite.config.js",
-];
-
-function bufferToString(output: string | Buffer | null | undefined): string {
-  if (typeof output === "string") return output;
-  return output?.toString() ?? "";
-}
-
-function normalizePackageSpecifier(specifier: string): string {
-  if (specifier.startsWith("@")) {
-    const [scope, name] = specifier.split("/");
-    return name ? `${scope}/${name}` : specifier;
-  }
-
-  const [name] = specifier.split("/");
-  return name ?? specifier;
-}
-
-export function getMissingPackagesFromImportError(
-  errorText: string,
-  requiredPackages: readonly string[],
-): string[] {
-  if (errorText.length === 0 || requiredPackages.length === 0) return [];
-
-  const missingPackages = new Set<string>();
-  const patterns = [
-    /Cannot find package ['"]([^'"]+)['"]/g,
-    /Cannot find module ['"]([^'"]+)['"]/g,
-  ];
-
-  for (const pattern of patterns) {
-    for (const match of errorText.matchAll(pattern)) {
-      const specifier = match[1];
-      if (specifier === undefined) continue;
-      const packageName = normalizePackageSpecifier(specifier);
-      if (requiredPackages.includes(packageName)) {
-        missingPackages.add(packageName);
-      }
-    }
-  }
-
-  if (missingPackages.size === 0 && errorText.includes("ERR_MODULE_NOT_FOUND")) {
-    for (const packageName of requiredPackages) {
-      if (errorText.includes(packageName)) {
-        missingPackages.add(packageName);
-      }
-    }
-  }
-
-  return [...missingPackages];
-}
-
-function getMissingPackagesFromConfigImport(
-  configPath: string,
-  requiredPackages: readonly string[],
-): string[] {
-  if (requiredPackages.length === 0) return [];
-
-  const cacheKey = `${configPath}\u0000${requiredPackages.join("\u0001")}`;
-  const cached = configImportabilityCache.get(cacheKey);
-  if (cached !== undefined) return cached;
-
-  const configPathJson = JSON.stringify(configPath);
-  const script = `
-    import { pathToFileURL } from "node:url";
-
-    try {
-      await import(pathToFileURL(${configPathJson}).href + "?fixture-check=1");
-    } catch (error) {
-      const message =
-        error && typeof error === "object" && "stack" in error && typeof error.stack === "string"
-          ? error.stack
-          : String(error);
-      process.stderr.write(message);
-      process.exit(1);
-    }
-  `;
-
-  const result = spawnSync(process.execPath, ["--input-type=module", "--eval", script], {
-    cwd: pathDirname(configPath),
-    stdio: ["ignore", "ignore", "pipe"],
-  });
-
-  if (result.status === 0) {
-    configImportabilityCache.set(cacheKey, []);
-    return [];
-  }
-
-  const missingPackages = getMissingPackagesFromImportError(
-    bufferToString(result.stderr),
-    requiredPackages,
-  );
-  configImportabilityCache.set(cacheKey, missingPackages);
-  return missingPackages;
-}
-
-function canImportPackage(packageName: string, fromDirPath: string): boolean {
-  const cacheKey = `${fromDirPath}\u0000${packageName}`;
-  const cached = packageImportabilityCache.get(cacheKey);
-  if (cached !== undefined) return cached;
-
-  const result = spawnSync(
-    process.execPath,
-    [
-      "--input-type=module",
-      "--eval",
-      `await import(${JSON.stringify(packageName)});`,
-    ],
-    {
-      cwd: fromDirPath,
-      stdio: "ignore",
-    },
-  );
-
-  const canImport = result.status === 0;
-  packageImportabilityCache.set(cacheKey, canImport);
-  return canImport;
-}
-
-export function getMissingPackages(
-  packageNames: readonly string[],
-  fromDirPath: string = PACKAGE_ROOT_PATH,
-): string[] {
-  if (packageNames.length === 0) return [];
-
-  return packageNames.filter((packageName) => !canImportPackage(packageName, fromDirPath));
-}
-
-export function getMissingPackagesForFixture(fixture: Fixture): string[] {
-  const cwd =
-    fixture.options.cwd === null ? fixture.dirPath : pathJoin(fixture.dirPath, fixture.options.cwd);
-
-  const missingPackages = getMissingPackages(fixture.options.requiredPackages, cwd);
-  if (missingPackages.length > 0) return missingPackages;
-
-  const baseDirs = cwd === fixture.dirPath ? [cwd] : [cwd, fixture.dirPath];
-  for (const baseDir of baseDirs) {
-    for (const filename of CONFIG_IMPORT_CHECK_FILENAMES) {
-      const configPath = pathJoin(baseDir, filename);
-      if (!existsSync(configPath)) continue;
-
-      const configMissingPackages = getMissingPackagesFromConfigImport(
-        configPath,
-        fixture.options.requiredPackages,
-      );
-      if (configMissingPackages.length > 0) return configMissingPackages;
-    }
-  }
-
-  return [];
 }
 
 // Options to pass to `testFixtureWithCommand`.

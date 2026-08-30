@@ -67,6 +67,8 @@ use oxc_parser::ParseOptions;
 use oxc_semantic::{Semantic, SemanticBuilder};
 use oxc_span::SourceType;
 use oxc_syntax::symbol::SymbolId;
+
+use crate::compiler::phases::phase3_transform::shared::js_scan::contains_identifier;
 use rustc_hash::FxHashSet;
 
 use super::ast_rewrite;
@@ -140,10 +142,8 @@ fn inner_is_block_statement(s: &str) -> bool {
     for kw in KEYWORDS {
         if let Some(rest) = inner.strip_prefix(kw) {
             // Word boundary after the keyword (so `letter` isn't matched as `let`).
-            let boundary = rest
-                .chars()
-                .next()
-                .is_none_or(|c| !c.is_alphanumeric() && c != '_' && c != '$');
+            let boundary =
+                rest.chars().next().is_none_or(|c| !c.is_alphanumeric() && c != '_' && c != '$');
             // Not an object key (`kw:`).
             if boundary && !rest.trim_start().starts_with(':') {
                 return true;
@@ -173,11 +173,8 @@ pub fn transform_state_reads_ast(
         return None;
     }
     // Fast probe — bail unless at least one effective state-var
-    // substring appears.
-    if !effective
-        .iter()
-        .any(|v| memchr::memmem::find(source.as_bytes(), v.as_bytes()).is_some())
-    {
+    // appears as a whole identifier token.
+    if !effective.iter().any(|v| contains_identifier(source, v)) {
         return None;
     }
     // Bare-object-literal handling: input starting with `{` AND
@@ -195,39 +192,59 @@ pub fn transform_state_reads_ast(
         && trimmed.ends_with('}')
         && !contains_top_level_semicolon(trimmed)
         && !inner_is_block_statement(trimmed);
-    let leading_ws = source.len() - source.trim_start().len();
-    let parse_source: std::borrow::Cow<str> = if needs_paren_wrap {
+    let paren_wrapped = |source: &str| {
+        let leading_ws = source.len() - source.trim_start().len();
         let trimmed_start = &source[leading_ws..];
         let trailing_ws = trimmed_start.len() - trimmed_start.trim_end().len();
         let core = &trimmed_start[..trimmed_start.len() - trailing_ws];
-        std::borrow::Cow::Owned(format!(
-            "{}({}){}",
-            &source[..leading_ws],
-            core,
-            &source[source.len() - trailing_ws..]
-        ))
+        format!("{}({}){}", &source[..leading_ws], core, &source[source.len() - trailing_ws..])
+    };
+    let parse_source: std::borrow::Cow<str> = if needs_paren_wrap {
+        std::borrow::Cow::Owned(paren_wrapped(source))
     } else {
         std::borrow::Cow::Borrowed(source)
     };
     let span_offset: i32 = if needs_paren_wrap { 1 } else { 0 };
 
-    ast_rewrite::with_program(
+    match run_state_reads_pass(source, &parse_source, span_offset, &effective) {
+        ast_rewrite::ParseAttempt::Parsed(out) => out,
+        // An expression whose leading token is an object literal — `{ a: m }.a`
+        // — is a block statement under the program goal and so never parses.
+        // The parser's verdict, not a byte scan, is what tells the two apart.
+        ast_rewrite::ParseAttempt::NotParsed if !needs_paren_wrap && trimmed.starts_with('{') => {
+            run_state_reads_pass(source, &paren_wrapped(source), 1, &effective).into_option()
+        }
+        ast_rewrite::ParseAttempt::NotParsed => None,
+    }
+}
+
+/// One parse-and-splice attempt for [`transform_state_reads_ast`]. `parse_source`
+/// may differ from `source` only by the `(`…`)` that forces expression goal;
+/// `span_offset` is what that insertion shifts every span by.
+fn run_state_reads_pass(
+    source: &str,
+    parse_source: &str,
+    span_offset: i32,
+    effective: &[&str],
+) -> ast_rewrite::ParseAttempt<String> {
+    ast_rewrite::with_program_attempt(
         &STATE_READS_ALLOC,
-        &parse_source,
+        parse_source,
         SourceType::mjs(),
-        ParseOptions {
-            allow_return_outside_function: true,
-            ..ParseOptions::default()
-        },
+        ParseOptions { allow_return_outside_function: true, ..ParseOptions::default() },
         |program| {
-            let semantic_ret = SemanticBuilder::new().with_build_nodes(true).build(program);
+            let semantic_ret = super::super::profile::semantic_build(
+                super::super::profile::SEM_STATE_READS,
+                program.source_text.len(),
+                || SemanticBuilder::new().with_build_nodes(true).build(program),
+            );
             let semantic = &semantic_ret.semantic;
             let effective_names: Vec<String> = effective.iter().map(|s| s.to_string()).collect();
             let state_var_symbols = find_state_var_symbols(semantic, &effective_names);
 
             let mut collector = StateReadsCollector {
                 semantic,
-                effective: &effective,
+                effective,
                 effective_names: &effective_names,
                 state_var_symbols,
                 replacements: Vec::new(),
@@ -293,8 +310,7 @@ impl<'a, 'sem, 'ast> Visit<'ast> for StateReadsCollector<'a, 'sem> {
         ) {
             return;
         }
-        self.replacements
-            .push((ident.span.start, ident.span.end, format!("$.get({})", name)));
+        self.replacements.push((ident.span.start, ident.span.end, format!("$.get({})", name)));
     }
 
     fn visit_assignment_expression(&mut self, expr: &AssignmentExpression<'ast>) {
@@ -333,10 +349,8 @@ impl<'a, 'sem, 'ast> Visit<'ast> for StateReadsCollector<'a, 'sem> {
             && obj.name == "$"
         {
             let prop = member.property.name.as_str();
-            let skip_first_arg = matches!(
-                prop,
-                "set" | "update" | "update_pre" | "mutate" | "get" | "safe_get"
-            );
+            let skip_first_arg =
+                matches!(prop, "set" | "update" | "update_pre" | "mutate" | "get" | "safe_get");
             if skip_first_arg && let Some(Argument::Identifier(id)) = call.arguments.first() {
                 self.skip(id);
             }

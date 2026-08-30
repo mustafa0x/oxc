@@ -64,7 +64,7 @@ use shared::TemplateEntry;
 /// [`shared::process_children`] directly. This handles the structural nodes
 /// (elements, html-tags, …). Unported node kinds emit nothing (a `// TODO`)
 /// so the walk stays total and the build correct for the supported subset.
-pub fn visit_node<'a>(node: &TemplateNode, state: &mut ServerTransformState<'a>) {
+pub fn visit_node<'a>(node: &TemplateNode<'a>, state: &mut ServerTransformState<'a>) {
     match node {
         TemplateNode::RegularElement(el) => element::visit_regular_element(el, state),
         TemplateNode::HtmlTag(tag) => html_tag::visit_html_tag(tag, state),
@@ -86,7 +86,9 @@ pub fn visit_node<'a>(node: &TemplateNode, state: &mut ServerTransformState<'a>)
             // Port of upstream server `SvelteFragment` — push the visited child
             // fragment as a `{ ... }` block statement.
             // SvelteFragment is NOT an `is_text_first` parent.
+            let saved_scope = state.enter_template_scope(node.start);
             let block = shared::build_fragment_block(&node.fragment, false, state);
+            state.restore_scope(saved_scope);
             state.template.push(TemplateEntry::Stmt(block));
         }
         // `<svelte:window>` / `<svelte:document>` have no upstream server visitor

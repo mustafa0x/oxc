@@ -3,19 +3,11 @@
 //! Provides helper functions for CSS analysis.
 //!
 //! Corresponds to Svelte's `2-analyze/css/utils.js`.
-
-/// Sentinel value for unknown CSS values.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Unknown;
-
 /// Returns all parent rules from a rule path; root is last.
 pub fn get_parent_rules<'a>(path: &[&'a serde_json::Value]) -> Vec<&'a serde_json::Value> {
     path.iter()
         .filter(|node| {
-            node.get("type")
-                .and_then(|t| t.as_str())
-                .map(|t| t == "Rule")
-                .unwrap_or(false)
+            node.get("type").and_then(|t| t.as_str()).map(|t| t == "Rule").unwrap_or(false)
         })
         .copied()
         .collect()
@@ -83,6 +75,38 @@ const UNKNOWN_MARKER: &str = "__UNKNOWN__";
 /// Returns `Some(Vec<String>)` if we can determine all possible values.
 ///
 /// This is used for class attribute analysis to determine which classes might be used.
+/// `get_possible_values` for a template expression, skipping the JSON
+/// materialization when the node type alone settles the answer.
+///
+/// `gather_possible_values` only inspects `Literal`, `ConditionalExpression`,
+/// `LogicalExpression`, `BinaryExpression`, `TemplateLiteral`,
+/// `TSAsExpression`, and — for a class attribute only — `ArrayExpression` and
+/// `ObjectExpression`. Everything else falls to its `_` arm, which marks the
+/// value unknown and makes `get_possible_values` return `None`. A bare
+/// `Identifier` (`class={cls}`, the common dynamic case) is in that group, so
+/// serializing the expression first is wasted work.
+pub fn get_possible_values_expr(
+    expr: &crate::ast::js::Expression,
+    is_class: bool,
+) -> Option<Vec<String>> {
+    if let Some(node_type) = expr.node_type() {
+        let inspected = matches!(
+            node_type,
+            "Literal"
+                | "ConditionalExpression"
+                | "LogicalExpression"
+                | "BinaryExpression"
+                | "TemplateLiteral"
+                | "TSAsExpression"
+        ) || (is_class
+            && matches!(node_type, "ArrayExpression" | "ObjectExpression"));
+        if !inspected {
+            return None;
+        }
+    }
+    get_possible_values(expr.as_json(), is_class)
+}
+
 pub fn get_possible_values(chunk: &serde_json::Value, is_class: bool) -> Option<Vec<String>> {
     let mut values = Vec::new();
     let chunk_type = chunk.get("type").and_then(|t| t.as_str());
@@ -225,10 +249,8 @@ fn gather_possible_values(
             if let Some(properties) = node.get("properties").and_then(|p| p.as_array()) {
                 for property in properties {
                     if property.get("type").and_then(|t| t.as_str()) == Some("Property") {
-                        let is_computed = property
-                            .get("computed")
-                            .and_then(|c| c.as_bool())
-                            .unwrap_or(false);
+                        let is_computed =
+                            property.get("computed").and_then(|c| c.as_bool()).unwrap_or(false);
 
                         if !is_computed {
                             if let Some(key) = property.get("key") {
@@ -338,13 +360,119 @@ fn gather_possible_values(
     }
 }
 
-/// True if is `:global` (without arguments).
-pub fn is_global_block_selector(selector: &serde_json::Value) -> bool {
-    if let Some(sel_type) = selector.get("type").and_then(|t| t.as_str())
-        && sel_type == "PseudoClassSelector"
-        && let Some(name) = selector.get("name").and_then(|n| n.as_str())
-    {
-        return name == "global" && selector.get("args").is_none();
+/// The class names an attribute value can produce, or `None` when the value is
+/// not statically knowable and every class selector therefore stays a candidate.
+///
+/// Shared so a dynamic element answers this the same way a regular one does; a
+/// per-element-type copy is what let `<svelte:element class={a ? 'x' : 'y'}>`
+/// keep every rule alive.
+pub fn possible_class_names(
+    value: &crate::ast::template::AttributeValue,
+) -> Option<rustc_hash::FxHashSet<String>> {
+    use crate::ast::template::{AttributeValue, AttributeValuePart};
+    use rustc_hash::FxHashSet;
+
+    let mut names: FxHashSet<String> = FxHashSet::default();
+
+    match value {
+        AttributeValue::Sequence(parts) => {
+            // Combinatorial expansion over the chunks, tracking whitespace
+            // boundaries so `class="foo{expr}bar"` yields the joined names.
+            let mut possible_values: FxHashSet<String> = FxHashSet::default();
+            let mut prev_values: Vec<String> = Vec::new();
+
+            for part in parts {
+                let current_vals = match part {
+                    AttributeValuePart::Text(text) => vec![text.data.to_string()],
+                    AttributeValuePart::ExpressionTag(expr_tag) => {
+                        get_possible_values_expr(&expr_tag.expression, true)?
+                    }
+                };
+
+                if prev_values.is_empty() {
+                    for cv in &current_vals {
+                        if cv.ends_with(char::is_whitespace) {
+                            possible_values.insert(cv.clone());
+                        } else {
+                            prev_values.push(cv.clone());
+                        }
+                    }
+                    if prev_values.len() < current_vals.len() {
+                        prev_values.push(" ".to_string());
+                    }
+                } else {
+                    let mut starts_with_space = Vec::new();
+                    let mut remaining = Vec::new();
+                    for cv in &current_vals {
+                        if cv.starts_with(char::is_whitespace) {
+                            starts_with_space.push(cv.clone());
+                        } else {
+                            remaining.push(cv.clone());
+                        }
+                    }
+
+                    if !remaining.is_empty() {
+                        if !starts_with_space.is_empty() {
+                            // Some values start with space - previous values are complete
+                            for pv in &prev_values {
+                                possible_values.insert(pv.clone());
+                            }
+                        }
+                        let mut combined = Vec::new();
+                        for pv in &prev_values {
+                            for rv in &remaining {
+                                combined.push(format!("{pv}{rv}"));
+                            }
+                        }
+                        prev_values = combined;
+                        for sv in &starts_with_space {
+                            if sv.ends_with(char::is_whitespace) {
+                                possible_values.insert(sv.clone());
+                            } else {
+                                prev_values.push(sv.clone());
+                            }
+                        }
+                    } else {
+                        for pv in &prev_values {
+                            possible_values.insert(pv.clone());
+                        }
+                        prev_values.clear();
+                        for sv in &starts_with_space {
+                            if sv.ends_with(char::is_whitespace) {
+                                possible_values.insert(sv.clone());
+                            } else {
+                                prev_values.push(sv.clone());
+                            }
+                        }
+                    }
+                    if prev_values.len() < current_vals.len() {
+                        prev_values.push(" ".to_string());
+                    }
+                    // Exponential growth, bail out
+                    if prev_values.len() > 20 {
+                        return None;
+                    }
+                }
+            }
+
+            for pv in prev_values {
+                possible_values.insert(pv);
+            }
+            for value in &possible_values {
+                for class_name in value.split_whitespace() {
+                    names.insert(class_name.to_string());
+                }
+            }
+        }
+        AttributeValue::Expression(expr_tag) => {
+            for value in get_possible_values_expr(&expr_tag.expression, true)? {
+                for class_name in value.split_whitespace() {
+                    names.insert(class_name.to_string());
+                }
+            }
+        }
+        AttributeValue::True(_) => {}
     }
-    false
+
+    Some(names)
 }

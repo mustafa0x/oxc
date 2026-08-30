@@ -60,21 +60,24 @@ pub fn wrap_state_derived_with_tag_declarators_ast(source: &str, is_ts: bool) ->
     ast_rewrite::rewrite_once(
         &MODULE_TAG_ALLOC,
         source,
-        if is_ts {
-            SourceType::ts().with_module(true)
-        } else {
-            SourceType::mjs()
-        },
+        if is_ts { SourceType::ts().with_module(true) } else { SourceType::mjs() },
         ParseOptions::default(),
         false,
-        |program| {
-            let mut replacements: Vec<Edit> = Vec::new();
-            for stmt in &program.body {
-                walk_statement_for_declarators(stmt, source, &mut replacements);
-            }
-            replacements
-        },
+        |program| collect_tag_declarator_edits(program, source),
     )
+}
+
+/// Collect `$.tag(...)` / `$.tag_proxy(...)` wraps for tag-eligible
+/// declarator initialisers from a single parse. Already-tagged inits
+/// are skipped, so this is idempotent and needs no fixed point of its
+/// own; the batched module dev-tail driver still folds it alongside the
+/// other collectors.
+pub(super) fn collect_tag_declarator_edits(program: &Program<'_>, source: &str) -> Vec<Edit> {
+    let mut replacements: Vec<Edit> = Vec::new();
+    for stmt in &program.body {
+        walk_statement_for_declarators(stmt, source, &mut replacements);
+    }
+    replacements
 }
 
 /// Recursive top-down walk that finds VariableDeclarations anywhere
@@ -109,6 +112,16 @@ fn walk_statement_for_declarators<'a>(
             walk_statement_for_declarators(&s.consequent, source, replacements);
             if let Some(alt) = &s.alternate {
                 walk_statement_for_declarators(alt, source, replacements);
+            }
+        }
+        Statement::LabeledStatement(s) => {
+            walk_statement_for_declarators(&s.body, source, replacements);
+        }
+        Statement::SwitchStatement(s) => {
+            for case in &s.cases {
+                for stmt in &case.consequent {
+                    walk_statement_for_declarators(stmt, source, replacements);
+                }
             }
         }
         Statement::ForStatement(s) => {
@@ -168,6 +181,11 @@ fn handle_variable_declaration<'a>(
             continue;
         };
         let name = id.name.as_str();
+        // `$$`-prefixed names are the compiler's own temps (`$$d`, `$$array`);
+        // upstream labels a binding the user wrote, never one it generated.
+        if name.starts_with("$$") {
+            continue;
+        }
 
         let Some(init) = &decl.init else {
             continue;
@@ -315,10 +333,7 @@ mod tests {
     fn handles_declarator_inside_block_in_function() {
         let src = "function f() { if (cond) { let x = $.state(0); } }";
         let out = wrap_state_derived_with_tag_declarators_ast(src, false).unwrap();
-        assert_eq!(
-            out,
-            "function f() { if (cond) { let x = $.tag($.state(0), 'x'); } }"
-        );
+        assert_eq!(out, "function f() { if (cond) { let x = $.tag($.state(0), 'x'); } }");
     }
 
     #[test]
@@ -326,6 +341,24 @@ mod tests {
         let src = "for (let x = $.state(0); ; ) {}";
         let out = wrap_state_derived_with_tag_declarators_ast(src, false).unwrap();
         assert_eq!(out, "for (let x = $.tag($.state(0), 'x'); ; ) {}");
+    }
+
+    #[test]
+    fn handles_declarator_inside_labeled_statement() {
+        let src = "declaration: var x = $.state(0);";
+        let out = wrap_state_derived_with_tag_declarators_ast(src, false).unwrap();
+        assert_eq!(out, "declaration: var x = $.tag($.state(0), 'x');");
+    }
+
+    #[test]
+    fn handles_declarators_inside_switch_cases() {
+        let src =
+            "switch (k) { case 1: let x = $.state(0); break; default: { let y = $.derived(1); } }";
+        let out = wrap_state_derived_with_tag_declarators_ast(src, false).unwrap();
+        assert_eq!(
+            out,
+            "switch (k) { case 1: let x = $.tag($.state(0), 'x'); break; default: { let y = $.tag($.derived(1), 'y'); } }"
+        );
     }
 
     #[test]

@@ -5,9 +5,7 @@
 //! Corresponds to Svelte's `2-analyze/visitors/ClassBody.js`.
 
 use rustc_hash::FxHashMap;
-use std::sync::LazyLock;
 
-use regex::Regex;
 use serde_json::Value;
 
 use super::super::errors;
@@ -15,10 +13,6 @@ use super::super::types::StateField;
 use super::VisitorContext;
 use crate::ast::typed_expr::JsNode;
 use crate::compiler::phases::phase2_analyze::AnalysisError;
-
-// Cached regex for sanitizing identifier names
-static REGEX_INVALID_IDENTIFIER_CHARS: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(^[^a-zA-Z_$]|[^a-zA-Z0-9_$])").unwrap());
 
 /// Visit a class body.
 ///
@@ -42,24 +36,6 @@ fn visit_impl(
         None => return Ok(()),
     };
 
-    // Track private identifiers to avoid conflicts when generating deconflicted names
-    let mut private_ids: Vec<String> = Vec::new();
-
-    // Collect private identifiers from methods and properties
-    for prop in body {
-        let prop_type = prop.get("type").and_then(|t| t.as_str());
-
-        if matches!(
-            prop_type,
-            Some("MethodDefinition") | Some("PropertyDefinition")
-        ) && let Some(key) = prop.get("key")
-            && key.get("type").and_then(|t| t.as_str()) == Some("PrivateIdentifier")
-            && let Some(name) = key.get("name").and_then(|n| n.as_str())
-        {
-            private_ids.push(name.to_string());
-        }
-    }
-
     // State fields map (name -> StateField)
     let mut state_fields: FxHashMap<String, StateField> = FxHashMap::default();
 
@@ -70,22 +46,32 @@ fn visit_impl(
     // Find constructor for analyzing this.x = $state(...) assignments
     let mut constructor: Option<&Value> = None;
 
+    /// Helper function to get a node's `(start, end)` source range
+    fn span(node: &Value) -> Option<(u32, u32)> {
+        let start = node.get("start")?.as_u64()? as u32;
+        let end = node.get("end")?.as_u64()? as u32;
+        Some((start, end))
+    }
+
+    /// Attach `node`'s source range to `error`, mirroring the node upstream
+    /// passes to its `e.*` constructor.
+    fn at_node(error: AnalysisError, node: &Value) -> AnalysisError {
+        match span(node) {
+            Some((start, end)) => error.at(start, end),
+            None => error,
+        }
+    }
+
     /// Helper function to get the name from a key (Identifier, PrivateIdentifier, or Literal)
     fn get_name(key: &Value) -> Option<String> {
         match key.get("type").and_then(|t| t.as_str()) {
             Some("Literal") => key.get("value").and_then(|v| {
-                v.as_str()
-                    .map(|s| s.to_string())
-                    .or_else(|| v.as_i64().map(|n| n.to_string()))
+                v.as_str().map(|s| s.to_string()).or_else(|| v.as_i64().map(|n| n.to_string()))
             }),
-            Some("PrivateIdentifier") => key
-                .get("name")
-                .and_then(|n| n.as_str())
-                .map(|n| format!("#{}", n)),
-            Some("Identifier") => key
-                .get("name")
-                .and_then(|n| n.as_str())
-                .map(|s| s.to_string()),
+            Some("PrivateIdentifier") => {
+                key.get("name").and_then(|n| n.as_str()).map(|n| format!("#{}", n))
+            }
+            Some("Identifier") => key.get("name").and_then(|n| n.as_str()).map(|s| s.to_string()),
             _ => None,
         }
     }
@@ -149,47 +135,24 @@ fn visit_impl(
         // Check if the value is a rune call
         let rune = value.and_then(get_rune);
 
-        if let Some(rune_name) = rune {
+        if rune.is_some() {
             // Check for duplicate state fields
             if state_fields.contains_key(&name) {
-                return Err(errors::state_field_duplicate(&name));
+                return Err(at_node(errors::state_field_duplicate(&name), node));
             }
 
             // Create the field key (prefixed with @ for static fields)
-            let field_key = if is_static {
-                format!("@{}", name)
-            } else {
-                name.clone()
-            };
+            let field_key = if is_static { format!("@{}", name) } else { name.clone() };
 
             // Check if there's already a method or assigned field with this name
             if let Some(existing) = fields.get(&field_key) {
                 // Error if there's already a method or an assigned prop (not just a plain prop)
                 if !(existing.len() == 1 && existing[0] == "prop") {
-                    return Err(errors::duplicate_class_field(&field_key));
+                    return Err(at_node(errors::duplicate_class_field(&field_key), node));
                 }
             }
 
-            // Create the state field
-            // Note: In JS, the key is filled out later for public state
-            // For private identifiers, use the key as-is
-            let key_value = if key.get("type").and_then(|t| t.as_str()) == Some("PrivateIdentifier")
-            {
-                key.clone()
-            } else {
-                // Will be filled with private identifier later
-                Value::Null
-            };
-
-            state_fields.insert(
-                name,
-                StateField {
-                    rune_type: rune_name,
-                    node: node.clone(),
-                    key: key_value,
-                    value: value.unwrap().clone(),
-                },
-            );
+            state_fields.insert(name, StateField { node: node.clone() });
         }
 
         Ok(())
@@ -201,14 +164,8 @@ fn visit_impl(
 
         // Handle PropertyDefinition
         if child_type == Some("PropertyDefinition") {
-            let computed = child
-                .get("computed")
-                .and_then(|c| c.as_bool())
-                .unwrap_or(false);
-            let is_static = child
-                .get("static")
-                .and_then(|s| s.as_bool())
-                .unwrap_or(false);
+            let computed = child.get("computed").and_then(|c| c.as_bool()).unwrap_or(false);
+            let is_static = child.get("static").and_then(|s| s.as_bool()).unwrap_or(false);
 
             if !computed
                 && !is_static
@@ -230,7 +187,7 @@ fn visit_impl(
                         && !existing.is_empty()
                         && !state_fields.contains_key(&field_name)
                     {
-                        return Err(errors::duplicate_class_field(&field_name));
+                        return Err(at_node(errors::duplicate_class_field(&field_name), child));
                     }
                     fields.insert(field_name, vec![kind.to_string()]);
                 }
@@ -239,32 +196,19 @@ fn visit_impl(
 
         // Handle MethodDefinition
         if child_type == Some("MethodDefinition") {
-            let kind = child
-                .get("kind")
-                .and_then(|k| k.as_str())
-                .unwrap_or("method");
+            let kind = child.get("kind").and_then(|k| k.as_str()).unwrap_or("method");
 
             if kind == "constructor" {
                 constructor = Some(child);
             } else {
-                let computed = child
-                    .get("computed")
-                    .and_then(|c| c.as_bool())
-                    .unwrap_or(false);
+                let computed = child.get("computed").and_then(|c| c.as_bool()).unwrap_or(false);
 
                 if !computed
                     && let Some(key) = child.get("key")
                     && let Some(name) = get_name(key)
                 {
-                    let is_static = child
-                        .get("static")
-                        .and_then(|s| s.as_bool())
-                        .unwrap_or(false);
-                    let field_key = if is_static {
-                        format!("@{}", name)
-                    } else {
-                        name.clone()
-                    };
+                    let is_static = child.get("static").and_then(|s| s.as_bool()).unwrap_or(false);
+                    let field_key = if is_static { format!("@{}", name) } else { name.clone() };
 
                     if let Some(existing) = fields.get_mut(&field_key) {
                         // Check for conflicts
@@ -272,7 +216,7 @@ fn visit_impl(
                             || existing.contains(&"prop".to_string())
                             || existing.contains(&"assigned_prop".to_string())
                         {
-                            return Err(errors::duplicate_class_field(&field_key));
+                            return Err(at_node(errors::duplicate_class_field(&field_key), child));
                         }
 
                         // Handle getter/setter pairs
@@ -291,7 +235,7 @@ fn visit_impl(
                             continue;
                         }
 
-                        return Err(errors::duplicate_class_field(&field_key));
+                        return Err(at_node(errors::duplicate_class_field(&field_key), child));
                     } else {
                         fields.insert(field_key, vec![kind.to_string()]);
                     }
@@ -342,10 +286,7 @@ fn visit_impl(
             }
 
             // Skip computed properties with non-literal keys
-            let computed = left
-                .get("computed")
-                .and_then(|c| c.as_bool())
-                .unwrap_or(false);
+            let computed = left.get("computed").and_then(|c| c.as_bool()).unwrap_or(false);
             if computed
                 && let Some(property) = left.get("property")
                 && property.get("type").and_then(|t| t.as_str()) != Some("Literal")
@@ -355,60 +296,17 @@ fn visit_impl(
 
             // Handle the assignment
             if let (Some(property), Some(right)) = (left.get("property"), expr.get("right")) {
-                handle_field(
-                    expr,
-                    property,
-                    Some(right),
-                    &mut state_fields,
-                    &mut fields,
-                    false,
-                )?;
+                handle_field(expr, property, Some(right), &mut state_fields, &mut fields, false)?;
             }
         }
     }
-
-    // Generate deconflicted private identifiers for public state fields
-    for (name, field) in state_fields.iter_mut() {
-        // Skip private identifiers (already have keys)
-        if name.starts_with('#') {
-            continue;
-        }
-
-        // Replace invalid identifier characters with underscores
-        let mut deconflicted = REGEX_INVALID_IDENTIFIER_CHARS
-            .replace_all(name, "_")
-            .to_string();
-
-        // Ensure it doesn't conflict with existing private identifiers
-        while private_ids.contains(&deconflicted) {
-            deconflicted = format!("_{}", deconflicted);
-        }
-
-        private_ids.push(deconflicted.clone());
-
-        // Create the private identifier
-        field.key = serde_json::json!({
-            "type": "PrivateIdentifier",
-            "name": deconflicted
-        });
-    }
-
-    // Store the state fields in the analysis
-    // Create a unique key for this class body node
-    let node_key = format!("{:?}", node); // Simple key based on the node structure
-    context
-        .analysis
-        .classes
-        .insert(node_key, state_fields.clone());
 
     // Set state_fields on context before visiting children.
     // This corresponds to context.next({ ...context.state, state_fields }) in the official compiler.
     // The state_fields are needed by validate_assignment (in AssignmentExpression visitor)
     // and PropertyDefinition visitor to detect state_field_invalid_assignment errors.
-    let saved_state_fields = std::mem::replace(
-        &mut context.state_fields,
-        state_fields.into_iter().collect(),
-    );
+    let saved_state_fields =
+        std::mem::replace(&mut context.state_fields, state_fields.into_iter().collect());
 
     // Visit children (methods, properties, etc.)
     // This is equivalent to context.next() in the JavaScript implementation.

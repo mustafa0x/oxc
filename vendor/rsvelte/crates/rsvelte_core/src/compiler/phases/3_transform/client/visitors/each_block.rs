@@ -44,12 +44,14 @@ use crate::compiler::phases::phase3_transform::client::types::{
 use crate::compiler::phases::phase3_transform::client::visitors::expression_converter::convert_expression;
 use crate::compiler::phases::phase3_transform::client::visitors::fragment::fragment as visit_fragment_impl;
 // Note: get_value from declarations is available if needed for reactive index/item access
+use crate::compiler::phases::phase3_transform::client::source_anchor::CommentRegion;
 use crate::compiler::phases::phase3_transform::client::types::ExpressionMetadata;
 use crate::compiler::phases::phase3_transform::client::visitors::shared::utils::{
     add_svelte_meta, apply_transforms_to_expression, build_expression,
 };
 use crate::compiler::phases::phase3_transform::js_ast::builders as b;
 use crate::compiler::phases::phase3_transform::js_ast::nodes::*;
+use crate::compiler::phases::phase3_transform::shared::js_scan::find_code;
 use crate::compiler::phases::phase3_transform::shared::template::escape_js_string;
 use rustc_hash::FxHashMap;
 use std::cell::Cell;
@@ -88,7 +90,13 @@ pub fn each_block(node: &EachBlock, context: &mut ComponentContext) {
     // Expression should be evaluated in the parent scope, not the scope
     // created by the each block itself
     // Build the collection expression
-    let collection = build_collection_expression(node, context);
+    let mut collection = build_collection_expression(node, context);
+    if let (Some(start), Some(end)) = (node.expression.start(), node.expression.end())
+        && let Some(region) =
+            CommentRegion::between(&context.state, node.start + 7, end, node.start + 7)
+    {
+        collection = region.anchor_inner(&context.arena, collection, start, end);
+    }
 
     // Add comment placeholder for uncontrolled blocks
     if !is_controlled {
@@ -140,7 +148,15 @@ pub fn each_block(node: &EachBlock, context: &mut ComponentContext) {
 
     // Generate unique identifiers for index and item
     let index = generate_index_identifier(node, each_node_meta);
-    let item = generate_item_identifier(node);
+    let item = if let Some(context_expr) = &node.context
+        && let Some(name) = context_expr.identifier_name()
+        && let (Some(start), Some(end)) = (context_expr.start(), context_expr.end())
+        && start < end
+    {
+        JsExpr::Spanned(context.arena.alloc_expr(b::id(name)), start, end)
+    } else {
+        generate_item_identifier(node)
+    };
 
     // Track usage
     // In the JS implementation, uses_index is set to true dynamically when:
@@ -167,6 +183,7 @@ pub fn each_block(node: &EachBlock, context: &mut ComponentContext) {
     // sibling each blocks. Reference: EachBlock.js lines 129-133
     let saved_transform = context.state.transform.clone();
     let saved_transform_deep_read = context.state.transform_deep_read.clone();
+    let saved_each_shadowing_names = context.state.each_shadowing_names.clone();
 
     // Build declarations for the render function body
     // This will insert transforms for the item and index into context.state.transform
@@ -199,10 +216,10 @@ pub fn each_block(node: &EachBlock, context: &mut ComponentContext) {
         if let Some(ref old_index_name) = saved_each_index_name {
             // Push the existing (outer) Rc to the ancestor stack, so writes to it
             // during nested body traversal will be visible to the outer each block.
-            context.state.ancestor_each_index_names.push((
-                old_index_name.clone(),
-                context.state.each_index_used.clone(),
-            ));
+            context
+                .state
+                .ancestor_each_index_names
+                .push((old_index_name.clone(), context.state.each_index_used.clone()));
         }
         context.state.each_index_name = Some(index_name.to_string());
         // Replace with a NEW Rc so the inner each doesn't share state with outer.
@@ -243,10 +260,10 @@ pub fn each_block(node: &EachBlock, context: &mut ComponentContext) {
     // `node.context.type === 'Identifier'` branch). Register this block's name so a
     // (possibly nested) assignment to it sets THIS block's flag.
     let pushed_item_flag = if let Some(ref name) = context_is_identifier_name {
-        context.state.each_item_name_flags.push((
-            name.clone(),
-            context.state.each_item_assign_or_mutate.clone(),
-        ));
+        context
+            .state
+            .each_item_name_flags
+            .push((name.clone(), context.state.each_item_assign_or_mutate.clone()));
         true
     } else {
         false
@@ -261,6 +278,10 @@ pub fn each_block(node: &EachBlock, context: &mut ComponentContext) {
     // Compute the item name
     let item_name = match &item {
         JsExpr::Identifier(name) => name.clone(),
+        JsExpr::Spanned(inner, _, _) => match context.arena.get_expr(*inner) {
+            JsExpr::Identifier(name) => name.clone(),
+            _ => "$$item".into(),
+        },
         _ => "$$item".into(),
     };
 
@@ -271,16 +292,11 @@ pub fn each_block(node: &EachBlock, context: &mut ComponentContext) {
     };
 
     // Compute collection expression for invalidation
-    let collection_expr_str = if let Some(ref coll_id) = collection_id {
-        format!("{}()", coll_id)
+    let collection_access_expr = if let Some(ref coll_id) = collection_id {
+        b::call(&context.arena, b::id(coll_id), vec![])
     } else {
-        // Generate the collection expression as a string
-        crate::compiler::phases::phase3_transform::js_ast::codegen::generate_expr(
-            &collection,
-            &context.arena,
-        )
+        collection.clone()
     };
-
     // Compute invalidation expressions from transitive deps
     // In the official compiler, transitive_deps come from analysis and contain the
     // bindings that need invalidation when an each item is mutated/assigned.
@@ -339,24 +355,6 @@ pub fn each_block(node: &EachBlock, context: &mut ComponentContext) {
                     }
                 }
             }
-        } else {
-            // Fallback: use the collection expression as the invalidation target.
-            // This is used when transitive_deps is empty (e.g., simple state variables).
-            // The collection_expr_str already has transforms applied (e.g., prop()
-            // calls for props, $.get() for state variables).
-            //
-            // Skip an unbound-global bare identifier (no binding in any scope):
-            // it isn't reactive, so upstream emits no invalidation for it — e.g.
-            // an implicit `{#each todos as todo}` in a script-less component
-            // where `todos` is never declared.
-            let is_unbound_global = matches!(
-                &collection,
-                JsExpr::Identifier(name)
-                    if context.state.analysis.root.find_binding_any_scope(name.as_str()).is_none()
-            );
-            if !is_unbound_global {
-                invalidation_exprs.push(collection_expr_str.clone());
-            }
         }
 
         // Also add parent each block invalidation deps
@@ -376,46 +374,30 @@ pub fn each_block(node: &EachBlock, context: &mut ComponentContext) {
     // to avoid getting the wrong binding (e.g., a same-named outer State variable).
     // The EachItem binding will have BindingKind::EachItem and the correct reassigned flag.
     let item_reassigned = if !context.state.analysis.runes {
-        // Find the EachItem binding specifically (not just any binding with that name)
-        let mut found_reassigned = false;
-        for scope in &context.state.scope_root.all_scopes {
-            if let Some(&binding_idx) = scope.declarations.get(item_name.as_str())
-                && let Some(binding) = context.state.scope_root.bindings.get(binding_idx)
-                && binding.kind == BindingKind::EachItem
-            {
-                found_reassigned = binding.reassigned;
-                break;
-            }
-        }
-        // Also check root scope
-        if !found_reassigned
-            && let Some(&binding_idx) = context
-                .state
-                .scope_root
-                .scope
-                .declarations
-                .get(item_name.as_str())
-            && let Some(binding) = context.state.scope_root.bindings.get(binding_idx)
-            && binding.kind == BindingKind::EachItem
-        {
-            found_reassigned = binding.reassigned;
-        }
-        found_reassigned
+        // Resolve this node's declaration directly. Scanning all scopes by name
+        // picks an arbitrary sibling/ancestor when nested each blocks reuse the
+        // same item name.
+        context
+            .state
+            .scope_root
+            .template_scope_map
+            .get(&node.start)
+            .and_then(|scope_idx| context.state.scope_root.all_scopes.get(*scope_idx))
+            .and_then(|scope| scope.declarations.get(item_name.as_str()))
+            .and_then(|binding_idx| context.state.scope_root.bindings.get(*binding_idx))
+            .is_some_and(|binding| binding.kind == BindingKind::EachItem && binding.reassigned)
     } else {
         false
     };
 
     // Determine if the context pattern is a simple Identifier (not destructured)
-    let context_is_identifier = node
-        .context
-        .as_ref()
-        .is_some_and(|ctx| ctx.is_identifier_node());
+    let context_is_identifier = node.context.as_ref().is_some_and(|ctx| ctx.is_identifier_node());
 
     let binding_used = Rc::new(Cell::new(false));
     context.state.each_binding_context.push(EachBindingContext {
         item_name: item_name.to_string(),
         item_reactive,
-        collection_expr: collection_expr_str.clone(),
+        collection_expr: collection_access_expr,
         collection_id: collection_id.clone(),
         invalidation_exprs: invalidation_exprs.clone(),
         index_name: index_name_str.to_string(),
@@ -434,7 +416,35 @@ pub fn each_block(node: &EachBlock, context: &mut ComponentContext) {
     // The Fragment visitor handles template creation and hoisting
     let prev_in_control_flow = context.state.in_control_flow_block;
     context.state.in_control_flow_block = true;
+    // Bump the template nesting level so a `{#snippet}` that is a DIRECT child of
+    // this `{#each}` body (not wrapped in an element) is NOT hoisted to the
+    // component root. `visit_fragment` here passes `is_root_fragment = true` (for
+    // the each block's text-first template handling), which makes the body
+    // fragment inherit this level, so it must already be >= 1. Mirrors upstream's
+    // `context.path.length === 1` check: a snippet inside `{#each}` has
+    // path-length >= 2 and stays local (SnippetBlock.js). Other blocks
+    // ({#if}/{#key}/{#await}) pass `is_root_fragment = false`, which already
+    // forces level 1.
+    let prev_nesting = context.state.template_nesting_level;
+    context.state.template_nesting_level += 1;
+    // Carry the each block's own Phase-2 scope while building the body, the way
+    // the snippet and declaring-element visitors do. `get_binding` consults
+    // `state.scope` first, so without this an item name that shadows an
+    // instance binding resolves to the OUTER one and `scope.evaluate`-style
+    // checks (`is_defined`, which decides the `?? ''` guard) answer for it.
+    let saved_scope = context.state.scope;
+    if let Some(each_scope) = context
+        .state
+        .scope_root
+        .template_scope_map
+        .get(&node.start)
+        .and_then(|idx| context.state.scope_root.all_scopes.get(*idx))
+    {
+        context.state.scope = each_scope;
+    }
     let body_block = visit_fragment(&node.body, context);
+    context.state.scope = saved_scope;
+    context.state.template_nesting_level = prev_nesting;
     context.state.in_control_flow_block = prev_in_control_flow;
 
     // Pop the each binding context
@@ -484,12 +494,27 @@ pub fn each_block(node: &EachBlock, context: &mut ComponentContext) {
     // Restore the original transform map to prevent leaking to sibling blocks
     context.state.transform = saved_transform;
     context.state.transform_deep_read = saved_transform_deep_read;
+    context.state.each_shadowing_names = saved_each_shadowing_names;
 
     // Build the key function
     let key_function = build_key_function(node, context, key_uses_index, &index);
 
     // Build render arguments: ($$anchor, item, [index], [collection_id])
     let render_args = build_render_args(&index, &item, uses_index, collection_id.as_ref());
+    let const_comment_region = if let Some(TemplateNode::ConstTag(tag)) = node.body.nodes.first()
+        && let (Some(item_start), Some(item_end), Some(comment_start), Some(comment_end)) = (
+            node.context.as_ref().and_then(|e| e.start()),
+            node.context.as_ref().and_then(|e| e.end()),
+            tag.declaration.start(),
+            tag.declaration.end(),
+        )
+        && let Some(region) =
+            CommentRegion::between(&context.state, comment_start, comment_end, node.start + 7)
+    {
+        Some((region, item_start, item_end))
+    } else {
+        None
+    };
 
     // Combine declarations and body statements
     // This matches JS: b.arrow(render_args, b.block(declarations.concat(block.body)))
@@ -497,17 +522,22 @@ pub fn each_block(node: &EachBlock, context: &mut ComponentContext) {
     render_body.extend(body_block.body);
 
     // Build the render function
-    let render_fn = b::arrow_block(
-        render_args.iter().map(convert_expr_to_pattern).collect(),
+    let mut render_fn = b::arrow_block(
+        render_args.iter().map(|expr| convert_expr_to_pattern(expr, &context.arena)).collect(),
         render_body,
     );
+    if let Some((region, item_start, item_end)) = const_comment_region {
+        // The source position belongs to the callback identifier. Anchor the
+        // completed arrow so conversion can remap that parameter's existing
+        // `SpannedIdentifier`; wrapping the render argument itself changes its
+        // variant before `convert_expr_to_pattern` and loses the parameter.
+        render_fn = region.anchor_inner(&context.arena, render_fn, item_start, item_end);
+    }
 
     // Handle async expressions
     let has_await = node.metadata.expression.has_await();
     // Check for blockers from both blocker_map and const_blocker_map (variables assigned after await)
-    let blocker_exprs = context
-        .state
-        .get_all_blockers_for_expr(&collection, &context.arena);
+    let blocker_exprs = context.state.get_all_blockers_for_expr(&collection, &context.arena);
     let has_blockers = !blocker_exprs.is_empty();
     let is_async = has_await || has_blockers;
 
@@ -536,31 +566,40 @@ pub fn each_block(node: &EachBlock, context: &mut ComponentContext) {
     };
 
     // Build $.each() call arguments
-    let mut each_args = vec![
-        context.state.node.clone(),
-        b::number(flags as f64),
-        thunk,
-        key_function,
-        render_fn,
-    ];
+    let mut each_args =
+        vec![context.state.node.clone(), b::number(flags as f64), thunk, key_function, render_fn];
 
     // Add fallback function if present
     if let Some(fallback) = &node.fallback {
+        // Same nesting bump as the body: a `{#snippet}` directly inside the
+        // `{:else}` fallback must stay local, not hoist to the component root.
+        let prev_nesting = context.state.template_nesting_level;
+        context.state.template_nesting_level += 1;
+        // Upstream visits the fallback with the each block's scope too, so an
+        // item name still shadows a same-named instance binding here.
+        let saved_scope = context.state.scope;
+        if let Some(each_scope) = context
+            .state
+            .scope_root
+            .template_scope_map
+            .get(&node.start)
+            .and_then(|idx| context.state.scope_root.all_scopes.get(*idx))
+        {
+            context.state.scope = each_scope;
+        }
         let fallback_block = visit_fragment(fallback, context);
+        context.state.scope = saved_scope;
+        context.state.template_nesting_level = prev_nesting;
         let fallback_fn = b::arrow_block(vec![b::id_pattern("$$anchor")], fallback_block.body);
         each_args.push(fallback_fn);
     }
 
     // Build the $.each() call
-    let each_call = b::call(
-        &context.arena,
-        b::member_path(&context.arena, "$.each"),
-        each_args,
-    );
+    let each_call = b::call(&context.arena, b::member_path(&context.arena, "$.each"), each_args);
 
     // Add svelte metadata
     let each_statement = if context.state.dev {
-        use crate::compiler::phases::phase3_transform::client::visitors::attribute::locate_in_source;
+        use crate::compiler::phases::phase3_transform::utils::locate_in_source;
         let (line, col) = locate_in_source(&context.state.analysis.source, node.start as usize);
         super::shared::utils::add_svelte_meta_dev(
             &context.arena,
@@ -584,20 +623,14 @@ pub fn each_block(node: &EachBlock, context: &mut ComponentContext) {
     // When is_async (has_await || has_blockers), wrap in $.async()
     if is_async {
         // Use blocker expressions from the blocker_map
-        let blockers = if has_blockers || has_await {
-            b::array(blocker_exprs)
-        } else {
-            b::array(vec![])
-        };
+        let blockers =
+            if has_blockers || has_await { b::array(blocker_exprs) } else { b::array(vec![]) };
 
         // Async values: only present when the expression itself has await.
         // When only has_blockers (no literal await), use void 0.
         // Reference: has_await ? b.array([get_collection]) : b.void0
-        let async_values = if has_await {
-            b::array(vec![get_collection])
-        } else {
-            b::undefined(&context.arena)
-        };
+        let async_values =
+            if has_await { b::array(vec![get_collection]) } else { b::undefined(&context.arena) };
 
         // Extract anchor parameter
         let anchor_param = match &context.state.node {
@@ -715,11 +748,7 @@ fn has_animate_directive(node: &EachBlock) -> bool {
 fn get_store_to_invalidate(node: &EachBlock, context: &ComponentContext) -> Option<String> {
     let obj_name = get_object_name(&node.expression)?;
     let binding = context.state.get_binding(&obj_name)?;
-    if matches!(binding.kind, BindingKind::StoreSub) {
-        Some(obj_name)
-    } else {
-        None
-    }
+    if matches!(binding.kind, BindingKind::StoreSub) { Some(obj_name) } else { None }
 }
 
 /// Get the root object name from an expression.
@@ -773,11 +802,7 @@ fn get_object_name(expr: &Expression) -> Option<String> {
 /// then check each declaration against the parent scope using `get_binding()`.
 fn get_collection_id_if_needed(node: &EachBlock, context: &mut ComponentContext) -> Option<String> {
     // Look up the each block's scope using its start position
-    let each_scope_idx = context
-        .state
-        .scope_root
-        .template_scope_map
-        .get(&node.start)?;
+    let each_scope_idx = context.state.scope_root.template_scope_map.get(&node.start)?;
 
     let each_scope = context.state.scope_root.all_scopes.get(*each_scope_idx)?;
 
@@ -869,11 +894,7 @@ fn generate_index_identifier(
     metadata: &crate::ast::template::EachBlockMetadata,
 ) -> JsExpr {
     if metadata.contains_group_binding {
-        if let Some(ref index) = metadata.index {
-            b::id(index)
-        } else {
-            b::id("$$index")
-        }
+        if let Some(ref index) = metadata.index { b::id(index) } else { b::id("$$index") }
     } else if let Some(ref index_name) = node.index {
         b::id(index_name.as_str())
     } else if let Some(ref index) = metadata.index {
@@ -1002,6 +1023,7 @@ fn build_declarations(
                 is_defined: true,
                 is_reactive: index_reactive,
                 replacement_id: None,
+                store_source: None,
             },
         );
         // A keyed each block's index is reactive — upstream gives it kind
@@ -1012,16 +1034,11 @@ fn build_declarations(
         // EachIndex kind. A non-keyed (static) index instead shadows any outer
         // same-named deep_read marker.
         if index_reactive {
-            context
-                .state
-                .transform_deep_read
-                .insert(index_name.to_string(), ());
+            context.state.transform_deep_read.insert(index_name.to_string(), ());
         } else {
-            context
-                .state
-                .transform_deep_read
-                .remove(&index_name.to_string());
+            context.state.transform_deep_read.remove(&index_name.to_string());
         }
+        context.state.each_shadowing_names.remove(&index_name.to_string());
     }
 
     // Handle simple identifier context
@@ -1045,6 +1062,7 @@ fn build_declarations(
                     is_defined: false,
                     is_reactive: true,
                     replacement_id: None,
+                    store_source: None,
                 },
             );
         } else {
@@ -1059,6 +1077,7 @@ fn build_declarations(
         // Each item is not a template-kind binding in legacy reactivity;
         // ensure any outer same-named deep_read marker is shadowed.
         context.state.transform_deep_read.remove(name);
+        context.state.each_shadowing_names.remove(name);
 
         if node.index.is_some()
             && node.metadata.contains_group_binding
@@ -1084,11 +1103,8 @@ fn build_declarations(
             if let serde_json::Value::Object(obj) = val {
                 let item_reactive = (flags & EACH_ITEM_REACTIVE) != 0;
 
-                let unwrapped_item = if item_reactive {
-                    "$.get($$item)".to_string()
-                } else {
-                    "$$item".to_string()
-                };
+                let unwrapped_item =
+                    if item_reactive { "$.get($$item)".to_string() } else { "$$item".to_string() };
 
                 // Extract paths using extract_destructured_paths that handles
                 // ArrayPattern with $.to_array() inserts and computed ObjectPattern keys.
@@ -1096,9 +1112,7 @@ fn build_declarations(
                 // time, matching the official compiler's
                 // `id.name = context.state.scope.generate('$$array')` (line 253 of EachBlock.js)
                 let (paths, inserts) =
-                    extract_destructured_paths(obj, &unwrapped_item, false, &mut || {
-                        context.state.generate_array_name()
-                    });
+                    extract_destructured_paths(obj, &unwrapped_item, false, context);
 
                 // Generate intermediate array declarations for ArrayPattern destructuring
                 // This corresponds to lines 256-262 in the official EachBlock.js
@@ -1127,6 +1141,7 @@ fn build_declarations(
                             is_defined: false,
                             is_reactive: true,
                             replacement_id: None,
+                            store_source: None,
                         },
                     );
                 }
@@ -1183,6 +1198,7 @@ fn build_declarations(
                                 is_defined: false,
                                 is_reactive: true,
                                 replacement_id: None,
+                                store_source: None,
                             },
                         );
 
@@ -1209,7 +1225,7 @@ fn build_declarations(
                             path.name.clone(),
                             IdentifierTransform {
                                 read_source: None,
-                                read: Some(|arena, node| b::call(arena, node, vec![])),
+                                read: Some(b::getter_call),
                                 assign: None,
                                 mutate: None,
                                 update: None,
@@ -1217,6 +1233,7 @@ fn build_declarations(
                                 is_defined: false,
                                 is_reactive: true,
                                 replacement_id: None,
+                                store_source: None,
                             },
                         );
 
@@ -1283,7 +1300,7 @@ fn extract_destructured_paths(
     obj: &serde_json::Map<String, serde_json::Value>,
     base_expr: &str,
     has_parent_default: bool,
-    array_name_gen: &mut dyn FnMut() -> String,
+    context: &mut ComponentContext,
 ) -> (Vec<DestructuredPath>, Vec<ArrayInsert>) {
     let mut paths = Vec::new();
     let mut inserts = Vec::new();
@@ -1295,7 +1312,7 @@ fn extract_destructured_paths(
         base_expr,
         base_expr,
         has_parent_default,
-        array_name_gen,
+        context,
     );
 
     (paths, inserts)
@@ -1309,14 +1326,11 @@ fn _extract_destructured_paths(
     expression: &str,
     _update_expression: &str,
     has_default_value: bool,
-    array_name_gen: &mut dyn FnMut() -> String,
+    context: &mut ComponentContext,
 ) {
     match param.get("type").and_then(|v| v.as_str()) {
         Some("Identifier") => {
-            let name = param
-                .get("name")
-                .and_then(|n| n.as_str())
-                .unwrap_or("$$unknown");
+            let name = param.get("name").and_then(|n| n.as_str()).unwrap_or("$$unknown");
             paths.push(DestructuredPath {
                 name: name.to_string(),
                 expression: expression.to_string(),
@@ -1423,17 +1437,15 @@ fn _extract_destructured_paths(
                                         &rest_expression,
                                         &rest_expression,
                                         has_default_value,
-                                        array_name_gen,
+                                        context,
                                     );
                                 }
                             }
                         } else if prop_type == Some("Property") {
                             let key = prop_obj.get("key").and_then(|k| k.as_object());
                             let value = prop_obj.get("value");
-                            let computed = prop_obj
-                                .get("computed")
-                                .and_then(|c| c.as_bool())
-                                .unwrap_or(false);
+                            let computed =
+                                prop_obj.get("computed").and_then(|c| c.as_bool()).unwrap_or(false);
 
                             if let (Some(key_obj), Some(value)) = (key, value) {
                                 let key_type = key_obj.get("type").and_then(|t| t.as_str());
@@ -1484,7 +1496,7 @@ fn _extract_destructured_paths(
                                         &prop_expr,
                                         &prop_update_expr,
                                         has_default_value,
-                                        array_name_gen,
+                                        context,
                                     );
                                     // Tag any newly-created paths with the deferred computed key info
                                     if let Some((base, key_json)) = deferred_key {
@@ -1509,7 +1521,7 @@ fn _extract_destructured_paths(
             };
 
             // Generate unique $$array name
-            let array_id = array_name_gen();
+            let array_id = context.state.generate_array_name();
 
             // Check if last element is RestElement
             let last_is_rest = elements
@@ -1525,10 +1537,7 @@ fn _extract_destructured_paths(
                 format!("$.to_array({}, {})", expression, elements.len())
             };
 
-            inserts.push(ArrayInsert {
-                id: array_id.clone(),
-                value: to_array_expr,
-            });
+            inserts.push(ArrayInsert { id: array_id.clone(), value: to_array_expr });
 
             // Process each element using the array_id as the base
             for (i, elem) in elements.iter().enumerate() {
@@ -1550,10 +1559,8 @@ fn _extract_destructured_paths(
                         if let Some(arg) = elem_obj.get("argument").and_then(|a| a.as_object()) {
                             let arg_type = arg.get("type").and_then(|t| t.as_str());
                             if arg_type == Some("Identifier") {
-                                let name = arg
-                                    .get("name")
-                                    .and_then(|n| n.as_str())
-                                    .unwrap_or("$$unknown");
+                                let name =
+                                    arg.get("name").and_then(|n| n.as_str()).unwrap_or("$$unknown");
                                 paths.push(DestructuredPath {
                                     name: name.to_string(),
                                     expression: rest_expression.clone(),
@@ -1571,7 +1578,7 @@ fn _extract_destructured_paths(
                                     &rest_expression,
                                     &rest_update_expression,
                                     has_default_value,
-                                    array_name_gen,
+                                    context,
                                 );
                             }
                         }
@@ -1590,7 +1597,7 @@ fn _extract_destructured_paths(
                             &array_expression,
                             &array_update_expression,
                             has_default_value,
-                            array_name_gen,
+                            context,
                         );
                     }
                 }
@@ -1603,10 +1610,7 @@ fn _extract_destructured_paths(
                 let default_val = param.get("right").cloned();
 
                 if left_type == Some("Identifier") {
-                    let name = left
-                        .get("name")
-                        .and_then(|n| n.as_str())
-                        .unwrap_or("$$unknown");
+                    let name = left.get("name").and_then(|n| n.as_str()).unwrap_or("$$unknown");
                     paths.push(DestructuredPath {
                         name: name.to_string(),
                         expression: expression.to_string(),
@@ -1617,14 +1621,23 @@ fn _extract_destructured_paths(
                         computed_key_json: None,
                     });
                 } else {
+                    // A NESTED pattern's default must wrap the base expression
+                    // (`meta: { tags: [t] } = {}` reads through
+                    // `$.fallback(item.meta, () => ({}), true)`), 写经 upstream
+                    // `_extract_paths`'s `build_fallback(expression, node.right)`.
+                    // The write-back LHS keeps the bare access.
+                    let read_expression = match default_val.as_ref() {
+                        Some(dv) => build_fallback_expression(expression, Some(dv), context),
+                        None => expression.to_string(),
+                    };
                     _extract_destructured_paths(
                         paths,
                         inserts,
                         left,
-                        expression,
+                        &read_expression,
                         _update_expression,
                         true,
-                        array_name_gen,
+                        context,
                     );
                 }
             }
@@ -1638,11 +1651,9 @@ fn format_json_expr_for_key(key_obj: &serde_json::Map<String, serde_json::Value>
     let key_type = key_obj.get("type").and_then(|t| t.as_str());
 
     match key_type {
-        Some("Identifier") => key_obj
-            .get("name")
-            .and_then(|n| n.as_str())
-            .unwrap_or("unknown")
-            .to_string(),
+        Some("Identifier") => {
+            key_obj.get("name").and_then(|n| n.as_str()).unwrap_or("unknown").to_string()
+        }
         Some("Literal") => {
             if let Some(raw) = key_obj.get("raw").and_then(|r| r.as_str()) {
                 raw.to_string()
@@ -1658,11 +1669,8 @@ fn format_json_expr_for_key(key_obj: &serde_json::Map<String, serde_json::Value>
         }
         Some("CallExpression") => {
             let callee = key_obj.get("callee");
-            let args = key_obj
-                .get("arguments")
-                .and_then(|a| a.as_array())
-                .cloned()
-                .unwrap_or_default();
+            let args =
+                key_obj.get("arguments").and_then(|a| a.as_array()).cloned().unwrap_or_default();
 
             let callee_str = if let Some(callee_val) = callee {
                 if let Some(callee_obj) = callee_val.as_object() {
@@ -1692,10 +1700,7 @@ fn format_json_expr_for_key(key_obj: &serde_json::Map<String, serde_json::Value>
         Some("MemberExpression") => {
             let object = key_obj.get("object").and_then(|o| o.as_object());
             let property = key_obj.get("property").and_then(|p| p.as_object());
-            let computed = key_obj
-                .get("computed")
-                .and_then(|c| c.as_bool())
-                .unwrap_or(false);
+            let computed = key_obj.get("computed").and_then(|c| c.as_bool()).unwrap_or(false);
 
             let obj_str = object.map_or("unknown".to_string(), format_json_expr_for_key);
             let prop_str = property.map_or("unknown".to_string(), format_json_expr_for_key);
@@ -1709,10 +1714,7 @@ fn format_json_expr_for_key(key_obj: &serde_json::Map<String, serde_json::Value>
         Some("BinaryExpression") => {
             let left = key_obj.get("left").and_then(|l| l.as_object());
             let right = key_obj.get("right").and_then(|r| r.as_object());
-            let operator = key_obj
-                .get("operator")
-                .and_then(|o| o.as_str())
-                .unwrap_or("+");
+            let operator = key_obj.get("operator").and_then(|o| o.as_str()).unwrap_or("+");
 
             let left_str = left.map_or("unknown".to_string(), format_json_expr_for_key);
             let right_str = right.map_or("unknown".to_string(), format_json_expr_for_key);
@@ -1721,14 +1723,8 @@ fn format_json_expr_for_key(key_obj: &serde_json::Map<String, serde_json::Value>
         }
         Some("UnaryExpression") => {
             let argument = key_obj.get("argument").and_then(|a| a.as_object());
-            let operator = key_obj
-                .get("operator")
-                .and_then(|o| o.as_str())
-                .unwrap_or("-");
-            let prefix = key_obj
-                .get("prefix")
-                .and_then(|p| p.as_bool())
-                .unwrap_or(true);
+            let operator = key_obj.get("operator").and_then(|o| o.as_str()).unwrap_or("-");
+            let prefix = key_obj.get("prefix").and_then(|p| p.as_bool()).unwrap_or(true);
 
             let arg_str = argument.map_or("unknown".to_string(), format_json_expr_for_key);
 
@@ -1751,16 +1747,10 @@ fn format_json_expr_for_key(key_obj: &serde_json::Map<String, serde_json::Value>
         }
         Some("TemplateLiteral") => {
             // Simple template literal support
-            let quasis = key_obj
-                .get("quasis")
-                .and_then(|q| q.as_array())
-                .cloned()
-                .unwrap_or_default();
-            let expressions = key_obj
-                .get("expressions")
-                .and_then(|e| e.as_array())
-                .cloned()
-                .unwrap_or_default();
+            let quasis =
+                key_obj.get("quasis").and_then(|q| q.as_array()).cloned().unwrap_or_default();
+            let expressions =
+                key_obj.get("expressions").and_then(|e| e.as_array()).cloned().unwrap_or_default();
 
             let mut result = String::from("`");
             for (i, quasi) in quasis.iter().enumerate() {
@@ -1807,10 +1797,7 @@ fn build_fallback_expression(
             format!("$.fallback({}, {})", expression, default_str)
         } else if let Some(obj) = default_val.as_object()
             && obj.get("type").and_then(|t| t.as_str()) == Some("CallExpression")
-            && obj
-                .get("arguments")
-                .and_then(|a| a.as_array())
-                .is_some_and(|a| a.is_empty())
+            && obj.get("arguments").and_then(|a| a.as_array()).is_some_and(|a| a.is_empty())
             && let Some(callee) = obj.get("callee").and_then(|c| c.as_object())
             && callee.get("type").and_then(|t| t.as_str()) == Some("Identifier")
         {
@@ -1834,6 +1821,13 @@ fn build_fallback_expression(
                     &default_expr,
                     &context.arena,
                 );
+            // An object-literal default must be parenthesized in the arrow body
+            // (`() => ({})`), or it parses as an empty function body.
+            let default_str = if default_str.starts_with('{') {
+                format!("({})", default_str)
+            } else {
+                default_str
+            };
             format!("$.fallback({}, () => {}, true)", expression, default_str)
         }
     } else {
@@ -1907,14 +1901,27 @@ fn build_key_function(
             LocalScope, apply_transforms_to_expression_with_shadowed,
         };
         let local_scope = LocalScope::from_shadowed(shadowed_names.into_iter());
-        let key_expr =
+        let mut key_expr =
             apply_transforms_to_expression_with_shadowed(&key_expr, context, &local_scope);
+        if let (Some(start), Some(end), Some((region_start, region_end))) =
+            (key.start(), key.end(), each_key_region(node, &context.state.options.source))
+            && let Some(region) =
+                CommentRegion::between(&context.state, region_start, region_end, region_start)
+        {
+            key_expr = region.anchor(&context.arena, key_expr, start, end);
+        }
 
         if let Some(context_expr) = &node.context {
-            let pattern = convert_expression_to_pattern(&context.arena, context_expr);
+            // 写经 upstream #18521 `context.visit(node.context, key_state)`: the
+            // key-function parameter pattern is visited under `key_state`, so a
+            // COMPUTED destructuring key (`{ [labelKey]: label }`) has its key
+            // expression rewritten to the prop / state access
+            // (`{ [$$props.labelKey]: label }`), while the each-context binding
+            // names stay shadowed.
+            let pattern = convert_context_pattern(context, context_expr, &local_scope);
 
             let params = if key_uses_index {
-                vec![pattern, convert_expr_to_pattern(index)]
+                vec![pattern, convert_expr_to_pattern(index, &context.arena)]
             } else {
                 vec![pattern]
             };
@@ -1924,6 +1931,19 @@ fn build_key_function(
     }
 
     b::member_path(&context.arena, "$.index")
+}
+
+/// The source inside the keyed-each parentheses. `EachBlock::key` starts at
+/// the expression, after leading trivia, so recover the opening delimiter from
+/// the code-only suffix after the item pattern. This deliberately ignores a
+/// `(` written inside a comment.
+fn each_key_region(node: &EachBlock<'_>, source: &str) -> Option<(u32, u32)> {
+    let context_end = node.context.as_ref()?.end()?;
+    let key_start = node.key.as_ref()?.start()?;
+    let key_end = node.key.as_ref()?.end()?;
+    let between = source.get(context_end as usize..key_start as usize)?;
+    let open = find_code(between.as_bytes(), b"(")? as u32;
+    Some((context_end + open + 1, key_end))
 }
 
 /// Collect all identifier names bound by a pattern (Identifier / ObjectPattern / ArrayPattern).
@@ -2010,9 +2030,9 @@ fn json_value_references_identifier(val: &serde_json::Value, name: &str) -> bool
             }
             false
         }
-        serde_json::Value::Array(arr) => arr
-            .iter()
-            .any(|v| json_value_references_identifier(v, name)),
+        serde_json::Value::Array(arr) => {
+            arr.iter().any(|v| json_value_references_identifier(v, name))
+        }
         _ => false,
     }
 }
@@ -2042,12 +2062,36 @@ fn visit_fragment(fragment: &Fragment, context: &mut ComponentContext) -> JsBloc
     visit_fragment_impl(fragment, context, true)
 }
 
-/// Convert an AST Expression to a JsPattern.
-#[allow(clippy::only_used_in_recursion)]
-fn convert_expression_to_pattern(
-    arena: &crate::compiler::phases::phase3_transform::js_ast::arena::JsArena,
+/// Convert the keyed-each KEY-FUNCTION parameter pattern (写经 upstream #18521's
+/// `context.visit(node.context, key_state)`): a COMPUTED destructuring key has
+/// its key expression converted and read-wrapped under the each-block
+/// `key_state` transforms (`{ [labelKey]: label }` → `{ [$$props.labelKey]:
+/// label }`), while the each-context binding names remain shadowed via
+/// `local_scope`. All other pattern shapes convert structurally.
+/// The key of a non-computed, non-identifier destructuring property, keeping the
+/// source spelling so the printed quote style matches.
+fn literal_property_key(
+    key: &serde_json::Map<String, serde_json::Value>,
+) -> Option<crate::compiler::phases::phase3_transform::js_ast::JsLiteral> {
+    use crate::compiler::phases::phase3_transform::js_ast::JsLiteral;
+    match key.get("value") {
+        Some(serde_json::Value::String(s)) => Some(match key.get("raw").and_then(|r| r.as_str()) {
+            Some(raw) if !raw.is_empty() => {
+                JsLiteral::RawString { value: s.as_str().into(), raw: raw.into() }
+            }
+            _ => JsLiteral::String(s.as_str().into()),
+        }),
+        Some(serde_json::Value::Number(n)) => Some(JsLiteral::Number(n.as_f64()?)),
+        _ => None,
+    }
+}
+
+fn convert_context_pattern(
+    context: &mut ComponentContext,
     expr: &Expression,
+    local_scope: &crate::compiler::phases::phase3_transform::client::visitors::shared::utils::LocalScope,
 ) -> JsPattern {
+    use crate::compiler::phases::phase3_transform::client::visitors::shared::utils::apply_transforms_to_expression_with_shadowed;
     let val = expr.as_json();
     if let serde_json::Value::Object(obj) = val {
         match obj.get("type").and_then(|v| v.as_str()) {
@@ -2058,83 +2102,144 @@ fn convert_expression_to_pattern(
             }
             Some("ObjectPattern") => {
                 if let Some(props) = obj.get("properties").and_then(|p| p.as_array()) {
-                    let properties = props
-                        .iter()
-                        .filter_map(|prop| {
-                            let prop_obj = prop.as_object()?;
-                            // A rest element `{ ...rest }` has no `key`; preserve it
-                            // as a Rest property so the key-function parameter keeps
-                            // the full destructure (matching upstream).
-                            if prop_obj.get("type").and_then(|t| t.as_str()) == Some("RestElement")
-                            {
-                                let arg = prop_obj.get("argument")?;
-                                let inner = convert_expression_to_pattern(
-                                    arena,
+                    let mut properties = Vec::with_capacity(props.len());
+                    for prop in props {
+                        let Some(prop_obj) = prop.as_object() else {
+                            continue;
+                        };
+                        if prop_obj.get("type").and_then(|t| t.as_str()) == Some("RestElement") {
+                            if let Some(arg) = prop_obj.get("argument") {
+                                let inner = convert_context_pattern(
+                                    context,
                                     &Expression::from_json(arg.clone()),
+                                    local_scope,
                                 );
-                                return Some(JsObjectPatternProperty::Rest(Box::new(inner)));
+                                properties.push(JsObjectPatternProperty::Rest(Box::new(inner)));
                             }
-                            let key = prop_obj.get("key")?.as_object()?;
-                            let key_name = key.get("name")?.as_str()?;
-                            let value = prop_obj.get("value")?;
-
-                            let value_pattern = if value.is_object() {
-                                convert_expression_to_pattern(
-                                    arena,
-                                    &Expression::from_json(value.clone()),
-                                )
-                            } else {
-                                JsPattern::Identifier(key_name.into())
+                            continue;
+                        }
+                        let (Some(key), Some(value)) = (prop_obj.get("key"), prop_obj.get("value"))
+                        else {
+                            continue;
+                        };
+                        let computed =
+                            prop_obj.get("computed").and_then(|c| c.as_bool()).unwrap_or(false);
+                        if computed {
+                            let key_js =
+                                convert_expression(&Expression::from_json(key.clone()), context);
+                            let key_js = apply_transforms_to_expression_with_shadowed(
+                                &key_js,
+                                context,
+                                local_scope,
+                            );
+                            let id = context.arena.alloc_expr(key_js);
+                            let value_pattern = convert_context_pattern(
+                                context,
+                                &Expression::from_json(value.clone()),
+                                local_scope,
+                            );
+                            properties.push(JsObjectPatternProperty::Property {
+                                key: JsPropertyKey::Computed(id),
+                                value: value_pattern,
+                                computed: true,
+                                shorthand: false,
+                            });
+                        } else {
+                            let key_obj = key.as_object();
+                            let key_name =
+                                key_obj.and_then(|k| k.get("name")).and_then(|n| n.as_str());
+                            // A literal key that is not a valid identifier
+                            // (`{ 'a-b': z }`) carries no `name`; dropping the
+                            // property left its value binding unbound in the
+                            // emitted key function.
+                            let key_js = match key_name {
+                                Some(name) => JsPropertyKey::Identifier(name.into()),
+                                None => match key_obj.and_then(literal_property_key) {
+                                    Some(lit) => JsPropertyKey::Literal(lit),
+                                    None => continue,
+                                },
                             };
-
-                            let shorthand = prop_obj
-                                .get("shorthand")
-                                .and_then(|s| s.as_bool())
-                                .unwrap_or(false);
-
-                            Some(JsObjectPatternProperty::Property {
-                                key: JsPropertyKey::Identifier(key_name.into()),
+                            let value_pattern = if value.is_object() {
+                                convert_context_pattern(
+                                    context,
+                                    &Expression::from_json(value.clone()),
+                                    local_scope,
+                                )
+                            } else if let Some(name) = key_name {
+                                JsPattern::Identifier(name.into())
+                            } else {
+                                continue;
+                            };
+                            let shorthand = key_name.is_some()
+                                && prop_obj
+                                    .get("shorthand")
+                                    .and_then(|s| s.as_bool())
+                                    .unwrap_or(false);
+                            properties.push(JsObjectPatternProperty::Property {
+                                key: key_js,
                                 value: value_pattern,
                                 computed: false,
                                 shorthand,
-                            })
-                        })
-                        .collect();
-
+                            });
+                        }
+                    }
                     return JsPattern::Object(JsObjectPattern { properties });
                 }
             }
             Some("ArrayPattern") => {
                 if let Some(elems) = obj.get("elements").and_then(|e| e.as_array()) {
-                    let elements = elems
-                        .iter()
-                        .map(|elem| {
-                            if elem.is_null() {
-                                None
-                            } else {
-                                Some(convert_expression_to_pattern(
-                                    arena,
-                                    &Expression::from_json(elem.clone()),
-                                ))
-                            }
-                        })
-                        .collect();
-
+                    let mut elements = Vec::with_capacity(elems.len());
+                    for elem in elems {
+                        if elem.is_null() {
+                            elements.push(None);
+                        } else {
+                            elements.push(Some(convert_context_pattern(
+                                context,
+                                &Expression::from_json(elem.clone()),
+                                local_scope,
+                            )));
+                        }
+                    }
                     return JsPattern::Array(JsArrayPattern { elements });
                 }
             }
             Some("RestElement") => {
                 if let Some(arg) = obj.get("argument") {
-                    let inner =
-                        convert_expression_to_pattern(arena, &Expression::from_json(arg.clone()));
+                    let inner = convert_context_pattern(
+                        context,
+                        &Expression::from_json(arg.clone()),
+                        local_scope,
+                    );
                     return JsPattern::Rest(Box::new(inner));
                 }
             }
             Some("AssignmentPattern") => {
-                #[allow(unused_variables)]
-                if let (Some(left), Some(_right)) = (obj.get("left"), obj.get("right")) {
-                    let left_pattern =
-                        convert_expression_to_pattern(arena, &Expression::from_json(left.clone()));
+                if let Some(left) = obj.get("left") {
+                    let left_pattern = convert_context_pattern(
+                        context,
+                        &Expression::from_json(left.clone()),
+                        local_scope,
+                    );
+                    // Keep the DEFAULT: upstream visits the whole pattern under
+                    // `key_state`, so `[first = 0]` keys on the defaulted value.
+                    // The default expression itself is visited (prop/state reads
+                    // rewritten; the context names stay shadowed).
+                    if let Some(right) = obj.get("right") {
+                        let right_js =
+                            convert_expression(&Expression::from_json(right.clone()), context);
+                        let right_js = apply_transforms_to_expression_with_shadowed(
+                            &right_js,
+                            context,
+                            local_scope,
+                        );
+                        let right_id = context.arena.alloc_expr(right_js);
+                        return JsPattern::Assignment(
+                            crate::compiler::phases::phase3_transform::js_ast::JsAssignmentPattern {
+                                left: Box::new(left_pattern),
+                                right: right_id,
+                            },
+                        );
+                    }
                     return left_pattern;
                 }
             }
@@ -2145,9 +2250,18 @@ fn convert_expression_to_pattern(
 }
 
 /// Convert a JsExpr reference to a pattern.
-fn convert_expr_to_pattern(expr: &JsExpr) -> JsPattern {
+fn convert_expr_to_pattern(
+    expr: &JsExpr,
+    arena: &crate::compiler::phases::phase3_transform::js_ast::JsArena,
+) -> JsPattern {
     match expr {
         JsExpr::Identifier(name) => JsPattern::Identifier(name.clone()),
+        JsExpr::Spanned(inner, start, end) => match arena.get_expr(*inner) {
+            JsExpr::Identifier(name) => {
+                JsPattern::SpannedIdentifier { name: name.clone(), start: *start, end: *end }
+            }
+            _ => JsPattern::Identifier("$$param".into()),
+        },
         _ => JsPattern::Identifier("$$param".into()),
     }
 }
@@ -2287,20 +2401,5 @@ mod tests {
         }));
         assert!(expression_references_identifier(&expr, "i"));
         assert!(!expression_references_identifier(&expr, "j"));
-    }
-
-    #[test]
-    fn test_convert_simple_pattern() {
-        let arena = crate::compiler::phases::phase3_transform::js_ast::arena::JsArena::new();
-        let expr = Expression::from_json(serde_json::json!({
-            "type": "Identifier",
-            "name": "item"
-        }));
-
-        let pattern = convert_expression_to_pattern(&arena, &expr);
-        match pattern {
-            JsPattern::Identifier(name) => assert_eq!(name, "item"),
-            _ => panic!("Expected identifier pattern"),
-        }
     }
 }

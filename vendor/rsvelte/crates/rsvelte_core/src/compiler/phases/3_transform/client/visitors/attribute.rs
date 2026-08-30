@@ -4,41 +4,19 @@
 //! `svelte/packages/svelte/src/compiler/phases/3-transform/client/visitors/Attribute.js`.
 
 use crate::ast::template::{Attribute, AttributeNode};
+use crate::compiler::phases::phase3_transform::client::source_anchor::CommentRegion;
 use crate::compiler::phases::phase3_transform::client::types::ComponentContext;
+use crate::compiler::phases::phase3_transform::client::types::Memoizer;
 use crate::compiler::phases::phase3_transform::client::visitors::shared::events::{
     build_event, convert_arrow_to_named_function,
 };
+use crate::compiler::phases::phase3_transform::client::visitors::shared::utils::{
+    build_render_statement_with_memoizer, expression_has_await,
+};
 use crate::compiler::phases::phase3_transform::js_ast::nodes::JsExpr;
+use crate::compiler::phases::phase3_transform::utils::locate_in_source;
 #[cfg(test)]
 use crate::compiler::utils::can_delegate_event;
-
-/// Visit an Attribute node and generate client-side code.
-///
-/// This visitor handles regular attributes and event attributes (on:*).
-/// For event attributes, it delegates to `visit_event_attribute`.
-///
-/// # Arguments
-///
-/// * `node` - The attribute node to visit
-/// * `context` - The component transformation context
-///
-/// # Corresponds to
-///
-/// `Attribute` function in `svelte/packages/svelte/src/compiler/phases/3-transform/client/visitors/Attribute.js`:
-///
-/// ```javascript
-/// export function Attribute(node, context) {
-///     if (is_event_attribute(node)) {
-///         visit_event_attribute(node, context);
-///     }
-/// }
-/// ```
-pub fn visit_attribute(node: &Attribute, context: &mut ComponentContext) {
-    // Check if this is an event attribute (on:*)
-    if let Some(attr_node) = is_event_attribute(node) {
-        visit_event_attribute(attr_node, context);
-    }
-}
 
 /// Check if an attribute is an event attribute.
 ///
@@ -55,7 +33,7 @@ pub fn visit_attribute(node: &Attribute, context: &mut ComponentContext) {
 ///     return is_expression_attribute(attribute) && attribute.name.startsWith('on');
 /// }
 /// ```
-pub fn is_event_attribute(attribute: &Attribute) -> Option<&AttributeNode> {
+pub fn is_event_attribute<'a>(attribute: &'a Attribute<'a>) -> Option<&'a AttributeNode<'a>> {
     match attribute {
         Attribute::Attribute(attr_node) => {
             // Check if name starts with "on"
@@ -64,11 +42,7 @@ pub fn is_event_attribute(attribute: &Attribute) -> Option<&AttributeNode> {
             }
 
             // Check if value is an expression
-            if is_expression_attribute_value(&attr_node.value) {
-                Some(attr_node)
-            } else {
-                None
-            }
+            if is_expression_attribute_value(&attr_node.value) { Some(attr_node) } else { None }
         }
         _ => None,
     }
@@ -181,14 +155,14 @@ pub fn visit_event_attribute(node: &AttributeNode, context: &mut ComponentContex
     // Extract the expression tag from the attribute value
     let expr_tag = extract_expression_tag(&node.value);
 
-    // Build the event handler
-    // Set in_event_attribute_handler flag so that coercive assignment transforms
-    // ($.assign) are skipped inside event handler arrow functions.
-    // Reference: AssignmentExpression.js lines 189-209
-    let saved_in_event_attribute = context.state.in_event_attribute_handler;
-    context.state.in_event_attribute_handler = true;
-    let handler = build_event_handler(expr_tag, context);
-    context.state.in_event_attribute_handler = saved_in_event_attribute;
+    // Upstream currently leaves an `await` inside the non-async event wrapper.
+    // Resolve async handlers through a local template-effect memoizer instead,
+    // so the awaited expression lives only in an `async () => ...` thunk.
+    let has_await =
+        expr_tag.metadata.expression.has_await() || expression_has_await(&expr_tag.expression);
+    let mut local_memoizer =
+        has_await.then(|| Memoizer::with_parent_conflicts(&context.state.memoizer));
+    let handler = build_event_handler(expr_tag, context, local_memoizer.as_mut());
 
     // Determine if this event should be delegated.
     //
@@ -210,14 +184,20 @@ pub fn visit_event_attribute(node: &AttributeNode, context: &mut ComponentContex
     // Only generate a name if the handler is actually an arrow function, to avoid consuming
     // names from the conflicts set unnecessarily.
     // Reference: events.js build_event(): `if (dev && handler.type === 'ArrowFunctionExpression')`
-    let handler = if context.state.options.dev && matches!(handler, JsExpr::Arrow(_)) {
+    let mut handler = if context.state.options.dev && matches!(handler, JsExpr::Arrow(_)) {
         let name = context.state.memoizer.generate_id(event_name);
         convert_arrow_to_named_function(handler, name.into())
     } else {
         handler
     };
 
-    let statement = b::stmt(
+    if let (Some(start), Some(end)) = (expr_tag.expression.start(), expr_tag.expression.end())
+        && let Some(region) = CommentRegion::of(&context.state, expr_tag, expr_tag.start + 1)
+    {
+        handler = region.anchor_inner(&context.arena, handler, start, end);
+    }
+
+    let mut statement = b::stmt(
         &context.arena,
         build_event(
             &context.arena,
@@ -229,6 +209,20 @@ pub fn visit_event_attribute(node: &AttributeNode, context: &mut ComponentContex
             delegated,
         ),
     );
+
+    if let Some(memoizer) = &local_memoizer {
+        statement = b::stmt(
+            &context.arena,
+            build_render_statement_with_memoizer(
+                &context.arena,
+                vec![statement],
+                memoizer.get_params(),
+                memoizer.sync_values(&context.arena),
+                memoizer.async_values(&context.arena),
+                None,
+            ),
+        );
+    }
 
     // Check if the parent is a special element (svelte:window, svelte:document, svelte:body)
     let is_special_element = context.current_parent().is_some_and(|parent| {
@@ -255,9 +249,9 @@ pub fn visit_event_attribute(node: &AttributeNode, context: &mut ComponentContex
 /// Extract the expression tag from an attribute value.
 ///
 /// Handles both direct ExpressionTag and single-element Sequence cases.
-pub fn extract_expression_tag(
-    value: &crate::ast::template::AttributeValue,
-) -> &crate::ast::template::ExpressionTag {
+pub fn extract_expression_tag<'a>(
+    value: &'a crate::ast::template::AttributeValue<'a>,
+) -> &'a crate::ast::template::ExpressionTag<'a> {
     use crate::ast::template::{AttributeValue, AttributeValuePart};
 
     match value {
@@ -288,6 +282,7 @@ pub fn extract_expression_tag(
 pub fn build_event_handler(
     expr_tag: &crate::ast::template::ExpressionTag,
     context: &mut ComponentContext,
+    async_memoizer: Option<&mut Memoizer>,
 ) -> crate::compiler::phases::phase3_transform::js_ast::nodes::JsExpr {
     use crate::compiler::phases::phase3_transform::js_ast::builders as b;
     use crate::compiler::phases::phase3_transform::js_ast::nodes::JsExpr;
@@ -299,16 +294,31 @@ pub fn build_event_handler(
     // Apply state transforms (e.g., count++ -> $.update(count))
     use crate::compiler::phases::phase3_transform::client::visitors::shared::utils::apply_transforms_to_expression;
     let js_expr = apply_transforms_to_expression(&js_expr, context);
+    let is_async_memoized = async_memoizer.is_some();
+    let js_expr = if let Some(memoizer) = async_memoizer {
+        memoizer.add(js_expr, false, true, false, false)
+    } else {
+        js_expr
+    };
 
     // Check if it's already a function
-    if matches!(js_expr, JsExpr::Arrow(_) | JsExpr::Function(_)) {
+    let mut unspanned = &js_expr;
+    while let JsExpr::Spanned(inner, _, _) = unspanned {
+        unspanned = context.arena.get_expr(*inner);
+    }
+
+    if matches!(unspanned, JsExpr::Arrow(_) | JsExpr::Function(_)) {
         return js_expr;
     }
 
     // Check if it's an identifier
-    if let JsExpr::Identifier(name) = &js_expr {
-        // Check if this identifier refers to a function in the scope
-        let binding = context.state.get_binding(name);
+    if let JsExpr::Identifier(name) = unspanned {
+        // Check if this identifier refers to a function in the scope.
+        // `resolve_shadowing_snippet_binding` (not a plain `get_binding`) so a
+        // block-local `{#snippet}` that shadows a same-named outer function
+        // correctly resolves to the snippet — see its doc comment for why
+        // `get_binding` alone can't be trusted here.
+        let binding = crate::compiler::phases::phase3_transform::client::visitors::shared::utils::resolve_shadowing_snippet_binding(name, context);
 
         if let Some(binding) = &binding {
             // If the binding's initial value is a function, use it as-is
@@ -322,21 +332,18 @@ pub fn build_event_handler(
         // trivially passes (matches JS optional chaining: binding?.declaration_kind !== 'import').
         use crate::compiler::phases::phase2_analyze::scope::DeclarationKind;
         if !context.state.dev
-            && binding
-                .as_ref()
-                .is_none_or(|b| b.declaration_kind != DeclarationKind::Import)
+            && binding.as_ref().is_none_or(|b| b.declaration_kind != DeclarationKind::Import)
         {
             return js_expr;
         }
     }
 
-    // Memoisation here uses the same broad "any CallExpression in the tree"
-    // semantics as the rest of Phase 3 — see `expression_tag_has_call` in
-    // `shared/element.rs` for why we don't read Phase 2's narrower flag.
-    let has_call =
-        crate::compiler::phases::phase3_transform::client::visitors::shared::element::expression_tag_has_call(
-            expr_tag,
-        );
+    // Use the analyzed call classification now that every attribute host
+    // populates it. An awaited call is already represented by the local
+    // memoizer's `$0`; deriving that identifier in component init would put
+    // `$0` outside the template-effect callback that binds it (visible
+    // specifically in dev).
+    let has_call = !is_async_memoized && expr_tag.metadata.expression.has_call();
 
     let mut js_expr = js_expr;
 
@@ -346,17 +353,10 @@ pub fn build_event_handler(
 
         // Create $.derived(thunk(handler)) - thunk optimizes () => fn() to fn
         let derived_arg = b::thunk(&context.arena, js_expr.clone());
-        let derived_call = b::call(
-            &context.arena,
-            b::member_path(&context.arena, "$.derived"),
-            vec![derived_arg],
-        );
+        let derived_call =
+            b::call(&context.arena, b::member_path(&context.arena, "$.derived"), vec![derived_arg]);
 
-        context.state.init.push(b::var_decl(
-            &context.arena,
-            &handler_name,
-            Some(derived_call),
-        ));
+        context.state.init.push(b::var_decl(&context.arena, &handler_name, Some(derived_call)));
 
         // Use $.get(handler_id) to get the current value - this becomes the new handler
         js_expr = b::call(
@@ -401,12 +401,11 @@ pub fn build_event_handler(
             apply_args.push(b::boolean(true));
         }
 
-        b::call(
-            &context.arena,
-            b::member_path(&context.arena, "$.apply"),
-            apply_args,
-        )
+        b::call(&context.arena, b::member_path(&context.arena, "$.apply"), apply_args)
     } else {
+        // Upstream's handler is still its own `ChainExpression`, so the `apply`
+        // member lands outside the chain and the printer parenthesises it.
+        let js_expr = b::close_optional_chain(&context.arena, js_expr);
         b::call(
             &context.arena,
             b::optional_member(&context.arena, js_expr, "apply"),
@@ -453,37 +452,12 @@ fn is_capture_event(name: &str) -> bool {
 /// }
 /// ```
 pub fn is_passive_event(name: &str) -> Option<bool> {
-    if matches!(name, "touchstart" | "touchmove") {
-        Some(true)
-    } else {
-        None
-    }
-}
-
-/// Compute 1-based line and 0-based column from a byte offset in source code.
-/// This matches the behavior of the `locator` function in the official Svelte compiler,
-/// which uses `getLocator(source, { offsetLine: 1 })` from `locate-character`.
-pub fn locate_in_source(source: &str, offset: usize) -> (usize, usize) {
-    let offset = offset.min(source.len());
-    let mut line = 1usize; // 1-based lines (offsetLine: 1)
-    let mut col = 0usize;
-    for (i, ch) in source.char_indices() {
-        if i >= offset {
-            break;
-        }
-        if ch == '\n' {
-            line += 1;
-            col = 0;
-        } else {
-            col += 1;
-        }
-    }
-    (line, col)
+    if matches!(name, "touchstart" | "touchmove") { Some(true) } else { None }
 }
 
 /// Check if an expression has side effects.
 /// Matches `has_side_effects` in events.js.
-fn expression_has_side_effects(expr: &crate::ast::js::Expression) -> bool {
+pub(super) fn expression_has_side_effects(expr: &crate::ast::js::Expression) -> bool {
     match expr.node_type() {
         Some("CallExpression" | "NewExpression" | "AssignmentExpression" | "UpdateExpression") => {
             true
@@ -516,7 +490,7 @@ fn json_has_side_effects(value: &serde_json::Value) -> bool {
 
 /// Check if expression is a call with no arguments to an identifier (for remove_parens).
 /// Matches the `remove_parens` check in events.js.
-fn expression_is_removable_call(
+pub(super) fn expression_is_removable_call(
     expr: &crate::ast::js::Expression,
     arena: &crate::ast::arena::ParseArena,
 ) -> bool {
@@ -567,9 +541,7 @@ mod tests {
             expression: Expression::from_json(serde_json::Value::Null),
             metadata: Default::default(),
         };
-        assert!(is_expression_attribute_value(&AttributeValue::Expression(
-            expr_tag.clone()
-        )));
+        assert!(is_expression_attribute_value(&AttributeValue::Expression(expr_tag.clone())));
 
         // Single-element sequence with ExpressionTag is an expression
         let sequence =

@@ -4,12 +4,11 @@
 //!
 //! This module corresponds to `svelte/packages/svelte/src/compiler/phases/1-parse/utils/bracket.js`
 
-use memchr::{memchr, memmem};
+use crate::compiler::phases::phase3_transform::shared::js_scan::slash_starts_regex_at;
+use memchr::memchr;
 
-use crate::error::{ParseError, ParseResult};
-use rustc_hash::FxHashMap;
-
-use super::super::parser::Parser;
+static BLOCK_COMMENT_END_FINDER: std::sync::LazyLock<memchr::memmem::Finder<'static>> =
+    std::sync::LazyLock::new(|| memchr::memmem::Finder::new(b"*/"));
 
 /// Find the end of a string expression.
 ///
@@ -20,15 +19,15 @@ use super::super::parser::Parser;
 ///
 /// # Returns
 /// The index of the end of this string expression, or `usize::MAX` if not found
-fn find_string_end(string: &str, search_start_index: usize, string_start_char: char) -> usize {
-    let string_to_search = if string_start_char == '`' {
+fn find_string_end(string: &str, search_start_index: usize, string_start_char: u8) -> usize {
+    let string_to_search = if string_start_char == b'`' {
         string
     } else {
         // we could slice at the search start index, but this way the index remains valid
-        // For single/double quotes, search only until the end of the current line
-        let newline_pos = memchr(b'\n', &string.as_bytes()[search_start_index..])
-            .map(|p| search_start_index + p)
-            .unwrap_or(string.len()); // If no newline, use the whole string
+        // A quoted string ends at the line's end — unless the newline is itself
+        // escaped, which is a LINE CONTINUATION and part of the string.
+        let newline_pos = find_unescaped_char(string, search_start_index, b'\n');
+        let newline_pos = if newline_pos == usize::MAX { string.len() } else { newline_pos };
         &string[0..newline_pos]
     };
 
@@ -44,7 +43,32 @@ fn find_string_end(string: &str, search_start_index: usize, string_start_char: c
 /// # Returns
 /// The index of the end of this regex expression, or `usize::MAX` if not found
 fn find_regex_end(string: &str, search_start_index: usize) -> usize {
-    find_unescaped_char(string, search_start_index, '/')
+    let bytes = string.as_bytes();
+    let mut i = search_start_index;
+    let mut in_character_class = false;
+
+    while i < bytes.len() {
+        match bytes[i] {
+            // An escape consumes the following byte both inside and outside a
+            // character class. In particular, `\]` must not close the class.
+            b'\\' => i += 2,
+            b'[' if !in_character_class => {
+                in_character_class = true;
+                i += 1;
+            }
+            b']' if in_character_class => {
+                in_character_class = false;
+                i += 1;
+            }
+            // A slash inside `[...]` is data, not the regex delimiter.
+            b'/' if !in_character_class => return i,
+            // JavaScript regex literals cannot contain a bare line terminator.
+            b'\n' | b'\r' => return usize::MAX,
+            _ => i += 1,
+        }
+    }
+
+    usize::MAX
 }
 
 /// Find the closing backtick of a template literal, properly handling `${...}`
@@ -103,14 +127,13 @@ fn find_template_literal_end(string: &str, start: usize) -> usize {
 ///
 /// # Returns
 /// The index of the first unescaped instance of `char`, or `usize::MAX` if not found
-fn find_unescaped_char(string: &str, search_start_index: usize, ch: char) -> usize {
+fn find_unescaped_char(string: &str, search_start_index: usize, ch: u8) -> usize {
+    let bytes = string.as_bytes();
     let mut i = search_start_index;
     loop {
-        let found_index = string[i..].find(ch).map(|p| i + p).unwrap_or(usize::MAX);
-
-        if found_index == usize::MAX {
+        let Some(found_index) = memchr(ch, &bytes[i..]).map(|p| i + p) else {
             return usize::MAX;
-        }
+        };
 
         if found_index == 0 || count_leading_backslashes(string, found_index - 1).is_multiple_of(2)
         {
@@ -148,6 +171,17 @@ fn count_leading_backslashes(string: &str, search_start_index: usize) -> usize {
     count
 }
 
+/// Bytes that can hide a bracket (string, template literal, comment or regex
+/// openers) and therefore need the state machine.
+static OPAQUE_BYTE: [bool; 256] = {
+    let mut table = [false; 256];
+    table[b'\'' as usize] = true;
+    table[b'"' as usize] = true;
+    table[b'`' as usize] = true;
+    table[b'/' as usize] = true;
+    table
+};
+
 /// Finds the corresponding closing bracket, ignoring brackets found inside comments,
 /// strings, or regex expressions.
 ///
@@ -166,50 +200,8 @@ pub fn find_matching_bracket(template: &str, index: usize, open: char) -> Option
         _ => return None,
     };
     let bytes = template.as_bytes();
-
-    // Fast path: for simple expressions like `{identifier}` or `{a.b.c}`,
-    // scan for the closing bracket directly. If we only encounter identifier
-    // characters, dots, whitespace, and no nesting/string/comment characters,
-    // we can return immediately without the full state machine.
-    if open == '{' {
-        let remaining = &bytes[index..];
-        // Use memchr to find the first '}' quickly
-        if let Some(close_offset) = memchr(b'}', remaining) {
-            // Check if the content between open and close is "simple" -
-            // contains no characters that require the full state machine:
-            // no nested brackets, no strings, no comments, no regex
-            let content = &remaining[..close_offset];
-            let is_simple = content.iter().all(|&b| {
-                b.is_ascii_alphanumeric()
-                    || b == b'_'
-                    || b == b'$'
-                    || b == b'.'
-                    || b == b' '
-                    || b == b'\t'
-                    || b == b'\n'
-                    || b == b'\r'
-                    || b == b'?'  // optional chaining
-                    || b == b','
-                    || b == b':'  // ternary, object literal
-                    || b == b';'
-                    || b == b'+'
-                    || b == b'-'
-                    || b == b'*'
-                    || b == b'%'
-                    || b == b'!'
-                    || b == b'='
-                    || b == b'<'
-                    || b == b'>'
-                    || b == b'&'
-                    || b == b'|'
-                    || b == b'^'
-                    || b == b'~'
-            });
-            if is_simple {
-                return Some(index + close_offset);
-            }
-        }
-    }
+    let open_byte = open as u8;
+    let close_byte = close as u8;
 
     let mut brackets = 1;
     let mut i = index;
@@ -219,11 +211,36 @@ pub fn find_matching_bracket(template: &str, index: usize, open: char) -> Option
     let mut prev_non_ws: Option<u8> = None;
 
     while brackets > 0 && i < template.len() {
+        // Only quotes, `/` and the bracket pair itself can change the state;
+        // every other byte (operators, identifiers, non-ASCII) just shifts
+        // `prev_non_ws`, so whole runs of them are skipped in one go.
+        let run_start = i;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if OPAQUE_BYTE[b as usize] || b == open_byte || b == close_byte {
+                break;
+            }
+            i += 1;
+        }
+        if i > run_start {
+            let mut k = i;
+            while k > run_start {
+                k -= 1;
+                if !bytes[k].is_ascii_whitespace() {
+                    prev_non_ws = Some(bytes[k]);
+                    break;
+                }
+            }
+            if i >= template.len() {
+                break;
+            }
+        }
+
         let ch = bytes[i] as char;
 
         match ch {
             '\'' | '"' => {
-                i = find_string_end(template, i + 1, ch);
+                i = find_string_end(template, i + 1, bytes[i]);
                 if i == usize::MAX {
                     i = template.len();
                 } else {
@@ -266,36 +283,14 @@ pub fn find_matching_bracket(template: &str, index: usize, open: char) -> Option
                 if next_char == '*' {
                     // Block comment. An unterminated `/*` (no closing `*/`)
                     // bails to EOF so the outer loop terminates and returns None.
-                    i = match memmem::find(&bytes[i + 1..], b"*/") {
+                    i = match BLOCK_COMMENT_END_FINDER.find(&bytes[i + 1..]) {
                         Some(p) => i + 1 + p + "*/".len(),
                         None => template.len(),
                     };
                     continue;
                 }
 
-                // Determine if `/` is a division operator or the start of a regex.
-                // After a value — identifier, number, closing paren/bracket, a
-                // postfix operator, or a string/template-literal close quote —
-                // `/` is division. (A `/` immediately after a string literal such
-                // as `'ab' / divisor` is always division: no regex can follow a
-                // value without an intervening operator.)
-                let is_division = match prev_non_ws {
-                    Some(c) => {
-                        c.is_ascii_alphanumeric()
-                            || c == b'_'
-                            || c == b'$'
-                            || c == b')'
-                            || c == b']'
-                            || c == b'+'
-                            || c == b'-'
-                            || c == b'\''
-                            || c == b'"'
-                            || c == b'`'
-                    }
-                    None => false,
-                };
-
-                if is_division {
+                if !slash_starts_regex_at(bytes, i, prev_non_ws) {
                     prev_non_ws = Some(b'/');
                     i += 1;
                     continue;
@@ -333,126 +328,6 @@ pub fn find_matching_bracket(template: &str, index: usize, open: char) -> Option
     None
 }
 
-/// Match brackets in the parser, handling nested brackets and quoted strings.
-///
-/// # Arguments
-/// * `parser` - The parser instance
-/// * `start` - The starting position (at the opening bracket)
-/// * `brackets` - Optional custom bracket mappings
-///
-/// # Returns
-/// The position after the closing bracket
-///
-/// # Errors
-/// Returns an error if brackets are mismatched or EOF is reached
-#[allow(dead_code)]
-pub fn match_bracket(
-    parser: &Parser,
-    start: usize,
-    brackets: Option<&FxHashMap<char, char>>,
-) -> ParseResult<usize> {
-    let default_brackets: FxHashMap<char, char> = [('{', '}'), ('(', ')'), ('[', ']')]
-        .iter()
-        .cloned()
-        .collect();
-
-    let brackets = brackets.unwrap_or(&default_brackets);
-    let close: Vec<char> = brackets.values().cloned().collect();
-    let mut bracket_stack: Vec<char> = Vec::new();
-
-    let mut i = start;
-    let bytes = parser.source.as_bytes();
-
-    while i < parser.source.len() {
-        let ch = bytes[i] as char;
-        i += 1;
-
-        if ch == '\'' || ch == '"' || ch == '`' {
-            i = match_quote(parser, i, ch)?;
-            continue;
-        }
-
-        if brackets.contains_key(&ch) {
-            bracket_stack.push(ch);
-        } else if close.contains(&ch) {
-            let popped = bracket_stack
-                .pop()
-                .ok_or_else(|| ParseError::UnexpectedToken {
-                    expected: "opening bracket".to_string(),
-                    found: ch.to_string(),
-                    span: (i - 1, i),
-                })?;
-
-            let expected = brackets.get(&popped).ok_or_else(|| ParseError::Generic {
-                message: format!("internal error: unknown bracket '{}'", popped),
-                span: (i - 1, i),
-            })?;
-
-            if ch != *expected {
-                return Err(ParseError::UnexpectedToken {
-                    expected: expected.to_string(),
-                    found: ch.to_string(),
-                    span: (i - 1, i),
-                });
-            }
-
-            if bracket_stack.is_empty() {
-                return Ok(i);
-            }
-        }
-    }
-
-    Err(ParseError::UnexpectedEof {
-        span: (parser.source.len(), parser.source.len()),
-    })
-}
-
-/// Match a quoted string in the parser.
-///
-/// # Arguments
-/// * `parser` - The parser instance
-/// * `start` - The position after the opening quote
-/// * `quote` - The quote character (`'`, `"`, or `` ` ``)
-///
-/// # Returns
-/// The position after the closing quote
-///
-/// # Errors
-/// Returns an error if the string is not terminated
-#[allow(dead_code)]
-fn match_quote(parser: &Parser, start: usize, quote: char) -> ParseResult<usize> {
-    let mut is_escaped = false;
-    let mut i = start;
-    let bytes = parser.source.as_bytes();
-
-    while i < parser.source.len() {
-        let ch = bytes[i] as char;
-        i += 1;
-
-        if is_escaped {
-            is_escaped = false;
-            continue;
-        }
-
-        if ch == quote {
-            return Ok(i);
-        }
-
-        if ch == '\\' {
-            is_escaped = true;
-        }
-
-        if quote == '`' && ch == '$' && i < parser.source.len() && bytes[i] == b'{' {
-            i = match_bracket(parser, i, None)?;
-        }
-    }
-
-    Err(ParseError::Generic {
-        message: "Unterminated string constant".to_string(),
-        span: (start - 1, start),
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -467,9 +342,9 @@ mod tests {
 
     #[test]
     fn test_find_unescaped_char() {
-        assert_eq!(find_unescaped_char("hello'world", 0, '\''), 5);
-        assert_eq!(find_unescaped_char(r"hello\'world'", 0, '\''), 12);
-        assert_eq!(find_unescaped_char("hello", 0, '\''), usize::MAX);
+        assert_eq!(find_unescaped_char("hello'world", 0, b'\''), 5);
+        assert_eq!(find_unescaped_char(r"hello\'world'", 0, b'\''), 12);
+        assert_eq!(find_unescaped_char("hello", 0, b'\''), usize::MAX);
     }
 
     #[test]
@@ -503,10 +378,7 @@ mod tests {
         assert_eq!(find_matching_bracket("{foo // unterminated", 1, '{'), None);
         // Attribute value: `class={foo /* unterminated}>` — the `/*` swallows the
         // closing `}` because no `*/` ever follows.
-        assert_eq!(
-            find_matching_bracket("{foo /* unterminated}>", 1, '{'),
-            None
-        );
+        assert_eq!(find_matching_bracket("{foo /* unterminated}>", 1, '{'), None);
         // `{#if}` header: `{#if foo // unterminated`
         assert_eq!(find_matching_bracket("{#if foo // bar", 1, '{'), None);
         // `{#each}` / `{#await}` header with unterminated block comment.
@@ -524,5 +396,19 @@ mod tests {
         assert_eq!(find_matching_bracket("{width/4}", 1, '{'), Some(8));
         assert_eq!(find_matching_bracket("{width/4*3}", 1, '{'), Some(10));
         assert_eq!(find_matching_bracket("{a + b/c}", 1, '{'), Some(8));
+
+        let non_null = "{asset.duration! / 1000}";
+        assert_eq!(find_matching_bracket(non_null, 1, '{'), Some(non_null.len() - 1));
+    }
+
+    #[test]
+    fn test_find_matching_bracket_with_slash_in_regex_character_class() {
+        let expression = r#"{v.replace(/(^wss:\/\/[^/]+)\/*$/i, '$1')}"#;
+        assert_eq!(find_matching_bracket(expression, 1, '{'), Some(expression.len() - 1));
+
+        // Escaped class closers do not expose a following slash as the regex
+        // delimiter either.
+        let escaped_close = r#"{/[[\]/}]+/.test(value)}"#;
+        assert_eq!(find_matching_bracket(escaped_close, 1, '{'), Some(escaped_close.len() - 1));
     }
 }

@@ -6,33 +6,69 @@ use rsvelte_core::ast::template::Script;
 
 use crate::error::FormatError;
 use crate::options::FormatOptions;
+use crate::width::VisualWidth;
 
 /// Format a standalone JS/TS source file in-process via `oxc_formatter` — the
 /// same engine `oxfmt` uses for `.ts`/`.js`, so the output is byte-identical
-/// without the `oxfmt` subprocess. `ext` is the file extension (`ts`/`tsx`/
-/// `js`/`jsx`/`mjs`/`cjs`) used to pick the parser dialect. EXPERIMENTAL: used
+/// without the `oxfmt` subprocess.
+///
+/// `ext` is the file extension (`ts`/`tsx`/`js`/`jsx`/`mjs`/`cjs`) used to pick the parser dialect. EXPERIMENTAL: used
 /// to benchmark a native (delegation-free) `.ts` path.
+///
+/// # Errors
+///
+/// Returns [`FormatError`] when parsing or printing the source fails.
 pub fn format_js_source(
     source: &str,
     ext: &str,
     options: &FormatOptions,
 ) -> Result<String, FormatError> {
     let source_type = SourceType::from_extension(ext).unwrap_or_else(|_| SourceType::ts());
+    // Standalone entry (not reached through `format`), so it never hits the
+    // per-file scratch reset — use a fresh per-call allocator to avoid leaking.
     let allocator = Allocator::default();
     let parser_ret = Parser::new(&allocator, source, source_type)
         .with_options(formatter_parse_options())
         .parse();
     if !parser_ret.diagnostics.is_empty() {
-        return Err(FormatError::ScriptParse(format!(
-            "{:?}",
-            parser_ret.diagnostics
-        )));
+        return Err(FormatError::ScriptParse(format!("{:?}", parser_ret.diagnostics)));
     }
-    let formatted = format_program(&allocator, &parser_ret.program, options.js.clone(), None)
+    let formatted =
+        print_program_guarded(&allocator, &parser_ret.program, options.js.clone(), source_type)?;
+    Ok(formatted.unwrap_or_else(|| source.to_string()))
+}
+
+/// Print a program through `oxc_formatter`, returning `None` when the formatted
+/// text would be a DIFFERENT program.
+///
+/// oxc drops parentheses that a brand check needs — `#x in (o || {})` prints as
+/// `#x in o || {}` and `(#x in o) * 2` as `#x in o * 2`
+/// (`upstream_issues/3451-oxc-private-in-parens.md`). A formatter must not
+/// rewrite what the code means, so this verifies the brand checks survived
+/// instead of predicting which ones oxc gets wrong. A program with no brand
+/// check takes the empty-record fast path and never re-parses.
+fn print_program_guarded<'a>(
+    allocator: &'a Allocator,
+    program: &oxc_ast::ast::Program<'a>,
+    js: JsFormatOptions,
+    source_type: SourceType,
+) -> Result<Option<String>, FormatError> {
+    let formatted = format_program(allocator, program, js)
         .print()
         .map_err(|e| FormatError::ScriptParse(format!("{e:?}")))?
         .into_code();
-    Ok(formatted)
+    let before = crate::private_in_guard::brand_check_shapes(program);
+    if before.is_empty() {
+        return Ok(Some(formatted));
+    }
+    let reparsed = Parser::new(allocator, &formatted, source_type)
+        .with_options(formatter_parse_options())
+        .parse();
+    if !reparsed.diagnostics.is_empty() {
+        return Ok(None);
+    }
+    let after = crate::private_in_guard::brand_check_shapes(&reparsed.program);
+    Ok((before == after).then_some(formatted))
 }
 
 /// The single indent unit (one nesting level) implied by `JsFormatOptions`.
@@ -51,21 +87,23 @@ fn indent_unit(opts: &JsFormatOptions) -> String {
 /// nodes — otherwise it hits an "Already disabled `preserveParens`"
 /// `unreachable!()` while walking the AST.
 fn formatter_parse_options() -> OxcParseOptions {
-    OxcParseOptions {
-        preserve_parens: false,
-        ..OxcParseOptions::default()
-    }
+    OxcParseOptions { preserve_parens: false, ..OxcParseOptions::default() }
 }
 
 /// Format a `<script>` body. Returns `(splice_start, splice_end, formatted_body)`
 /// in source-byte offsets, or `None` if the body is empty / whitespace-only.
-pub(crate) fn format_script(
+pub fn format_script(
     source: &str,
     script: &Script,
     options: &FormatOptions,
 ) -> Result<Option<(u32, u32, String)>, FormatError> {
     let (body_start, body_end) = body_span(source, script)?;
     let body = &source[body_start..body_end];
+
+    // Sort Tailwind class strings in configured `functions` calls (`cn(...)` /
+    // `cva(...)`) before formatting, so oxc re-prints from the sorted source.
+    let sorted_body = crate::tailwind_sort::sort_script_functions(body, options);
+    let body = sorted_body.as_deref().unwrap_or(body);
 
     if body.trim().is_empty() {
         // A whitespace-only body (e.g. `<script>\n\t\n</script>`) collapses to a
@@ -74,10 +112,14 @@ pub(crate) fn format_script(
         if body.is_empty() {
             return Ok(None);
         }
-        return Ok(Some((body_start as u32, body_end as u32, "\n".to_string())));
+        return Ok(Some((
+            crate::source_offset(body_start),
+            crate::source_offset(body_end),
+            "\n".to_string(),
+        )));
     }
 
-    let allocator = Allocator::default();
+    let allocator = crate::scratch::acquire();
     // Always parse as TypeScript: oxfmt's `.svelte` mode via `prettier-plugin-svelte`
     // uses `babel-ts` (TypeScript parser) for ALL `<script>` blocks regardless of
     // `lang="ts"`. TypeScript is a superset of JS so valid JS parses identically,
@@ -94,14 +136,10 @@ pub(crate) fn format_script(
     // scripts as `.ts` (no comma). Matching the extension keeps `<T>` as `<T>`.
     let source_type = SourceType::from_extension("ts").unwrap_or_else(|_| SourceType::ts());
 
-    let parser_ret = Parser::new(&allocator, body, source_type)
-        .with_options(formatter_parse_options())
-        .parse();
+    let parser_ret =
+        Parser::new(allocator, body, source_type).with_options(formatter_parse_options()).parse();
     if !parser_ret.diagnostics.is_empty() {
-        return Err(FormatError::ScriptParse(format!(
-            "{:?}",
-            parser_ret.diagnostics
-        )));
+        return Err(FormatError::ScriptParse(format!("{:?}", parser_ret.diagnostics)));
     }
 
     // When the body is indented, format it one indent level narrower than the
@@ -111,17 +149,14 @@ pub(crate) fn format_script(
     // full configured width.
     let mut js = options.js.clone();
     if options.indent_script_and_style {
-        let nested_width = js
-            .line_width
-            .value()
-            .saturating_sub(js.indent_width.value() as u16);
+        let nested_width = js.line_width.value().saturating_sub(u16::from(js.indent_width.value()));
         js.line_width =
             oxc_formatter_core::LineWidth::try_from(nested_width).unwrap_or(js.line_width);
     }
-    let formatted = format_program(&allocator, &parser_ret.program, js, None)
-        .print()
-        .map_err(|e| FormatError::ScriptParse(format!("{e:?}")))?
-        .into_code();
+    let Some(formatted) = print_program_guarded(allocator, &parser_ret.program, js, source_type)?
+    else {
+        return Ok(None);
+    };
 
     // oxc_formatter emits a trailing newline. Add one indent level to
     // every non-empty line so the body is nested under `<script>` using
@@ -133,15 +168,12 @@ pub(crate) fn format_script(
     // `svelteIndentScriptAndStyle` (default true) controls whether the body is
     // indented one level under `<script>`. When disabled, the body sits flush at
     // column 0 (an empty indent unit re-indents every line to column 0).
-    let unit = if options.indent_script_and_style {
-        indent_unit(&options.js)
-    } else {
-        String::new()
-    };
+    let unit =
+        if options.indent_script_and_style { indent_unit(&options.js) } else { String::new() };
     let body_indented = crate::reindent::reindent(formatted.trim_end(), &unit, false);
     let wrapped = format!("\n{body_indented}\n");
 
-    Ok(Some((body_start as u32, body_end as u32, wrapped)))
+    Ok(Some((crate::source_offset(body_start), crate::source_offset(body_end), wrapped)))
 }
 
 /// Format a `<script>` element nested in the markup (e.g. inside
@@ -149,7 +181,7 @@ pub(crate) fn format_script(
 /// so they'd otherwise be left verbatim. `depth` is the element's nesting depth;
 /// its body renders at `depth + 1` levels of indent. Returns the splice edit, or
 /// `None` when the body is empty / unparseable.
-pub(crate) fn format_nested_script(
+pub fn format_nested_script(
     source: &str,
     start: u32,
     end: u32,
@@ -172,15 +204,14 @@ pub(crate) fn format_nested_script(
     if body.trim().is_empty() {
         return Ok(None);
     }
-    let allocator = Allocator::default();
+    let allocator = crate::scratch::acquire();
     // Same reasoning as format_script: always use TS source type so that
     // numeric-looking string property keys are preserved (oracle uses babel-ts).
     // `from_extension("ts")` (extension `Some(Ts)`) avoids the forced
     // `<T>` → `<T,>` arrow type-parameter comma that a `None` extension triggers.
     let source_type = SourceType::from_extension("ts").unwrap_or_else(|_| SourceType::ts());
-    let parser_ret = Parser::new(&allocator, body, source_type)
-        .with_options(formatter_parse_options())
-        .parse();
+    let parser_ret =
+        Parser::new(allocator, body, source_type).with_options(formatter_parse_options()).parse();
     if !parser_ret.diagnostics.is_empty() {
         // Can't parse → leave the nested script untouched.
         return Ok(None);
@@ -189,28 +220,27 @@ pub(crate) fn format_nested_script(
     let unit = indent_unit(&options.js);
     // `svelteIndentScriptAndStyle` (default true): when disabled, drop the extra
     // body indent level so the body sits at the element's own depth.
-    let body_indent = if options.indent_script_and_style {
-        unit.repeat(depth + 1)
-    } else {
-        unit.repeat(depth)
-    };
+    let body_indent =
+        if options.indent_script_and_style { unit.repeat(depth + 1) } else { unit.repeat(depth) };
     // Narrow the width by the final nesting so wrap decisions match the indented
     // result (mirrors `format_script`'s one-level narrowing, generalised).
     let mut js = options.js.clone();
-    let narrow = (body_indent.len() as u16).min(js.line_width.value().saturating_sub(1));
+    let narrow =
+        (crate::formatter_width(body_indent.visual_width(crate::width::tab_width(options))))
+            .min(js.line_width.value().saturating_sub(1));
     let nested_width = js.line_width.value().saturating_sub(narrow);
     js.line_width = oxc_formatter_core::LineWidth::try_from(nested_width).unwrap_or(js.line_width);
-    let formatted = format_program(&allocator, &parser_ret.program, js, None)
-        .print()
-        .map_err(|e| FormatError::ScriptParse(format!("{e:?}")))?
-        .into_code();
+    let Some(formatted) = print_program_guarded(allocator, &parser_ret.program, js, source_type)?
+    else {
+        return Ok(None);
+    };
 
     let reindented = crate::reindent::reindent(formatted.trim_end(), &body_indent, false);
     let tag_indent = unit.repeat(depth);
     let spliced = format!("\n{reindented}\n{tag_indent}");
     Ok(Some((
-        start + open_end as u32,
-        start + close_start as u32,
+        start + crate::source_offset(open_end),
+        start + crate::source_offset(close_start),
         spliced,
     )))
 }
@@ -224,7 +254,7 @@ pub(crate) fn format_nested_script(
 ///   `<script lang='ts'>` → `<script lang="ts">`).
 ///
 /// Returns the edit only when it changes something.
-pub(crate) fn format_open_tag(
+pub fn format_open_tag(
     source: &str,
     start: u32,
     end: u32,
@@ -236,18 +266,22 @@ pub(crate) fn format_open_tag(
     let normalized = normalize_open_tag(tag);
     let line_width = options.js.line_width.value() as usize;
     let indent_width = options.js.indent_width.value() as usize;
-    let result = if normalized.len() > line_width {
-        // The normalized flat tag overflows the print width — wrap each
-        // attribute onto its own line at one level of indent (the top-level
-        // `<script>` / `<style>` block is always at depth 0).
-        wrap_script_open_tag(&normalized, indent_width).unwrap_or(normalized)
+    // The wrapped form puts each attribute on its own line at one level of indent
+    // (the top-level `<script>` / `<style>` block is always at depth 0). It is used
+    // when the flat tag overflows the print width, and — like prettier's
+    // `attributeLine` — whenever `singleAttributePerLine` meets >1 attribute.
+    let wrapped = wrap_script_open_tag(&normalized, indent_width);
+    let force_single_attr = options.attributes.single_attribute_per_line
+        && wrapped.as_ref().is_some_and(|(_, n)| *n > 1);
+    let result = if normalized.len() > line_width || force_single_attr {
+        wrapped.map_or(normalized, |(tag, _)| tag)
     } else {
         normalized
     };
     if result == tag {
         return None;
     }
-    Some((start, start + tag_end_rel as u32, result))
+    Some((start, start + crate::source_offset(tag_end_rel), result))
 }
 
 /// Reformat a flat normalized open tag (e.g. `<script lang="ts" generics="T extends ...">`)
@@ -260,17 +294,15 @@ pub(crate) fn format_open_tag(
 /// >
 /// ```
 ///
-/// Returns `None` when the tag can't be parsed (e.g. no attributes).
-fn wrap_script_open_tag(tag: &str, indent_width: usize) -> Option<String> {
+/// Returns the wrapped tag and its attribute count, or `None` when the tag can't
+/// be parsed (e.g. no attributes).
+fn wrap_script_open_tag(tag: &str, indent_width: usize) -> Option<(String, usize)> {
     // Strip the leading `<` and trailing `>`.
     let inner = tag.strip_prefix('<')?.strip_suffix('>')?;
-    // Split tag name from attributes. Tag name is everything up to the first space.
-    let (tag_name, rest) = if let Some(sp) = inner.find(' ') {
-        (&inner[..sp], inner[sp + 1..].trim())
-    } else {
-        // No attributes — nothing to wrap.
-        return None;
-    };
+    // Split tag name from attributes. Tag name is everything up to the first
+    // space; without attributes there is nothing to wrap.
+    let sp = inner.find(' ')?;
+    let (tag_name, rest) = (&inner[..sp], inner[sp + 1..].trim());
     // Parse attributes from the flat string. All values are double-quoted after
     // normalize_open_tag, so we scan respecting quoted spans.
     let mut attrs: Vec<String> = Vec::new();
@@ -319,7 +351,7 @@ fn wrap_script_open_tag(tag: &str, indent_width: usize) -> Option<String> {
         if i < len {
             i += 1; // skip closing `"`
         }
-        attrs.push(format!("{}=\"{}\"", name, val));
+        attrs.push(format!("{name}=\"{val}\""));
     }
     if attrs.is_empty() {
         return None;
@@ -332,7 +364,7 @@ fn wrap_script_open_tag(tag: &str, indent_width: usize) -> Option<String> {
         out.push_str(attr);
     }
     out.push_str("\n>");
-    Some(out)
+    Some((out, attrs.len()))
 }
 
 /// Normalize whitespace and quote styles in a `<script …>` / `<style …>` open
@@ -480,10 +512,7 @@ fn body_span(source: &str, script: &Script) -> Result<(usize, usize), FormatErro
         .rfind("</script")
         .ok_or_else(|| FormatError::Parse("script closing tag missing".into()))?;
 
-    Ok((
-        script.start as usize + body_start_rel,
-        script.start as usize + body_end_rel,
-    ))
+    Ok((script.start as usize + body_start_rel, script.start as usize + body_end_rel))
 }
 
 /// Byte offset (relative to `block`) of the `>` that closes the opening tag,

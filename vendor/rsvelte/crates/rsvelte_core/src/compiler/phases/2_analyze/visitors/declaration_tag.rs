@@ -16,7 +16,7 @@
 use super::super::AnalysisError;
 use super::super::errors;
 use super::super::warnings;
-use super::shared::utils::{walk_js_expression, walk_js_expression_node};
+use super::shared::utils::walk_js_expression_node;
 use super::{FragmentOwnerType, VisitorContext};
 use crate::ast::template::DeclarationTag;
 use crate::ast::typed_expr::JsNode;
@@ -45,7 +45,7 @@ pub fn visit(tag: &mut DeclarationTag, context: &mut VisitorContext) -> Result<(
             || context.analysis.uses_rest_props
             || context.analysis.instance_has_legacy_patterns)
     {
-        return Err(errors::declaration_tag_no_legacy_mode());
+        return Err(errors::declaration_tag_no_legacy_mode().at(tag.start, tag.end));
     }
 
     // Validate placement: same set of fragment owners as `{@const}`.
@@ -61,6 +61,7 @@ pub fn visit(tag: &mut DeclarationTag, context: &mut VisitorContext) -> Result<(
                 | FragmentOwnerType::SvelteFragment
                 | FragmentOwnerType::SvelteBoundary
                 | FragmentOwnerType::Component
+                | FragmentOwnerType::SvelteSelf
                 | FragmentOwnerType::RegularElementWithSlot
                 | FragmentOwnerType::SvelteElementWithSlot
         )
@@ -82,7 +83,7 @@ pub fn visit(tag: &mut DeclarationTag, context: &mut VisitorContext) -> Result<(
         || fragment_owner.is_none();
 
     if !is_valid_placement {
-        return Err(errors::const_tag_invalid_placement());
+        return Err(errors::const_tag_invalid_placement().at(tag.start, tag.end));
     }
 
     // Walk init expressions for state/await/blocker discovery. The declaration
@@ -98,13 +99,12 @@ pub fn visit(tag: &mut DeclarationTag, context: &mut VisitorContext) -> Result<(
     let decl_node = tag.declaration.as_node();
     let arena = context.parse_arena;
 
+    // Any other declaration shape carries no init to walk; the JSON fallback
+    // this replaced re-tested the same type and so was already a no-op.
     if let JsNode::VariableDeclaration { declarations, .. } = &*decl_node {
         let decls = arena.get_js_children(*declarations);
         for d in decls {
-            if let JsNode::VariableDeclarator {
-                init: Some(init), ..
-            } = d
-            {
+            if let JsNode::VariableDeclarator { init: Some(init), .. } = d {
                 let init_node = arena.get_js_node(*init);
                 walk_js_expression_node(init_node, context, &mut tag.metadata.expression)?;
                 super::await_block::collect_pickled_awaits_node(
@@ -114,24 +114,6 @@ pub fn visit(tag: &mut DeclarationTag, context: &mut VisitorContext) -> Result<(
                 );
             }
         }
-    } else {
-        // Fallback: walk via JSON shape.
-        let value = tag.declaration.as_json();
-        if value.get("type").and_then(|t| t.as_str()) == Some("VariableDeclaration")
-            && let Some(declarations) = value.get("declarations").and_then(|d| d.as_array())
-        {
-            for declaration in declarations {
-                if let Some(init) = declaration.get("init")
-                    && !init.is_null()
-                {
-                    walk_js_expression(init, context, &mut tag.metadata.expression)?;
-                    super::await_block::collect_pickled_awaits(
-                        init,
-                        &mut context.analysis.pickled_awaits,
-                    );
-                }
-            }
-        }
     }
 
     // `state_referenced_locally` warning (Svelte 5.56.1 #18348). A declaration
@@ -139,7 +121,7 @@ pub fn visit(tag: &mut DeclarationTag, context: &mut VisitorContext) -> Result<(
     // closure or a `$state(…)` / `$derived(…)` call argument — only captures the
     // initial value (e.g. `{let e = $state(0), f = e}`). rsvelte's main
     // Identifier visitor, which normally emits this warning, does not run on
-    // declaration tags (they use the specialized `walk_js_expression` walker for
+    // declaration tags (they use the specialized `walk_js_expression_node` walker for
     // metadata discovery), so we replicate the structural check here: any
     // reactive binding referenced at the "top level" of an initializer warns.
     if context.analysis.runes && !context.is_ignored("state_referenced_locally") {
@@ -173,14 +155,8 @@ fn warn_local_state_reads(node: &serde_json::Value, context: &mut VisitorContext
             let Some(name) = node.get("name").and_then(|n| n.as_str()) else {
                 return;
             };
-            let eligible = context
-                .analysis
-                .root
-                .scope
-                .declarations
-                .get(name)
-                .copied()
-                .is_some_and(|idx| {
+            let eligible =
+                context.analysis.root.scope.declarations.get(name).copied().is_some_and(|idx| {
                     matches!(
                         context.analysis.root.bindings[idx].kind,
                         BindingKind::State | BindingKind::RawState | BindingKind::Derived
@@ -192,9 +168,7 @@ fn warn_local_state_reads(node: &serde_json::Value, context: &mut VisitorContext
                 context
                     .analysis
                     .warnings
-                    .push(warnings::state_referenced_locally(
-                        name, "closure", start, end,
-                    ));
+                    .push(warnings::state_referenced_locally(name, "closure", start, end));
             }
         }
         // Reads inside a nested function are reactive — do not descend.
@@ -249,15 +223,11 @@ fn callee_is_state_rune(call: &serde_json::Value) -> bool {
         return false;
     };
     match callee.get("type").and_then(|t| t.as_str()) {
-        Some("Identifier") => matches!(
-            callee.get("name").and_then(|n| n.as_str()),
-            Some("$state" | "$derived")
-        ),
+        Some("Identifier") => {
+            matches!(callee.get("name").and_then(|n| n.as_str()), Some("$state" | "$derived"))
+        }
         Some("MemberExpression") => matches!(
-            callee
-                .get("object")
-                .and_then(|o| o.get("name"))
-                .and_then(|n| n.as_str()),
+            callee.get("object").and_then(|o| o.get("name")).and_then(|n| n.as_str()),
             Some("$state" | "$derived")
         ),
         _ => false,

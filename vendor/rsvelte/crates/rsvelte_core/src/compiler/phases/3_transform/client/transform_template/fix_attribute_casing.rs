@@ -294,8 +294,5 @@ static SVG_ATTRIBUTE_LOOKUP: LazyLock<FxHashMap<String, &'static str>> = LazyLoc
 /// The properly cased attribute name, or the original name if not an SVG attribute
 pub fn fix_attribute_casing(name: &str) -> String {
     let lowercase = name.to_lowercase();
-    SVG_ATTRIBUTE_LOOKUP
-        .get(&lowercase)
-        .map(|&s| s.to_string())
-        .unwrap_or_else(|| lowercase)
+    SVG_ATTRIBUTE_LOOKUP.get(&lowercase).map(|&s| s.to_string()).unwrap_or_else(|| lowercase)
 }

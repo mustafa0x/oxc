@@ -18,10 +18,7 @@ use crate::compiler::phases::phase2_analyze::{AnalysisError, BindingKind, errors
 /// uses `is_reference_for_identifier_typed` for the reference check,
 /// then delegates to `visit_identifier_inner`.
 pub fn visit_typed(node: &JsNode, context: &mut VisitorContext) -> Result<(), AnalysisError> {
-    let JsNode::Identifier {
-        name, start, end, ..
-    } = node
-    else {
+    let JsNode::Identifier { name, start, end, .. } = node else {
         return Ok(());
     };
 
@@ -57,8 +54,14 @@ fn visit_identifier_inner(
     // Corresponds to Svelte's L266-269 and L351-352 in 2-analyze/index.js
     if name == "$" || name.starts_with("$$") {
         // $$ prefixed names except reserved ones ($$props, $$restProps, $$slots) are illegal
-        if name != "$$props" && name != "$$restProps" && name != "$$slots" {
-            return Err(errors::global_reference_invalid(name));
+        // Upstream walks the module scope's UNRESOLVED references, so a `$` that
+        // resolves to a binding — a parameter, most often — is not one of these.
+        if name != "$$props"
+            && name != "$$restProps"
+            && name != "$$slots"
+            && context.analysis.root.get_binding(name, context.scope).is_none()
+        {
+            return Err(errors::global_reference_invalid(name).at(start, end));
         }
     }
 
@@ -70,14 +73,11 @@ fn visit_identifier_inner(
     // Check for `arguments` outside of functions
     if name == "arguments" {
         let is_in_function = context.js_path.iter().any(|n| {
-            matches!(
-                n.get_type_str(),
-                Some("FunctionDeclaration") | Some("FunctionExpression")
-            )
+            matches!(n.get_type_str(), Some("FunctionDeclaration") | Some("FunctionExpression"))
         });
 
         if !is_in_function {
-            return Err(errors::invalid_arguments_usage());
+            return Err(errors::invalid_arguments_usage().at(start, end));
         }
     }
 
@@ -121,16 +121,12 @@ fn visit_identifier_inner(
             false
         };
 
-        if context
-            .analysis
-            .root
-            .get_binding(name, context.scope)
-            .is_none()
+        if context.analysis.root.get_binding(name, context.scope).is_none()
             && !is_store_sub
             && !has_store_sub_binding
         {
             // This is a rune - validate it
-            return validate_rune_usage(name, &context.js_path, context.parse_arena);
+            return validate_rune_usage(name, start, end, &context.js_path, context.parse_arena);
         }
     }
 
@@ -163,11 +159,7 @@ fn visit_identifier_inner(
             return false;
         }
         // For value entries, use JSON path
-        ancestor
-            .get("label")
-            .and_then(|l| l.get("name"))
-            .and_then(|n| n.as_str())
-            == Some("$")
+        ancestor.get("label").and_then(|l| l.get("name")).and_then(|n| n.as_str()) == Some("$")
     });
 
     // Check if this reference is in a StyleDirective
@@ -237,12 +229,8 @@ fn visit_identifier_inner(
         expression.references.insert(binding_idx);
 
         // Check if this reference involves state
-        let binding = &context.analysis.root.bindings[binding_idx];
-        let involves_state = binding.kind != BindingKind::Static
-            && (binding.kind == BindingKind::Prop
-                || binding.kind == BindingKind::BindableProp
-                || binding.kind == BindingKind::RestProp
-                || !binding.is_function());
+        let involves_state =
+            super::shared::utils::binding_reference_has_state(binding_idx, context);
 
         if involves_state {
             expression.set_has_state(true);
@@ -253,19 +241,10 @@ fn visit_identifier_inner(
     // Corresponds to Svelte's Identifier.js L104-152
     //
     // The official compiler has `node !== binding.node` check to skip warnings for the
-    // declaration identifier itself. We approximate this by checking if the identifier
-    // is inside a VariableDeclarator's `id` pattern (which is the declaration site).
-    let is_declaration_node = context.js_path.iter().any(|ancestor| {
-        if ancestor.get_type_str() == Some("VariableDeclarator") {
-            // Check if the current node's position falls within the `id` pattern range
-            let id_start = ancestor.get_child_field_start("id", context.parse_arena);
-            let id_end = ancestor.get_child_field_end("id", context.parse_arena);
-            if let (Some(id_s), Some(id_e)) = (id_start, id_end) {
-                return start >= id_s && start < id_e;
-            }
-        }
-        false
-    });
+    // declaration identifier itself. `declaration_start` records that exact node; using the
+    // whole declarator pattern also hides references in computed keys.
+    let is_declaration_node =
+        context.analysis.root.bindings[binding_idx].declaration_start == Some(start);
 
     if context.analysis.runes && !is_declaration_node {
         let binding = &context.analysis.root.bindings[binding_idx];
@@ -303,7 +282,9 @@ fn visit_identifier_inner(
                 BindingKind::State => {
                     binding.reassigned || {
                         // Also warn if the initial $state() call has an argument that won't be proxied
-                        // We approximate: check if initial_node_type is a primitive type
+                        // Match should_proxy's non-proxyable expression kinds. Logical
+                        // and conditional expressions deliberately fall through to true
+                        // upstream because either branch may produce a proxyable value.
                         binding.initial_node_type.as_deref().is_some_and(|t| {
                             matches!(
                                 t,
@@ -311,8 +292,6 @@ fn visit_identifier_inner(
                                     | "TemplateLiteral"
                                     | "BinaryExpression"
                                     | "UnaryExpression"
-                                    | "ConditionalExpression"
-                                    | "LogicalExpression"
                             )
                         })
                     }
@@ -329,9 +308,7 @@ fn visit_identifier_inner(
             // checking source positions.
             let is_before_declaration = binding.declaration_kind
                 == crate::compiler::phases::phase2_analyze::scope::DeclarationKind::Var
-                && binding
-                    .declaration_start
-                    .is_some_and(|decl_start| start < decl_start);
+                && binding.declaration_start.is_some_and(|decl_start| start < decl_start);
 
             if is_eligible_kind && !is_before_declaration {
                 // Check this is a read, not a write
@@ -402,15 +379,12 @@ fn visit_identifier_inner(
                         }
                     }
 
-                    context
-                        .analysis
-                        .warnings
-                        .push(warnings::state_referenced_locally(
-                            name,
-                            warning_type,
-                            Some(start),
-                            Some(end),
-                        ));
+                    context.analysis.warnings.push(warnings::state_referenced_locally(
+                        name,
+                        warning_type,
+                        Some(start),
+                        Some(end),
+                    ));
                 }
             }
         }
@@ -420,11 +394,18 @@ fn visit_identifier_inner(
     // Corresponds to Svelte's Identifier.js L154-159
     if context.in_reactive_declaration {
         let binding = &context.analysis.root.bindings[binding_idx];
-        // Check if binding is in module scope (scope_index == 0) and is reassigned
-        if binding.scope_index == 0 && binding.reassigned {
+        // Upstream declares synthetic store subscriptions in the *instance* scope, so
+        // they never satisfy its `binding.scope === module.scope` test; rsvelte parks
+        // them in scope 0 alongside the real module-script declarations.
+        if binding.scope_index == 0
+            && binding.reassigned
+            && !matches!(binding.kind, BindingKind::StoreSub)
+        {
             // Route through emit_warning so a `svelte-ignore` in scope can
             // suppress it (H-118); a direct push bypasses the ignore stack.
-            context.emit_warning(warnings::reactive_declaration_module_script_dependency());
+            context.emit_warning(
+                warnings::reactive_declaration_module_script_dependency().at(start, end),
+            );
         }
     }
 
@@ -442,9 +423,7 @@ fn check_callee_is_state_rune(
     if let Some(callee_node) = call_entry.get_callee_typed(arena) {
         return match callee_node {
             JsNode::Identifier { name, .. } => name.as_str() == "$state",
-            JsNode::MemberExpression {
-                object, property, ..
-            } => {
+            JsNode::MemberExpression { object, property, .. } => {
                 let obj = arena.get_js_node(*object);
                 let prop = arena.get_js_node(*property);
                 obj.get_field_str("name") == Some("$state")
@@ -458,13 +437,9 @@ fn check_callee_is_state_rune(
     if let Some(callee) = call_entry.get("callee") {
         let is_direct = callee.get("name").and_then(|n| n.as_str()) == Some("$state");
         let is_member = callee.get("type").and_then(|t| t.as_str()) == Some("MemberExpression")
-            && callee
-                .get("object")
-                .and_then(|o| o.get("name").and_then(|n| n.as_str()))
+            && callee.get("object").and_then(|o| o.get("name").and_then(|n| n.as_str()))
                 == Some("$state")
-            && callee
-                .get("property")
-                .and_then(|p| p.get("name").and_then(|n| n.as_str()))
+            && callee.get("property").and_then(|p| p.get("name").and_then(|n| n.as_str()))
                 == Some("raw");
         return is_direct || is_member;
     }
@@ -477,6 +452,8 @@ fn check_callee_is_state_rune(
 /// Handles validation of rune syntax like `$state()`, `$derived.by()`, etc.
 fn validate_rune_usage(
     rune_name: &str,
+    start: u32,
+    end: u32,
     js_path: &[super::JsPathEntry],
     arena: &crate::ast::arena::ParseArena,
 ) -> Result<(), AnalysisError> {
@@ -487,6 +464,7 @@ fn validate_rune_usage(
     };
 
     let mut current_rune_name = rune_name.to_string();
+    let mut current_span = (start, end);
 
     // Walk up through MemberExpression chain to build the full rune name
     while path_idx > 0 {
@@ -496,9 +474,15 @@ fn validate_rune_usage(
             break;
         }
 
+        if let (Some(start), Some(end)) =
+            (parent.get_field_u64("start"), parent.get_field_u64("end"))
+        {
+            current_span = (start as u32, end as u32);
+        }
+
         // Check for computed property
         if parent.get_field_bool("computed").unwrap_or(false) {
-            return Err(errors::rune_invalid_computed_property());
+            return Err(errors::rune_invalid_computed_property().at(current_span.0, current_span.1));
         }
 
         // Build the full rune name
@@ -512,30 +496,41 @@ fn validate_rune_usage(
             }
         } else {
             // Fall back to value-based access for property name
-            parent
-                .get("property")
-                .and_then(|p| p.get("name"))
-                .and_then(|n| n.as_str())
+            parent.get("property").and_then(|p| p.get("name")).and_then(|n| n.as_str())
         };
 
         if let Some(prop_name) = prop_name {
             let full_name = format!("{}.{}", current_rune_name, prop_name);
 
             if !is_rune(&full_name) {
+                // Upstream advances to the member's parent before reporting these
+                // errors. For the usual call shape this includes the parentheses.
+                let error_span = js_path
+                    .get(path_idx - 1)
+                    .and_then(|parent| {
+                        Some((
+                            parent.get_field_u64("start")? as u32,
+                            parent.get_field_u64("end")? as u32,
+                        ))
+                    })
+                    .unwrap_or(current_span);
+
                 // Check for renamed runes
                 if full_name == "$effect.active" {
-                    return Err(errors::rune_renamed("$effect.active", "$effect.tracking"));
+                    return Err(errors::rune_renamed("$effect.active", "$effect.tracking")
+                        .at(error_span.0, error_span.1));
                 }
 
                 if full_name == "$state.frozen" {
-                    return Err(errors::rune_renamed("$state.frozen", "$state.raw"));
+                    return Err(errors::rune_renamed("$state.frozen", "$state.raw")
+                        .at(error_span.0, error_span.1));
                 }
 
                 if full_name == "$state.is" {
-                    return Err(errors::rune_removed("$state.is"));
+                    return Err(errors::rune_removed("$state.is").at(error_span.0, error_span.1));
                 }
 
-                return Err(errors::rune_invalid_name(&full_name));
+                return Err(errors::rune_invalid_name(&full_name).at(error_span.0, error_span.1));
             }
 
             current_rune_name = full_name;
@@ -549,7 +544,7 @@ fn validate_rune_usage(
     if path_idx > 0 {
         let parent = &js_path[path_idx];
         if parent.get_type_str() != Some("CallExpression") {
-            return Err(errors::rune_missing_parentheses());
+            return Err(errors::rune_missing_parentheses().at(current_span.0, current_span.1));
         }
     }
 
@@ -597,7 +592,9 @@ fn check_const_tag_snippet_reference(
                 snippet_scope = Some(*scope);
                 snippet_name = Some(sname.clone());
             }
-            super::FragmentOwnerType::Component if found_snippet => {
+            super::FragmentOwnerType::Component | super::FragmentOwnerType::SvelteSelf
+                if found_snippet =>
+            {
                 // For components, all named snippets trigger this check
                 if snippet_scope == Some(binding_scope) {
                     return Err(errors::const_tag_invalid_reference(name));

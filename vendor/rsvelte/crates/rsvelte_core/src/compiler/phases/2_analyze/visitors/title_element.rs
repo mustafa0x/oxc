@@ -11,10 +11,14 @@ use crate::ast::template::{TemplateNode, TitleElement};
 use crate::compiler::phases::phase2_analyze::AnalysisError;
 
 /// Visit a title element.
-pub fn visit(title: &mut TitleElement, context: &mut VisitorContext) -> Result<(), AnalysisError> {
+pub fn visit<'a, 'b: 'a>(
+    title: &mut TitleElement<'b>,
+    context: &mut VisitorContext<'a>,
+) -> Result<(), AnalysisError> {
     // Check for illegal attributes - title cannot have any attributes or directives
-    if !title.attributes.is_empty() {
-        return Err(errors::title_illegal_attribute());
+    if let Some(attribute) = title.attributes.first() {
+        let (start, end) = attribute.span();
+        return Err(errors::title_illegal_attribute().at(start, end));
     }
 
     // Check that all children are Text or ExpressionTag
@@ -24,7 +28,8 @@ pub fn visit(title: &mut TitleElement, context: &mut VisitorContext) -> Result<(
                 // These are allowed
             }
             _ => {
-                return Err(errors::title_invalid_content());
+                let (start, end) = child.span();
+                return Err(errors::title_invalid_content().at(start, end));
             }
         }
     }
